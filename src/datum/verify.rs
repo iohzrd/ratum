@@ -1,0 +1,1673 @@
+use crate::bitcoin::{self, CoinbaseTx};
+use crate::datum::messages::{ClientConfig, CoinbaseOutput, CoinbaserResponse, RejectReason};
+use crate::datum::share::{
+    self, COINBASE_ID_SUBSIDY_ONLY, CoinbaseSection, JobSection, MAX_JOBS, MAX_USERNAME, PowSubmit,
+};
+use crate::header::{self, HeaderV2};
+use crate::target;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex};
+
+/// `MAX_COINBASE_TYPES` in the gateway's `datum_stratum.h`, which sizes its coinbase array.
+pub const MAX_COINBASE_TYPES: u8 = 6;
+pub const MAX_SEEN: usize = 1 << 20;
+
+#[derive(Debug)]
+pub struct ReplayGuard {
+    seen: HashSet<[u8; 32]>,
+    order: VecDeque<[u8; 32]>,
+    capacity: usize,
+}
+
+impl ReplayGuard {
+    pub fn new(capacity: usize) -> Self {
+        ReplayGuard { seen: HashSet::new(), order: VecDeque::new(), capacity: capacity.max(1) }
+    }
+
+    /// Records a hash and reports whether it is new, removing the oldest once full.
+    pub fn accept(&mut self, hash: [u8; 32]) -> bool {
+        if !self.seen.insert(hash) {
+            return false;
+        }
+        self.order.push_back(hash);
+        while self.order.len() > self.capacity {
+            if let Some(old) = self.order.pop_front() {
+                self.seen.remove(&old);
+            }
+        }
+        true
+    }
+
+    /// Removes a hash, so work that `accept` recorded but that was never credited (a share
+    /// whose ledger write failed) can be credited when it is resent rather than refused as
+    /// a duplicate. Returns whether it was present.
+    pub fn remove(&mut self, hash: &[u8; 32]) -> bool {
+        if !self.seen.remove(hash) {
+            return false;
+        }
+        if let Some(pos) = self.order.iter().position(|h| h == hash) {
+            self.order.remove(pos);
+        }
+        true
+    }
+
+    pub fn len(&self) -> usize {
+        self.seen.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.seen.is_empty()
+    }
+}
+
+impl Default for ReplayGuard {
+    fn default() -> Self {
+        ReplayGuard::new(MAX_SEEN)
+    }
+}
+
+pub const DEFAULT_NTIME_WINDOW_SECS: u64 = 2 * 60 * 60;
+
+/// How long a job built on a replaced tip is still credited. A share meeting the
+/// network target skips the staleness test, so this covers only the interval during which the
+/// tip the pool holds and the tip the gateway built on differ.
+pub const TIP_GRACE_SECS: u64 = 1;
+
+/// How many replaced tips to keep. The chain can produce several tips in quick succession
+/// when competing blocks arrive at the same height, and each one displaces the last, so
+/// holding only the most recently replaced tip would refuse work that is still credited.
+const MAX_RECENT_TIPS: usize = 8;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PoolPolicy {
+    pub payout_script: Vec<u8>,
+    pub prime_id: u32,
+    pub coinbase_tag: String,
+    pub min_difficulty: u64,
+    pub ntime_window_secs: u64,
+    pub activation: Option<(u32, String)>,
+}
+
+impl PoolPolicy {
+    pub fn from_config(c: &ClientConfig) -> Self {
+        PoolPolicy {
+            payout_script: c.payout_script.clone(),
+            prime_id: c.prime_id,
+            coinbase_tag: c.coinbase_tag.clone(),
+            min_difficulty: c.min_difficulty,
+            ntime_window_secs: DEFAULT_NTIME_WINDOW_SECS,
+            activation: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Rebuilt {
+    pub difficulty: u64,
+    pub block_hash: [u8; 32],
+    pub header: Vec<u8>,
+    pub is_v2: bool,
+    /// The assembled coinbase transaction.
+    pub coinbase_tx: Vec<u8>,
+    pub height: u32,
+    pub txn_count: u32,
+    pub paid_to_split: u64,
+    pub paid_to_pool: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Accepted {
+    pub work: Rebuilt,
+    pub is_block: bool,
+}
+
+#[derive(Clone, Debug)]
+struct JobState {
+    job: JobSection,
+    coinbases: HashMap<u8, CoinbaseSection>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Verifier {
+    policy: PoolPolicy,
+    jobs: Vec<Option<JobState>>,
+    /// One split per coinbaser id, overwritten when an id repeats. No installed job still
+    /// names a repeated id: the gateway fetches at most one coinbaser per job
+    /// (`datum_coinbaser.c`, only when `need_coinbaser` is set), so the `MAX_JOBS` slots are reused
+    /// at least as fast as the `u8` id space is.
+    splits: HashMap<u8, Vec<CoinbaseOutput>>,
+    replay: Arc<Mutex<ReplayGuard>>,
+    tip: Option<[u8; 32]>,
+    /// The target of the block the node would build on its tip. A job building on the tip
+    /// may not claim an easier target than this: a header whose bits are easier than the
+    /// node's next-block nbits is rejected by the node, so shares on such a job are work that
+    /// cannot become a block.
+    /// `None` when no template has been read, and the check is skipped.
+    tip_next_target: Option<target::Target>,
+    /// Tips that are no longer current, each with the time it stopped being current.
+    recent_tips: VecDeque<([u8; 32], u64)>,
+}
+
+impl Verifier {
+    pub fn new(policy: PoolPolicy) -> Self {
+        Verifier::with_replay_guard(policy, Arc::new(Mutex::new(ReplayGuard::default())))
+    }
+
+    pub fn with_replay_guard(policy: PoolPolicy, replay: Arc<Mutex<ReplayGuard>>) -> Self {
+        Verifier {
+            policy,
+            jobs: vec![None; MAX_JOBS],
+            splits: HashMap::new(),
+            replay,
+            tip: None,
+            tip_next_target: None,
+            recent_tips: VecDeque::new(),
+        }
+    }
+
+    /// Record the compact target of the block the node would build on its tip, from the
+    /// `bits` a template carries. `None` bits, or bits that do not decode, leave no target
+    /// and the job's network target is not checked against the chain.
+    pub fn set_next_target(&mut self, next_bits: Option<u32>) {
+        self.tip_next_target = next_bits.and_then(target::bits_to_target);
+    }
+
+    pub fn replay_guard(&self) -> Arc<Mutex<ReplayGuard>> {
+        Arc::clone(&self.replay)
+    }
+
+    pub fn policy(&self) -> &PoolPolicy {
+        &self.policy
+    }
+
+    pub fn record_split(&mut self, response: &CoinbaserResponse) {
+        self.splits.insert(response.coinbaser_id, response.outputs.clone());
+    }
+
+    pub fn set_tip(&mut self, tip: Option<[u8; 32]>, now: u64) {
+        if self.tip != tip {
+            if let Some(replaced) = self.tip {
+                self.recent_tips.push_back((replaced, now));
+            }
+            while self
+                .recent_tips
+                .front()
+                .is_some_and(|(_, at)| now.saturating_sub(*at) > TIP_GRACE_SECS)
+            {
+                self.recent_tips.pop_front();
+            }
+            while self.recent_tips.len() > MAX_RECENT_TIPS {
+                self.recent_tips.pop_front();
+            }
+        }
+        self.tip = tip;
+    }
+
+    /// Whether the reconstructed work meets the network target the node reports for the block
+    /// it would build on its tip. This is the authoritative test for a block; the job's own
+    /// `nbits` is attacker-controlled and is never trusted for it. With no template read
+    /// (`tip_next_target` is `None`) nothing is a block, so nothing is relayed until the pool
+    /// has the node's target.
+    fn meets_network_target(&self, work: &Rebuilt) -> bool {
+        self.tip_next_target
+            .as_ref()
+            .is_some_and(|target| target::meets_target(&work.block_hash, target))
+    }
+
+    /// Whether a job building on `prev_hash` builds on a tip that stopped being current
+    /// recently enough that the work on it is still credited.
+    fn within_tip_grace(&self, prev_hash: [u8; 32], now: u64) -> bool {
+        self.recent_tips.iter().any(|(hash, replaced_at)| {
+            *hash == prev_hash && now.saturating_sub(*replaced_at) <= TIP_GRACE_SECS
+        })
+    }
+
+    pub fn reason_for_decode_error(e: &share::Error) -> RejectReason {
+        match e {
+            share::Error::BadExtranonceSize(_) => RejectReason::BadExtranonceSize,
+            share::Error::BadUsername => RejectReason::BadUsername,
+            share::Error::BadMerkleCount(_) => RejectReason::BadMerkleCount,
+            share::Error::BadBlake2bSection => RejectReason::BadBlake2bSection,
+            share::Error::Truncated(_) | share::Error::UnknownSection(_) => RejectReason::Other,
+        }
+    }
+
+    pub fn verify(&mut self, s: &PowSubmit, now: u64) -> Result<Accepted, RejectReason> {
+        let work = self.rebuild(s, now)?;
+
+        let share_target = target::target_for_pot(s.target_byte);
+        if !target::meets_target(&work.block_hash, &share_target) {
+            return Err(RejectReason::HighHash);
+        }
+        // Whether the share is a block is checked against the pool's own view of the network
+        // target, taken from the node's template, never against the job's self-declared
+        // `nbits`: bits are attacker-controlled, and trusting them would let a gateway claim
+        // arbitrarily easy bits so that every ordinary share counts as a block the pool then
+        // relays and the node rejects.
+        let is_block = self.meets_network_target(&work);
+
+        if !crate::lock(&self.replay).accept(work.block_hash) {
+            return Err(RejectReason::DuplicateWork);
+        }
+        Ok(Accepted { work, is_block })
+    }
+
+    /// Reconstruct the share's coinbase transaction, merkle root and header from the installed
+    /// job and the pool's policy. Before reconstructing, a job built on a replaced tip past
+    /// `TIP_GRACE_SECS` is refused as `StaleBlock` unless the share meets the network target,
+    /// and a job on the tip claiming easier bits than the node's next block is refused as
+    /// `BadTarget`.
+    pub fn rebuild(&mut self, s: &PowSubmit, now: u64) -> Result<Rebuilt, RejectReason> {
+        self.install_sections(s)?;
+
+        let idx = s.job_id as usize;
+        let state = self.jobs.get(idx).and_then(|j| j.as_ref()).ok_or(RejectReason::BadJobId)?;
+        let work = reconstruct(&self.policy, &self.splits, state, s, now)?;
+
+        // Whether the work is a block is determined before staleness, the order the gateway
+        // uses. It submits a block to its node and forwards it here whatever the tip has since
+        // become, so refusing it would discard both the block and the miner's credit. A
+        // block is recognized by meeting the node's network target, never by the job's own
+        // `nbits`: were `nbits` trusted here, a gateway could bypass the staleness check for
+        // arbitrary off-tip work by claiming easy bits, and be credited for stale work.
+        if !self.meets_network_target(&work)
+            && let Some(tip) = self.tip
+            && state.job.prev_hash != tip
+            && !self.within_tip_grace(state.job.prev_hash, now)
+        {
+            return Err(RejectReason::StaleBlock);
+        }
+
+        // A job building on the current tip must not claim an easier network target than the
+        // node's own next block. Harder bits only lower the gateway's own share rate and are not
+        // checked; only shares on the tip are checked, since a job on another tip cannot be
+        // compared to this template.
+        if self.tip == Some(state.job.prev_hash)
+            && let Some(node_target) = self.tip_next_target
+        {
+            let job_target = target::bits_to_target(u32::from_le_bytes(state.job.nbits))
+                .ok_or(RejectReason::BadTarget)?;
+            // Bigger target is easier; a job easier than the node's is refused.
+            if job_target > node_target {
+                return Err(RejectReason::BadTarget);
+            }
+        }
+        Ok(work)
+    }
+
+    /// The gateway sends the job section while the job's `server_has_merkle_branches` is false
+    /// and the coinbase section the first time each coinbase id is used for the job
+    /// (`server_has_coinbase[id]`, `datum_protocol.c`), so the pool keeps them and later shares
+    /// carry neither.
+    fn install_sections(&mut self, s: &PowSubmit) -> Result<(), RejectReason> {
+        if s.subsidy_only {
+            if s.coinbase_id != COINBASE_ID_SUBSIDY_ONLY {
+                return Err(RejectReason::BadCoinbaseId);
+            }
+        } else if s.coinbase_id >= MAX_COINBASE_TYPES {
+            return Err(RejectReason::BadCoinbaseId);
+        }
+
+        let idx = s.job_id as usize;
+        if let Some(job) = &s.job {
+            let changed = self.jobs[idx].as_ref().is_none_or(|state| state.job != *job);
+            if changed {
+                self.jobs[idx] = Some(JobState { job: job.clone(), coinbases: HashMap::new() });
+            }
+        }
+        if let Some(cb) = &s.coinbase {
+            if cb.coinbase_id != s.coinbase_id {
+                return Err(RejectReason::CoinbaseIdMismatch);
+            }
+            let state = self.jobs[idx].as_mut().ok_or(RejectReason::BadJobId)?;
+            state.coinbases.insert(cb.coinbase_id, cb.clone());
+        }
+        Ok(())
+    }
+}
+
+fn reconstruct(
+    policy: &PoolPolicy,
+    splits: &HashMap<u8, Vec<CoinbaseOutput>>,
+    state: &JobState,
+    s: &PowSubmit,
+    now: u64,
+) -> Result<Rebuilt, RejectReason> {
+    let job = &state.job;
+
+    if s.username.is_empty()
+        || s.username.len() > MAX_USERNAME
+        || !s.username.bytes().all(|b| (0x21..=0x7e).contains(&b))
+        // The identity is everything before the first dot, so a leading dot leaves an empty
+        // one, and the share would be credited to "".
+        || s.username.starts_with('.')
+    {
+        return Err(RejectReason::BadUsername);
+    }
+    if s.target_byte >= 64
+        || u64::from(s.target_byte) < u64::from(target::floor_pot(policy.min_difficulty))
+    {
+        return Err(RejectReason::BadTarget);
+    }
+    // A BLAKE2b share's block time comes from its section; the 32-bit ntime the version 1
+    // layout carries is not what the header commits to. When the time-offset selector is
+    // set the time the header commits to is `time_on_wire + time_offset` (`build_header_v2`, and
+    // the node's `nTime = WrappingAdd(time_on_wire, offset)`), and the offset is a field the
+    // miner controls, so the window has to be tested against that sum rather than the wire
+    // value it could otherwise roll far past the window.
+    let ntime = match &s.blake2b {
+        None => s.ntime,
+        Some(b) if s.use_time_offset => {
+            let (time_offset, _) = b.time_fields();
+            b.time_on_wire.wrapping_add(time_offset)
+        }
+        Some(b) => b.time_on_wire,
+    };
+    if policy.ntime_window_secs != 0 {
+        let ntime_distance = u64::from(ntime).abs_diff(now);
+        if ntime_distance > policy.ntime_window_secs {
+            return Err(RejectReason::BadNtime);
+        }
+    }
+
+    let cb = state.coinbases.get(&s.coinbase_id).ok_or(RejectReason::CoinbaseMissing)?;
+    let zeros = [0u8; share::EXTRANONCE_SIZE];
+    let mut coinbase_tx = cb.assemble(if s.is_v2() { &zeros } else { &s.extranonce });
+
+    // Upstream `datum_stratum.c` (version 1) quickdiff overwrites the last two bytes of coinb1
+    // to make the work unique, so a rebuild repeats the overwrite. Version 2 gets its uniqueness
+    // from the target byte, written in below, so there the flag is informational.
+    if s.quickdiff && !s.is_v2() {
+        let n = cb.coinb1.len();
+        if n < 2 {
+            return Err(RejectReason::BadCoinbase);
+        }
+        let current = u16::from_le_bytes([coinbase_tx[n - 2], coinbase_tx[n - 1]]);
+        let replacement: u16 = if current != 0x5144 { 0x5144 } else { 0xAEBB };
+        coinbase_tx[n - 2..n].copy_from_slice(&replacement.to_le_bytes());
+    }
+
+    let parsed = bitcoin::parse_coinbase(&coinbase_tx).map_err(|_| RejectReason::BadCoinbase)?;
+    if parsed.has_witness {
+        return Err(RejectReason::BadCoinbase);
+    }
+
+    let pot_index = locate_pot_byte(&parsed, policy, job.height)?;
+    if usize::from(s.target_byte_index_of(job)) != pot_index {
+        return Err(RejectReason::TargetMismatch);
+    }
+    coinbase_tx[pot_index] = s.target_byte;
+
+    let (paid_to_split, paid_to_pool) = check_outputs(policy, splits, job, &parsed, s)?;
+
+    // A subsidy-only block holds nothing but the coinbase, so its merkle root is the
+    // coinbase hash and there is no branch to hash in.
+    let branches: &[[u8; 32]] = if s.subsidy_only { &[] } else { job.merkle_branches.as_slice() };
+    let merkle_root = bitcoin::merkle_root(&bitcoin::sha256d(&coinbase_tx), branches);
+
+    let (header, hash) = match &s.blake2b {
+        None => {
+            let h = bitcoin::serialize_header(
+                s.version,
+                &job.prev_hash,
+                &merkle_root,
+                s.ntime,
+                &job.nbits,
+                s.nonce,
+            );
+            let hash = bitcoin::reversed(&bitcoin::sha256d(&h));
+            (h.to_vec(), hash)
+        }
+        Some(b) => {
+            let h = build_header_v2(job, s, b, &merkle_root)?;
+            (h.serialize().to_vec(), h.hash_components().result)
+        }
+    };
+
+    Ok(Rebuilt {
+        difficulty: s.difficulty(),
+        block_hash: hash,
+        header,
+        is_v2: s.is_v2(),
+        coinbase_tx,
+        height: job.height,
+        txn_count: job.txn_count,
+        paid_to_split,
+        paid_to_pool,
+    })
+}
+
+/// The header the hardware hashed, built from the job section the gateway sent (kept by
+/// `install_sections`), the pool's policy, and the fields the hardware controls.
+///
+/// The pool constructs rather than verifies. Every field the hardware does not set comes
+/// from the kept job section or from pool policy, so the share carries nothing to cross-check
+/// them against; only the fields the miner sets come from the share. The version 1 branch
+/// above does the same.
+fn build_header_v2(
+    job: &JobSection,
+    s: &PowSubmit,
+    b: &share::Blake2bSection,
+    merkle_root: &[u8; 32],
+) -> Result<HeaderV2, RejectReason> {
+    let (nonce, nonce2) = b.nonce_fields();
+    let (time_offset, nonce3) = b.time_fields();
+    // The share carries the twelve bytes that vary; the header field's leading four are
+    // the ones the gateway holds at zero.
+    let extranonce =
+        share::header_extranonce(&s.extranonce).ok_or(RejectReason::BadExtranonceSize)?;
+    // The header counts the coinbase among the block's transactions and the job counts
+    // only what follows it, so a block the node accepts needs one more than the job declares
+    // (`validation.cpp`: for a version 2 header, `block.m_txcount != block.vtx.size()`).
+    // Subsidy-only work carries the coinbase alone.
+    let tx_count = if s.subsidy_only { 1 } else { u64::from(job.txn_count) + 1 };
+    let txcount = u16::try_from(tx_count).map_err(|_| RejectReason::BadCoinbase)?;
+
+    let mut h = HeaderV2 {
+        version: (s.version & !header::V2_FLAG) as i32,
+        prev_block: job.prev_hash,
+        merkle_root: *merkle_root,
+        time: b.time_on_wire,
+        bits: u32::from_le_bytes(job.nbits),
+        nonce,
+        nonce2,
+        nonce3,
+        extranonce,
+        time_offset,
+        txcount,
+        // Profile 0, the Sia layout, is the only one the DATUM share format can carry and the
+        // only one the gateway issues; the share carries no profile field. The
+        // time-offset selector is carried in the message's reserved bytes.
+        flags: if s.use_time_offset { header::FLAG_USE_TIME_OFFSET } else { 0 },
+        // Set by pool policy; the gateway does not supply it. A null key makes the mask zero, so
+        // the miner receives true block hashes; when an anti-withholding key is configured it is
+        // filled in here and the gateway never receives it.
+        xor_key_mask_clear_bits: 0,
+        xor_key: [0u8; 16],
+        height: job.height as i32,
+        mm_rhs: [0u8; 32],
+    };
+    if s.use_time_offset {
+        h.time = b.time_on_wire.wrapping_add(time_offset);
+    }
+    Ok(h)
+}
+
+fn locate_pot_byte(
+    tx: &CoinbaseTx,
+    policy: &PoolPolicy,
+    height: u32,
+) -> Result<usize, RejectReason> {
+    let pushes = bitcoin::script_pushes(&tx.script_sig);
+    let prime = policy.prime_id.to_le_bytes();
+    let uid_push = pushes
+        .iter()
+        .position(|(_, data)| data.len() == 7 && data[3..7] == prime)
+        .ok_or(RejectReason::MissingPoolTag)?;
+
+    match &policy.activation {
+        Some((activation_height, headline)) if *activation_height == height => {
+            let wanted = headline.as_bytes();
+            let found =
+                !wanted.is_empty() && tx.script_sig.windows(wanted.len()).any(|w| w == wanted);
+            if !found {
+                return Err(RejectReason::MissingHeadline);
+            }
+        }
+        _ => {
+            if !policy.coinbase_tag.is_empty() {
+                let tag = policy.coinbase_tag.as_bytes();
+                let ok = uid_push > 0 && {
+                    let (_, data) = pushes[uid_push - 1];
+                    data.len() > tag.len()
+                        && &data[..tag.len()] == tag
+                        // What the gateway writes after the primary tag: 0x00 when it
+                        // is the only tag, 0x0F when a secondary one follows.
+                        && matches!(data[tag.len()], 0x00 | 0x0f)
+                };
+                if !ok {
+                    return Err(RejectReason::MissingPoolTag);
+                }
+            }
+        }
+    }
+
+    Ok(tx.script_sig_offset + pushes[uid_push].0)
+}
+
+fn check_outputs(
+    policy: &PoolPolicy,
+    splits: &HashMap<u8, Vec<CoinbaseOutput>>,
+    job: &JobSection,
+    tx: &CoinbaseTx,
+    s: &PowSubmit,
+) -> Result<(u64, u64), RejectReason> {
+    let empty: Vec<CoinbaseOutput> = Vec::new();
+    let dictated =
+        if s.subsidy_only { &empty } else { splits.get(&job.coinbaser_id).unwrap_or(&empty) };
+
+    // `next` only increases, so the dictated outputs must appear in the order the
+    // pool sent them, though outputs paying the pool may appear between them.
+    let mut next = 0usize;
+    let mut paid_to_split = 0u64;
+    let mut paid_to_pool = 0u64;
+    for out in &tx.outputs {
+        if out.value == 0 {
+            continue;
+        }
+        if let Some(pos) =
+            dictated[next..].iter().position(|d| d.value == out.value && d.script == out.script)
+        {
+            paid_to_split = paid_to_split.saturating_add(out.value);
+            next += pos + 1;
+            continue;
+        }
+        if out.script == policy.payout_script {
+            paid_to_pool = paid_to_pool.saturating_add(out.value);
+            continue;
+        }
+        return Err(RejectReason::BadCoinbaseOutputs);
+    }
+
+    if !s.subsidy_only && paid_to_split.saturating_add(paid_to_pool) != job.coinbase_value {
+        return Err(RejectReason::BadCoinbase);
+    }
+
+    Ok((paid_to_split, paid_to_pool))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bitcoin::TxOut;
+
+    const NOW: u64 = 1_760_000_000;
+    const NBITS: [u8; 4] = [0xff, 0xff, 0x7f, 0x20];
+    const COINBASE_VALUE: u64 = 312_500_000;
+
+    const DIFF1_NONCE: u32 = 0x9737_ad5a;
+    const DIFF1_EXTRANONCE: [u8; share::EXTRANONCE_SIZE] = [7u8; share::EXTRANONCE_SIZE];
+    const HARD_NBITS: [u8; 4] = [0xff, 0xff, 0x00, 0x1c];
+    const DIFF1_NONCE_HARD: u32 = 0xfdf5_fc9a;
+    const DIFF1_NTIME_OFFSET_HARD: u32 = 1;
+    const DIFF1_NONCE_V2: u32 = 0x099c_1d0f;
+    const DIFF1_NTIME_OFFSET_V2: u32 = 0;
+
+    fn policy() -> PoolPolicy {
+        PoolPolicy {
+            payout_script: p2wpkh(0xee),
+            prime_id: 0x0000_0001,
+            coinbase_tag: "RATUM".to_string(),
+            min_difficulty: 1,
+            ntime_window_secs: DEFAULT_NTIME_WINDOW_SECS,
+            activation: None,
+        }
+    }
+
+    use crate::fixtures::{self, Tagging, p2wpkh};
+
+    fn coinbase_sections(p: &PoolPolicy, outputs: &[CoinbaseOutput]) -> (CoinbaseSection, usize) {
+        let tagging = Tagging { tag: &p.coinbase_tag, prime_id: p.prime_id, headline: None };
+        fixtures::coinbase(&tagging, &p.payout_script, outputs, COINBASE_VALUE)
+    }
+
+    fn activation_coinbase(
+        p: &PoolPolicy,
+        headline: &str,
+        outputs: &[CoinbaseOutput],
+    ) -> (CoinbaseSection, usize) {
+        let tagging = Tagging { tag: "", prime_id: p.prime_id, headline: Some(headline) };
+        fixtures::coinbase(&tagging, &p.payout_script, outputs, COINBASE_VALUE)
+    }
+
+    fn job_section(pot_index: usize) -> JobSection {
+        JobSection {
+            prev_hash: [0x5a; 32],
+            target_byte_index: pot_index as u16,
+            nbits: NBITS,
+            coinbaser_id: 1,
+            height: 840_000,
+            coinbase_value: COINBASE_VALUE,
+            txn_count: 0,
+            txn_total_weight: 0,
+            txn_total_size: 0,
+            txn_total_sigops: 0,
+            merkle_branches: vec![],
+        }
+    }
+
+    fn split() -> CoinbaserResponse {
+        CoinbaserResponse {
+            value: COINBASE_VALUE,
+            coinbaser_id: 1,
+            outputs: vec![
+                CoinbaseOutput { value: 100_000_000, script: p2wpkh(0x01) },
+                CoinbaseOutput { value: 50_000_000, script: p2wpkh(0x02) },
+            ],
+        }
+    }
+
+    fn setup() -> (Verifier, PowSubmit) {
+        with_outputs(&split().outputs)
+    }
+
+    fn setup_hard() -> (Verifier, PowSubmit) {
+        let (mut v, mut s) = with_outputs(&split().outputs);
+        let mut job = s.job.clone().unwrap();
+        job.nbits = HARD_NBITS;
+        s.job = Some(job);
+        s.nonce = DIFF1_NONCE_HARD;
+        s.ntime = NOW as u32 + DIFF1_NTIME_OFFSET_HARD;
+        // The node's next block is at the hard target, which this share does not meet, so it
+        // is not a block: whether a share is a block is determined by the node's template, not
+        // the job's bits.
+        v.set_next_target(Some(u32::from_le_bytes(HARD_NBITS)));
+        (v, s)
+    }
+
+    fn with_outputs(outputs: &[CoinbaseOutput]) -> (Verifier, PowSubmit) {
+        let p = policy();
+        let (cb, pot_index) = coinbase_sections(&p, outputs);
+        let mut v = Verifier::new(p);
+        v.record_split(&split());
+        // The normal case: the node's next-block target equals the job's bits, so a share
+        // meeting that target is a block. Tests that exercise the on-tip check override this.
+        v.set_next_target(Some(u32::from_le_bytes(NBITS)));
+        let submit = PowSubmit {
+            job_id: 0,
+            coinbase_id: 0,
+            is_block: false,
+            subsidy_only: false,
+            quickdiff: false,
+            target_byte: 0,
+            ntime: NOW as u32,
+            nonce: DIFF1_NONCE,
+            version: 0x2000_0000,
+            extranonce: DIFF1_EXTRANONCE.to_vec(),
+            username: "bc1qexample.worker1".to_string(),
+            use_time_offset: false,
+            job: Some(job_section(pot_index)),
+            coinbase: Some(cb),
+            blake2b: None,
+        };
+        (v, submit)
+    }
+
+    #[test]
+    fn rebuilds_a_correct_share() {
+        let (mut v, s) = setup();
+        let w = v.rebuild(&s, NOW).unwrap();
+        assert_eq!(w.difficulty, 1);
+        assert_eq!(w.height, 840_000);
+        assert_eq!(w.paid_to_split, 150_000_000);
+        assert_eq!(w.paid_to_pool, COINBASE_VALUE - 150_000_000);
+        assert_eq!(&w.header[36..68], &bitcoin::sha256d(&w.coinbase_tx));
+        assert_eq!(&w.header[0..4], &s.version.to_le_bytes());
+        assert_eq!(&w.header[4..36], &[0x5a; 32]);
+        assert_eq!(&w.header[68..72], &s.ntime.to_le_bytes());
+        assert_eq!(&w.header[72..76], &NBITS);
+        assert_eq!(&w.header[76..80], &s.nonce.to_le_bytes());
+        assert_eq!(w.block_hash, bitcoin::reversed(&bitcoin::sha256d(&w.header)));
+        assert_eq!(
+            w.coinbase_tx[s.job.as_ref().unwrap().target_byte_index as usize],
+            s.target_byte
+        );
+        let n = s.coinbase.as_ref().unwrap().coinb1.len();
+        assert_eq!(&w.coinbase_tx[n..n + share::EXTRANONCE_SIZE], &DIFF1_EXTRANONCE);
+        assert!(!w.is_v2);
+    }
+
+    #[test]
+    fn accepts_a_share_that_meets_the_share_target() {
+        let (mut v, s) = setup();
+        let a = v.verify(&s, NOW).unwrap();
+        assert_eq!(a.work.difficulty, 1);
+        assert!(target::meets_target(&a.work.block_hash, &target::DIFF1_TARGET));
+        assert!(a.is_block);
+        let mut again = s.clone();
+        again.job = None;
+        again.coinbase = None;
+        assert_eq!(v.verify(&again, NOW), Err(RejectReason::DuplicateWork));
+        again.nonce ^= 1;
+        assert_eq!(v.verify(&again, NOW), Err(RejectReason::HighHash));
+    }
+
+    #[test]
+    fn a_share_that_misses_the_network_target_is_not_a_block() {
+        let (mut v, s) = setup_hard();
+        let a = v.verify(&s, NOW).unwrap();
+        assert!(target::meets_target(&a.work.block_hash, &target::DIFF1_TARGET));
+        assert!(!a.is_block);
+    }
+
+    /// Whether a share is a block comes from the node's template target, not the job's own bits.
+    /// A share whose job claims an arbitrarily easy target cannot make the pool treat it as a
+    /// block (and relay a block the node rejects) when the node's next block is at a target the
+    /// share does not meet.
+    #[test]
+    fn an_easy_job_target_does_not_make_a_share_a_block() {
+        let (mut v, s) = setup(); // the job's own nbits are the easiest target
+        // The node's next-block target is harder than the diff-1 target this share meets.
+        v.set_next_target(Some(0x1b00_ffff));
+        // The job builds on 0x5a, which was the tip before the last change, so the share is
+        // within TIP_GRACE_SECS and not stale, and being off the current tip the easier-than-node
+        // check does not apply. Whether it is a block is left to the node's target alone.
+        v.set_tip(Some([0x5a; 32]), NOW);
+        v.set_tip(Some([0x11; 32]), NOW);
+        let a = v.verify(&s, NOW).unwrap();
+        assert!(target::meets_target(&a.work.block_hash, &target::DIFF1_TARGET));
+        assert!(!a.is_block, "the job's easy bits must not make an ordinary share a block");
+    }
+
+    fn setup_v2() -> (Verifier, PowSubmit) {
+        let p = policy();
+        let sp = split();
+        let (cb, pot_index) = coinbase_sections(&p, &sp.outputs);
+        let mut v = Verifier::new(p);
+        v.record_split(&sp);
+        v.set_next_target(Some(u32::from_le_bytes(NBITS)));
+
+        let job = job_section(pot_index);
+        let time_on_wire = NOW as u32 + DIFF1_NTIME_OFFSET_V2;
+        let mut sia_nonce = [0u8; 8];
+        sia_nonce[..4].copy_from_slice(&DIFF1_NONCE_V2.to_le_bytes());
+        let b = share::Blake2bSection { sia_ntime: [0u8; 8], sia_nonce, time_on_wire };
+        let submit = PowSubmit {
+            job_id: 0,
+            coinbase_id: 0,
+            is_block: false,
+            subsidy_only: false,
+            quickdiff: false,
+            target_byte: 0,
+            ntime: time_on_wire,
+            nonce: DIFF1_NONCE_V2,
+            version: header::V2_FLAG | 0x2000_0000,
+            extranonce: vec![0x33; share::EXTRANONCE_SIZE],
+            username: "bc1qexample.worker1".to_string(),
+            use_time_offset: false,
+            job: Some(job),
+            coinbase: Some(cb),
+            blake2b: Some(b),
+        };
+        (v, submit)
+    }
+
+    /// The header the pool built for a share, deserialized from the header it would relay.
+    fn built_header(w: &Rebuilt) -> HeaderV2 {
+        HeaderV2::deserialize(&w.header).expect("a version 2 header")
+    }
+
+    #[test]
+    fn rebuilds_a_version_2_share() {
+        let (mut v, s) = setup_v2();
+        let w = v.rebuild(&s, NOW).unwrap();
+        assert!(w.is_v2);
+        assert_eq!(w.header.len(), crate::header::HEADER_V2_SIZE);
+        assert_eq!(w.paid_to_split, 150_000_000);
+        assert_eq!(w.paid_to_pool, COINBASE_VALUE - 150_000_000);
+        let h = built_header(&w);
+        assert_eq!(w.block_hash, h.hash_components().result);
+        assert_ne!(w.block_hash, bitcoin::reversed(&bitcoin::sha256d(&w.header)));
+        let n = s.coinbase.as_ref().unwrap().coinb1.len();
+        assert_eq!(&w.coinbase_tx[n..n + share::EXTRANONCE_SIZE], &[0u8; 12]);
+        let mut coinb1 = vec![0u8, 0, 0];
+        coinb1.extend_from_slice(&h.precompute().h2);
+        assert_eq!(coinb1.len(), 35);
+        let mut leaf = vec![0u8];
+        leaf.extend_from_slice(&coinb1);
+        leaf.extend_from_slice(&h.extranonce);
+        assert_eq!(crate::header::blake2b_256(&leaf), h.precompute().hash1);
+    }
+
+    #[test]
+    fn accepts_a_version_2_share_that_meets_the_share_target() {
+        let (mut v, s) = setup_v2();
+        let a = v.verify(&s, NOW).unwrap();
+        assert!(a.work.is_v2);
+        assert_eq!(a.work.difficulty, 1);
+        assert!(target::meets_target(&a.work.block_hash, &target::DIFF1_TARGET));
+        assert!(a.is_block);
+        let mut again = s.clone();
+        again.job = None;
+        again.coinbase = None;
+        assert_eq!(v.verify(&again, NOW), Err(RejectReason::DuplicateWork));
+        let mut rolled = again.clone();
+        let mut b = rolled.blake2b.unwrap();
+        b.sia_nonce[4] = 1; // m_nonce2, the second half of the Sia nonce
+        rolled.blake2b = Some(b);
+        assert_eq!(v.verify(&rolled, NOW), Err(RejectReason::HighHash));
+    }
+
+    /// The pool fills every header field the miner does not control from the job section the
+    /// gateway sent: the merkle root, prev_block, height, bits, version and txcount. The share
+    /// supplies only the nonce fields and the time-offset selector.
+    #[test]
+    fn a_version_2_header_is_the_gateways_job_plus_the_miners_nonces() {
+        let (mut v, s) = setup_v2();
+        let job = s.job.clone().unwrap();
+        let w = v.rebuild(&s, NOW).unwrap();
+        let h = built_header(&w);
+
+        assert_eq!(h.prev_block, job.prev_hash);
+        assert_eq!(h.height, job.height as i32);
+        assert_eq!(h.bits, u32::from_le_bytes(job.nbits));
+        assert_eq!(h.merkle_root, bitcoin::sha256d(&w.coinbase_tx), "no branches in this job");
+        assert_eq!(h.version, 0x2000_0000);
+        // Pool policy, and null while the anti-withholding key is unused.
+        assert_eq!(h.xor_key, [0u8; 16]);
+        assert_eq!(h.mm_rhs, [0u8; 32]);
+        assert_eq!(h.xor_key_mask_clear_bits, 0);
+
+        // The Sia fields split into four header fields, in this order.
+        let b = s.blake2b.unwrap();
+        assert_eq!((h.nonce, h.nonce2), b.nonce_fields());
+        assert_eq!((h.time_offset, h.nonce3), b.time_fields());
+        assert_eq!(
+            h.extranonce,
+            share::header_extranonce(&s.extranonce).unwrap(),
+            "the twelve sent, left-padded into the header field"
+        );
+        assert_eq!(h.time, b.time_on_wire, "no time offset with flags 0");
+    }
+
+    /// Profile 0 is the only layout the DATUM share format can carry, so it is the only one the
+    /// pool can build. Nothing in a share can select another.
+    #[test]
+    fn a_version_2_header_is_always_the_sia_profile() {
+        let (mut v, s) = setup_v2();
+        let h = built_header(&v.rebuild(&s, NOW).unwrap());
+        assert_eq!(h.asic_profile(), 0);
+        assert_eq!(h.flags, 0);
+        assert_eq!(h.asic_input_with(&h.precompute().hash1, &h.precompute().h2).len(), 80);
+    }
+
+    /// The time-offset selector adds the offset to the block time; without it the offset is
+    /// only nonce.
+    #[test]
+    fn the_time_offset_flag_decides_whether_the_offset_moves_the_block_time() {
+        let (mut v, base) = setup_v2();
+        let mut s = base.clone();
+        let mut b = s.blake2b.unwrap();
+        b.sia_ntime[..4].copy_from_slice(&600u32.to_le_bytes());
+        s.blake2b = Some(b);
+        let h = built_header(&v.rebuild(&s, NOW).unwrap());
+        assert_eq!(h.time_offset, 600);
+        assert_eq!(h.time, b.time_on_wire, "flag clear: the offset is nonce space");
+
+        s.use_time_offset = true;
+        let h = built_header(&v.rebuild(&s, NOW).unwrap());
+        assert_eq!(h.time, b.time_on_wire + 600, "flag set: the offset is added to the time");
+        assert_eq!(h.time_on_wire(), b.time_on_wire, "and the serialized time is unchanged");
+    }
+
+    /// The header counts the coinbase; the job counts only what follows it. With the wrong
+    /// count the node rejects the block (`block.m_txcount != block.vtx.size()`).
+    /// The pool fills it in from the job, so there is no count to disagree with.
+    #[test]
+    fn a_version_2_header_counts_the_coinbase_among_its_transactions() {
+        let (mut v, mut s) = setup_v2();
+        let job = s.job.clone().unwrap();
+        assert_eq!(job.txn_count, 0);
+        assert_eq!(built_header(&v.rebuild(&s, NOW).unwrap()).txcount, 1, "the coinbase alone");
+
+        let mut with_txns = job.clone();
+        with_txns.txn_count = 2;
+        s.job = Some(with_txns);
+        assert_eq!(built_header(&v.rebuild(&s, NOW).unwrap()).txcount, 3, "two plus the coinbase");
+    }
+
+    /// Subsidy-only work carries the coinbase and nothing else, however many transactions
+    /// the job declares after it, so its header counts one rather than one more than the job.
+    #[test]
+    fn a_subsidy_only_version_2_header_counts_only_the_coinbase() {
+        let p = policy();
+        // No dictated split: subsidy-only work may pay nobody but the pool.
+        let (mut cb, pot_index) = coinbase_sections(&p, &[]);
+        cb.coinbase_id = COINBASE_ID_SUBSIDY_ONLY;
+        let mut v = Verifier::new(p);
+
+        let mut job = job_section(pot_index);
+        job.txn_count = 7;
+        job.merkle_branches = vec![[0x42; 32]];
+
+        let s = PowSubmit {
+            job_id: 0,
+            coinbase_id: COINBASE_ID_SUBSIDY_ONLY,
+            is_block: false,
+            subsidy_only: true,
+            quickdiff: false,
+            target_byte: 0,
+            ntime: NOW as u32,
+            nonce: 0,
+            version: header::V2_FLAG | 0x2000_0000,
+            extranonce: vec![0x33; share::EXTRANONCE_SIZE],
+            username: "bc1qexample.worker1".to_string(),
+            use_time_offset: false,
+            job: Some(job),
+            coinbase: Some(cb),
+            blake2b: Some(share::Blake2bSection {
+                sia_ntime: [0u8; 8],
+                sia_nonce: [0u8; 8],
+                time_on_wire: NOW as u32,
+            }),
+        };
+        let w = v.rebuild(&s, NOW).expect("the job's seven transactions are not carried");
+        let h = built_header(&w);
+        assert_eq!(h.txcount, 1, "the coinbase alone, not the job's seven plus one");
+        // No branches are hashed in either, so the root is the coinbase hash itself.
+        assert_eq!(h.merkle_root, bitcoin::sha256d(&w.coinbase_tx));
+    }
+
+    #[test]
+    fn a_version_2_quickdiff_share_is_rebuilt_from_its_target_byte() {
+        // The gateway makes version 2 quickdiff work unique through the PoT byte,
+        // which reaches here as target_byte and is written into the coinbase whether
+        // or not the flag is set. Only version 1 needs the coinb1 overwrite, so the
+        // rebuild must be identical either way.
+        let (mut v, s) = setup_v2();
+        let plain = v.rebuild(&s, NOW).unwrap();
+        let mut quick = s.clone();
+        quick.quickdiff = true;
+        let with_quickdiff = v.rebuild(&quick, NOW).unwrap();
+        assert_eq!(with_quickdiff.coinbase_tx, plain.coinbase_tx);
+        assert_eq!(with_quickdiff.block_hash, plain.block_hash);
+    }
+
+    #[test]
+    fn version_2_shares_round_trip_through_encode_and_decode() {
+        let (_, s) = setup_v2();
+        let bytes = s.encode();
+        assert_eq!(bytes[17], share::EXTRANONCE_SIZE as u8);
+        let decoded = PowSubmit::decode(&bytes).unwrap();
+        assert_eq!(decoded, s);
+        assert!(decoded.is_v2());
+    }
+
+    #[test]
+    fn hashes_merkle_branches_into_the_root() {
+        let (mut v, mut s) = setup();
+        let mut job = s.job.clone().unwrap();
+        job.merkle_branches = vec![[0x11; 32], [0x22; 32]];
+        s.job = Some(job.clone());
+        let w = v.rebuild(&s, NOW).unwrap();
+        let expected =
+            bitcoin::merkle_root(&bitcoin::sha256d(&w.coinbase_tx), &job.merkle_branches);
+        assert_eq!(&w.header[36..68], &expected);
+        assert_ne!(&w.header[36..68], &bitcoin::sha256d(&w.coinbase_tx));
+    }
+
+    #[test]
+    fn later_shares_reuse_the_installed_sections() {
+        let (mut v, first) = setup();
+        let full = v.rebuild(&first, NOW).unwrap();
+        let mut second = first.clone();
+        second.job = None;
+        second.coinbase = None;
+        assert_eq!(v.rebuild(&second, NOW).unwrap(), full);
+    }
+
+    #[test]
+    fn rejects_a_share_for_an_unknown_job() {
+        let (mut v, s) = setup();
+        let mut unknown_job = s.clone();
+        unknown_job.job = None;
+        unknown_job.coinbase = None;
+        unknown_job.job_id = 5;
+        assert_eq!(v.rebuild(&unknown_job, NOW), Err(RejectReason::BadJobId));
+    }
+
+    #[test]
+    fn rejects_a_hash_above_the_share_target() {
+        let (mut v, mut s) = setup();
+        s.target_byte = 40;
+        assert_eq!(v.verify(&s, NOW), Err(RejectReason::HighHash));
+    }
+
+    /// What the PoT byte is for. It is written into the coinbase before the
+    /// pool hashes, so a share cannot be submitted as work done at a difficulty other than
+    /// the one it was mined at: the rebuilt coinbase differs, and with it the merkle root
+    /// and the hash. Without it a gateway's claim would be accepted as declared, and the
+    /// ledger credits `1 << target_byte`: the share below is credited 1, and the same work
+    /// claiming twenty bits more would be credited 1048576.
+    #[test]
+    fn a_share_cannot_claim_more_difficulty_than_it_was_mined_at() {
+        let (mut v, as_mined) = setup_v2();
+        let accepted = v.verify(&as_mined, NOW).expect("solved at difficulty 1");
+        assert_eq!(accepted.work.difficulty, 1);
+
+        let mut inflated = as_mined.clone();
+        inflated.target_byte = 20;
+        assert_eq!(inflated.difficulty(), 1 << 20, "what the ledger would have credited");
+        assert_eq!(v.verify(&inflated, NOW), Err(RejectReason::HighHash));
+
+        // The claim is committed, so the pool rebuilds a different coinbase for it: one
+        // byte different, which is the whole mechanism.
+        let as_mined_cb = v.rebuild(&as_mined, NOW).unwrap().coinbase_tx;
+        let inflated_cb = v.rebuild(&inflated, NOW).unwrap().coinbase_tx;
+        let differing = as_mined_cb.iter().zip(&inflated_cb).filter(|(a, b)| a != b).count();
+        assert_eq!(differing, 1, "exactly the PoT byte");
+    }
+
+    /// A share whose target byte is not a difficulty exponent: what a gateway that never wrote
+    /// the PoT byte into the coinbase sends, since the byte it reads back is whatever was
+    /// already there. It is refused rather than credited as 2^63.
+    #[test]
+    fn a_target_byte_that_is_not_a_difficulty_exponent_is_refused() {
+        let (mut v, base) = setup_v2();
+        for byte in [0xffu8, 0x80, 64] {
+            let mut s = base.clone();
+            s.target_byte = byte;
+            assert_eq!(v.rebuild(&s, NOW), Err(RejectReason::BadTarget), "byte {byte:#04x}");
+        }
+    }
+
+    #[test]
+    fn rejects_difficulty_below_the_pool_minimum() {
+        let mut p = policy();
+        p.min_difficulty = 16384;
+        let (_, s) = setup();
+        let mut v = Verifier::new(p);
+        v.record_split(&split());
+        assert_eq!(v.rebuild(&s, NOW), Err(RejectReason::BadTarget));
+        let mut ok = s.clone();
+        ok.target_byte = 14;
+        assert!(v.rebuild(&ok, NOW).is_ok());
+    }
+
+    #[test]
+    fn rejects_a_coinbase_paying_someone_else() {
+        let p = policy();
+        let mut redirected = split();
+        redirected.outputs[1].script = p2wpkh(0x99);
+        let (cb, pot_index) = coinbase_sections(&p, &redirected.outputs);
+        let mut v = Verifier::new(p);
+        v.record_split(&split());
+        let (_, base) = setup();
+        let mut share = base.clone();
+        share.coinbase = Some(cb);
+        share.job = Some(job_section(pot_index));
+        assert_eq!(v.rebuild(&share, NOW), Err(RejectReason::BadCoinbaseOutputs));
+    }
+
+    #[test]
+    fn rejects_a_coinbase_whose_outputs_total_less_than_the_job_value() {
+        let p = policy();
+        let sp = split();
+        let (mut cb, pot_index) = coinbase_sections(&p, &sp.outputs);
+        let full = cb.assemble(&[0u8; share::EXTRANONCE_SIZE]);
+        let remainder = bitcoin::parse_coinbase(&full).unwrap().outputs[2].value;
+        let pos = cb
+            .coinb2
+            .windows(8)
+            .position(|w| w == remainder.to_le_bytes())
+            .expect("remainder output value");
+        cb.coinb2[pos..pos + 8].copy_from_slice(&(remainder - 1).to_le_bytes());
+
+        let mut v = Verifier::new(p);
+        v.record_split(&sp);
+        let (_, base) = setup();
+        let mut share = base.clone();
+        share.coinbase = Some(cb);
+        share.job = Some(job_section(pot_index));
+        assert_eq!(v.rebuild(&share, NOW), Err(RejectReason::BadCoinbase));
+    }
+
+    #[test]
+    fn accepts_a_split_the_gateway_could_not_fit_entirely() {
+        let (mut v, s) = with_outputs(&split().outputs[..1]);
+        let w = v.rebuild(&s, NOW).unwrap();
+        assert_eq!(w.paid_to_split, 100_000_000);
+        assert_eq!(w.paid_to_pool, COINBASE_VALUE - 100_000_000);
+
+        let (mut v, s) = with_outputs(&split().outputs[1..]);
+        let w = v.rebuild(&s, NOW).unwrap();
+        assert_eq!(w.paid_to_split, 50_000_000);
+    }
+
+    #[test]
+    fn a_repeated_coinbaser_id_cannot_outlive_the_job_naming_it() {
+        // `splits` keeps one entry per id and drops the previous. Shrinking the job slots
+        // below the id space would let a job outlive the split it names, and its shares
+        // would then be checked against a different one.
+        assert!(MAX_JOBS > usize::from(u8::MAX));
+    }
+
+    #[test]
+    fn a_share_is_checked_against_the_split_its_job_used() {
+        let p = policy();
+        let old_split = split();
+        let (cb, pot_index) = coinbase_sections(&p, &old_split.outputs);
+        let mut v = Verifier::new(p.clone());
+        v.record_split(&old_split);
+        v.record_split(&CoinbaserResponse {
+            value: COINBASE_VALUE,
+            coinbaser_id: old_split.coinbaser_id + 1,
+            outputs: vec![CoinbaseOutput { value: COINBASE_VALUE, script: p2wpkh(0x77) }],
+        });
+
+        let (_, base) = setup();
+        let mut share = base.clone();
+        share.coinbase = Some(cb);
+        let mut job = job_section(pot_index);
+        job.coinbaser_id = old_split.coinbaser_id;
+        share.job = Some(job);
+        let w = v.rebuild(&share, NOW).unwrap();
+        assert_eq!(w.paid_to_split, 150_000_000);
+
+        let mut wrong = share.clone();
+        let mut job = wrong.job.clone().unwrap();
+        job.coinbaser_id = old_split.coinbaser_id + 1;
+        wrong.job = Some(job);
+        assert_eq!(v.rebuild(&wrong, NOW), Err(RejectReason::BadCoinbaseOutputs));
+    }
+
+    #[test]
+    fn rejects_split_outputs_in_the_wrong_order() {
+        let mut reordered = split().outputs;
+        reordered.swap(0, 1);
+        let (mut v, s) = with_outputs(&reordered);
+        assert_eq!(v.rebuild(&s, NOW), Err(RejectReason::BadCoinbaseOutputs));
+    }
+
+    #[test]
+    fn rejects_a_coinbase_without_the_pool_tag() {
+        let mut other = policy();
+        other.coinbase_tag = "SOMEONEELSE".to_string();
+        let (cb, pot_index) = coinbase_sections(&other, &split().outputs);
+        let mut v = Verifier::new(policy());
+        v.record_split(&split());
+        let (_, base) = setup();
+        let mut share = base.clone();
+        share.coinbase = Some(cb);
+        share.job = Some(job_section(pot_index));
+        assert_eq!(v.rebuild(&share, NOW), Err(RejectReason::MissingPoolTag));
+    }
+
+    #[test]
+    fn rejects_a_coinbase_without_the_prime_id() {
+        let mut other = policy();
+        other.prime_id = 0x1234_5678;
+        let (cb, pot_index) = coinbase_sections(&other, &split().outputs);
+        let mut v = Verifier::new(policy());
+        v.record_split(&split());
+        let (_, base) = setup();
+        let mut share = base.clone();
+        share.coinbase = Some(cb);
+        share.job = Some(job_section(pot_index));
+        assert_eq!(v.rebuild(&share, NOW), Err(RejectReason::MissingPoolTag));
+    }
+
+    const HEADLINE: &str = "RATUM 2026 the fork that let the SC-Lite mine bitcoin";
+
+    #[test]
+    fn accepts_the_activation_block_whose_coinbase_carries_the_headline() {
+        let mut p = policy();
+        p.activation = Some((840_000, HEADLINE.to_string()));
+        let (cb, pot_index) = activation_coinbase(&p, HEADLINE, &split().outputs);
+        let mut v = Verifier::new(p);
+        v.record_split(&split());
+        let (_, base) = setup();
+        let mut share = base.clone();
+        share.coinbase = Some(cb);
+        share.job = Some(job_section(pot_index));
+        let w = v.rebuild(&share, NOW).unwrap();
+        assert_eq!(w.height, 840_000);
+        assert_eq!(w.paid_to_split, 150_000_000);
+    }
+
+    #[test]
+    fn rejects_an_activation_block_without_the_headline() {
+        let mut p = policy();
+        p.activation = Some((840_000, HEADLINE.to_string()));
+        let (cb, pot_index) = activation_coinbase(&p, "SOME OTHER HEADLINE", &split().outputs);
+        let mut v = Verifier::new(p);
+        v.record_split(&split());
+        let (_, base) = setup();
+        let mut share = base.clone();
+        share.coinbase = Some(cb);
+        share.job = Some(job_section(pot_index));
+        assert_eq!(v.rebuild(&share, NOW), Err(RejectReason::MissingHeadline));
+    }
+
+    #[test]
+    fn the_headline_rule_applies_only_at_the_activation_height() {
+        let mut p = policy();
+        p.activation = Some((840_001, HEADLINE.to_string()));
+        let (cb, pot_index) = activation_coinbase(&p, HEADLINE, &split().outputs);
+        let mut v = Verifier::new(p);
+        v.record_split(&split());
+        let (_, base) = setup();
+        let mut share = base.clone();
+        share.coinbase = Some(cb);
+        share.job = Some(job_section(pot_index));
+        assert_eq!(v.rebuild(&share, NOW), Err(RejectReason::MissingPoolTag));
+
+        let mut p = policy();
+        p.activation = Some((840_001, HEADLINE.to_string()));
+        let (cb, pot_index) = coinbase_sections(&p, &split().outputs);
+        let mut v = Verifier::new(p);
+        v.record_split(&split());
+        let mut share = base.clone();
+        share.coinbase = Some(cb);
+        share.job = Some(job_section(pot_index));
+        assert!(v.rebuild(&share, NOW).is_ok());
+    }
+
+    #[test]
+    fn rejects_a_target_byte_index_pointing_elsewhere() {
+        let (mut v, mut s) = setup();
+        let mut job = s.job.clone().unwrap();
+        job.target_byte_index += 1;
+        s.job = Some(job);
+        assert_eq!(v.rebuild(&s, NOW), Err(RejectReason::TargetMismatch));
+    }
+
+    #[test]
+    fn rejects_an_ntime_outside_the_window() {
+        let (mut v, s) = setup();
+        let mut old = s.clone();
+        old.ntime = (NOW - DEFAULT_NTIME_WINDOW_SECS - 1) as u32;
+        assert_eq!(v.rebuild(&old, NOW), Err(RejectReason::BadNtime));
+        let mut ahead = s.clone();
+        ahead.ntime = (NOW + DEFAULT_NTIME_WINDOW_SECS + 1) as u32;
+        assert_eq!(v.rebuild(&ahead, NOW), Err(RejectReason::BadNtime));
+        let mut p = policy();
+        p.ntime_window_secs = 0;
+        let mut v = Verifier::new(p);
+        v.record_split(&split());
+        assert!(v.rebuild(&old, NOW).is_ok());
+    }
+
+    #[test]
+    fn rejects_a_bad_username() {
+        let (mut v, s) = setup();
+        // A leading dot leaves the identity (everything before the first dot) empty, which
+        // must be refused rather than credited to "".
+        for name in ["", "has space", "tab\there", ".", ".rig"] {
+            let mut bad = s.clone();
+            bad.username = name.to_string();
+            assert_eq!(v.rebuild(&bad, NOW), Err(RejectReason::BadUsername), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn a_time_offset_that_moves_the_block_time_out_of_the_window_is_refused() {
+        let (mut v, base) = setup_v2();
+        // The serialized time is current, but a large offset with the selector set puts the
+        // block time the node commits to (serialized + offset) past the
+        // window.
+        let mut s = base.clone();
+        let mut b = s.blake2b.unwrap();
+        b.sia_ntime[..4].copy_from_slice(&(DEFAULT_NTIME_WINDOW_SECS as u32 + 10).to_le_bytes());
+        s.blake2b = Some(b);
+        s.use_time_offset = true;
+        assert_eq!(v.rebuild(&s, NOW), Err(RejectReason::BadNtime));
+
+        // The same offset with the selector clear is only nonce space, so the block time is
+        // still the serialized time and stays inside the window.
+        let mut ok = s.clone();
+        ok.use_time_offset = false;
+        assert!(v.rebuild(&ok, NOW).is_ok());
+    }
+
+    #[test]
+    fn rejects_a_stale_job_once_a_tip_is_known() {
+        let (mut v, s) = setup_hard();
+        v.set_tip(Some([0x11; 32]), NOW);
+        assert_eq!(v.rebuild(&s, NOW), Err(RejectReason::StaleBlock));
+        v.set_tip(Some([0x5a; 32]), NOW);
+        assert!(v.rebuild(&s, NOW).is_ok());
+        v.set_tip(None, NOW);
+        assert!(v.rebuild(&s, NOW).is_ok());
+    }
+
+    #[test]
+    fn rejects_a_tip_job_that_claims_an_easier_target_than_the_node() {
+        // The setup job builds on 0x5a... at regtest bits (0x207fffff), the easiest target.
+        let (mut v, s) = setup();
+        v.set_tip(Some([0x5a; 32]), NOW);
+
+        // The node's next block is harder (bits 0x1d00ffff), so the job's easier bits are refused.
+        v.set_next_target(Some(0x1d00_ffff));
+        assert_eq!(v.rebuild(&s, NOW), Err(RejectReason::BadTarget));
+
+        // A job at least as hard as the node's next block is accepted.
+        let mut ok = s.clone();
+        let mut job = ok.job.clone().unwrap();
+        job.nbits = 0x1d00_ffffu32.to_le_bytes();
+        ok.job = Some(job);
+        assert!(v.rebuild(&ok, NOW).is_ok());
+    }
+
+    #[test]
+    fn the_network_target_check_needs_a_tip_match_and_a_template() {
+        let (mut v, s) = setup();
+
+        // A harder template is set, but the job builds on 0x5a... while the tip is elsewhere,
+        // so the two are not comparable and the job is not refused for its bits.
+        v.set_next_target(Some(0x1d00_ffff));
+        v.set_tip(Some([0x11; 32]), NOW);
+        assert!(v.rebuild(&s, NOW).is_ok(), "a job off the tip is not target-checked");
+
+        // On the tip but with no template read, the check is skipped.
+        v.set_tip(Some([0x5a; 32]), NOW);
+        v.set_next_target(None);
+        assert!(v.rebuild(&s, NOW).is_ok(), "no template means no target check");
+    }
+
+    #[test]
+    fn a_share_that_solves_a_block_is_credited_whatever_the_tip_is() {
+        // The gateway tests for a block before it tests for staleness and forwards the
+        // block either way, so a tip change must not refuse the finder's block.
+        let (mut v, s) = setup();
+        v.set_tip(Some([0x11; 32]), NOW);
+        assert!(
+            v.rebuild(&s, NOW + 3_600).is_ok(),
+            "a block is credited after TIP_GRACE_SECS has elapsed"
+        );
+    }
+
+    #[test]
+    fn credits_the_job_the_tip_replaced_until_the_grace_ends() {
+        let (mut v, s) = setup_hard();
+        // The share's job builds on 0x5a. The tip is replaced, which is what a share that
+        // is itself a block does: the gateway submits the block, the pool's node reports it,
+        // and only then does the share arrive.
+        v.set_tip(Some([0x5a; 32]), NOW);
+        v.set_tip(Some([0x11; 32]), NOW);
+        assert!(v.rebuild(&s, NOW).is_ok(), "the share that replaced the tip is still credited");
+        assert!(v.rebuild(&s, NOW + TIP_GRACE_SECS).is_ok(), "the grace has not ended");
+        assert_eq!(
+            v.rebuild(&s, NOW + TIP_GRACE_SECS + 1),
+            Err(RejectReason::StaleBlock),
+            "past the grace the job is stale"
+        );
+    }
+
+    #[test]
+    fn the_grace_outlasts_the_tips_that_follow_it() {
+        let (mut v, s) = setup_hard();
+        // Competing blocks at one height replace each other in quick succession. The job's
+        // parent is still recent, and work on it could still become the tip.
+        v.set_tip(Some([0x5a; 32]), NOW);
+        v.set_tip(Some([0x11; 32]), NOW);
+        v.set_tip(Some([0x22; 32]), NOW);
+        v.set_tip(Some([0x33; 32]), NOW);
+        assert!(v.rebuild(&s, NOW).is_ok(), "0x5a stopped being the tip within TIP_GRACE_SECS");
+        assert_eq!(
+            v.rebuild(&s, NOW + TIP_GRACE_SECS + 1),
+            Err(RejectReason::StaleBlock),
+            "age ends the grace, not the number of tips since"
+        );
+    }
+
+    #[test]
+    fn only_a_bounded_number_of_replaced_tips_is_kept() {
+        let (mut v, s) = setup_hard();
+        v.set_tip(Some([0x5a; 32]), NOW);
+        for i in 0..=MAX_RECENT_TIPS as u8 {
+            v.set_tip(Some([i; 32]), NOW);
+        }
+        assert_eq!(
+            v.rebuild(&s, NOW),
+            Err(RejectReason::StaleBlock),
+            "0x5a has been removed from recent_tips"
+        );
+    }
+
+    #[test]
+    fn a_repeated_tip_does_not_restart_the_grace() {
+        let (mut v, s) = setup_hard();
+        v.set_tip(Some([0x5a; 32]), NOW);
+        v.set_tip(Some([0x11; 32]), NOW);
+        // The watcher reports the same tip again later; it is not a change, so the grace
+        // still runs from when the tip changed.
+        v.set_tip(Some([0x11; 32]), NOW + TIP_GRACE_SECS);
+        assert_eq!(v.rebuild(&s, NOW + TIP_GRACE_SECS + 1), Err(RejectReason::StaleBlock));
+    }
+
+    #[test]
+    fn rejects_a_coinbase_id_the_share_does_not_claim() {
+        let (mut v, s) = setup();
+        let mut mismatched = s.clone();
+        let mut cb = mismatched.coinbase.clone().unwrap();
+        cb.coinbase_id = 3;
+        mismatched.coinbase = Some(cb);
+        assert_eq!(v.rebuild(&mismatched, NOW), Err(RejectReason::CoinbaseIdMismatch));
+
+        let mut out_of_range = s.clone();
+        out_of_range.coinbase_id = MAX_COINBASE_TYPES;
+        assert_eq!(v.rebuild(&out_of_range, NOW), Err(RejectReason::BadCoinbaseId));
+
+        let mut wrong_subsidy = s.clone();
+        wrong_subsidy.subsidy_only = true;
+        assert_eq!(v.rebuild(&wrong_subsidy, NOW), Err(RejectReason::BadCoinbaseId));
+    }
+
+    #[test]
+    fn rejects_a_share_for_a_coinbase_never_sent() {
+        let (mut v, s) = setup();
+        let mut no_cb = s.clone();
+        no_cb.coinbase = None;
+        assert_eq!(v.rebuild(&no_cb, NOW), Err(RejectReason::CoinbaseMissing));
+    }
+
+    #[test]
+    fn quickdiff_changes_the_bytes_before_the_extranonce() {
+        let (mut v, s) = setup();
+        let plain = v.rebuild(&s, NOW).unwrap();
+        let mut quick = s.clone();
+        quick.quickdiff = true;
+        let with_quickdiff = v.rebuild(&quick, NOW).unwrap();
+        let n = s.coinbase.as_ref().unwrap().coinb1.len();
+        assert_eq!(&with_quickdiff.coinbase_tx[n - 2..n], &0x5144u16.to_le_bytes());
+        assert_ne!(with_quickdiff.coinbase_tx, plain.coinbase_tx);
+        assert_eq!(&with_quickdiff.coinbase_tx[..n - 2], &plain.coinbase_tx[..n - 2]);
+        assert_eq!(&with_quickdiff.coinbase_tx[n..], &plain.coinbase_tx[n..]);
+    }
+
+    #[test]
+    fn a_replayed_share_is_refused_however_the_sections_are_resent() {
+        let (mut v, s) = setup();
+        assert!(v.verify(&s, NOW).is_ok());
+
+        assert_eq!(v.verify(&s, NOW), Err(RejectReason::DuplicateWork));
+        let mut bare = s.clone();
+        bare.job = None;
+        bare.coinbase = None;
+        assert_eq!(v.verify(&bare, NOW), Err(RejectReason::DuplicateWork));
+        let mut other = s.clone();
+        let mut job = other.job.clone().unwrap();
+        job.height += 1;
+        other.job = Some(job);
+        let _ = v.verify(&other, NOW);
+        assert_eq!(v.verify(&s, NOW), Err(RejectReason::DuplicateWork));
+        let mut same_work_other_job = s.clone();
+        same_work_other_job.job_id = 5;
+        assert_eq!(v.verify(&same_work_other_job, NOW), Err(RejectReason::DuplicateWork));
+    }
+
+    #[test]
+    fn a_share_is_credited_once_across_connections() {
+        let (mut first, s) = setup();
+        let mut second = Verifier::with_replay_guard(policy(), first.replay_guard());
+        second.record_split(&split());
+
+        assert!(first.verify(&s, NOW).is_ok());
+        assert_eq!(second.verify(&s, NOW), Err(RejectReason::DuplicateWork));
+
+        let mut alone = Verifier::new(policy());
+        alone.record_split(&split());
+        assert!(alone.verify(&s, NOW).is_ok());
+    }
+
+    #[test]
+    fn replay_guard_removes_the_oldest_hash_first() {
+        let mut g = ReplayGuard::new(2);
+        assert!(g.accept([1; 32]));
+        assert!(g.accept([2; 32]));
+        assert!(!g.accept([1; 32]));
+        assert_eq!(g.len(), 2);
+        assert!(g.accept([3; 32]));
+        assert_eq!(g.len(), 2);
+        assert!(g.accept([1; 32]));
+        assert!(!g.accept([3; 32]));
+        let mut g = ReplayGuard::new(0);
+        assert!(g.accept([9; 32]));
+        assert!(!g.accept([9; 32]));
+    }
+
+    #[test]
+    fn a_removed_hash_can_be_accepted_again() {
+        let mut g = ReplayGuard::new(4);
+        assert!(g.accept([1; 32]));
+        assert!(g.accept([2; 32]));
+        assert!(!g.accept([1; 32]));
+        assert!(g.remove(&[1; 32]), "the hash was present");
+        assert!(!g.remove(&[1; 32]), "and is gone now");
+        assert_eq!(g.len(), 1);
+        assert!(g.accept([1; 32]), "a removed hash is accepted again when it is resent");
+        assert!(!g.accept([2; 32]), "the one that stayed is still a duplicate");
+    }
+
+    #[test]
+    fn a_rejected_share_is_not_recorded_as_seen() {
+        let (mut v, mut s) = setup();
+        s.target_byte = 40;
+        assert_eq!(v.verify(&s, NOW), Err(RejectReason::HighHash));
+        assert_eq!(v.verify(&s, NOW), Err(RejectReason::HighHash));
+        s.target_byte = 0;
+        assert!(v.verify(&s, NOW).is_ok());
+    }
+
+    #[test]
+    fn a_resent_job_section_keeps_the_coinbases_already_installed() {
+        let (mut v, s) = setup();
+        v.rebuild(&s, NOW).unwrap();
+        let mut again = s.clone();
+        again.coinbase = None;
+        assert!(v.rebuild(&again, NOW).is_ok());
+    }
+
+    #[test]
+    fn rebuilds_a_subsidy_only_share() {
+        let p = policy();
+        let (mut cb, pot_index) = coinbase_sections(&p, &[]);
+        cb.coinbase_id = COINBASE_ID_SUBSIDY_ONLY;
+        let mut v = Verifier::new(p);
+        let (_, base) = setup();
+        let mut share = base.clone();
+        share.subsidy_only = true;
+        share.coinbase_id = COINBASE_ID_SUBSIDY_ONLY;
+        share.coinbase = Some(cb);
+        let mut job = job_section(pot_index);
+        job.merkle_branches = vec![[0x42; 32]];
+        share.job = Some(job);
+
+        let w = v.rebuild(&share, NOW).unwrap();
+        assert_eq!(w.paid_to_split, 0);
+        assert_eq!(w.paid_to_pool, COINBASE_VALUE);
+        assert_eq!(&w.header[36..68], &bitcoin::sha256d(&w.coinbase_tx));
+    }
+
+    #[test]
+    fn maps_decode_errors_to_reject_reasons() {
+        assert_eq!(
+            Verifier::reason_for_decode_error(&share::Error::BadExtranonceSize(16)),
+            RejectReason::BadExtranonceSize
+        );
+        assert_eq!(
+            Verifier::reason_for_decode_error(&share::Error::Truncated("x")),
+            RejectReason::Other
+        );
+    }
+
+    #[test]
+    fn rejects_a_coinbase_that_is_not_a_transaction() {
+        let (mut v, mut s) = setup();
+        s.coinbase =
+            Some(CoinbaseSection { coinbase_id: 0, coinb1: vec![0x01, 0x02], coinb2: vec![] });
+        assert_eq!(v.rebuild(&s, NOW), Err(RejectReason::BadCoinbase));
+    }
+
+    #[test]
+    fn ignores_zero_value_outputs() {
+        let p = policy();
+        let tx = CoinbaseTx {
+            version: 1,
+            script_sig_offset: 0,
+            script_sig: vec![],
+            sequence: 0xffff_ffff,
+            outputs: vec![
+                TxOut { value: 0, script: vec![0x6a, 0x0e] },
+                TxOut { value: COINBASE_VALUE, script: p.payout_script.clone() },
+            ],
+            lock_time: 0,
+            has_witness: false,
+        };
+        let (_, s) = setup();
+        let paid = check_outputs(&p, &HashMap::new(), &job_section(0), &tx, &s).unwrap();
+        assert_eq!(paid, (0, COINBASE_VALUE));
+    }
+
+    #[test]
+    #[ignore = "searches ~2^32 hashes; run with --release -- --ignored to regenerate the nonces"]
+    fn find_a_difficulty_1_nonce() {
+        for (name, (mut v, s)) in [("DIFF1_NONCE", setup()), ("DIFF1_NONCE_HARD", setup_hard())] {
+            let mut header: [u8; bitcoin::HEADER_SIZE] =
+                v.rebuild(&s, NOW).unwrap().header.try_into().unwrap();
+            let base = u32::from_le_bytes(header[68..72].try_into().unwrap());
+            for offset in 0..16u32 {
+                header[68..72].copy_from_slice(&(base + offset).to_le_bytes());
+                let ntime_offset = base + offset - NOW as u32;
+                if let Some(nonce) = find_nonce(header) {
+                    println!("{name} = {nonce:#010x}, ntime offset {ntime_offset}");
+                    break;
+                }
+                println!("{name}: no solution at ntime offset {ntime_offset}");
+            }
+        }
+        find_a_difficulty_1_nonce_v2();
+    }
+
+    fn find_a_difficulty_1_nonce_v2() {
+        let (mut v, mut s) = setup_v2();
+        for offset in 0..16u32 {
+            // Search against the header the pool would build: change the section's
+            // `time_on_wire` and rebuild, rather than rewriting the serialized header's time
+            // bytes as the version 1 search does.
+            let mut b = s.blake2b.unwrap();
+            b.time_on_wire = NOW as u32 + offset;
+            s.blake2b = Some(b);
+            s.ntime = b.time_on_wire;
+            let w = v.rebuild(&s, NOW + u64::from(offset)).expect("rebuild");
+            let h = built_header(&w);
+            let pre = h.precompute();
+            let input = h.asic_input_with(&pre.hash1, &pre.h2);
+            match crate::nonce::search(
+                &input,
+                32,
+                crate::header::blake2b_256,
+                &target::DIFF1_TARGET,
+                || false,
+            ) {
+                None => println!("DIFF1_NONCE_V2: no solution at ntime offset {offset}"),
+                Some(nonce) => {
+                    println!("DIFF1_NONCE_V2 = {nonce:#010x}, ntime offset {offset}");
+                    return;
+                }
+            }
+        }
+        panic!("no version 2 nonce met difficulty 1");
+    }
+
+    fn find_nonce(header: [u8; bitcoin::HEADER_SIZE]) -> Option<u32> {
+        crate::nonce::search(
+            &header,
+            76,
+            |h| bitcoin::reversed(&bitcoin::sha256d(h)),
+            &target::DIFF1_TARGET,
+            || false,
+        )
+    }
+}

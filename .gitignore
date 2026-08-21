@@ -1,0 +1,10 @@
+/target
+references/
+
+# ratum-prime.key is written to the working directory when ratum-prime runs without --data-dir
+# or --key; shares.redb is the ledger's name inside --data-dir, listed for a data directory set
+# to the working directory (with neither --data-dir nor --ledger no ledger file is written).
+# Runtime state, never committed.
+/ratum-prime.key
+/shares.redb
+prime-data/

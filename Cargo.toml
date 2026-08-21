@@ -1,0 +1,21 @@
+[package]
+name = "ratum"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+base64 = "0.23.1"
+blake2 = "0.10"
+bytes = "1"
+clap = { version = "4.6.6", features = ["derive"] }
+dryoc = "1"
+env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
+hex = "0.4"
+log = "0.4"
+minreq = "3.0.0"
+redb = "4.2.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2.0.20"
+toml = "1.1.4"
