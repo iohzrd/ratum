@@ -3,9 +3,7 @@
 RATUM is the pool server of the DATUM protocol, written in Rust. A DATUM Gateway runs beside a
 miner's own node, builds the block templates and serves stratum to the hardware; the pool it
 connects to, which the gateway calls DATUM Prime, dictates where the coinbase pays, verifies
-the shares that come back and relays the blocks. The gateway is published and the pool is
-not. RATUM is that pool, for the Bitcoin Knots BLAKE2b hardfork chain
-([bitcoinknots/bitcoin#359](https://github.com/bitcoinknots/bitcoin/pull/359)).
+the shares that come back and relays the blocks. RATUM is a pool for the [Bitcoin Knots BLAKE2b hardfork chain](https://github.com/bitcoinknots/bitcoin/pull/359).
 
 RATUM pairs with the DATUM Gateway fork at https://github.com/iohzrd/datum_gateway (branch
 `blake2b`), which sends the version 2 header section.
