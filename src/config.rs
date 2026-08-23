@@ -65,6 +65,7 @@ settings! {
     window: f64,
     window_floor: u128,
     min_payout: u64,
+    fee_bps: u16,
     activation_height: u32,
     headline: String,
     rpc: String,

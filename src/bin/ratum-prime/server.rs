@@ -138,17 +138,27 @@ impl Drop for OpenConnectionGuard {
     }
 }
 
-/// There is no pool fee. `Ledger::split` divides the coinbase value to the satoshi, so the
-/// pool's script is paid only on failure: an address that does not resolve, a script too
-/// long to pay, an empty window, or a split `on_coinbaser_request` could not encode. Each
-/// is logged.
-///
-/// A declared fee would be a `bps` field here, deducted before the split as a dictated output.
+/// `fee_bps` is the operator fee in basis points (hundredths of a percent), 0 to 100, so at
+/// most 1% (`main` refuses more). The pool receives it: `value - fee` is split among the
+/// miners, and the gateway pays the fee to the pool's payout script as the coinbase remainder,
+/// by the same mechanism as the pool's fallback residue (an address that does not resolve, a
+/// script too long to pay, an empty window, or a split that could not be encoded). `fee_bps`
+/// is 0 by default, so nothing is withheld and `Ledger::split` divides the whole coinbase
+/// value to the satoshi.
 #[derive(Clone, Copy)]
 pub(crate) struct PayoutPolicy {
     pub(crate) min_payout: u64,
     pub(crate) window_multiple: f64,
     pub(crate) window_floor: u128,
+    pub(crate) fee_bps: u16,
+}
+
+impl PayoutPolicy {
+    /// The operator fee taken from a coinbase value of `value` sats: `fee_bps` hundredths of a
+    /// percent, rounded down so the operator never takes more than the exact rate.
+    pub(crate) fn fee_on(&self, value: u64) -> u64 {
+        (u128::from(value) * u128::from(self.fee_bps) / 10_000) as u64
+    }
 }
 
 pub(crate) fn unix_now() -> u64 {
@@ -221,10 +231,15 @@ pub(crate) fn resolve_address(node: &rpc::Client, address: &str) -> Result<Resol
 
 pub(crate) fn coinbaser_outputs(server: &Server, value: u64) -> (Vec<CoinbaseOutput>, usize, u128) {
     let node = &server.node;
+    // The pool receives the operator fee; what remains is split among the miners. The gateway
+    // pays the fee to the pool's payout script as the coinbase remainder (the value minus these
+    // dictated outputs), so no output is dictated for it here.
+    let operator_fee = server.payout.fee_on(value);
+    let miners_share = value - operator_fee;
     let (split, shares, work) = {
         let l = lock(&server.ledger);
         (
-            l.split(value, server.payout.min_payout, messages::MAX_COINBASER_OUTPUTS),
+            l.split(miners_share, server.payout.min_payout, messages::MAX_COINBASER_OUTPUTS),
             l.len(),
             l.total_work(),
         )
@@ -259,6 +274,15 @@ mod tests {
         resolved: &[(&str, Option<Vec<u8>>)],
         min_payout: u64,
     ) -> Server {
+        server_with_fee(shares, resolved, min_payout, 0)
+    }
+
+    fn server_with_fee(
+        shares: &[(&str, u64)],
+        resolved: &[(&str, Option<Vec<u8>>)],
+        min_payout: u64,
+        fee_bps: u16,
+    ) -> Server {
         let mut ledger = Ledger::new(u128::MAX);
         for (i, (identity, difficulty)) in shares.iter().enumerate() {
             let mut hash = [0u8; 32];
@@ -285,7 +309,7 @@ mod tests {
             replay: Arc::new(Mutex::new(ReplayGuard::default())),
             ledger: Mutex::new(ledger),
             resolver: Mutex::new(resolver),
-            payout: PayoutPolicy { min_payout, window_multiple: 8.0, window_floor: 1 },
+            payout: PayoutPolicy { min_payout, window_multiple: 8.0, window_floor: 1, fee_bps },
             config_payload: config.encode().unwrap(),
             policy: PoolPolicy::from_config(&config),
             open_connections: AtomicUsize::new(0),
@@ -317,6 +341,41 @@ mod tests {
         // Fully allocated, so the gateway has no remainder to pay to the pool.
         assert_eq!(outputs.iter().map(|o| o.value).sum::<u64>(), 1_000_000);
         assert!(outputs.iter().all(|o| o.script != POOL));
+    }
+
+    #[test]
+    fn a_fee_is_deducted_before_the_split_and_left_to_the_pool() {
+        // fee_bps 100 is 1%: 10_000 of 1_000_000 is withheld, and 990_000 is split among the
+        // miners. The dictated outputs total the split, not the value; the gateway pays the
+        // 10_000 difference to the pool's payout script as the coinbase remainder.
+        let server = server_with_fee(
+            &[("alice", 3), ("bob", 1)],
+            &[("alice", Some(p2wpkh(0xa1))), ("bob", Some(p2wpkh(0xb2)))],
+            0,
+            100,
+        );
+        let (outputs, _, _) = coinbaser_outputs(&server, 1_000_000);
+        assert_eq!(
+            outputs.iter().map(|o| (o.value, o.script.clone())).collect::<Vec<_>>(),
+            vec![(742_500, p2wpkh(0xa1)), (247_500, p2wpkh(0xb2))]
+        );
+        let paid: u64 = outputs.iter().map(|o| o.value).sum();
+        assert_eq!(paid, 990_000);
+        // The pool keeps what the split did not distribute.
+        assert_eq!(1_000_000 - paid, 10_000);
+        assert!(outputs.iter().all(|o| o.script != POOL));
+    }
+
+    #[test]
+    fn the_fee_is_rounded_down_so_the_operator_never_over_takes() {
+        let with_bps =
+            |bps| PayoutPolicy { min_payout: 0, window_multiple: 8.0, window_floor: 1, fee_bps: bps };
+        assert_eq!(with_bps(0).fee_on(1_000_000), 0, "no fee by default");
+        assert_eq!(with_bps(50).fee_on(1_000_000), 5_000, "0.5%");
+        // 100 (1%) is the highest fee `main` accepts.
+        assert_eq!(with_bps(100).fee_on(1_000_000), 10_000);
+        // 1% of 1 sat is 0.01 sat, rounded down to 0: the miner keeps it.
+        assert_eq!(with_bps(100).fee_on(1), 0);
     }
 
     #[test]

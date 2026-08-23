@@ -170,6 +170,53 @@ fn a_split_pays_the_miners_in_the_window_by_work() {
 }
 
 #[test]
+fn a_fee_is_deducted_from_the_split_and_left_to_the_pool() {
+    let node = FakeNode::start();
+    node.set_difficulty(1.0);
+    support::lock(&node.state).coinbase_value = Some(1_000_000);
+    let dir = TempDir::new("coinbaser-fee");
+    seed_alice_and_bob(&dir);
+
+    // 100 bps is 1%, the maximum fee: 10_000 of 1_000_000 is deducted before the split, and
+    // 990_000 is split three to one. The gateway pays the 10_000 remainder to the pool's
+    // payout script.
+    let pool = Pool::start(
+        dir,
+        PoolArgs {
+            rpc_url: Some(node.url()),
+            window_floor: 4,
+            min_payout: 1,
+            extra: vec!["--fee-bps".into(), "100".into()],
+            ..Default::default()
+        },
+    );
+    pool.expect_line("operator fee 100 bps");
+
+    let mut gateway = pool.connect();
+    let _config = gateway.recv();
+    let request = CoinbaserRequest { value: 1_000_000, prev_hash: node.tip_internal() };
+    gateway.send_mining(&request.encode());
+
+    let (payload, _) = gateway.recv_until(server_subcmd::COINBASER);
+    let response = CoinbaserResponse::decode(&payload).expect("coinbaser response");
+    let paid: Vec<(u64, Vec<u8>)> =
+        response.outputs.iter().map(|o| (o.value, o.script.clone())).collect();
+    assert_eq!(
+        paid,
+        vec![
+            (742_500, script_for_address("alice")),
+            (247_500, script_for_address("bob")),
+        ],
+        "three quarters of the value after the fee is alice's"
+    );
+    let split_total: u64 = response.outputs.iter().map(|o| o.value).sum();
+    assert_eq!(split_total, 990_000, "the split is the value minus the 1% fee");
+    // The response carries the full value; the difference is the remainder the gateway pays
+    // to the pool's payout script.
+    assert_eq!(response.value - split_total, 10_000, "the pool keeps the fee");
+}
+
+#[test]
 fn an_address_the_node_rejects_removes_only_that_miner_from_the_split() {
     let node = FakeNode::start();
     support::lock(&node.state).invalid_addresses.insert("bob".to_string());

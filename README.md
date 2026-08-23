@@ -55,8 +55,11 @@ One ledger serves every gateway: a block found by any of them pays the miners of
 in proportion to their work in the window. A miner's identity is its stratum username up to
 the first `.`. The outputs total the coinbase to the satoshi; an identity that cannot be paid
 (past the 512 outputs the gateway accepts, or under `--min-payout`) leaves the denominator
-too, so its value goes to the other miners. There is no pool fee: the pool's own script is
-paid only when something has failed, and each such case is logged.
+too, so its value goes to the other miners. The operator fee defaults to 0 (`--fee-bps 0`):
+with no fee, the pool's own script is paid only when something has failed, and each such case
+is logged. A fee is set with `--fee-bps` in basis points (hundredths of a percent, 0 to 100,
+so at most 1%); it is deducted from the coinbase value before the split, and the gateway pays
+it to the pool's payout script as the remainder.
 
 ## Logging
 

@@ -177,6 +177,18 @@ fn main() -> io::Result<()> {
         "a count of satoshis",
         |_| true,
     );
+    // The operator fee in basis points (hundredths of a percent), 0 to 100, so at most 1%. It
+    // is deducted from the coinbase value before the split; the gateway pays it to the pool's
+    // payout script as the remainder. The default 0 deducts nothing, so the whole value is
+    // split among miners.
+    let fee_bps = cli::resolve::<u16>(
+        c.fee_bps.as_deref(),
+        f.fee_bps,
+        0,
+        "--fee-bps",
+        "basis points from 0 to 100 (a fee of at most 1%)",
+        |n| *n <= 100,
+    );
     let activation_height = cli::resolve_opt::<u32>(
         c.activation_height.as_deref(),
         f.activation_height,
@@ -339,7 +351,8 @@ fn main() -> io::Result<()> {
 
     info!(
         "payouts: window {window_multiple}x network difficulty (floor {window_floor}, \
-         {startup_window} at startup), minimum {min_payout} sats"
+         {startup_window} at startup), minimum {min_payout} sats, \
+         operator fee {fee_bps} bps"
     );
 
     let activation = match (activation_height, headline.is_empty()) {
@@ -458,7 +471,7 @@ fn main() -> io::Result<()> {
         replay,
         ledger: Mutex::new(ledger),
         resolver: Mutex::new(Resolver::new()),
-        payout: PayoutPolicy { min_payout, window_multiple, window_floor },
+        payout: PayoutPolicy { min_payout, window_multiple, window_floor, fee_bps },
         policy,
         config_payload,
         open_connections: AtomicUsize::new(0),
