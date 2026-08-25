@@ -41,10 +41,11 @@ pub(crate) fn watch_node(
                     let mut display = t.hash;
                     display.reverse();
                     info!(
-                        "node tip: height {} difficulty {} {}",
+                        "node tip: height {} difficulty {} {} (chain {})",
                         t.height,
                         t.difficulty,
-                        hex::encode(display)
+                        hex::encode(display),
+                        t.chain.name()
                     );
                     last = Some(t.hash);
                     have_template = false;
@@ -127,6 +128,13 @@ pub(crate) struct Server {
     /// The count of open connections, bounded by `max_connections`.
     pub(crate) open_connections: AtomicUsize,
     pub(crate) max_connections: usize,
+    /// The port a gateway connects to (the `--listen` port), reported by the stats interface
+    /// so the page can show how to reach the pool.
+    pub(crate) datum_port: u16,
+    /// The host, or `host:port`, gateways should use to reach the pool (`--advertise-address`).
+    /// `None` falls back to the address the stats page was reached on. The stats interface only
+    /// displays it.
+    pub(crate) advertise: Option<String>,
 }
 
 /// Decrements `open_connections` when the connection's thread ends.
@@ -314,6 +322,8 @@ mod tests {
             policy: PoolPolicy::from_config(&config),
             open_connections: AtomicUsize::new(0),
             max_connections: 8,
+            datum_port: 28915,
+            advertise: None,
         }
     }
 
@@ -368,8 +378,12 @@ mod tests {
 
     #[test]
     fn the_fee_is_rounded_down_so_the_operator_never_over_takes() {
-        let with_bps =
-            |bps| PayoutPolicy { min_payout: 0, window_multiple: 8.0, window_floor: 1, fee_bps: bps };
+        let with_bps = |bps| PayoutPolicy {
+            min_payout: 0,
+            window_multiple: 8.0,
+            window_floor: 1,
+            fee_bps: bps,
+        };
         assert_eq!(with_bps(0).fee_on(1_000_000), 0, "no fee by default");
         assert_eq!(with_bps(50).fee_on(1_000_000), 5_000, "0.5%");
         // 100 (1%) is the highest fee `main` accepts.

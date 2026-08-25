@@ -51,6 +51,8 @@ macro_rules! settings {
 // `deny_unknown_fields` is what rejects it.
 settings! {
     listen: String,
+    stats_listen: String,
+    advertise_address: String,
     data_dir: String,
     key: String,
     motd: String,

@@ -194,6 +194,7 @@ fn respond(
             let s = lock(state);
             (
                 serde_json::json!({
+                    "chain": "regtest",
                     "bestblockhash": s.tip_display,
                     "blocks": s.height,
                     "difficulty": s.difficulty,

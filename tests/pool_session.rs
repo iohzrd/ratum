@@ -203,10 +203,7 @@ fn a_fee_is_deducted_from_the_split_and_left_to_the_pool() {
         response.outputs.iter().map(|o| (o.value, o.script.clone())).collect();
     assert_eq!(
         paid,
-        vec![
-            (742_500, script_for_address("alice")),
-            (247_500, script_for_address("bob")),
-        ],
+        vec![(742_500, script_for_address("alice")), (247_500, script_for_address("bob")),],
         "three quarters of the value after the fee is alice's"
     );
     let split_total: u64 = response.outputs.iter().map(|o| o.value).sum();

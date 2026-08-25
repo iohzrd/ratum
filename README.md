@@ -61,6 +61,21 @@ is logged. A fee is set with `--fee-bps` in basis points (hundredths of a percen
 so at most 1%); it is deducted from the coinbase value before the split, and the gateway pays
 it to the pool's payout script as the remainder.
 
+## Stats interface
+
+`--stats-listen <address>` starts a read-only HTTP interface (off unless the address is
+given): `/stats.json` is a snapshot of the tip, the coinbase value, the operator fee, the
+connected gateways and the per-miner share of the window; `/` is a page that fetches and
+renders it. It serves only GET and takes no action, and it exposes no secret (not the node
+credentials, not the pool signing key). Bind it to `127.0.0.1` unless it is behind a reverse
+proxy, since the page is unauthenticated: `--stats-listen 127.0.0.1:28917`.
+
+The page also shows how to point a gateway at the pool: the DATUM address, the public key, and
+a `datum_gateway` config block. The address host is the one the page was reached on, which is
+correct when the page is opened at the pool's public host; set `--advertise-address` (a host,
+or `host:port`) when the public address differs, for example the pool is behind NAT or a
+port-mapping proxy: `--advertise-address pool.example.com:28915`.
+
 ## Logging
 
 `RUST_LOG` selects the level through `env_logger`: `info`, the default, for settings, node

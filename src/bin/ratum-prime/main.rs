@@ -1,6 +1,7 @@
 mod cli;
 mod connection;
 mod server;
+mod stats;
 
 use connection::handle;
 use log::{error, info, warn};
@@ -113,6 +114,14 @@ fn main() -> io::Result<()> {
     let f = loaded.file;
 
     let listen = cli::resolve_str(c.listen.clone(), f.listen, "0.0.0.0:28915");
+    // The read-only stats interface. Unset by default; the interface starts only when this
+    // names an address. Bind it to 127.0.0.1 unless it is behind a reverse proxy, since the
+    // page is unauthenticated.
+    let stats_listen = c.stats_listen.clone().or(f.stats_listen);
+    // The host, or host:port, gateways should use to reach the pool, shown on the stats page.
+    // Unset falls back to the address the page was reached on, so set this when the public
+    // address differs from that (for example the pool is behind NAT or a port-mapping proxy).
+    let advertise_address = c.advertise_address.clone().or(f.advertise_address);
     let data_dir = c.data_dir.clone().or(f.data_dir);
     let key_path = c.key.clone().or(f.key);
     let motd = cli::resolve_str(c.motd.clone(), f.motd, "RATUM Prime");
@@ -124,10 +133,13 @@ fn main() -> io::Result<()> {
         "a power of two",
         |n| n.is_power_of_two(),
     );
+    // Each connection is a gateway served by its own thread, so this bounds threads, file
+    // descriptors and memory, and limits a connection flood. It is not a protocol limit. A
+    // larger pool raises this together with the process file-descriptor and thread limits.
     let max_connections = cli::resolve::<usize>(
         c.max_connections.as_deref(),
         f.max_connections,
-        256,
+        1024,
         "--max-connections",
         "a positive number",
         |n| *n > 0,
@@ -476,7 +488,18 @@ fn main() -> io::Result<()> {
         config_payload,
         open_connections: AtomicUsize::new(0),
         max_connections,
+        // The port a gateway connects to, for the stats page to display. Parsed from the
+        // configured listen address; the host a gateway uses is the one it reaches the pool on.
+        datum_port: listen.rsplit_once(':').and_then(|(_, p)| p.parse().ok()).unwrap_or(0),
+        advertise: advertise_address,
     });
+
+    if let Some(addr) = &stats_listen {
+        match stats::spawn(Arc::clone(&server), addr) {
+            Ok(bound) => info!("stats interface listening on http://{bound}"),
+            Err(e) => error!("stats interface could not start on {addr}: {e}"),
+        }
+    }
 
     let listener = TcpListener::bind(&listen)?;
     let bound = listener.local_addr().map_or(listen.clone(), |a| a.to_string());

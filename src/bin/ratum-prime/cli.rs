@@ -29,6 +29,10 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub listen: Option<String>,
     #[arg(long)]
+    pub stats_listen: Option<String>,
+    #[arg(long)]
+    pub advertise_address: Option<String>,
+    #[arg(long)]
     pub data_dir: Option<String>,
     #[arg(long)]
     pub config: Option<String>,

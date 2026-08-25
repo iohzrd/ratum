@@ -3,7 +3,7 @@
 
 mod support;
 
-use ratum::rpc::{Client, Error};
+use ratum::rpc::{Chain, Client, Error};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
@@ -116,10 +116,11 @@ fn a_call_carries_basic_auth_and_the_json_rpc_envelope() {
 fn the_tip_is_read_in_internal_byte_order() {
     let display = "0000000000000000000123456789abcdef0123456789abcdef0123456789abcd";
     let stub = Stub::serving(vec![ok(&format!(
-        r#"{{"bestblockhash":"{display}","blocks":961632,"difficulty":1.5e14}}"#
+        r#"{{"chain":"main","bestblockhash":"{display}","blocks":961632,"difficulty":1.5e14}}"#
     ))]);
     let tip = stub.client().tip().expect("tip");
     assert_eq!(tip.height, 961_632);
+    assert_eq!(tip.chain, Chain::Main);
     assert!((tip.difficulty - 1.5e14).abs() < 1.0);
 
     let mut expected: [u8; 32] = hex::decode(display).unwrap().try_into().unwrap();
@@ -130,11 +131,12 @@ fn the_tip_is_read_in_internal_byte_order() {
 #[test]
 fn a_tip_missing_a_field_is_an_error_not_a_default() {
     for body in [
-        r#"{"blocks":1,"difficulty":1.0}"#,
-        r#"{"bestblockhash":"00","difficulty":1.0}"#,
-        r#"{"bestblockhash":"00","blocks":1}"#,
-        r#"{"bestblockhash":"not hex","blocks":1,"difficulty":1.0}"#,
-        r#"{"bestblockhash":"aabb","blocks":1,"difficulty":1.0}"#,
+        r#"{"chain":"main","blocks":1,"difficulty":1.0}"#,
+        r#"{"chain":"main","bestblockhash":"00","difficulty":1.0}"#,
+        r#"{"chain":"main","bestblockhash":"00","blocks":1}"#,
+        r#"{"chain":"main","bestblockhash":"not hex","blocks":1,"difficulty":1.0}"#,
+        r#"{"chain":"main","bestblockhash":"aabb","blocks":1,"difficulty":1.0}"#,
+        r#"{"bestblockhash":"00","blocks":1,"difficulty":1.0}"#,
     ] {
         let stub = Stub::serving(vec![ok(body)]);
         assert!(

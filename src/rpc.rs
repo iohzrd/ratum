@@ -41,11 +41,49 @@ impl Error {
     }
 }
 
+/// The chain the node reports in `getblockchaininfo`'s `chain` field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Chain {
+    Main,
+    Test,
+    Testnet4,
+    Signet,
+    Regtest,
+    /// A `chain` value not listed above.
+    Other,
+}
+
+impl Chain {
+    fn parse(name: &str) -> Chain {
+        match name {
+            "main" => Chain::Main,
+            "test" => Chain::Test,
+            "testnet4" => Chain::Testnet4,
+            "signet" => Chain::Signet,
+            "regtest" => Chain::Regtest,
+            _ => Chain::Other,
+        }
+    }
+
+    /// The name as `getblockchaininfo` reports it; `"other"` for an unlisted value.
+    pub fn name(self) -> &'static str {
+        match self {
+            Chain::Main => "main",
+            Chain::Test => "test",
+            Chain::Testnet4 => "testnet4",
+            Chain::Signet => "signet",
+            Chain::Regtest => "regtest",
+            Chain::Other => "other",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Tip {
     pub hash: [u8; 32],
     pub height: u32,
     pub difficulty: f64,
+    pub chain: Chain,
 }
 
 /// The two facts the pool reads from a block template: what the next block may pay, and the
@@ -212,12 +250,15 @@ impl Client {
         let difficulty = info["difficulty"]
             .as_f64()
             .ok_or_else(|| Error::BadResponse("no difficulty".into()))?;
+        let chain = Chain::parse(
+            info["chain"].as_str().ok_or_else(|| Error::BadResponse("no chain".into()))?,
+        );
         let mut hash: [u8; 32] = hex::decode(display)
             .ok()
             .and_then(|b| b.try_into().ok())
             .ok_or_else(|| Error::BadResponse(format!("bestblockhash {display:?}")))?;
         hash.reverse();
-        Ok(Tip { hash, height, difficulty })
+        Ok(Tip { hash, height, difficulty, chain })
     }
 
     pub fn wait_for_block_height(&self, height: u32, timeout: Duration) -> Result<u32, Error> {
