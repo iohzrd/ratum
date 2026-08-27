@@ -18,6 +18,9 @@ pub struct NodeState {
     /// a block against this target, not against a job's self-declared bits.
     pub next_bits: String,
     pub invalid_addresses: HashSet<String>,
+    /// Addresses `validateaddress` answers with a 42-byte scriptPubKey, what the node
+    /// returns for a future witness version: valid, but over the coinbase output limit.
+    pub oversized_addresses: HashSet<String>,
     pub submitted: Vec<String>,
     pub submit_reply: Option<String>,
     pub serves_waitforblockheight: bool,
@@ -33,6 +36,7 @@ impl NodeState {
             coinbase_value: Some(312_500_000),
             next_bits: "207fffff".to_string(),
             invalid_addresses: HashSet::new(),
+            oversized_addresses: HashSet::new(),
             submitted: Vec::new(),
             submit_reply: None,
             serves_waitforblockheight: true,
@@ -240,10 +244,18 @@ fn respond(
             if lock(state).invalid_addresses.contains(&address) {
                 return (serde_json::json!({"isvalid": false}), serde_json::Value::Null);
             }
+            let script = if lock(state).oversized_addresses.contains(&address) {
+                // OP_2 followed by a 40-byte witness program: 42 bytes.
+                let mut s = vec![0x52, 0x28];
+                s.extend(std::iter::repeat_n(0xab, 40));
+                s
+            } else {
+                script_for_address(&address)
+            };
             (
                 serde_json::json!({
                     "isvalid": true,
-                    "scriptPubKey": hex::encode(script_for_address(&address)),
+                    "scriptPubKey": hex::encode(script),
                 }),
                 serde_json::Value::Null,
             )

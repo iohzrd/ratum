@@ -265,9 +265,13 @@ pub fn script_pushes(script: &[u8]) -> Vec<(usize, &[u8])> {
 ///
 /// `Consensus::CheckOutputSizes` (Knots `src/consensus/tx_verify.cpp`): empty skipped, at
 /// most `MAX_OUTPUT_SCRIPT_SIZE` (34) bytes, or `MAX_OUTPUT_DATA_SIZE` (83) beginning
-/// OP_RETURN. The node applies it to the coinbase only while the BIP9 deployment
-/// `DEPLOYMENT_REDUCED_DATA` is active; that deployment is independent of `Blake2bHeight`,
-/// so the pool applies it without checking deployment state.
+/// OP_RETURN. The node applies it to the generation transaction of every block RDTS is
+/// active for: from `Blake2bHeight` until the parent's median time past reaches
+/// `RdtsExpiryTime` (`ConnectBlock`, on the `reduced_data` rule the template reports).
+/// Knots 29.4.1 removed the versionbits deployment `DEPLOYMENT_REDUCED_DATA` this used to
+/// depend on. The pool applies the limit to every block rather than tracking the expiry: it
+/// never builds a block the rule would invalidate, at the cost of paying an oversized
+/// identity's amount to the pool payout script after the expiry as well.
 ///
 /// The gateway's `addr_2_output_script` cannot exceed 34, but RATUM resolves addresses
 /// through `validateaddress`, which returns up to 42 bytes for a future witness version:

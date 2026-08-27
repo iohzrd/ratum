@@ -333,6 +333,34 @@ fn an_address_the_node_rejects_stops_the_pool() {
 }
 
 #[test]
+fn an_address_whose_script_is_too_long_for_a_coinbase_output_stops_the_pool() {
+    // `validateaddress` accepts a future witness version and returns a scriptPubKey of up to
+    // 42 bytes for it. That script is the coinbase remainder output, which cannot be left
+    // out, so the gateway serves no work at all for as long as the node enforces the
+    // reduced_data rule. Refusing it at startup names the flag instead.
+    let node = FakeNode::start();
+    support::lock(&node.state).oversized_addresses.insert("bcrt1future".to_string());
+    let argv = vec![
+        "--listen".to_string(),
+        "127.0.0.1:0".to_string(),
+        "--payout-address".to_string(),
+        "bcrt1future".to_string(),
+        "--rpc".to_string(),
+        node.url(),
+        "--rpc-user".to_string(),
+        "u".to_string(),
+        "--rpc-pass".to_string(),
+        "p".to_string(),
+    ];
+    let borrowed: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let output = run_pool(&borrowed);
+    assert_eq!(output.status.code(), Some(2));
+    let printed = printed(&output);
+    assert!(printed.contains("--payout-address gives a 42-byte script"), "{printed}");
+    assert!(printed.contains("34 bytes"), "{printed}");
+}
+
+#[test]
 fn a_node_that_cannot_be_reached_stops_the_pool_before_it_listens() {
     // Port 1 on the loopback interface refuses connections.
     let output = run_pool(&[

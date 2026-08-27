@@ -43,11 +43,15 @@ it is credited, indexed by its hash and held under an exclusive lock: `--ledger`
 A payout is measured over the most recent shares whose difficulties sum to `--window` times the
 network difficulty (`8` by default, OCEAN's TIDES rule), never below `--window-floor`, re-sized as
 difficulty changes; shares trimmed when it narrows are re-read from the database when it widens.
-At the BLAKE2b activation height Knots shifts the target left by `Blake2bTargetShift` (20)
-bits, dividing the difficulty by about `2^20`; later retargets adjust from there, at most
-4x per period. An operator running it should set `--window-floor` to hold the intended span of
-work, and keep the whole ledger (the default) so the pre-fork shares are credited again as the
-window widens.
+At the BLAKE2b activation height Knots sets the block's target once, outside the usual
+retarget. On mainnet, signet and regtest it shifts the previous target left by
+`Blake2bTargetShift` (20) bits, dividing the difficulty by about `2^20`. On testnet3 and
+testnet4 it ignores the previous target and sets `nBits` to `0x1a00ffff`, difficulty
+`16777216`; from that height the testnet 20-minute minimum-difficulty exception no longer
+applies, because it is skipped for v2 headers. Later retargets adjust from whichever value
+applied, at most 4x per period. An operator running it should set `--window-floor` to hold
+the intended span of work, and keep the whole ledger (the default) so the pre-fork shares are
+credited again as the window widens.
 
 ## The split
 
@@ -55,7 +59,10 @@ One ledger serves every gateway: a block found by any of them pays the miners of
 in proportion to their work in the window. A miner's identity is its stratum username up to
 the first `.`. The outputs total the coinbase to the satoshi; an identity that cannot be paid
 (past the 512 outputs the gateway accepts, or under `--min-payout`) leaves the denominator
-too, so its value goes to the other miners. The operator fee defaults to 0 (`--fee-bps 0`):
+too, so its value goes to the other miners. An identity whose address resolves to a script
+over the coinbase output limit (34 bytes, or 83 beginning OP_RETURN) is left out after the
+split instead, so its amount is paid to the pool rather than to the other miners; the gateway
+drops such an output as well, for the same reason. The operator fee defaults to 0 (`--fee-bps 0`):
 with no fee, the pool's own script is paid only when something has failed, and each such case
 is logged. A fee is set with `--fee-bps` in basis points (hundredths of a percent, 0 to 100,
 so at most 1%); it is deducted from the coinbase value before the split, and the gateway pays

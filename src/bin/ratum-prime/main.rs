@@ -416,15 +416,7 @@ fn main() -> io::Result<()> {
                 );
                 std::process::exit(2);
             }
-            Ok(b) if !b.is_empty() && output_script_size_is_valid(&b) => b,
-            Ok(b) if !b.is_empty() => {
-                eprintln!(
-                    "--payout-script is {} bytes, which a block carrying it would be rejected \
-                     for: a coinbase output script may be at most 34 bytes",
-                    b.len()
-                );
-                std::process::exit(2);
-            }
+            Ok(b) if !b.is_empty() => b,
             _ => {
                 eprintln!("--payout-script must be a non-empty hex script, got {hex_script:?}");
                 std::process::exit(2);
@@ -446,6 +438,21 @@ fn main() -> io::Result<()> {
             }
         },
     };
+    // The gateway copies this script into every stratum job and pays it the coinbase
+    // remainder, so unlike an oversized miner output it cannot be left out of the block.
+    // While the node enforces the reduced_data rule a block carrying an oversized one is
+    // rejected as bad-txns-vout-script-toolarge, and the gateway refuses to serve work for
+    // every such block. Both sources need the check: `validateaddress` accepts a future
+    // witness version, whose scriptPubKey reaches 42 bytes.
+    if !output_script_size_is_valid(&payout_script) {
+        let flag = if payout_address.is_some() { "--payout-address" } else { "--payout-script" };
+        eprintln!(
+            "{flag} gives a {}-byte script, which a block carrying it would be rejected for: \
+             a coinbase output script may be at most 34 bytes",
+            payout_script.len()
+        );
+        std::process::exit(2);
+    }
     info!("pool payout script: {}", hex::encode(&payout_script));
 
     let config = ClientConfig { payout_script, prime_id, coinbase_tag, min_difficulty };

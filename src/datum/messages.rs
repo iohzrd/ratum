@@ -18,7 +18,10 @@ pub mod client_subcmd {
 
 pub use super::framing::STRUCT_END;
 pub const CONFIG_VERSION: u8 = 1;
-pub const MAX_PAYOUT_SCRIPT: usize = 255;
+/// The gateway's `pool_addr_script` field (`T_DATUM_STRATUM_JOB`, `src/datum_stratum.h`).
+/// A longer script has nowhere to go: the gateway copies it into every stratum job and
+/// writes it into the generation transaction verbatim, so it cannot be truncated to fit.
+pub const MAX_PAYOUT_SCRIPT: usize = 64;
 /// One less than the gateway's parser accepts (255, into a 256-byte buffer).
 pub const MAX_COINBASE_TAG: usize = 254;
 
