@@ -83,6 +83,44 @@
   <p>Add this to your <code>datum_gateway</code> config, alongside your own <code>mining</code>
     and <code>stratum</code> settings:</p>
   <pre id="gateway-config"></pre>
+
+  <h2>Miner usernames</h2>
+  <p>The pool credits work to the stratum username up to the first <code>.</code>, and that
+    part must be an address this chain's node accepts. A share under anything else is rejected
+    with <code>BadUsername</code> (reason 14), which your gateway reports to the miner. Two
+    gateway settings decide what the pool receives:</p>
+  <div style="overflow-x:auto">
+    <table>
+      <thead><tr>
+        <th>Gateway setting</th>
+        <th>Username the pool receives</th>
+        <th>Paid to</th>
+      </tr></thead>
+      <tbody>
+        <tr>
+          <td><code>pool_pass_full_users: true</code><br>(the config above)</td>
+          <td>the miner's own stratum username, unchanged</td>
+          <td>each miner's address, so miners behind one gateway can be paid separately</td>
+        </tr>
+        <tr>
+          <td><code>pool_pass_workers: true</code><br><code>pool_pass_full_users: false</code></td>
+          <td>the gateway's <code>mining_pool_address</code>, then <code>.</code> and the
+            miner's username</td>
+          <td>the gateway's address; the worker name still reaches the pool</td>
+        </tr>
+        <tr>
+          <td>both <code>false</code></td>
+          <td>the gateway's <code>mining_pool_address</code> alone</td>
+          <td>the gateway's address; no worker name reaches the pool</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+  <p>With <code>pool_pass_full_users</code>, set each miner's stratum username to an address,
+    optionally followed by <code>.workername</code>: a bare worker name is what the pool
+    cannot pay. Both settings default to true in the gateway, and
+    <code>pool_pass_full_users</code> wins when both are set, so an untouched config forwards
+    raw usernames.</p>
 </section>
 
 <footer>Read-only. Refreshes every 5 s. <span id="fee"></span>
