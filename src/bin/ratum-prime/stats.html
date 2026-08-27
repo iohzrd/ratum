@@ -180,7 +180,7 @@ async function tick() {
     // so the split's amount is left to the pool instead. Its shares were recorded before the
     // pool began refusing them, or under a node that could not be reached at the time.
     const unpayable = m.payable === false;
-    const tag = unpayable ? `<span class="tag" title="${esc(m.unpayable_reason || "")}">unpaid</span>` : "";
+    const tag = unpayable ? `<span class="tag" title="${esc(m.unpayable_reason || "")}">unpayable</span>` : "";
     return `<tr class="${unpayable ? "unpayable" : ""}">
       <td>${esc(m.identity)}${tag}</td>
       <td class="num">${num(m.work)}</td>
