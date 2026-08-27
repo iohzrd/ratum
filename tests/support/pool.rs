@@ -159,8 +159,11 @@ impl Pool {
             lines,
             _node: owned_node,
         };
+        // `ratum_prime] listening on <addr> (at most N connections)`. The module suffix is part
+        // of the needle because tiny_http logs `Server listening on <addr>` for the stats
+        // interface at debug, which would otherwise match first and give the stats port.
         let listening = pool
-            .wait_for_line("listening on ", TIMEOUT)
+            .wait_for_line("ratum_prime] listening on ", TIMEOUT)
             .expect("the pool never logged that it was listening");
         pool.addr = after(&listening, "listening on ")
             .split_whitespace()

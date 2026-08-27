@@ -4,7 +4,7 @@
 //! change the pool. It is started only when `--stats-listen` names an address; bind it to
 //! `127.0.0.1` unless it is behind a reverse proxy, since the page is unauthenticated.
 
-use crate::server::{Server, unix_now};
+use crate::server::{Resolver, Server, unix_now};
 use log::warn;
 use ratum::datum::messages::MAX_COINBASER_OUTPUTS;
 use ratum::lock;
@@ -87,11 +87,25 @@ fn snapshot(server: &Server) -> String {
         .map(|(identity, work)| {
             let share_percent =
                 if total_work > 0 { *work as f64 / total_work as f64 * 100.0 } else { 0.0 };
+            // Read-through of the resolver cache only: an unauthenticated request must not
+            // make the pool call the node. Every identity credited since the pool started was
+            // resolved on its first share, so `null` is an identity read back from the ledger
+            // at startup that has not submitted since.
+            let (payable, unpayable_reason) = match Resolver::cached(&server.resolver, identity) {
+                Some(Ok(_)) => (Some(true), None),
+                Some(Err(why)) => (Some(false), Some(why.to_string())),
+                None => (None, None),
+            };
             serde_json::json!({
                 "identity": identity,
                 "work": work.to_string(),
                 "share_percent": share_percent,
+                // What the split allocates. An identity that is not payable is not paid it:
+                // the amount is left in the coinbase remainder, which the gateway pays to the
+                // pool's payout script.
                 "payout_sats": payout_sats.get(identity).copied().unwrap_or(0),
+                "payable": payable,
+                "unpayable_reason": unpayable_reason,
             })
         })
         .collect();

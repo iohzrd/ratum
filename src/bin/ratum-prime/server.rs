@@ -174,18 +174,51 @@ pub(crate) fn unix_now() -> u64 {
 }
 
 pub(crate) struct Resolver {
-    scripts: HashMap<String, Option<Vec<u8>>>,
+    scripts: HashMap<String, Result<Vec<u8>, Unpayable>>,
     order: std::collections::VecDeque<String>,
 }
 
 const MAX_CACHED_ADDRESSES: usize = 1 << 16;
+
+/// Why an identity cannot be paid a coinbase output. Determined by the node, so it does not
+/// change until the identity does, and is cached with the identity.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Unpayable {
+    /// `validateaddress` reports the identity is not a valid address.
+    NotAnAddress,
+    /// A valid address the node returned no `scriptPubKey` for.
+    NoScript,
+    /// Longer than a coinbase output may be (`output_script_size_is_valid`).
+    ScriptTooLong(usize),
+}
+
+impl std::fmt::Display for Unpayable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Unpayable::NotAnAddress => write!(f, "not a valid address"),
+            Unpayable::NoScript => write!(f, "an address the node returns no script for"),
+            Unpayable::ScriptTooLong(n) => {
+                write!(f, "over the coinbase output limit ({n} bytes)")
+            }
+        }
+    }
+}
+
+/// Whether an identity can be paid a coinbase output.
+pub(crate) enum Payability {
+    Script(Vec<u8>),
+    Unpayable(Unpayable),
+    /// The node could not be asked. Distinct from `Unpayable` so an RPC failure does not make
+    /// the pool refuse an identity that is valid: the caller treats it as payable.
+    Unknown,
+}
 
 impl Resolver {
     pub(crate) fn new() -> Self {
         Resolver { scripts: HashMap::new(), order: std::collections::VecDeque::new() }
     }
 
-    fn insert(&mut self, address: &str, script: Option<Vec<u8>>) {
+    fn insert(&mut self, address: &str, script: Result<Vec<u8>, Unpayable>) {
         if self.scripts.insert(address.to_string(), script).is_none() {
             self.order.push_back(address.to_string());
         }
@@ -196,24 +229,54 @@ impl Resolver {
         }
     }
 
-    fn script_for(cache: &Mutex<Self>, node: &rpc::Client, address: &str) -> Option<Vec<u8>> {
-        if let Some(known) = lock(cache).scripts.get(address) {
-            return known.clone();
+    /// The cached answer for `address`, without asking the node. The stats interface reads
+    /// through this so an unauthenticated HTTP request cannot make the pool call the node.
+    pub(crate) fn cached(cache: &Mutex<Self>, address: &str) -> Option<Result<Vec<u8>, Unpayable>> {
+        lock(cache).scripts.get(address).cloned()
+    }
+
+    /// Resolve `address` through `validateaddress`, from the cache when it has been resolved
+    /// before. A determinate answer (a script, or a reason it cannot be paid) is cached; an
+    /// RPC failure is not, so the next call asks again.
+    pub(crate) fn payability(cache: &Mutex<Self>, node: &rpc::Client, address: &str) -> Payability {
+        if let Some(known) = Resolver::cached(cache, address) {
+            return known.into();
         }
         let resolved = match resolve_address(node, address) {
-            Ok(Resolved::Script(script)) => Some(script),
-            Ok(Resolved::Invalid) => {
-                warn!("payout address {address:?} is not valid; it will not be paid");
-                None
-            }
-            Ok(Resolved::NoScript) => None,
+            Ok(r) => classify(r),
             Err(e) => {
                 warn!("could not resolve payout address {address:?}: {e}");
-                return None;
+                return Payability::Unknown;
             }
         };
+        if let Err(why) = &resolved {
+            warn!("payout address {address:?} cannot be paid: {why}");
+        }
         lock(cache).insert(address, resolved.clone());
-        resolved
+        resolved.into()
+    }
+}
+
+impl From<Result<Vec<u8>, Unpayable>> for Payability {
+    fn from(r: Result<Vec<u8>, Unpayable>) -> Self {
+        match r {
+            Ok(script) => Payability::Script(script),
+            Err(why) => Payability::Unpayable(why),
+        }
+    }
+}
+
+/// Sort what the node returned for an address into a payable script or a reason it cannot be
+/// paid. The output-size limit is applied here, at resolution, so the share path, the split
+/// and the stats interface all read one answer per identity.
+fn classify(resolved: Resolved) -> Result<Vec<u8>, Unpayable> {
+    match resolved {
+        Resolved::Script(script) if !output_script_size_is_valid(&script) => {
+            Err(Unpayable::ScriptTooLong(script.len()))
+        }
+        Resolved::Script(script) => Ok(script),
+        Resolved::Invalid => Err(Unpayable::NotAnAddress),
+        Resolved::NoScript => Err(Unpayable::NoScript),
     }
 }
 
@@ -254,17 +317,21 @@ pub(crate) fn coinbaser_outputs(server: &Server, value: u64) -> (Vec<CoinbaseOut
     };
     let mut outputs = Vec::with_capacity(split.len());
     for (identity, amount) in split {
-        if let Some(script) = Resolver::script_for(&server.resolver, node, &identity) {
-            if !output_script_size_is_valid(&script) {
-                warn!(
-                    "      {identity} resolves to a {}-byte script, too long for a coinbase \
-                     output; paying the other outputs and leaving this identity's amount to \
-                     the pool",
-                    script.len()
-                );
-                continue;
-            }
-            outputs.push(CoinbaseOutput { value: amount, script });
+        // An identity is resolved on the share that first credits it, so all of these are
+        // cached and this loop makes no RPC call in the ordinary case. Anything but a script
+        // (the node is unreachable, or the identity was credited before this check existed
+        // and is not payable) leaves its amount out of the dictated outputs, and the gateway
+        // pays that amount to the pool's payout script as part of the remainder.
+        match Resolver::payability(&server.resolver, node, &identity) {
+            Payability::Script(script) => outputs.push(CoinbaseOutput { value: amount, script }),
+            Payability::Unpayable(why) => warn!(
+                "      {identity} cannot be paid ({why}); paying the other outputs and \
+                 leaving this identity's amount to the pool"
+            ),
+            Payability::Unknown => warn!(
+                "      {identity} could not be resolved; paying the other outputs and \
+                 leaving this identity's amount to the pool"
+            ),
         }
     }
     (outputs, shares, work)
@@ -275,11 +342,11 @@ mod tests {
     use super::*;
     use ratum::datum::messages::ClientConfig;
 
-    /// `script_for` returns from its cache before calling the node, so the node client, which
-    /// cannot connect, is never called.
+    /// `payability` returns from its cache before calling the node, so the node client, which
+    /// cannot connect, is never called for an address `resolved` names.
     fn server_with(
         shares: &[(&str, u64)],
-        resolved: &[(&str, Option<Vec<u8>>)],
+        resolved: &[(&str, Result<Vec<u8>, Unpayable>)],
         min_payout: u64,
     ) -> Server {
         server_with_fee(shares, resolved, min_payout, 0)
@@ -287,7 +354,7 @@ mod tests {
 
     fn server_with_fee(
         shares: &[(&str, u64)],
-        resolved: &[(&str, Option<Vec<u8>>)],
+        resolved: &[(&str, Result<Vec<u8>, Unpayable>)],
         min_payout: u64,
         fee_bps: u16,
     ) -> Server {
@@ -338,7 +405,7 @@ mod tests {
     fn a_split_names_every_miner_and_never_the_pool() {
         let server = server_with(
             &[("alice", 3), ("bob", 1)],
-            &[("alice", Some(p2wpkh(0xa1))), ("bob", Some(p2wpkh(0xb2)))],
+            &[("alice", Ok(p2wpkh(0xa1))), ("bob", Ok(p2wpkh(0xb2)))],
             0,
         );
         let (outputs, shares, work) = coinbaser_outputs(&server, 1_000_000);
@@ -360,7 +427,7 @@ mod tests {
         // 10_000 difference to the pool's payout script as the coinbase remainder.
         let server = server_with_fee(
             &[("alice", 3), ("bob", 1)],
-            &[("alice", Some(p2wpkh(0xa1))), ("bob", Some(p2wpkh(0xb2)))],
+            &[("alice", Ok(p2wpkh(0xa1))), ("bob", Ok(p2wpkh(0xb2)))],
             0,
             100,
         );
@@ -406,7 +473,7 @@ mod tests {
         // the gateway pays to the pool.
         let server = server_with(
             &[("alice", 3), ("nonsense", 1)],
-            &[("alice", Some(p2wpkh(0xa1))), ("nonsense", None)],
+            &[("alice", Ok(p2wpkh(0xa1))), ("nonsense", Err(Unpayable::NotAnAddress))],
             0,
         );
         let (outputs, _, _) = coinbaser_outputs(&server, 1_000_000);
@@ -419,12 +486,14 @@ mod tests {
     #[test]
     fn a_script_too_long_to_pay_is_left_out_rather_than_sent() {
         // A coinbase output script may be at most 34 bytes; a longer one builds a block the
-        // network rejects.
+        // network rejects. `classify` applies the limit when the address is resolved, so the
+        // identity is unpayable from that point on rather than being dropped per template.
         let long = vec![0x00; 35];
         assert!(!output_script_size_is_valid(&long));
+        assert_eq!(classify(Resolved::Script(long)), Err(Unpayable::ScriptTooLong(35)));
         let server = server_with(
             &[("alice", 3), ("toolong", 1)],
-            &[("alice", Some(p2wpkh(0xa1))), ("toolong", Some(long))],
+            &[("alice", Ok(p2wpkh(0xa1))), ("toolong", Err(Unpayable::ScriptTooLong(35)))],
             0,
         );
         let (outputs, _, _) = coinbaser_outputs(&server, 1_000_000);
@@ -433,12 +502,45 @@ mod tests {
     }
 
     #[test]
+    fn classify_sorts_what_the_node_returns() {
+        assert_eq!(classify(Resolved::Invalid), Err(Unpayable::NotAnAddress));
+        assert_eq!(classify(Resolved::NoScript), Err(Unpayable::NoScript));
+        assert_eq!(classify(Resolved::Script(p2wpkh(0xa1))), Ok(p2wpkh(0xa1)));
+        // 42 bytes: what validateaddress returns for a future witness version, over the
+        // 34-byte coinbase output limit but under the 64-byte CoinbaserResponse field.
+        assert_eq!(classify(Resolved::Script(vec![0x00; 42])), Err(Unpayable::ScriptTooLong(42)));
+        // An OP_RETURN script may be 83 bytes.
+        assert!(classify(Resolved::Script(vec![ratum::bitcoin::OP_RETURN; 83])).is_ok());
+        assert_eq!(
+            classify(Resolved::Script(vec![ratum::bitcoin::OP_RETURN; 84])),
+            Err(Unpayable::ScriptTooLong(84))
+        );
+    }
+
+    #[test]
+    fn a_cached_answer_is_returned_without_asking_the_node() {
+        // The node client in these tests cannot connect, so an uncached identity is `Unknown`
+        // rather than unpayable: an RPC failure must not reject an identity that is valid.
+        let server = server_with(&[], &[("alice", Ok(p2wpkh(0xa1)))], 0);
+        assert!(matches!(
+            Resolver::payability(&server.resolver, &server.node, "alice"),
+            Payability::Script(s) if s == p2wpkh(0xa1)
+        ));
+        assert!(matches!(
+            Resolver::payability(&server.resolver, &server.node, "unseen"),
+            Payability::Unknown
+        ));
+        // An unresolvable identity is not cached, so the next call asks the node again.
+        assert!(Resolver::cached(&server.resolver, "unseen").is_none());
+    }
+
+    #[test]
     fn the_minimum_is_applied_before_addresses_are_resolved() {
         // The small miner is removed from the split and its work leaves the denominator, so the
         // large one takes the whole value, not 999_000.
         let server = server_with(
             &[("large", 999), ("small", 1)],
-            &[("large", Some(p2wpkh(0xa1))), ("small", Some(p2wpkh(0xb2)))],
+            &[("large", Ok(p2wpkh(0xa1))), ("small", Ok(p2wpkh(0xb2)))],
             10_000,
         );
         let (outputs, shares, _) = coinbaser_outputs(&server, 1_000_000);

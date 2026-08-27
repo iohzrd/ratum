@@ -59,21 +59,38 @@ One ledger serves every gateway: a block found by any of them pays the miners of
 in proportion to their work in the window. A miner's identity is its stratum username up to
 the first `.`. The outputs total the coinbase to the satoshi; an identity that cannot be paid
 (past the 512 outputs the gateway accepts, or under `--min-payout`) leaves the denominator
-too, so its value goes to the other miners. An identity whose address resolves to a script
-over the coinbase output limit (34 bytes, or 83 beginning OP_RETURN) is left out after the
-split instead, so its amount is paid to the pool rather than to the other miners; the gateway
-drops such an output as well, for the same reason. The operator fee defaults to 0 (`--fee-bps 0`):
-with no fee, the pool's own script is paid only when something has failed, and each such case
-is logged. A fee is set with `--fee-bps` in basis points (hundredths of a percent, 0 to 100,
-so at most 1%); it is deducted from the coinbase value before the split, and the gateway pays
-it to the pool's payout script as the remainder.
+too, so its value goes to the other miners.
+
+Work is credited only to an identity a coinbase output can pay. The first share from an
+identity is resolved through the node's `validateaddress` and the answer is kept for the rest
+of the run: an identity that is not an address, or that resolves to a script over the coinbase
+output limit (34 bytes, or 83 beginning OP_RETURN), has its shares rejected with
+`BadUsername`, which the gateway reports to the miner, rather than credited for work no output
+can pay. A gateway with `pool_pass_full_users` sends the miner's own stratum username, so that
+username must be an address this chain's node accepts, optionally followed by `.workername`.
+A node the pool cannot reach leaves the identity unresolved rather than unpayable and the
+share is credited as usual, so an RPC outage does not reject valid miners. An identity in the
+window that is unresolved or unpayable when the split is built (credited before this check, or
+while the node was unreachable) is left out after the split, so its amount is paid to the pool
+rather than to the other miners; the gateway drops such an output as well, for the same
+reason.
+
+The operator fee defaults to 0 (`--fee-bps 0`): with no fee, the pool's own script is paid
+only when something has failed, and each such case is logged. A fee is set with `--fee-bps` in
+basis points (hundredths of a percent, 0 to 100, so at most 1%); it is deducted from the
+coinbase value before the split, and the gateway pays it to the pool's payout script as the
+remainder.
 
 ## Stats interface
 
 `--stats-listen <address>` starts a read-only HTTP interface (off unless the address is
 given): `/stats.json` is a snapshot of the tip, the coinbase value, the operator fee, the
 connected gateways and the per-miner share of the window; `/` is a page that fetches and
-renders it. It serves only GET and takes no action, and it exposes no secret (not the node
+renders it. A miner carries `payable`: `false` marks an identity the node resolved and the
+coinbase cannot pay, with `unpayable_reason` naming why, and the page shows it as unpaid in
+place of a payout it would not receive; `null` is an identity the pool has not resolved, since
+the snapshot reads the cache the share path and the split fill and never calls the node
+itself. It serves only GET and takes no action, and it exposes no secret (not the node
 credentials, not the pool signing key). Bind it to `127.0.0.1` unless it is behind a reverse
 proxy, since the page is unauthenticated: `--stats-listen 127.0.0.1:28917`.
 

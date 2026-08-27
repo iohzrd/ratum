@@ -4,6 +4,7 @@
 
 mod support;
 
+use ratum::datum::messages::{CoinbaserRequest, server_subcmd};
 use ratum::ledger::Ledger;
 use std::time::{SystemTime, UNIX_EPOCH};
 use support::work;
@@ -84,6 +85,9 @@ fn the_stats_interface_serves_a_json_snapshot_and_a_page() {
     let bob = miners.iter().find(|m| m["identity"] == "bob").expect("bob is listed");
     assert!((alice["share_percent"].as_f64().unwrap() - 75.0).abs() < 1e-9);
     assert!((bob["share_percent"].as_f64().unwrap() - 25.0).abs() < 1e-9);
+    // Read back from the ledger and not resolved since: the snapshot reads the resolver cache
+    // and does not call the node itself, so it reports neither payable nor unpayable.
+    assert!(alice["payable"].is_null(), "an identity the pool has not resolved is unknown");
 
     // The page.
     let (code, body) = get(&format!("http://{addr}/"));
@@ -95,4 +99,53 @@ fn the_stats_interface_serves_a_json_snapshot_and_a_page() {
     // An unknown path is a 404, not the page or the snapshot.
     let (code, _) = get(&format!("http://{addr}/nope"));
     assert_eq!(code, 404);
+}
+
+/// An identity the node reports as not an address is marked unpayable in the snapshot, so the
+/// page does not show a payout it will not receive.
+#[test]
+fn an_identity_that_cannot_be_paid_is_marked_unpayable() {
+    let node = FakeNode::start();
+    node.set_tip(&hex::encode(work::PREV_HASH), 100);
+    node.set_difficulty(1.0);
+    node.set_coinbase_value(Some(1_000_000));
+    support::lock(&node.state).invalid_addresses.insert("bob".to_string());
+
+    let dir = TempDir::new("stats-unpayable");
+    seed_alice_and_bob(&dir);
+    let pool = Pool::start(
+        dir,
+        PoolArgs {
+            rpc_url: Some(node.url()),
+            window_floor: 4,
+            min_payout: 1,
+            extra: vec!["--stats-listen".into(), "127.0.0.1:0".into()],
+            ..Default::default()
+        },
+    );
+    let addr = stats_addr(&pool);
+
+    // A coinbaser request resolves every identity in the window, which is what fills the cache
+    // the snapshot reads.
+    let mut gateway = pool.connect();
+    let _config = gateway.recv();
+    gateway.send_mining(
+        &CoinbaserRequest { value: 1_000_000, prev_hash: node.tip_internal() }.encode(),
+    );
+    let _ = gateway.recv_until(server_subcmd::COINBASER);
+
+    let (code, body) = get(&format!("http://{addr}/stats.json"));
+    assert_eq!(code, 200, "stats.json: {body}");
+    let s: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+    let miners = s["window"]["miners"].as_array().expect("a miners array");
+    let alice = miners.iter().find(|m| m["identity"] == "alice").expect("alice is listed");
+    let bob = miners.iter().find(|m| m["identity"] == "bob").expect("bob is listed");
+
+    assert_eq!(alice["payable"], true);
+    assert!(alice["unpayable_reason"].is_null());
+    assert_eq!(bob["payable"], false, "the node reports bob is not an address");
+    assert_eq!(bob["unpayable_reason"], "not a valid address");
+    // Bob keeps his work and his share of the window; what the split allocates him is simply
+    // not paid to him.
+    assert!((bob["share_percent"].as_f64().unwrap() - 25.0).abs() < 1e-9);
 }

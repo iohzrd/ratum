@@ -1,19 +1,19 @@
 //! One gateway connection: the handshake, then the loop that reads its frames and
 //! responds to its coinbaser requests, shares, and block transactions.
 
-use crate::server::{Server, coinbaser_outputs, unix_now};
+use crate::server::{Payability, Resolver, Server, coinbaser_outputs, unix_now};
 use log::{debug, error, info, warn};
 use ratum::datum::framing::{self, Header, KeyRatchet};
 use ratum::datum::handshake::{Session, accept, open_hello};
 use ratum::datum::messages::{
-    CoinbaseOutput, CoinbaserRequest, CoinbaserResponse, ShareResponse, ShareVerdict, blocknotify,
-    client_subcmd,
+    CoinbaseOutput, CoinbaserRequest, CoinbaserResponse, RejectReason, ShareResponse, ShareVerdict,
+    blocknotify, client_subcmd,
 };
 use ratum::datum::share::PowSubmit;
 use ratum::datum::validation::{self, TxnBundle};
 use ratum::datum::verify::{Accepted, Verifier};
 use ratum::{ledger, lock, rpc};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
@@ -206,6 +206,7 @@ pub(crate) fn handle(mut stream: TcpStream, server: &Server) -> io::Result<()> {
         session,
         verifier: Verifier::with_replay_guard(server.policy.clone(), Arc::clone(&server.replay)),
         credited: HashMap::new(),
+        reported_unpayable: HashSet::new(),
         coinbaser_id: 0,
         awaiting_txns: HashMap::new(),
         known_tip: None,
@@ -230,6 +231,9 @@ struct Connection<'a> {
     session: Session,
     verifier: Verifier,
     credited: HashMap<String, u64>,
+    /// The identities this connection has already reported as unpayable, so the reason is
+    /// logged at warn once rather than on every share. Bounded by `MAX_CREDITED_NAMES`.
+    reported_unpayable: HashSet<String>,
     coinbaser_id: u8,
     awaiting_txns: HashMap<u8, Accepted>,
     known_tip: Option<[u8; 32]>,
@@ -501,6 +505,15 @@ impl Connection<'_> {
                          network target"
                     );
                 }
+                // A share is credited to an identity only if the coinbase can pay it. The
+                // check is here, after the relay above, so a block is still submitted, and
+                // before the credit, so work is never counted for an identity whose amount
+                // would be paid to the pool as the coinbase remainder instead. The share's
+                // hash stays in the `ReplayGuard`: the verdict depends on the username, which
+                // a resend of the same share would carry again.
+                if self.is_unpayable(&s.username) {
+                    return Ok((ShareVerdict::Rejected(RejectReason::BadUsername), pending));
+                }
                 // Credit after arranging relay, and never let a ledger write error close the
                 // connection: the block relay above and any pending transaction fetch must
                 // outlive it. On failure the share is not credited and `record_and_credit`
@@ -529,6 +542,37 @@ impl Connection<'_> {
                 Ok((ShareVerdict::Rejected(reason), None))
             }
         }
+    }
+
+    /// Whether the identity that `username` credits to cannot be paid a coinbase output. When
+    /// it cannot, the share is rejected with `BadUsername` instead of credited. The reason is
+    /// logged at warn the first time this connection sees the identity, since every later
+    /// share from the same name produces the same rejection.
+    ///
+    /// Only a definite answer from the node rejects. `Payability::Unknown` (the node could not
+    /// be reached) is treated as payable, so an RPC outage does not reject shares from
+    /// identities that are valid.
+    fn is_unpayable(&mut self, username: &str) -> bool {
+        let identity = ledger::identity_of(username);
+        let Payability::Unpayable(why) =
+            Resolver::payability(&self.server.resolver, &self.server.node, identity)
+        else {
+            return false;
+        };
+        let first = self.reported_unpayable.len() < MAX_CREDITED_NAMES
+            && self.reported_unpayable.insert(identity.to_string());
+        if first {
+            warn!(
+                "[{}]   <- rejecting shares from {identity:?}, which cannot be paid: {why}. \
+                 The gateway sends the miner's own stratum username when \
+                 pool_pass_full_users is set; that username must be an address this chain's \
+                 node accepts, optionally followed by '.workername'.",
+                self.peer
+            );
+        } else {
+            debug!("[{}]   <- rejected: {identity:?} cannot be paid ({why})", self.peer);
+        }
+        true
     }
 
     /// Write an accepted share to the ledger, re-sizing the window to the current network

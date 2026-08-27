@@ -235,7 +235,7 @@ fn an_address_the_node_rejects_removes_only_that_miner_from_the_split() {
     let response = CoinbaserResponse::decode(&payload).expect("coinbaser response");
     assert_eq!(response.outputs.len(), 1, "alice is still paid: {response:?}");
     assert_eq!(response.outputs[0].script, script_for_address("alice"));
-    pool.expect_line("is not valid");
+    pool.expect_line("cannot be paid: not a valid address");
 }
 
 #[test]

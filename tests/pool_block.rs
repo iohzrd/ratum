@@ -198,6 +198,38 @@ fn a_block_with_no_other_transactions_is_relayed_at_once() {
     pool.expect_line("BLOCK at height 840000");
 }
 
+/// A share whose identity the node reports as not an address is rejected as `BadUsername`
+/// and not credited, but the block it solved is still relayed: the block pays the outputs the
+/// coinbaser dictated, which is independent of who submitted it.
+#[test]
+#[ignore = "searches ~2^32 hashes; run with --release -- --ignored"]
+fn a_share_from_an_identity_that_cannot_be_paid_is_rejected_and_its_block_relayed() {
+    let node = FakeNode::start();
+    let pool = started("unpayable-username", &node);
+    // The identity is the username up to the first `.`, so "alice.rig1" resolves "alice".
+    support::lock(&node.state).invalid_addresses.insert("alice".to_string());
+    let mut gateway = ready(&pool);
+
+    let (mut w, _) = work_with_transactions();
+    w.job.merkle_branches.clear();
+    w.job.txn_count = 0;
+    let (from, _) = *solved();
+    let (ntime, nonce) = find_nonce_with_retries(&w, from);
+    let mut share = w.submit(USERNAME, ntime, nonce, TARGET_BYTE);
+    share.is_block = true;
+
+    assert_eq!(
+        submit(&mut gateway, &share).verdict,
+        ShareVerdict::Rejected(RejectReason::BadUsername)
+    );
+    assert!(
+        node.wait_for_submission(Duration::from_secs(10)).is_some(),
+        "the block is relayed even though its submitter cannot be paid"
+    );
+    assert!(pool.ledger_lines().is_empty(), "the share is not credited to an unpayable identity");
+    pool.expect_line("rejecting shares from \"alice\"");
+}
+
 #[test]
 #[ignore = "searches ~2^32 hashes; run with --release -- --ignored"]
 fn a_block_with_transactions_is_asked_for_and_then_relayed() {
