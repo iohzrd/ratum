@@ -93,8 +93,12 @@ remainder.
 
 `--stats-listen <address>` starts a read-only HTTP interface (off unless the address is
 given): `/stats.json` is a snapshot of the tip, the coinbase value, the operator fee, the
-connected gateways and the per-miner share of the window; `/` is a page that fetches and
-renders it. A miner carries `payable`: `false` marks an identity the node resolved and the
+connected gateways, the build the pool is running and the per-miner share of the window; `/`
+is a page that fetches and renders it. `pool.version` is the package version and the git
+commit the binary was compiled from (`0.1.0 (1d6a05b59172)`, with `-dirty` appended when a
+tracked file differed from that commit and `unknown` in place of the hash when the source was
+not a git checkout); the page shows it under the update time, and `--version` prints the same
+string. A miner carries `payable`: `false` marks an identity the node resolved and the
 coinbase cannot pay, with `unpayable_reason` naming why, and the page shows it as unpaid in
 place of a payout it would not receive; `null` is an identity the pool has not resolved, since
 the snapshot reads the cache the share path and the split fill and never calls the node

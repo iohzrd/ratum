@@ -74,6 +74,11 @@ fn the_stats_interface_serves_a_json_snapshot_and_a_page() {
     // What a gateway needs to connect: the DATUM port (0, since the test listens on :0), the
     // pool's public key (32-byte sign key plus 32-byte box key, hex, so 128 characters), and
     // the operator-set advertise address the page shows in place of the browser's host.
+    // The build: the package version and the git commit build.rs recorded, "unknown" when the
+    // source is not a git checkout.
+    assert_eq!(s["pool"]["version"], ratum::VERSION);
+    assert!(s["pool"]["version"].as_str().expect("a version string").starts_with("0."));
+
     assert_eq!(s["pool"]["datum_port"], 0);
     assert_eq!(s["pool"]["pubkey"].as_str().expect("a pubkey string").len(), 128);
     assert_eq!(s["pool"]["advertise"], "pool.example.com:29000");

@@ -19,6 +19,7 @@
            flex-wrap: wrap; gap: .5rem; border-bottom: 1px solid var(--line);
            padding-bottom: .75rem; margin-bottom: 1rem; }
   .motd { color: var(--muted); }
+  .right { text-align: right; }
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
           gap: .75rem; margin-bottom: 1.25rem; }
   .card { background: var(--card); border: 1px solid var(--line); border-radius: 8px;
@@ -58,7 +59,10 @@
     <h1>RATUM Prime<span class="chain" id="chain"></span></h1>
     <div class="motd" id="motd"></div>
   </div>
-  <div class="motd" id="updated">connecting...</div>
+  <div class="motd right">
+    <div id="updated">connecting...</div>
+    <div id="version"></div>
+  </div>
 </header>
 
 <div class="grid" id="cards"></div>
@@ -231,6 +235,9 @@ async function tick() {
 
   const when = new Date((s.generated_at || 0) * 1000);
   document.getElementById("updated").textContent = "updated " + when.toLocaleTimeString();
+
+  // The build the pool is running: package version and the git commit it was compiled from.
+  document.getElementById("version").textContent = s.pool.version || "";
 }
 
 tick();

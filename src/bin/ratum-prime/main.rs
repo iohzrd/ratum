@@ -152,6 +152,9 @@ fn init_logging() {
 fn main() -> io::Result<()> {
     init_logging();
     let loaded = cli::load();
+    // After argument parsing, so `--version` and `--help` print only their own output. Every
+    // run that reaches this point records which build produced the log that follows.
+    info!("ratum-prime {}", ratum::VERSION);
     let c = &loaded.cli;
     let f = loaded.file;
 

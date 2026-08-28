@@ -16,7 +16,7 @@ use std::str::FromStr;
 #[derive(Parser, Debug)]
 #[command(
     name = "ratum-prime",
-    version,
+    version = ratum::VERSION,
     about = "DATUM Prime: the pool server of the DATUM protocol",
     // So a value like "-1" after a numeric flag is taken as the value rather than parsed
     // as a flag; "-v" and other non-numbers are still rejected as unknown arguments.

@@ -130,6 +130,8 @@ fn snapshot(server: &Server) -> String {
     let snapshot = serde_json::json!({
         "pool": {
             "motd": server.motd,
+            // The build this pool is running: the package version and the git commit.
+            "version": ratum::VERSION,
             "coinbase_tag": server.policy.coinbase_tag,
             "prime_id": server.policy.prime_id,
             "payout_script": hex::encode(&server.policy.payout_script),
