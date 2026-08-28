@@ -7,7 +7,7 @@ use ratum::datum::messages::{CoinbaserRequest, CoinbaserResponse, server_subcmd}
 use ratum::ledger::Ledger;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
-use support::{FakeNode, Pool, PoolArgs, TempDir, script_for_address};
+use support::{FakeNode, Pool, PoolArgs, TempDir, printed, run_pool, script_for_address};
 
 fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
@@ -22,15 +22,17 @@ fn next_hash() -> [u8; 32] {
     h
 }
 
-/// The default ledger inside a data directory.
+/// The default ledger inside a data directory: named after the chain the node reports, and
+/// the fake node reports regtest.
 fn ledger_path(dir: &TempDir) -> std::path::PathBuf {
-    dir.join("shares.redb")
+    dir.join("regtest.redb")
 }
 
 /// Record `count` shares of `difficulty` each into the ledger at `path`, alternating between
 /// two miners, then close it so the pool can open it.
 fn seed(path: &std::path::Path, count: usize, difficulty: u64) {
-    let (mut ledger, _) = Ledger::open(path, u128::MAX, None).expect("open the seed ledger");
+    let (mut ledger, _) =
+        Ledger::open(path, u128::MAX, None, Some("regtest")).expect("open the seed ledger");
     for i in 0..count {
         let who = if i % 4 == 0 { "alice" } else { "bob" };
         let at = now() - (count - i) as u64;
@@ -85,7 +87,8 @@ fn a_restart_credits_the_same_miners_it_did_before() {
     support::lock(&node.state).coinbase_value = Some(1_000_000);
     let dir = TempDir::new("restart");
     {
-        let (mut l, _) = Ledger::open(&ledger_path(&dir), u128::MAX, None).expect("seed ledger");
+        let (mut l, _) =
+            Ledger::open(&ledger_path(&dir), u128::MAX, None, None).expect("seed ledger");
         l.record(now(), "alice", 3, &next_hash()).unwrap();
         l.record(now(), "bob", 1, &next_hash()).unwrap();
     }
@@ -178,4 +181,65 @@ fn an_empty_ledger_seeds_no_hashes() {
         !pool.lines().iter().any(|l| l.contains("ReplayGuard seeded")),
         "nothing was read back, so nothing was seeded"
     );
+}
+
+/// The ledger inside a data directory is named after the chain the node reports, so a pool
+/// moved to another network opens another file rather than this one.
+#[test]
+fn the_ledger_is_named_after_the_nodes_chain() {
+    let node = FakeNode::start();
+    let dir = TempDir::new("ledger-name");
+    let expected = ledger_path(&dir);
+    let pool = Pool::start(dir, PoolArgs { rpc_url: Some(node.url()), ..Default::default() });
+    let line = pool.expect_line("share window from");
+    assert!(line.contains("regtest.redb"), "{line}");
+    assert!(expected.is_file(), "{} should exist", expected.display());
+}
+
+/// A ledger stamped for another chain is refused at startup: the pool exits with the reason
+/// instead of paying this chain's coinbase to shares found on the other.
+#[test]
+fn a_ledger_of_another_chain_refuses_to_start() {
+    let node = FakeNode::start();
+    let dir = TempDir::new("ledger-other-chain");
+    // Placed where a regtest pool looks, but stamped as mainnet shares.
+    drop(Ledger::open(&ledger_path(&dir), u128::MAX, None, Some("main")).expect("seed"));
+    let data_dir = dir.path().display().to_string();
+    let output = run_pool(&[
+        "--listen",
+        "127.0.0.1:0",
+        "--data-dir",
+        &data_dir,
+        "--payout-script",
+        "00141111111111111111111111111111111111111111",
+        "--rpc",
+        &node.url(),
+    ]);
+    assert!(!output.status.success(), "output:\n{}", printed(&output));
+    let text = printed(&output);
+    assert!(text.contains("holds shares for chain main"), "{text}");
+    assert!(text.contains("the node is on chain regtest"), "{text}");
+}
+
+/// `--dump-ledger --data-dir` reads the one ledger in the directory without asking the node
+/// which chain named it, and refuses to guess between two.
+#[test]
+fn dump_ledger_reads_the_one_ledger_in_a_data_dir() {
+    let dir = TempDir::new("dump-dir");
+    let data_dir = dir.path().display().to_string();
+    {
+        let (mut l, _) =
+            Ledger::open(&ledger_path(&dir), u128::MAX, None, Some("regtest")).expect("seed");
+        l.record(now(), "alice", 7, &next_hash()).unwrap();
+    }
+    let output = run_pool(&["--dump-ledger", "--data-dir", &data_dir]);
+    assert!(output.status.success(), "{}", printed(&output));
+    let text = printed(&output);
+    assert!(text.contains(" 7 alice "), "{text}");
+
+    drop(Ledger::open(&dir.join("main.redb"), u128::MAX, None, Some("main")).expect("second"));
+    let output = run_pool(&["--dump-ledger", "--data-dir", &data_dir]);
+    assert_eq!(output.status.code(), Some(2), "{}", printed(&output));
+    let text = printed(&output);
+    assert!(text.contains("more than one ledger") && text.contains("main.redb"), "{text}");
 }

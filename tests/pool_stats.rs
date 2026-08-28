@@ -16,8 +16,8 @@ fn now() -> u64 {
 
 /// Seed the ledger with alice (work 3) and bob (work 1), so the window is three parts to one.
 fn seed_alice_and_bob(dir: &TempDir) {
-    let (mut l, _) =
-        Ledger::open(&dir.join("shares.redb"), u128::MAX, None).expect("open the seed ledger");
+    let (mut l, _) = Ledger::open(&dir.join("regtest.redb"), u128::MAX, None, None)
+        .expect("open the seed ledger");
     l.record(now(), "alice", 3, &[0x11; 32]).unwrap();
     l.record(now(), "bob", 1, &[0x22; 32]).unwrap();
 }

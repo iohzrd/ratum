@@ -241,5 +241,5 @@ printf 'ledger:\n'
 # The ledger is a redb database; stop the pool to release its lock, then dump it as text.
 kill "$POOL_PID" 2>/dev/null || true
 sleep 1
-"$ROOT/target/release/ratum-prime" --dump-ledger --ledger "$WORK/pool/shares.redb" 2>/dev/null \
+"$ROOT/target/release/ratum-prime" --dump-ledger --ledger "$WORK/pool/regtest.redb" 2>/dev/null \
     || true

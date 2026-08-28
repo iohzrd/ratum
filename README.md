@@ -37,8 +37,16 @@ min-payout = 546                # smallest output written; a miner under it leav
 
 Every accepted share is written to a [redb](https://github.com/cberner/redb) database before
 it is credited, indexed by its hash and held under an exclusive lock: `--ledger` names the file,
-`--data-dir` puts `shares.redb` inside, and with neither the window is held in memory only.
+`--data-dir` puts `<chain>.redb` inside (`main.redb`, `testnet4.redb`, `regtest.redb`, ...,
+named after the `chain` the node reports), and with neither the window is held in memory only.
 `--ledger-keep <n>` keeps the newest `n × 2^20` shares and deletes the rest.
+
+A ledger serves one chain. It is stamped with the node's chain when created and the stamp is
+checked on every open: a pool whose node is on another chain refuses to start rather than pay
+that chain's coinbase to shares found on this one. A ledger written before stamps existed
+(`shares.redb`) has no stamp; rename it to `<chain>.redb` and the first open stamps it. The
+pool asks the node for its chain before opening the ledger, and exits if the node's chain
+changes while it runs.
 
 A payout is measured over the most recent shares whose difficulties sum to `--window` times the
 network difficulty (`8` by default, OCEAN's TIDES rule), never below `--window-floor`, re-sized as

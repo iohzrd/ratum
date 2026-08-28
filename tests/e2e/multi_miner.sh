@@ -329,7 +329,7 @@ start_miner "$CAROL" "$CAROL_CPUS" carol "$STRATUM_PORT_B"
 # read while the pool runs. During mining, count and attribute accepted shares from the pool
 # log ("<- accepted ...; <user> credited"); after the pool is stopped, dump the database to a
 # text file the checks below read.
-LEDGER_DB="$WORK/pool/shares.redb"
+LEDGER_DB="$WORK/pool/regtest.redb"
 LEDGER="$WORK/pool/shares.txt"
 step "accumulating $SHARE_COUNT shares (up to ${TIMEOUT}s)"
 # Wait for the target, and for every miner to hold at least one share, so that the split

@@ -21,6 +21,13 @@ const SHARES: TableDefinition<u64, &[u8]> = TableDefinition::new("shares");
 /// complement to the in-memory `ReplayGuard`.
 const BY_HASH: TableDefinition<&[u8], u64> = TableDefinition::new("by_hash");
 
+/// Facts about the ledger as a whole. `META_CHAIN` holds the chain whose shares it records,
+/// written when the ledger is created and checked on every open, so a ledger of one chain's
+/// shares is never opened by a pool on another: shares recorded on a test network would
+/// otherwise be paid from a mainnet coinbase.
+const META: TableDefinition<&str, &str> = TableDefinition::new("meta");
+const META_CHAIN: &str = "chain";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Share {
     pub at: u64,
@@ -36,6 +43,9 @@ pub struct ReadBack {
     /// Whether the window covers more work than the retained ledger holds, so some older
     /// work is not credited.
     pub truncated: bool,
+    /// Whether the ledger carried no chain stamp and was stamped with the chain given on this
+    /// open: a ledger written before stamps existed, adopted once.
+    pub stamped: bool,
 }
 
 /// Pack a share into the row value: at (8, LE), difficulty (8, LE), hash (32), then identity.
@@ -76,15 +86,47 @@ struct Store {
 }
 
 impl Store {
-    fn open(path: &Path, keep: Option<usize>) -> io::Result<Self> {
+    /// Open the ledger at `path`, creating it if absent. With `chain`, the ledger's chain
+    /// stamp must match it: a ledger stamped for another chain is refused with
+    /// `InvalidData`, and one with no stamp (written before stamps existed) is stamped now.
+    /// Without `chain` (`--dump-ledger`) the stamp is neither checked nor written. Returns
+    /// whether this open stamped the ledger.
+    fn open(path: &Path, keep: Option<usize>, chain: Option<&str>) -> io::Result<(Self, bool)> {
         // redb takes an exclusive lock on the file, so a second pool on the same ledger is
         // refused here rather than corrupting the share ledger.
         let db = Database::create(path).map_err(to_io)?;
-        // Create the tables if the database is new, and find where the sequence continues.
+        // Create the tables if the database is new, check or write the chain stamp, and find
+        // where the sequence continues.
         let w = db.begin_write().map_err(to_io)?;
+        let mut stamped = false;
         {
-            w.open_table(SHARES).map_err(to_io)?;
+            // Whether shares were recorded before this open: an unstamped ledger holding
+            // some is one written before stamps existed and adopted now, which is reported;
+            // an empty one is simply created stamped.
+            let held_shares = !w.open_table(SHARES).map_err(to_io)?.is_empty().map_err(to_io)?;
             w.open_table(BY_HASH).map_err(to_io)?;
+            let mut meta = w.open_table(META).map_err(to_io)?;
+            if let Some(chain) = chain {
+                let stored = meta.get(META_CHAIN).map_err(to_io)?.map(|v| v.value().to_string());
+                match stored {
+                    Some(stored) if stored != chain => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "{} holds shares for chain {stored}, but the node is on chain \
+                                 {chain}; a ledger serves one chain, so give --ledger a file \
+                                 of {chain} shares",
+                                path.display()
+                            ),
+                        ));
+                    }
+                    Some(_) => {}
+                    None => {
+                        meta.insert(META_CHAIN, chain).map_err(to_io)?;
+                        stamped = held_shares;
+                    }
+                }
+            }
         }
         w.commit().map_err(to_io)?;
         let next_seq = {
@@ -93,7 +135,15 @@ impl Store {
             shares.last().map_err(to_io)?.map(|(k, _)| k.value() + 1).unwrap_or(0)
         };
         let retain = keep.map(|k| (k.max(1) as u64).saturating_mul(SHARES_PER_KEEP_UNIT));
-        Ok(Store { db, next_seq, retain_bound: retain })
+        Ok((Store { db, next_seq, retain_bound: retain }, stamped))
+    }
+
+    /// The chain stamp, or `None` for a ledger written before stamps existed.
+    #[cfg(test)]
+    fn chain(&self) -> io::Result<Option<String>> {
+        let r = self.db.begin_read().map_err(to_io)?;
+        let meta = r.open_table(META).map_err(to_io)?;
+        Ok(meta.get(META_CHAIN).map_err(to_io)?.map(|v| v.value().to_string()))
     }
 
     /// Store a share durably. Returns `false` if its hash is already present, so it is not
@@ -240,10 +290,19 @@ impl Ledger {
         }
     }
 
-    pub fn open(path: &Path, window: u128, keep: Option<usize>) -> io::Result<(Self, ReadBack)> {
+    /// Open the ledger at `path` for the shares of `chain` (the name the node reports:
+    /// `main`, `testnet4`, ...), which the ledger is stamped with; see `Store::open`. `None`
+    /// opens without the chain check, for reading a ledger back.
+    pub fn open(
+        path: &Path,
+        window: u128,
+        keep: Option<usize>,
+        chain: Option<&str>,
+    ) -> io::Result<(Self, ReadBack)> {
         let mut ledger = Ledger::new(window);
-        let store = Store::open(path, keep)?;
-        let (shares, read_back) = store.read_back(ledger.window)?;
+        let (store, stamped) = Store::open(path, keep, chain)?;
+        let (shares, mut read_back) = store.read_back(ledger.window)?;
+        read_back.stamped = stamped;
         for share in shares {
             ledger.push(share);
             ledger.trim();
@@ -708,7 +767,56 @@ mod tests {
 
     // A ledger backed by a redb store, for the durability tests below.
     fn open(scratch: &Scratch, window: u128, keep: Option<usize>) -> (Ledger, ReadBack) {
-        Ledger::open(&scratch.join("shares.redb"), window, keep).unwrap()
+        Ledger::open(&scratch.join("regtest.redb"), window, keep, Some("regtest")).unwrap()
+    }
+
+    #[test]
+    fn a_new_ledger_is_stamped_with_its_chain() {
+        let scratch = Scratch::new("stamp-new");
+        let path = scratch.join("main.redb");
+        let (_, read_back) = Ledger::open(&path, 1, None, Some("main")).unwrap();
+        assert!(!read_back.stamped, "creating a ledger is not adopting one");
+        let (store, _) = Store::open(&path, None, None).unwrap();
+        assert_eq!(store.chain().unwrap().as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn a_ledger_of_another_chain_is_refused() {
+        let scratch = Scratch::new("stamp-other");
+        let path = scratch.join("shares.redb");
+        drop(Ledger::open(&path, 1, None, Some("testnet4")).unwrap());
+        let err = Ledger::open(&path, 1, None, Some("main"))
+            .err()
+            .expect("a ledger of another chain is refused");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let msg = err.to_string();
+        assert!(msg.contains("chain testnet4") && msg.contains("chain main"), "{msg}");
+        // Reading it back does not check the stamp.
+        drop(Ledger::open(&path, 1, None, None).unwrap());
+        // The refused open wrote nothing: the stamp is unchanged.
+        let (store, _) = Store::open(&path, None, None).unwrap();
+        assert_eq!(store.chain().unwrap().as_deref(), Some("testnet4"));
+    }
+
+    #[test]
+    fn an_unstamped_ledger_is_adopted_by_the_first_chain_to_open_it() {
+        let scratch = Scratch::new("stamp-adopt");
+        let path = scratch.join("shares.redb");
+        // Written before stamps existed: opened without a chain, so no stamp.
+        {
+            let (mut l, _) = Ledger::open(&path, u128::MAX, None, None).unwrap();
+            l.record(1, "alice", 16, &hash(1)).unwrap();
+        }
+        let (store, _) = Store::open(&path, None, None).unwrap();
+        assert_eq!(store.chain().unwrap(), None);
+        drop(store);
+        let (l, read_back) = Ledger::open(&path, u128::MAX, None, Some("testnet4")).unwrap();
+        assert!(read_back.stamped);
+        assert_eq!(l.len(), 1, "adoption keeps the shares");
+        drop(l);
+        // Once adopted it belongs to that chain.
+        assert!(Ledger::open(&path, 1, None, Some("main")).is_err());
+        assert!(!Ledger::open(&path, 1, None, Some("testnet4")).unwrap().1.stamped);
     }
 
     #[test]
@@ -868,7 +976,7 @@ mod tests {
     #[test]
     fn retention_keeps_the_most_recent_shares() {
         let scratch = Scratch::new("retain");
-        let mut store = Store::open(&scratch.join("shares.redb"), None).unwrap();
+        let (mut store, _) = Store::open(&scratch.join("regtest.redb"), None, None).unwrap();
         store.retain_bound = Some(5);
         for i in 0..12u64 {
             let share = Share { at: i, identity: "m".into(), difficulty: 16, hash: Some(hash(i)) };

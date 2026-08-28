@@ -26,6 +26,7 @@ pub(crate) fn watch_node(
     coinbase_value: SharedCoinbaseValue,
     next_bits: SharedNextBits,
     interval: Duration,
+    expected_chain: Option<rpc::Chain>,
 ) {
     let mut last: Option<[u8; 32]> = None;
     // Whether the template for the current tip has been read. A template read can fail
@@ -37,6 +38,23 @@ pub(crate) fn watch_node(
     loop {
         let height = match node.tip() {
             Ok(t) => {
+                // The ledger is named after and stamped with the chain the pool started on;
+                // a node moved to another chain under a running pool would have its shares
+                // credited to that ledger, so stop instead.
+                match expected_chain {
+                    Some(expected) if t.chain != expected => {
+                        error!(
+                            "the node is on chain {} but this pool started on chain {} and \
+                             its ledger holds {} shares; exiting rather than credit shares \
+                             of one chain to the ledger of another",
+                            t.chain.name(),
+                            expected.name(),
+                            expected.name()
+                        );
+                        std::process::exit(1);
+                    }
+                    _ => {}
+                }
                 if last != Some(t.hash) {
                     let mut display = t.hash;
                     display.reverse();

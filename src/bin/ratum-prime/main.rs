@@ -22,19 +22,61 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// Where the share ledger lives, as far as the command line settles it.
+enum LedgerLocation {
+    /// `--ledger <file>`: this file, whatever chain the node is on.
+    File(PathBuf),
+    /// `--data-dir <dir>` without `--ledger`: `<chain>.redb` inside, named once the node
+    /// reports its chain.
+    InDir(PathBuf),
+    /// Neither: the share window is held in memory only.
+    None,
+}
+
+/// The `*.redb` files directly inside `dir`, sorted by name.
+fn ledger_files_in(dir: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "redb"))
+        .collect();
+    found.sort();
+    Ok(found)
+}
+
 /// Print the ledger as `<unix-seconds> <difficulty> <identity> <share-hash>` lines, oldest
 /// first, then exit. Exports or audits the ledger; the e2e tests read it this way. Opening
 /// takes the ledger's exclusive lock, so the pool must not be running.
 /// The column order `<at> <difficulty> <identity> <share-hash>` is read by
 /// `tests/e2e/multi_miner.sh` (awk fields 2, 3 and 4) and reconstructed from log lines by
 /// `tests/support/pool.rs` `ledger_lines`; a change here changes both.
-fn dump_ledger(path: Option<&Path>) -> io::Result<()> {
+fn dump_ledger(location: &LedgerLocation) -> io::Result<()> {
     use std::fmt::Write as _;
-    let Some(path) = path else {
-        eprintln!("--dump-ledger needs a ledger: give --ledger or --data-dir");
-        std::process::exit(2);
+    let path = match location {
+        LedgerLocation::File(p) => p.clone(),
+        // The file is named after the node's chain, which is not asked for here (the node
+        // need not be running to read a ledger back), so the directory must hold one ledger.
+        LedgerLocation::InDir(dir) => match ledger_files_in(dir)?.as_slice() {
+            [one] => one.clone(),
+            [] => {
+                eprintln!("no ledger (*.redb) in {}", dir.display());
+                std::process::exit(2);
+            }
+            many => {
+                let names: Vec<String> = many.iter().map(|p| p.display().to_string()).collect();
+                eprintln!(
+                    "{} holds more than one ledger; give --ledger to choose one of: {}",
+                    dir.display(),
+                    names.join(", ")
+                );
+                std::process::exit(2);
+            }
+        },
+        LedgerLocation::None => {
+            eprintln!("--dump-ledger needs a ledger: give --ledger or --data-dir");
+            std::process::exit(2);
+        }
     };
-    let (ledger, _) = Ledger::open(path, u128::MAX, None)?;
+    let (ledger, _) = Ledger::open(&path, u128::MAX, None, None)?;
     let mut out = String::new();
     for share in ledger.dump()? {
         let _ = writeln!(
@@ -237,14 +279,17 @@ fn main() -> io::Result<()> {
         (None, Some(dir)) => dir.join("ratum-prime.key"),
         (None, None) => PathBuf::from("ratum-prime.key"),
     };
-    let ledger_path = match (ledger_path, &data_dir) {
-        (Some(p), _) => Some(PathBuf::from(p)),
-        (None, Some(dir)) => Some(dir.join("shares.redb")),
-        (None, None) => None,
+    // Where the ledger is: a file named outright, or a data directory in which the file is
+    // named after the node's chain (`main.redb`, `testnet4.redb`, ...), known once the node
+    // answers.
+    let ledger_location = match (ledger_path, &data_dir) {
+        (Some(p), _) => LedgerLocation::File(PathBuf::from(p)),
+        (None, Some(dir)) => LedgerLocation::InDir(dir.clone()),
+        (None, None) => LedgerLocation::None,
     };
 
     if loaded.cli.dump_ledger {
-        return dump_ledger(ledger_path.as_deref());
+        return dump_ledger(&ledger_location);
     }
 
     let pool_keys = load_or_create_keys(&key_path)?;
@@ -292,92 +337,15 @@ fn main() -> io::Result<()> {
         );
         std::process::exit(2);
     };
-    let node = {
-        // With a cookie, give the node client the path so it re-reads on a 401 or 403: bitcoind
-        // rewrites the cookie on restart, and otherwise a node restart would leave the pool
-        // unable to authenticate until it too was restarted. The early read above still
-        // validates the file and exits with status 2 if it is malformed.
-        let client = match &rpc_cookie {
-            Some(path) => rpc::Client::with_cookie(url, PathBuf::from(path)),
-            None => rpc::Client::new(url, &rpc_user, &rpc_pass),
-        }
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
-        let (watcher, shared) = (client.clone(), Arc::clone(&tip));
-        let shared_value = Arc::clone(&coinbase_value);
-        let shared_bits = Arc::clone(&next_bits);
-        std::thread::spawn(move || watch_node(watcher, shared, shared_value, shared_bits, poll));
-        info!(
-            "watching the node at {url}: waiting on each new block, \
-             re-reading the tip at least every {:.3}s",
-            poll.as_secs_f64()
-        );
-        client
-    };
-
-    let startup_window = match node.tip() {
-        Ok(t) => ledger::window_for_difficulty(t.difficulty, window_multiple, window_floor),
-        Err(e) => {
-            warn!(
-                "could not read the node difficulty to size the share window ({e}); \
-                 starting from the floor of {window_floor}, so shares recorded before \
-                 this restart are credited only as far back as that floor reaches"
-            );
-            window_floor
-        }
-    };
-
-    let ledger = match &ledger_path {
-        Some(path) => {
-            let (l, read_back) = Ledger::open(path, startup_window, ledger_keep)?;
-            if read_back.skipped != 0 {
-                warn!("{} unreadable rows in {} were skipped", read_back.skipped, path.display());
-            }
-            if read_back.truncated {
-                warn!(
-                    "the share window exceeds the retained ledger in {}: older work is \
-                     not credited (raise --ledger-keep to keep it)",
-                    path.display()
-                );
-            }
-            info!(
-                "share window from {}: {} shares, {} work",
-                path.display(),
-                l.len(),
-                l.total_work()
-            );
-            match ledger_keep {
-                Some(n) => info!(
-                    "keeping at most {} of the most recent shares in {}",
-                    n as u64 * ledger::SHARES_PER_KEEP_UNIT,
-                    path.display()
-                ),
-                None => info!("every share in {} is kept", path.display()),
-            }
-            l
-        }
-        None => {
-            warn!("no --ledger file or --data-dir; the share window is lost on restart");
-            Ledger::new(startup_window)
-        }
-    };
-
-    info!(
-        "payouts: window {window_multiple}x network difficulty (floor {window_floor}, \
-         {startup_window} at startup), minimum {min_payout} sats, \
-         operator fee {fee_bps} bps"
-    );
-
-    let activation = match (activation_height, headline.is_empty()) {
-        (Some(h), false) => {
-            info!("activation: height {h}, headline {headline:?}");
-            Some((h, headline.clone()))
-        }
-        (Some(_), true) | (None, false) => {
-            eprintln!("--activation-height and --headline must be given together");
-            std::process::exit(2);
-        }
-        (None, true) => None,
-    };
+    // With a cookie, give the node client the path so it re-reads on a 401 or 403: bitcoind
+    // rewrites the cookie on restart, and otherwise a node restart would leave the pool
+    // unable to authenticate until it too was restarted. The early read above still
+    // validates the file and exits with status 2 if it is malformed.
+    let node = match &rpc_cookie {
+        Some(path) => rpc::Client::with_cookie(url, PathBuf::from(path)),
+        None => rpc::Client::new(url, &rpc_user, &rpc_pass),
+    }
+    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
 
     // The two payout options are mutually exclusive, but the command line overrides the file
     // like every other setting: one given on the command line supersedes the other written in
@@ -454,6 +422,124 @@ fn main() -> io::Result<()> {
         std::process::exit(2);
     }
     info!("pool payout script: {}", hex::encode(&payout_script));
+
+    // The node's chain names the ledger file and is stamped inside it, so with a ledger to
+    // open the node must answer before the pool goes on. Without a ledger the window starts
+    // from the floor when the node is unreachable, and is lost on restart in any case.
+    let startup_tip = loop {
+        match node.tip() {
+            Ok(t) => break Some(t),
+            Err(e) if matches!(ledger_location, LedgerLocation::None) => {
+                warn!(
+                    "could not read the node difficulty to size the share window ({e}); \
+                     starting from the floor of {window_floor}, so shares recorded before \
+                     this restart are credited only as far back as that floor reaches"
+                );
+                break None;
+            }
+            Err(e) => {
+                warn!(
+                    "could not read the node's chain and difficulty ({e}); the ledger is \
+                     named after the chain, so retrying in {:.3}s",
+                    poll.as_secs_f64()
+                );
+                std::thread::sleep(poll);
+            }
+        }
+    };
+    let chain = startup_tip.map(|t| t.chain);
+    let startup_window = match startup_tip {
+        Some(t) => ledger::window_for_difficulty(t.difficulty, window_multiple, window_floor),
+        None => window_floor,
+    };
+    {
+        let (watcher, shared) = (node.clone(), Arc::clone(&tip));
+        let shared_value = Arc::clone(&coinbase_value);
+        let shared_bits = Arc::clone(&next_bits);
+        std::thread::spawn(move || {
+            watch_node(watcher, shared, shared_value, shared_bits, poll, chain)
+        });
+        info!(
+            "watching the node at {url}: waiting on each new block, \
+             re-reading the tip at least every {:.3}s",
+            poll.as_secs_f64()
+        );
+    }
+    let ledger_path = match (&ledger_location, chain) {
+        (LedgerLocation::File(p), _) => Some(p.clone()),
+        (LedgerLocation::InDir(dir), Some(rpc::Chain::Other)) => {
+            eprintln!(
+                "the node reports a chain this pool has no name for, so it cannot name the \
+                 ledger in {}; give --ledger a file for it",
+                dir.display()
+            );
+            std::process::exit(2);
+        }
+        (LedgerLocation::InDir(dir), Some(c)) => Some(dir.join(format!("{}.redb", c.name()))),
+        (LedgerLocation::InDir(_), None) => unreachable!("a data directory waits for the chain"),
+        (LedgerLocation::None, _) => None,
+    };
+    let chain_name = chain.map(rpc::Chain::name);
+
+    let ledger = match &ledger_path {
+        Some(path) => {
+            let (l, read_back) = Ledger::open(path, startup_window, ledger_keep, chain_name)?;
+            if read_back.stamped {
+                info!(
+                    "{} carried no chain stamp and is now stamped {}",
+                    path.display(),
+                    chain_name.unwrap_or("?")
+                );
+            }
+            if read_back.skipped != 0 {
+                warn!("{} unreadable rows in {} were skipped", read_back.skipped, path.display());
+            }
+            if read_back.truncated {
+                warn!(
+                    "the share window exceeds the retained ledger in {}: older work is \
+                     not credited (raise --ledger-keep to keep it)",
+                    path.display()
+                );
+            }
+            info!(
+                "share window from {}: {} shares, {} work",
+                path.display(),
+                l.len(),
+                l.total_work()
+            );
+            match ledger_keep {
+                Some(n) => info!(
+                    "keeping at most {} of the most recent shares in {}",
+                    n as u64 * ledger::SHARES_PER_KEEP_UNIT,
+                    path.display()
+                ),
+                None => info!("every share in {} is kept", path.display()),
+            }
+            l
+        }
+        None => {
+            warn!("no --ledger file or --data-dir; the share window is lost on restart");
+            Ledger::new(startup_window)
+        }
+    };
+
+    info!(
+        "payouts: window {window_multiple}x network difficulty (floor {window_floor}, \
+         {startup_window} at startup), minimum {min_payout} sats, \
+         operator fee {fee_bps} bps"
+    );
+
+    let activation = match (activation_height, headline.is_empty()) {
+        (Some(h), false) => {
+            info!("activation: height {h}, headline {headline:?}");
+            Some((h, headline.clone()))
+        }
+        (Some(_), true) | (None, false) => {
+            eprintln!("--activation-height and --headline must be given together");
+            std::process::exit(2);
+        }
+        (None, true) => None,
+    };
 
     let config = ClientConfig { payout_script, prime_id, coinbase_tag, min_difficulty };
     let config_payload = match config.encode() {
