@@ -12,6 +12,18 @@ use std::sync::{Arc, Mutex};
 pub const MAX_COINBASE_TYPES: u8 = 6;
 pub const MAX_SEEN: usize = 1 << 20;
 
+/// The most coinbase-section bytes (`coinb1` plus `coinb2`, summed across every stored job and
+/// coinbase id) one connection's verifier keeps installed.
+///
+/// `install_sections` caches each job's coinbase sections so later shares can omit them, before
+/// any proof-of-work check, so a peer can pin memory with shares it knows will be rejected: the
+/// `MAX_JOBS` (256) slots times `MAX_COINBASE_TYPES` coinbase ids times two 64 KiB (`u16`) sections
+/// is roughly 196 MiB per connection, and `--max-connections` of those is an out-of-memory denial
+/// of service. This bounds the total instead. A conforming gateway holds a few live jobs, each with
+/// a coinbase well under 40 KiB even at the 512-output split limit, so its real footprint is a few
+/// MiB; the cap is far above that and rejects only an abusive flood, with `CoinbaseTooLarge`.
+pub const MAX_INSTALLED_COINBASE_BYTES: usize = 32 << 20;
+
 #[derive(Debug)]
 pub struct ReplayGuard {
     seen: HashSet<[u8; 32]>,
@@ -127,6 +139,18 @@ struct JobState {
     coinbases: HashMap<u8, CoinbaseSection>,
 }
 
+impl JobState {
+    /// The coinbase-section bytes this job holds, counted against
+    /// `MAX_INSTALLED_COINBASE_BYTES`.
+    fn coinbase_bytes(&self) -> usize {
+        self.coinbases.values().map(coinbase_bytes).sum()
+    }
+}
+
+fn coinbase_bytes(cb: &CoinbaseSection) -> usize {
+    cb.coinb1.len() + cb.coinb2.len()
+}
+
 #[derive(Clone, Debug)]
 pub struct Verifier {
     policy: PoolPolicy,
@@ -146,6 +170,9 @@ pub struct Verifier {
     tip_next_target: Option<target::Target>,
     /// Tips that are no longer current, each with the time it stopped being current.
     recent_tips: VecDeque<([u8; 32], u64)>,
+    /// The `coinb1`-plus-`coinb2` bytes currently cached across every job slot, kept in step
+    /// with `jobs` so `install_sections` can bound it by `MAX_INSTALLED_COINBASE_BYTES`.
+    installed_coinbase_bytes: usize,
 }
 
 impl Verifier {
@@ -162,6 +189,7 @@ impl Verifier {
             tip: None,
             tip_next_target: None,
             recent_tips: VecDeque::new(),
+            installed_coinbase_bytes: 0,
         }
     }
 
@@ -312,6 +340,12 @@ impl Verifier {
         if let Some(job) = &s.job {
             let changed = self.jobs[idx].as_ref().is_none_or(|state| state.job != *job);
             if changed {
+                // Replacing a job discards its cached coinbases, so drop their bytes from the
+                // running total before the new (coinbase-less) slot takes their place.
+                if let Some(old) = self.jobs[idx].take() {
+                    self.installed_coinbase_bytes =
+                        self.installed_coinbase_bytes.saturating_sub(old.coinbase_bytes());
+                }
                 self.jobs[idx] = Some(JobState { job: job.clone(), coinbases: HashMap::new() });
             }
         }
@@ -319,8 +353,27 @@ impl Verifier {
             if cb.coinbase_id != s.coinbase_id {
                 return Err(RejectReason::CoinbaseIdMismatch);
             }
-            let state = self.jobs[idx].as_mut().ok_or(RejectReason::BadJobId)?;
-            state.coinbases.insert(cb.coinbase_id, cb.clone());
+            if self.jobs[idx].is_none() {
+                return Err(RejectReason::BadJobId);
+            }
+            // Cache the section only if it keeps the connection under the byte cap. The cache
+            // is filled before any proof-of-work check, so without this a peer flooding shares
+            // it knows will be rejected could pin memory across every job and coinbase id.
+            let old = self.jobs[idx]
+                .as_ref()
+                .and_then(|state| state.coinbases.get(&cb.coinbase_id))
+                .map_or(0, coinbase_bytes);
+            let projected =
+                self.installed_coinbase_bytes.saturating_sub(old) + coinbase_bytes(cb);
+            if projected > MAX_INSTALLED_COINBASE_BYTES {
+                return Err(RejectReason::CoinbaseTooLarge);
+            }
+            self.installed_coinbase_bytes = projected;
+            self.jobs[idx]
+                .as_mut()
+                .expect("slot present")
+                .coinbases
+                .insert(cb.coinbase_id, cb.clone());
         }
         Ok(())
     }
@@ -1004,6 +1057,86 @@ mod tests {
         second.job = None;
         second.coinbase = None;
         assert_eq!(v.rebuild(&second, NOW).unwrap(), full);
+    }
+
+    /// The verifier caches each job's coinbase sections before any proof-of-work check, so a
+    /// peer flooding shares it knows will be rejected must not pin unbounded memory: past
+    /// `MAX_INSTALLED_COINBASE_BYTES` an installing share is refused with `CoinbaseTooLarge`,
+    /// and replacing a job frees the bytes its coinbases held so the total does not leak.
+    #[test]
+    fn installed_coinbase_sections_are_bounded_per_connection() {
+        // A share carrying a distinct job (one slot per job id) and a 64 KiB coinbase, whose
+        // bytes are what count against the cap. The coinbase is not a real transaction, so a
+        // share under the cap is rejected only later, in `reconstruct`; over the cap it is
+        // refused in `install_sections`, before that, with `CoinbaseTooLarge`.
+        fn flood_share(job_id: u8, coinbase_id: u8) -> PowSubmit {
+            let mut job = job_section(0);
+            job.height = 840_000 + u32::from(job_id); // a distinct slot per job id
+            PowSubmit {
+                job_id,
+                coinbase_id,
+                is_block: false,
+                subsidy_only: false,
+                quickdiff: false,
+                target_byte: 0,
+                ntime: NOW as u32,
+                nonce: 0,
+                version: 0x2000_0000,
+                extranonce: DIFF1_EXTRANONCE.to_vec(),
+                username: "bc1qexample".to_string(),
+                use_time_offset: false,
+                job: Some(job),
+                coinbase: Some(CoinbaseSection {
+                    coinbase_id,
+                    coinb1: Vec::new(),
+                    coinb2: vec![0xcd; u16::MAX as usize],
+                }),
+                blake2b: None,
+            }
+        }
+
+        let per_share = u16::MAX as usize; // coinb1 (0) + coinb2 (65535)
+        let mut v = Verifier::new(policy());
+        let mut installed = 0usize;
+        let mut refused = None;
+        'outer: for job_id in 0..=u8::MAX {
+            for coinbase_id in 0..MAX_COINBASE_TYPES {
+                match v.rebuild(&flood_share(job_id, coinbase_id), NOW) {
+                    Err(RejectReason::CoinbaseTooLarge) => {
+                        refused = Some((job_id, installed));
+                        break 'outer;
+                    }
+                    // Cached: `reconstruct` then rejects the bogus coinbase.
+                    Err(RejectReason::BadCoinbase) => installed += per_share,
+                    other => panic!("unexpected verdict while filling: {other:?}"),
+                }
+            }
+        }
+
+        let (refused_job_id, cached) =
+            refused.expect("the cap is reached before the id space is exhausted");
+        assert!(
+            cached <= MAX_INSTALLED_COINBASE_BYTES && cached + per_share > MAX_INSTALLED_COINBASE_BYTES,
+            "refused with {cached} bytes cached, not near the {MAX_INSTALLED_COINBASE_BYTES}-byte cap",
+        );
+
+        // A coinbase on a fresh, unused job id is still refused: nothing has been freed.
+        let fresh_id = refused_job_id + 1;
+        assert_eq!(
+            v.rebuild(&flood_share(fresh_id, 0), NOW),
+            Err(RejectReason::CoinbaseTooLarge),
+        );
+
+        // Replacing job 0 with a changed job frees the coinbase bytes its slot held, so the
+        // same coinbase that was just refused now fits and is cached (rejected later, in
+        // `reconstruct`, as the bogus transaction it is).
+        let mut freed = flood_share(0, 0);
+        freed.job.as_mut().unwrap().height = 999_999; // a different job for slot 0
+        assert_eq!(
+            v.rebuild(&freed, NOW),
+            Err(RejectReason::BadCoinbase),
+            "a replaced job's freed bytes must let a coinbase install again",
+        );
     }
 
     #[test]
