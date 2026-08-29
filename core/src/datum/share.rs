@@ -1,4 +1,5 @@
 use crate::cursor::{Cursor, Truncated};
+use crate::header::HeaderV2;
 
 pub use super::messages::client_subcmd::SUBMIT_POW;
 pub const SECTION_JOB: u8 = 0x01;
@@ -15,12 +16,11 @@ pub const RESERVED_USE_TIME_OFFSET: u8 = 0x01;
 pub use super::framing::STRUCT_END;
 /// The extranonce bytes a share carries: extranonce1 then extranonce2.
 ///
-/// A version 1 share splices these into the coinbase. A version 2 share's extranonce is a
-/// 16-byte header field instead (`m_extranonce`), but its leading four bytes are zero: the
-/// gateway's extranonce1 is eight bytes (`DATUM_HEADER_V2_EXTRANONCE1_SIZE`): four zero bytes
-/// (`DATUM_HEADER_V2_EXTRANONCE_PAD`) then the four-byte session id. So the same twelve are sent
-/// and the pool restores the padding. What distinguishes the versions is the presence of the
-/// BLAKE2b section, not a size.
+/// The header's extranonce is a 16-byte field (`m_extranonce`) whose leading four bytes are
+/// zero: the gateway's extranonce1 is eight bytes (`DATUM_HEADER_V2_EXTRANONCE1_SIZE`): four
+/// zero bytes (`DATUM_HEADER_V2_EXTRANONCE_PAD`) then the four-byte session id. The share
+/// sends the twelve that vary, in the field the upstream DATUM format sizes for them, and the
+/// pool restores the padding.
 pub const EXTRANONCE_SIZE: usize = 12;
 /// The header field the twelve are restored into (`DATUM_HEADER_V2_EXTRANONCE_SIZE`).
 pub const EXTRANONCE_SIZE_V2: usize = 16;
@@ -48,6 +48,10 @@ pub enum Error {
     UnknownSection(u8),
     #[error("malformed BLAKE2b section")]
     BadBlake2bSection,
+    /// The share carries no 0x03 section: the upstream (SHA256d) DATUM format, which this
+    /// pool does not verify.
+    #[error("no BLAKE2b section")]
+    MissingBlake2bSection,
 }
 
 impl From<Truncated> for Error {
@@ -122,7 +126,29 @@ pub fn header_extranonce(extranonce: &[u8]) -> Option<[u8; EXTRANONCE_SIZE_V2]> 
     Some(out)
 }
 
+/// The twelve bytes a share sends for a header's 16-byte extranonce field: `None` when the
+/// four the gateway holds at zero are not zero. The inverse of `header_extranonce`.
+pub fn share_extranonce(field: &[u8; EXTRANONCE_SIZE_V2]) -> Option<Vec<u8>> {
+    if field[..EXTRANONCE_V2_PAD] != [0u8; EXTRANONCE_V2_PAD] {
+        return None;
+    }
+    Some(field[EXTRANONCE_V2_PAD..].to_vec())
+}
+
 impl Blake2bSection {
+    /// The section for a header in ASIC profile 0: the four nonce and time fields spliced
+    /// into the two eight-byte Sia fields, and the time as the header serializes it. The
+    /// inverse of `nonce_fields`, `time_fields` and `HeaderV2::time_on_wire`.
+    pub fn from_header(h: &HeaderV2) -> Self {
+        let mut sia_nonce = [0u8; 8];
+        sia_nonce[..4].copy_from_slice(&h.nonce.to_le_bytes());
+        sia_nonce[4..].copy_from_slice(&h.nonce2.to_le_bytes());
+        let mut sia_ntime = [0u8; 8];
+        sia_ntime[..4].copy_from_slice(&h.time_offset.to_le_bytes());
+        sia_ntime[4..].copy_from_slice(&h.nonce3.to_le_bytes());
+        Blake2bSection { sia_ntime, sia_nonce, time_on_wire: h.time_on_wire() }
+    }
+
     /// `nNonce` and `m_nonce2`, in that order.
     pub fn nonce_fields(&self) -> (u32, u32) {
         (le32(&self.sia_nonce[..4]), le32(&self.sia_nonce[4..]))
@@ -138,6 +164,10 @@ fn le32(b: &[u8]) -> u32 {
     u32::from_le_bytes(b.try_into().expect("four bytes"))
 }
 
+/// A share as the gateway submits it (0x27). The fixed fields are the upstream DATUM
+/// layout; `ntime`, `nonce` and `version` are carried in it but the header the pool builds
+/// takes its time and nonces from `blake2b` (the 0x03 section, which every share must carry)
+/// and its version from `version` with the v2 flag stripped.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PowSubmit {
     pub job_id: u8,
@@ -146,7 +176,10 @@ pub struct PowSubmit {
     pub subsidy_only: bool,
     pub quickdiff: bool,
     pub target_byte: u8,
+    /// The upstream format's 32-bit time field; the gateway writes `blake2b.time_on_wire`.
     pub ntime: u32,
+    /// The upstream format's nonce field; the gateway writes the header's `nNonce`, which
+    /// `blake2b.sia_nonce` also carries.
     pub nonce: u32,
     pub version: u32,
     pub extranonce: Vec<u8>,
@@ -157,14 +190,10 @@ pub struct PowSubmit {
     pub use_time_offset: bool,
     pub job: Option<JobSection>,
     pub coinbase: Option<CoinbaseSection>,
-    pub blake2b: Option<Blake2bSection>,
+    pub blake2b: Blake2bSection,
 }
 
 impl PowSubmit {
-    pub fn is_v2(&self) -> bool {
-        self.blake2b.is_some()
-    }
-
     /// The target byte index this share claims: its own job section's when it carries
     /// one, otherwise the installed `job`'s.
     pub fn target_byte_index_of(&self, job: &JobSection) -> u16 {
@@ -264,6 +293,7 @@ impl PowSubmit {
                 other => return Err(Error::UnknownSection(other)),
             }
         }
+        let blake2b = blake2b.ok_or(Error::MissingBlake2bSection)?;
 
         Ok(PowSubmit {
             job_id,
@@ -332,14 +362,13 @@ impl PowSubmit {
             out.extend_from_slice(&c.coinb1);
             out.extend_from_slice(&c.coinb2);
         }
-        if let Some(b) = &self.blake2b {
-            out.push(SECTION_BLAKE2B);
-            out.push(BLAKE2B_ALGORITHM);
-            out.extend_from_slice(&b.sia_ntime);
-            out.extend_from_slice(&b.sia_nonce);
-            out.push(BLAKE2B_TIME);
-            out.extend_from_slice(&b.time_on_wire.to_le_bytes());
-        }
+        let b = &self.blake2b;
+        out.push(SECTION_BLAKE2B);
+        out.push(BLAKE2B_ALGORITHM);
+        out.extend_from_slice(&b.sia_ntime);
+        out.extend_from_slice(&b.sia_nonce);
+        out.push(BLAKE2B_TIME);
+        out.extend_from_slice(&b.time_on_wire.to_le_bytes());
         out.push(STRUCT_END);
         out
     }
@@ -365,7 +394,11 @@ mod tests {
             use_time_offset: false,
             job: None,
             coinbase: None,
-            blake2b: None,
+            blake2b: Blake2bSection {
+                sia_ntime: [0x11; 8],
+                sia_nonce: [0x22; 8],
+                time_on_wire: 0x6543_2100,
+            },
         }
     }
 
@@ -426,7 +459,18 @@ mod tests {
         assert_eq!(&bytes[30..49], b"bc1qexample.worker1");
         assert_eq!(bytes[49], 0);
         assert_eq!(&bytes[50..54], &[0u8; 4]);
-        assert_eq!(bytes[54], STRUCT_END);
+        assert_eq!(bytes[54], SECTION_BLAKE2B);
+        assert_eq!(bytes[54 + 23], STRUCT_END);
+    }
+
+    /// A share in the upstream format, without the 0x03 section, is refused: the pool builds
+    /// no SHA256d header.
+    #[test]
+    fn a_share_without_the_blake2b_section_is_refused() {
+        let bytes = minimal().encode();
+        let mut upstream = bytes[..54].to_vec();
+        upstream.push(STRUCT_END);
+        assert_eq!(PowSubmit::decode(&upstream), Err(Error::MissingBlake2bSection));
     }
 
     /// The section is a fixed 23 bytes. Asserted here because both ends hardcode these
@@ -436,11 +480,6 @@ mod tests {
     fn blake2b_section_layout_is_exact() {
         let mut s = minimal();
         s.extranonce = vec![0x33; EXTRANONCE_SIZE];
-        s.blake2b = Some(Blake2bSection {
-            sia_ntime: [0x11; 8],
-            sia_nonce: [0x22; 8],
-            time_on_wire: 0x6543_2100,
-        });
         let bytes = s.encode();
         let at = bytes.len() - 24; // the section, then the 0xFE terminator
         assert_eq!(bytes[bytes.len() - 1], STRUCT_END);
@@ -496,7 +535,7 @@ mod tests {
         let mut bytes = minimal().encode();
         bytes[17] = 8;
         assert_eq!(PowSubmit::decode(&bytes), Err(Error::BadExtranonceSize(8)));
-        // Twelve is the only size, whichever header version the share carries.
+        // Twelve is the only size: the header's 16-byte field less the four zero bytes.
         for n in [0u8, 8, 11, 13, 16, 255] {
             let mut bytes = minimal().encode();
             bytes[17] = n;
@@ -514,6 +553,30 @@ mod tests {
         assert_eq!(&field[EXTRANONCE_V2_PAD..], &twelve[..]);
         assert_eq!(header_extranonce(&[0u8; 16]), None, "the field is not what is sent");
         assert_eq!(header_extranonce(&[]), None);
+    }
+
+    #[test]
+    fn the_section_from_a_header_splits_back_into_its_fields() {
+        let h = HeaderV2 {
+            nonce: 0x1413_1211,
+            nonce2: 0x1817_1615,
+            time_offset: 0x0403_0201,
+            nonce3: 0x0807_0605,
+            time: 1_700_000_100,
+            flags: crate::header::FLAG_USE_TIME_OFFSET,
+            ..Default::default()
+        };
+        let b = Blake2bSection::from_header(&h);
+        assert_eq!(b.nonce_fields(), (h.nonce, h.nonce2));
+        assert_eq!(b.time_fields(), (h.time_offset, h.nonce3));
+        assert_eq!(b.time_on_wire, h.time_on_wire());
+        assert_eq!(b.time_on_wire.wrapping_add(h.time_offset), h.time);
+        let mut field = [0u8; EXTRANONCE_SIZE_V2];
+        field[4..].copy_from_slice(&[9u8; 12]);
+        let twelve = share_extranonce(&field).unwrap();
+        assert_eq!(header_extranonce(&twelve), Some(field));
+        field[0] = 1;
+        assert_eq!(share_extranonce(&field), None);
     }
 
     #[test]

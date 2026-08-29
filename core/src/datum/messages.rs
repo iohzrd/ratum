@@ -267,7 +267,8 @@ pub enum RejectReason {
     Other = 30,
     // 40..43 are RATUM's own codes for the header v2 checks; the gateway defines only 10..30 and
     // logs an unknown code as an integer.
-    /// The 0x03 section's algorithm byte is not 0x01 or its time marker is not 0x04.
+    /// The 0x03 section is absent (the upstream SHA256d share format, which this pool does
+    /// not verify), its algorithm byte is not 0x01, or its time marker is not 0x04.
     BadBlake2bSection = 40,
     /// Reserved; not returned by this version.
     HeaderFieldMismatch = 41,

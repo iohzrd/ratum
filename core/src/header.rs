@@ -218,7 +218,7 @@ impl HeaderV2 {
         h2d[64..].copy_from_slice(&self.mm_rhs);
         let h2 = tagged_sha256("Merge-mining hook", &h2d);
 
-        // Stratum v1 carries 51 of these 52 bytes: coinb1 (the last three bytes of the zero word,
+        // Stratum carries 51 of these 52 bytes: coinb1 (the last three bytes of the zero word,
         // then h2: 35 bytes) and the 16-byte extranonce. The word's first byte is the 0x00 leaf
         // prefix the Siacoin hasher adds itself, so coinb1 does not carry it.
         let mut ss = [0u8; 52];

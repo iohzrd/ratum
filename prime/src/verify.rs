@@ -104,9 +104,11 @@ impl PoolPolicy {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rebuilt {
     pub difficulty: u64,
+    /// The proof-of-work hash, in the byte order targets are compared in
+    /// (`HashComponents::result`).
     pub block_hash: [u8; 32],
-    pub header: Vec<u8>,
-    pub is_v2: bool,
+    /// The serialized version 2 header the share names.
+    pub header: [u8; header::HEADER_V2_SIZE],
     /// The assembled coinbase transaction.
     pub coinbase_tx: Vec<u8>,
     pub height: u32,
@@ -227,7 +229,9 @@ impl Verifier {
             share::Error::BadExtranonceSize(_) => RejectReason::BadExtranonceSize,
             share::Error::BadUsername => RejectReason::BadUsername,
             share::Error::BadMerkleCount(_) => RejectReason::BadMerkleCount,
-            share::Error::BadBlake2bSection => RejectReason::BadBlake2bSection,
+            share::Error::BadBlake2bSection | share::Error::MissingBlake2bSection => {
+                RejectReason::BadBlake2bSection
+            }
             share::Error::Truncated(_) | share::Error::UnknownSection(_) => RejectReason::Other,
         }
     }
@@ -349,19 +353,18 @@ fn reconstruct(
     {
         return Err(RejectReason::BadTarget);
     }
-    // A BLAKE2b share's block time comes from its section; the 32-bit ntime the version 1
-    // layout carries is not what the header commits to. When the time-offset selector is
-    // set the time the header commits to is `time_on_wire + time_offset` (`build_header_v2`, and
-    // the node's `nTime = WrappingAdd(time_on_wire, offset)`), and the offset is a field the
-    // miner controls, so the window has to be tested against that sum rather than the wire
-    // value it could otherwise roll far past the window.
-    let ntime = match &s.blake2b {
-        None => s.ntime,
-        Some(b) if s.use_time_offset => {
-            let (time_offset, _) = b.time_fields();
-            b.time_on_wire.wrapping_add(time_offset)
-        }
-        Some(b) => b.time_on_wire,
+    // The block time comes from the BLAKE2b section; the 32-bit `ntime` field of the upstream
+    // layout is not what the header commits to. When the time-offset selector is set the
+    // time the header commits to is `time_on_wire + time_offset` (`build_header_v2`, and the
+    // node's `nTime = WrappingAdd(time_on_wire, offset)`), and the offset is a field the miner
+    // controls, so the window has to be tested against that sum rather than the wire value it
+    // could otherwise roll far past the window.
+    let b = &s.blake2b;
+    let ntime = if s.use_time_offset {
+        let (time_offset, _) = b.time_fields();
+        b.time_on_wire.wrapping_add(time_offset)
+    } else {
+        b.time_on_wire
     };
     if policy.ntime_window_secs != 0 {
         let ntime_distance = u64::from(ntime).abs_diff(now);
@@ -370,22 +373,11 @@ fn reconstruct(
         }
     }
 
+    // The header carries the extranonce, so the coinbase holds twelve zero bytes where the
+    // upstream format splices it in. The `quickdiff` flag is informational: the work's
+    // uniqueness is the target byte written in below (upstream overwrote coinb1 for it).
     let cb = state.coinbases.get(&s.coinbase_id).ok_or(RejectReason::CoinbaseMissing)?;
-    let zeros = [0u8; share::EXTRANONCE_SIZE];
-    let mut coinbase_tx = cb.assemble(if s.is_v2() { &zeros } else { &s.extranonce });
-
-    // Upstream `datum_stratum.c` (version 1) quickdiff overwrites the last two bytes of coinb1
-    // to make the work unique, so a rebuild repeats the overwrite. Version 2 gets its uniqueness
-    // from the target byte, written in below, so there the flag is informational.
-    if s.quickdiff && !s.is_v2() {
-        let n = cb.coinb1.len();
-        if n < 2 {
-            return Err(RejectReason::BadCoinbase);
-        }
-        let current = u16::from_le_bytes([coinbase_tx[n - 2], coinbase_tx[n - 1]]);
-        let replacement: u16 = if current != 0x5144 { 0x5144 } else { 0xAEBB };
-        coinbase_tx[n - 2..n].copy_from_slice(&replacement.to_le_bytes());
-    }
+    let mut coinbase_tx = cb.assemble(&[0u8; share::EXTRANONCE_SIZE]);
 
     let parsed = bitcoin::parse_coinbase(&coinbase_tx).map_err(|_| RejectReason::BadCoinbase)?;
     if parsed.has_witness {
@@ -405,30 +397,12 @@ fn reconstruct(
     let branches: &[[u8; 32]] = if s.subsidy_only { &[] } else { job.merkle_branches.as_slice() };
     let merkle_root = bitcoin::merkle_root(&bitcoin::sha256d(&coinbase_tx), branches);
 
-    let (header, hash) = match &s.blake2b {
-        None => {
-            let h = bitcoin::serialize_header(
-                s.version,
-                &job.prev_hash,
-                &merkle_root,
-                s.ntime,
-                &job.nbits,
-                s.nonce,
-            );
-            let hash = bitcoin::reversed(&bitcoin::sha256d(&h));
-            (h.to_vec(), hash)
-        }
-        Some(b) => {
-            let h = build_header_v2(job, s, b, &merkle_root)?;
-            (h.serialize().to_vec(), h.hash_components().result)
-        }
-    };
+    let h = build_header_v2(job, s, b, &merkle_root)?;
 
     Ok(Rebuilt {
         difficulty: s.difficulty(),
-        block_hash: hash,
-        header,
-        is_v2: s.is_v2(),
+        block_hash: h.hash_components().result,
+        header: h.serialize(),
         coinbase_tx,
         height: job.height,
         txn_count: job.txn_count,
@@ -442,8 +416,7 @@ fn reconstruct(
 ///
 /// The pool constructs rather than verifies. Every field the hardware does not set comes
 /// from the kept job section or from pool policy, so the share carries nothing to cross-check
-/// them against; only the fields the miner sets come from the share. The version 1 branch
-/// above does the same.
+/// them against; only the fields the miner sets come from the share.
 fn build_header_v2(
     job: &JobSection,
     s: &PowSubmit,
@@ -581,17 +554,76 @@ mod tests {
     use super::*;
     use ratum::bitcoin::TxOut;
 
+    /// The gateway builds a share's sections from the header the miner produced
+    /// (`Blake2bSection::from_header`, `share_extranonce`); the pool rebuilds the header from
+    /// them here. The two must be inverses.
+    #[test]
+    fn build_header_v2_inverts_from_header_and_share_extranonce() {
+        let mut extranonce = [0u8; 16];
+        extranonce[4..].copy_from_slice(&[7u8; 12]);
+        let h = HeaderV2 {
+            version: 0x2000_0000,
+            prev_block: [0xaa; 32],
+            merkle_root: [0xbb; 32],
+            time: 1_700_000_100,
+            bits: 0x207f_ffff,
+            nonce: 1,
+            nonce2: 2,
+            nonce3: 3,
+            extranonce,
+            time_offset: 4,
+            txcount: 1,
+            flags: header::FLAG_USE_TIME_OFFSET,
+            height: 21,
+            ..Default::default()
+        };
+        let job = JobSection {
+            prev_hash: h.prev_block,
+            target_byte_index: 0,
+            nbits: h.bits.to_le_bytes(),
+            coinbaser_id: 0,
+            height: 21,
+            coinbase_value: 0,
+            txn_count: 0,
+            txn_total_weight: 0,
+            txn_total_size: 0,
+            txn_total_sigops: 0,
+            merkle_branches: vec![],
+        };
+        let b = share::Blake2bSection::from_header(&h);
+        let s = PowSubmit {
+            job_id: 0,
+            coinbase_id: 0,
+            is_block: false,
+            subsidy_only: true,
+            quickdiff: false,
+            target_byte: 10,
+            ntime: b.time_on_wire,
+            nonce: h.nonce,
+            version: header::V2_FLAG | h.version as u32,
+            extranonce: share::share_extranonce(&h.extranonce).unwrap(),
+            username: String::new(),
+            use_time_offset: h.flags & header::FLAG_USE_TIME_OFFSET != 0,
+            job: None,
+            coinbase: None,
+            blake2b: b,
+        };
+        assert_eq!(build_header_v2(&job, &s, &b, &h.merkle_root).unwrap(), h);
+    }
+
     const NOW: u64 = 1_760_000_000;
     const NBITS: [u8; 4] = [0xff, 0xff, 0x7f, 0x20];
     const COINBASE_VALUE: u64 = 312_500_000;
 
-    const DIFF1_NONCE: u32 = 0x9737_ad5a;
-    const DIFF1_EXTRANONCE: [u8; share::EXTRANONCE_SIZE] = [7u8; share::EXTRANONCE_SIZE];
+    const EXTRANONCE: [u8; share::EXTRANONCE_SIZE] = [0x33; share::EXTRANONCE_SIZE];
     const HARD_NBITS: [u8; 4] = [0xff, 0xff, 0x00, 0x1c];
-    const DIFF1_NONCE_HARD: u32 = 0xfdf5_fc9a;
-    const DIFF1_NTIME_OFFSET_HARD: u32 = 1;
-    const DIFF1_NONCE_V2: u32 = 0x099c_1d0f;
-    const DIFF1_NTIME_OFFSET_V2: u32 = 0;
+    /// Nonces meeting difficulty 1 for the header `setup` and `setup_hard` build, found by
+    /// `find_a_difficulty_1_nonce` (ignored: it searches the nonce space). The job's bits are
+    /// hashed, so the two jobs need different nonces.
+    const DIFF1_NONCE: u32 = 0x099c_1d0f;
+    const DIFF1_NTIME_OFFSET: u32 = 0;
+    const DIFF1_NONCE_HARD: u32 = 0x5823_2ac6;
+    const DIFF1_NTIME_OFFSET_HARD: u32 = 0;
 
     fn policy() -> PoolPolicy {
         PoolPolicy {
@@ -647,20 +679,53 @@ mod tests {
         }
     }
 
+    /// The section a profile-0 share carries for `nonce` at `time_on_wire`: `m_nonce2`,
+    /// `m_nonce3` and the time offset zero.
+    fn section(time_on_wire: u32, nonce: u32) -> share::Blake2bSection {
+        let mut sia_nonce = [0u8; 8];
+        sia_nonce[..4].copy_from_slice(&nonce.to_le_bytes());
+        share::Blake2bSection { sia_ntime: [0u8; 8], sia_nonce, time_on_wire }
+    }
+
+    /// A share on `job` and `cb` whose header meets difficulty 1 when the job's bits are
+    /// `NBITS` and the section is the one `setup` gives it.
+    fn share_on(job: JobSection, cb: CoinbaseSection) -> PowSubmit {
+        let time_on_wire = NOW as u32 + DIFF1_NTIME_OFFSET;
+        PowSubmit {
+            job_id: 0,
+            coinbase_id: 0,
+            is_block: false,
+            subsidy_only: false,
+            quickdiff: false,
+            target_byte: 0,
+            ntime: time_on_wire,
+            nonce: DIFF1_NONCE,
+            version: header::V2_FLAG | 0x2000_0000,
+            extranonce: EXTRANONCE.to_vec(),
+            username: "bc1qexample.worker1".to_string(),
+            use_time_offset: false,
+            job: Some(job),
+            coinbase: Some(cb),
+            blake2b: section(time_on_wire, DIFF1_NONCE),
+        }
+    }
+
     fn setup() -> (Verifier, PowSubmit) {
         with_outputs(&split().outputs)
     }
 
+    /// `setup` with the job's bits at a target no share here meets, and the node's next block
+    /// at the same target, so a share meeting difficulty 1 is a share and not a block: whether
+    /// a share is a block is determined by the node's template, not the job's bits.
     fn setup_hard() -> (Verifier, PowSubmit) {
         let (mut v, mut s) = with_outputs(&split().outputs);
         let mut job = s.job.clone().unwrap();
         job.nbits = HARD_NBITS;
         s.job = Some(job);
+        let time_on_wire = NOW as u32 + DIFF1_NTIME_OFFSET_HARD;
         s.nonce = DIFF1_NONCE_HARD;
-        s.ntime = NOW as u32 + DIFF1_NTIME_OFFSET_HARD;
-        // The node's next block is at the hard target, which this share does not meet, so it
-        // is not a block: whether a share is a block is determined by the node's template, not
-        // the job's bits.
+        s.ntime = time_on_wire;
+        s.blake2b = section(time_on_wire, DIFF1_NONCE_HARD);
         v.set_next_target(Some(u32::from_le_bytes(HARD_NBITS)));
         (v, s)
     }
@@ -673,24 +738,12 @@ mod tests {
         // The normal case: the node's next-block target equals the job's bits, so a share
         // meeting that target is a block. Tests that exercise the on-tip check override this.
         v.set_next_target(Some(u32::from_le_bytes(NBITS)));
-        let submit = PowSubmit {
-            job_id: 0,
-            coinbase_id: 0,
-            is_block: false,
-            subsidy_only: false,
-            quickdiff: false,
-            target_byte: 0,
-            ntime: NOW as u32,
-            nonce: DIFF1_NONCE,
-            version: 0x2000_0000,
-            extranonce: DIFF1_EXTRANONCE.to_vec(),
-            username: "bc1qexample.worker1".to_string(),
-            use_time_offset: false,
-            job: Some(job_section(pot_index)),
-            coinbase: Some(cb),
-            blake2b: None,
-        };
-        (v, submit)
+        (v, share_on(job_section(pot_index), cb))
+    }
+
+    /// The header the pool built for a share, deserialized from the header it would relay.
+    fn built_header(w: &Rebuilt) -> HeaderV2 {
+        HeaderV2::deserialize(&w.header).expect("a version 2 header")
     }
 
     #[test]
@@ -701,20 +754,29 @@ mod tests {
         assert_eq!(w.height, 840_000);
         assert_eq!(w.paid_to_split, 150_000_000);
         assert_eq!(w.paid_to_pool, COINBASE_VALUE - 150_000_000);
-        assert_eq!(&w.header[36..68], &bitcoin::sha256d(&w.coinbase_tx));
-        assert_eq!(&w.header[0..4], &s.version.to_le_bytes());
-        assert_eq!(&w.header[4..36], &[0x5a; 32]);
-        assert_eq!(&w.header[68..72], &s.ntime.to_le_bytes());
-        assert_eq!(&w.header[72..76], &NBITS);
-        assert_eq!(&w.header[76..80], &s.nonce.to_le_bytes());
-        assert_eq!(w.block_hash, bitcoin::reversed(&bitcoin::sha256d(&w.header)));
+        assert_eq!(w.header.len(), ratum::header::HEADER_V2_SIZE);
+        let h = built_header(&w);
+        assert_eq!(h.merkle_root, bitcoin::sha256d(&w.coinbase_tx), "no branches in this job");
+        assert_eq!(h.version, 0x2000_0000);
+        assert_eq!(h.prev_block, [0x5a; 32]);
+        assert_eq!(h.time, s.blake2b.time_on_wire);
+        assert_eq!(h.bits, u32::from_le_bytes(NBITS));
+        assert_eq!(h.nonce, s.nonce);
+        assert_eq!(w.block_hash, h.hash_components().result);
         assert_eq!(
             w.coinbase_tx[s.job.as_ref().unwrap().target_byte_index as usize],
             s.target_byte
         );
+        // The header carries the extranonce; the coinbase holds zeros in its place.
         let n = s.coinbase.as_ref().unwrap().coinb1.len();
-        assert_eq!(&w.coinbase_tx[n..n + share::EXTRANONCE_SIZE], &DIFF1_EXTRANONCE);
-        assert!(!w.is_v2);
+        assert_eq!(&w.coinbase_tx[n..n + share::EXTRANONCE_SIZE], &[0u8; 12]);
+        assert_eq!(h.extranonce, share::header_extranonce(&EXTRANONCE).unwrap());
+        // The Stratum leaf: coinb1 (three zero bytes and h2) with the extranonce after it,
+        // under the 0x00 prefix the Siacoin hasher adds.
+        let mut leaf = vec![0u8, 0, 0, 0];
+        leaf.extend_from_slice(&h.precompute().h2);
+        leaf.extend_from_slice(&h.extranonce);
+        assert_eq!(ratum::header::blake2b_256(&leaf), h.precompute().hash1);
     }
 
     #[test]
@@ -728,8 +790,9 @@ mod tests {
         again.job = None;
         again.coinbase = None;
         assert_eq!(v.verify(&again, NOW), Err(RejectReason::DuplicateWork));
-        again.nonce ^= 1;
-        assert_eq!(v.verify(&again, NOW), Err(RejectReason::HighHash));
+        let mut rolled = again.clone();
+        rolled.blake2b.sia_nonce[4] = 1; // m_nonce2, the second half of the Sia nonce
+        assert_eq!(v.verify(&rolled, NOW), Err(RejectReason::HighHash));
     }
 
     #[test]
@@ -759,91 +822,12 @@ mod tests {
         assert!(!a.is_block, "the job's easy bits must not make an ordinary share a block");
     }
 
-    fn setup_v2() -> (Verifier, PowSubmit) {
-        let p = policy();
-        let sp = split();
-        let (cb, pot_index) = coinbase_sections(&p, &sp.outputs);
-        let mut v = Verifier::new(p);
-        v.record_split(&sp);
-        v.set_next_target(Some(u32::from_le_bytes(NBITS)));
-
-        let job = job_section(pot_index);
-        let time_on_wire = NOW as u32 + DIFF1_NTIME_OFFSET_V2;
-        let mut sia_nonce = [0u8; 8];
-        sia_nonce[..4].copy_from_slice(&DIFF1_NONCE_V2.to_le_bytes());
-        let b = share::Blake2bSection { sia_ntime: [0u8; 8], sia_nonce, time_on_wire };
-        let submit = PowSubmit {
-            job_id: 0,
-            coinbase_id: 0,
-            is_block: false,
-            subsidy_only: false,
-            quickdiff: false,
-            target_byte: 0,
-            ntime: time_on_wire,
-            nonce: DIFF1_NONCE_V2,
-            version: header::V2_FLAG | 0x2000_0000,
-            extranonce: vec![0x33; share::EXTRANONCE_SIZE],
-            username: "bc1qexample.worker1".to_string(),
-            use_time_offset: false,
-            job: Some(job),
-            coinbase: Some(cb),
-            blake2b: Some(b),
-        };
-        (v, submit)
-    }
-
-    /// The header the pool built for a share, deserialized from the header it would relay.
-    fn built_header(w: &Rebuilt) -> HeaderV2 {
-        HeaderV2::deserialize(&w.header).expect("a version 2 header")
-    }
-
-    #[test]
-    fn rebuilds_a_version_2_share() {
-        let (mut v, s) = setup_v2();
-        let w = v.rebuild(&s, NOW).unwrap();
-        assert!(w.is_v2);
-        assert_eq!(w.header.len(), ratum::header::HEADER_V2_SIZE);
-        assert_eq!(w.paid_to_split, 150_000_000);
-        assert_eq!(w.paid_to_pool, COINBASE_VALUE - 150_000_000);
-        let h = built_header(&w);
-        assert_eq!(w.block_hash, h.hash_components().result);
-        assert_ne!(w.block_hash, bitcoin::reversed(&bitcoin::sha256d(&w.header)));
-        let n = s.coinbase.as_ref().unwrap().coinb1.len();
-        assert_eq!(&w.coinbase_tx[n..n + share::EXTRANONCE_SIZE], &[0u8; 12]);
-        let mut coinb1 = vec![0u8, 0, 0];
-        coinb1.extend_from_slice(&h.precompute().h2);
-        assert_eq!(coinb1.len(), 35);
-        let mut leaf = vec![0u8];
-        leaf.extend_from_slice(&coinb1);
-        leaf.extend_from_slice(&h.extranonce);
-        assert_eq!(ratum::header::blake2b_256(&leaf), h.precompute().hash1);
-    }
-
-    #[test]
-    fn accepts_a_version_2_share_that_meets_the_share_target() {
-        let (mut v, s) = setup_v2();
-        let a = v.verify(&s, NOW).unwrap();
-        assert!(a.work.is_v2);
-        assert_eq!(a.work.difficulty, 1);
-        assert!(target::meets_target(&a.work.block_hash, &target::DIFF1_TARGET));
-        assert!(a.is_block);
-        let mut again = s.clone();
-        again.job = None;
-        again.coinbase = None;
-        assert_eq!(v.verify(&again, NOW), Err(RejectReason::DuplicateWork));
-        let mut rolled = again.clone();
-        let mut b = rolled.blake2b.unwrap();
-        b.sia_nonce[4] = 1; // m_nonce2, the second half of the Sia nonce
-        rolled.blake2b = Some(b);
-        assert_eq!(v.verify(&rolled, NOW), Err(RejectReason::HighHash));
-    }
-
     /// The pool fills every header field the miner does not control from the job section the
     /// gateway sent: the merkle root, prev_block, height, bits, version and txcount. The share
     /// supplies only the nonce fields and the time-offset selector.
     #[test]
-    fn a_version_2_header_is_the_gateways_job_plus_the_miners_nonces() {
-        let (mut v, s) = setup_v2();
+    fn the_header_is_the_gateways_job_plus_the_miners_nonces() {
+        let (mut v, s) = setup();
         let job = s.job.clone().unwrap();
         let w = v.rebuild(&s, NOW).unwrap();
         let h = built_header(&w);
@@ -859,7 +843,7 @@ mod tests {
         assert_eq!(h.xor_key_mask_clear_bits, 0);
 
         // The Sia fields split into four header fields, in this order.
-        let b = s.blake2b.unwrap();
+        let b = s.blake2b;
         assert_eq!((h.nonce, h.nonce2), b.nonce_fields());
         assert_eq!((h.time_offset, h.nonce3), b.time_fields());
         assert_eq!(
@@ -873,8 +857,8 @@ mod tests {
     /// Profile 0 is the only layout the DATUM share format can carry, so it is the only one the
     /// pool can build. Nothing in a share can select another.
     #[test]
-    fn a_version_2_header_is_always_the_sia_profile() {
-        let (mut v, s) = setup_v2();
+    fn the_header_is_always_the_sia_profile() {
+        let (mut v, s) = setup();
         let h = built_header(&v.rebuild(&s, NOW).unwrap());
         assert_eq!(h.asic_profile(), 0);
         assert_eq!(h.flags, 0);
@@ -885,11 +869,10 @@ mod tests {
     /// only nonce.
     #[test]
     fn the_time_offset_flag_decides_whether_the_offset_moves_the_block_time() {
-        let (mut v, base) = setup_v2();
+        let (mut v, base) = setup();
         let mut s = base.clone();
-        let mut b = s.blake2b.unwrap();
-        b.sia_ntime[..4].copy_from_slice(&600u32.to_le_bytes());
-        s.blake2b = Some(b);
+        s.blake2b.sia_ntime[..4].copy_from_slice(&600u32.to_le_bytes());
+        let b = s.blake2b;
         let h = built_header(&v.rebuild(&s, NOW).unwrap());
         assert_eq!(h.time_offset, 600);
         assert_eq!(h.time, b.time_on_wire, "flag clear: the offset is nonce space");
@@ -904,8 +887,8 @@ mod tests {
     /// count the node rejects the block (`block.m_txcount != block.vtx.size()`).
     /// The pool fills it in from the job, so there is no count to disagree with.
     #[test]
-    fn a_version_2_header_counts_the_coinbase_among_its_transactions() {
-        let (mut v, mut s) = setup_v2();
+    fn the_header_counts_the_coinbase_among_its_transactions() {
+        let (mut v, mut s) = setup();
         let job = s.job.clone().unwrap();
         assert_eq!(job.txn_count, 0);
         assert_eq!(built_header(&v.rebuild(&s, NOW).unwrap()).txcount, 1, "the coinbase alone");
@@ -919,7 +902,7 @@ mod tests {
     /// Subsidy-only work carries the coinbase and nothing else, however many transactions
     /// the job declares after it, so its header counts one rather than one more than the job.
     #[test]
-    fn a_subsidy_only_version_2_header_counts_only_the_coinbase() {
+    fn a_subsidy_only_header_counts_only_the_coinbase() {
         let p = policy();
         // No dictated split: subsidy-only work may pay nobody but the pool.
         let (mut cb, pot_index) = coinbase_sections(&p, &[]);
@@ -945,11 +928,7 @@ mod tests {
             use_time_offset: false,
             job: Some(job),
             coinbase: Some(cb),
-            blake2b: Some(share::Blake2bSection {
-                sia_ntime: [0u8; 8],
-                sia_nonce: [0u8; 8],
-                time_on_wire: NOW as u32,
-            }),
+            blake2b: section(NOW as u32, 0),
         };
         let w = v.rebuild(&s, NOW).expect("the job's seven transactions are not carried");
         let h = built_header(&w);
@@ -959,12 +938,12 @@ mod tests {
     }
 
     #[test]
-    fn a_version_2_quickdiff_share_is_rebuilt_from_its_target_byte() {
-        // The gateway makes version 2 quickdiff work unique through the PoT byte,
-        // which reaches here as target_byte and is written into the coinbase whether
-        // or not the flag is set. Only version 1 needs the coinb1 overwrite, so the
-        // rebuild must be identical either way.
-        let (mut v, s) = setup_v2();
+    fn a_quickdiff_share_is_rebuilt_from_its_target_byte() {
+        // The gateway makes quickdiff work unique through the PoT byte, which reaches here
+        // as target_byte and is written into the coinbase whether or not the flag is set
+        // (the upstream SHA256d format overwrote coinb1 instead), so the rebuild is
+        // identical either way.
+        let (mut v, s) = setup();
         let plain = v.rebuild(&s, NOW).unwrap();
         let mut quick = s.clone();
         quick.quickdiff = true;
@@ -974,13 +953,11 @@ mod tests {
     }
 
     #[test]
-    fn version_2_shares_round_trip_through_encode_and_decode() {
-        let (_, s) = setup_v2();
+    fn shares_round_trip_through_encode_and_decode() {
+        let (_, s) = setup();
         let bytes = s.encode();
         assert_eq!(bytes[17], share::EXTRANONCE_SIZE as u8);
-        let decoded = PowSubmit::decode(&bytes).unwrap();
-        assert_eq!(decoded, s);
-        assert!(decoded.is_v2());
+        assert_eq!(PowSubmit::decode(&bytes).unwrap(), s);
     }
 
     #[test]
@@ -992,8 +969,9 @@ mod tests {
         let w = v.rebuild(&s, NOW).unwrap();
         let expected =
             bitcoin::merkle_root(&bitcoin::sha256d(&w.coinbase_tx), &job.merkle_branches);
-        assert_eq!(&w.header[36..68], &expected);
-        assert_ne!(&w.header[36..68], &bitcoin::sha256d(&w.coinbase_tx));
+        let root = built_header(&w).merkle_root;
+        assert_eq!(root, expected);
+        assert_ne!(root, bitcoin::sha256d(&w.coinbase_tx));
     }
 
     #[test]
@@ -1031,7 +1009,7 @@ mod tests {
     /// claiming twenty bits more would be credited 1048576.
     #[test]
     fn a_share_cannot_claim_more_difficulty_than_it_was_mined_at() {
-        let (mut v, as_mined) = setup_v2();
+        let (mut v, as_mined) = setup();
         let accepted = v.verify(&as_mined, NOW).expect("solved at difficulty 1");
         assert_eq!(accepted.work.difficulty, 1);
 
@@ -1053,7 +1031,7 @@ mod tests {
     /// already there. It is refused rather than credited as 2^63.
     #[test]
     fn a_target_byte_that_is_not_a_difficulty_exponent_is_refused() {
-        let (mut v, base) = setup_v2();
+        let (mut v, base) = setup();
         for byte in [0xffu8, 0x80, 64] {
             let mut s = base.clone();
             s.target_byte = byte;
@@ -1265,12 +1243,17 @@ mod tests {
     #[test]
     fn rejects_an_ntime_outside_the_window() {
         let (mut v, s) = setup();
+        // The block time is the section's `time_on_wire`; the fixed `ntime` field is not
+        // what the header commits to, and is left as it is.
         let mut old = s.clone();
-        old.ntime = (NOW - DEFAULT_NTIME_WINDOW_SECS - 1) as u32;
+        old.blake2b.time_on_wire = (NOW - DEFAULT_NTIME_WINDOW_SECS - 1) as u32;
         assert_eq!(v.rebuild(&old, NOW), Err(RejectReason::BadNtime));
         let mut ahead = s.clone();
-        ahead.ntime = (NOW + DEFAULT_NTIME_WINDOW_SECS + 1) as u32;
+        ahead.blake2b.time_on_wire = (NOW + DEFAULT_NTIME_WINDOW_SECS + 1) as u32;
         assert_eq!(v.rebuild(&ahead, NOW), Err(RejectReason::BadNtime));
+        let mut stale_field = s.clone();
+        stale_field.ntime = (NOW - DEFAULT_NTIME_WINDOW_SECS - 1) as u32;
+        assert!(v.rebuild(&stale_field, NOW).is_ok(), "the fixed field is not the block time");
         let mut p = policy();
         p.ntime_window_secs = 0;
         let mut v = Verifier::new(p);
@@ -1292,14 +1275,13 @@ mod tests {
 
     #[test]
     fn a_time_offset_that_moves_the_block_time_out_of_the_window_is_refused() {
-        let (mut v, base) = setup_v2();
+        let (mut v, base) = setup();
         // The serialized time is current, but a large offset with the selector set puts the
         // block time the node commits to (serialized + offset) past the
         // window.
         let mut s = base.clone();
-        let mut b = s.blake2b.unwrap();
-        b.sia_ntime[..4].copy_from_slice(&(DEFAULT_NTIME_WINDOW_SECS as u32 + 10).to_le_bytes());
-        s.blake2b = Some(b);
+        s.blake2b.sia_ntime[..4]
+            .copy_from_slice(&(DEFAULT_NTIME_WINDOW_SECS as u32 + 10).to_le_bytes());
         s.use_time_offset = true;
         assert_eq!(v.rebuild(&s, NOW), Err(RejectReason::BadNtime));
 
@@ -1453,20 +1435,6 @@ mod tests {
     }
 
     #[test]
-    fn quickdiff_changes_the_bytes_before_the_extranonce() {
-        let (mut v, s) = setup();
-        let plain = v.rebuild(&s, NOW).unwrap();
-        let mut quick = s.clone();
-        quick.quickdiff = true;
-        let with_quickdiff = v.rebuild(&quick, NOW).unwrap();
-        let n = s.coinbase.as_ref().unwrap().coinb1.len();
-        assert_eq!(&with_quickdiff.coinbase_tx[n - 2..n], &0x5144u16.to_le_bytes());
-        assert_ne!(with_quickdiff.coinbase_tx, plain.coinbase_tx);
-        assert_eq!(&with_quickdiff.coinbase_tx[..n - 2], &plain.coinbase_tx[..n - 2]);
-        assert_eq!(&with_quickdiff.coinbase_tx[n..], &plain.coinbase_tx[n..]);
-    }
-
-    #[test]
     fn a_replayed_share_is_refused_however_the_sections_are_resent() {
         let (mut v, s) = setup();
         assert!(v.verify(&s, NOW).is_ok());
@@ -1567,7 +1535,7 @@ mod tests {
         let w = v.rebuild(&share, NOW).unwrap();
         assert_eq!(w.paid_to_split, 0);
         assert_eq!(w.paid_to_pool, COINBASE_VALUE);
-        assert_eq!(&w.header[36..68], &bitcoin::sha256d(&w.coinbase_tx));
+        assert_eq!(built_header(&w).merkle_root, bitcoin::sha256d(&w.coinbase_tx));
     }
 
     #[test]
@@ -1610,64 +1578,38 @@ mod tests {
         assert_eq!(paid, (0, COINBASE_VALUE));
     }
 
+    /// Regenerates `DIFF1_NONCE` and `DIFF1_NONCE_HARD` with their ntime offsets: search
+    /// against the header the pool would build, at the section's `time_on_wire` stepped from
+    /// `NOW`.
     #[test]
     #[ignore = "searches ~2^32 hashes; run with --release -- --ignored to regenerate the nonces"]
     fn find_a_difficulty_1_nonce() {
-        for (name, (mut v, s)) in [("DIFF1_NONCE", setup()), ("DIFF1_NONCE_HARD", setup_hard())] {
-            let mut header: [u8; bitcoin::HEADER_SIZE] =
-                v.rebuild(&s, NOW).unwrap().header.try_into().unwrap();
-            let base = u32::from_le_bytes(header[68..72].try_into().unwrap());
+        for (name, (mut v, mut s)) in [("DIFF1_NONCE", setup()), ("DIFF1_NONCE_HARD", setup_hard())]
+        {
+            let mut found = false;
             for offset in 0..16u32 {
-                header[68..72].copy_from_slice(&(base + offset).to_le_bytes());
-                let ntime_offset = base + offset - NOW as u32;
-                if let Some(nonce) = find_nonce(header) {
-                    println!("{name} = {nonce:#010x}, ntime offset {ntime_offset}");
-                    break;
-                }
-                println!("{name}: no solution at ntime offset {ntime_offset}");
-            }
-        }
-        find_a_difficulty_1_nonce_v2();
-    }
-
-    fn find_a_difficulty_1_nonce_v2() {
-        let (mut v, mut s) = setup_v2();
-        for offset in 0..16u32 {
-            // Search against the header the pool would build: change the section's
-            // `time_on_wire` and rebuild, rather than rewriting the serialized header's time
-            // bytes as the version 1 search does.
-            let mut b = s.blake2b.unwrap();
-            b.time_on_wire = NOW as u32 + offset;
-            s.blake2b = Some(b);
-            s.ntime = b.time_on_wire;
-            let w = v.rebuild(&s, NOW + u64::from(offset)).expect("rebuild");
-            let h = built_header(&w);
-            let pre = h.precompute();
-            let input = h.asic_input_with(&pre.hash1, &pre.h2);
-            match ratum::nonce::search(
-                &input,
-                32,
-                ratum::header::blake2b_256,
-                &target::DIFF1_TARGET,
-                || false,
-            ) {
-                None => println!("DIFF1_NONCE_V2: no solution at ntime offset {offset}"),
-                Some(nonce) => {
-                    println!("DIFF1_NONCE_V2 = {nonce:#010x}, ntime offset {offset}");
-                    return;
+                s.blake2b.time_on_wire = NOW as u32 + offset;
+                s.ntime = s.blake2b.time_on_wire;
+                let w = v.rebuild(&s, NOW + u64::from(offset)).expect("rebuild");
+                let h = built_header(&w);
+                let pre = h.precompute();
+                let input = h.asic_input_with(&pre.hash1, &pre.h2);
+                match ratum::nonce::search(
+                    &input,
+                    32,
+                    ratum::header::blake2b_256,
+                    &target::DIFF1_TARGET,
+                    || false,
+                ) {
+                    None => println!("{name}: no solution at ntime offset {offset}"),
+                    Some(nonce) => {
+                        println!("{name} = {nonce:#010x}, ntime offset {offset}");
+                        found = true;
+                        break;
+                    }
                 }
             }
+            assert!(found, "no nonce met difficulty 1 for {name}");
         }
-        panic!("no version 2 nonce met difficulty 1");
-    }
-
-    fn find_nonce(header: [u8; bitcoin::HEADER_SIZE]) -> Option<u32> {
-        ratum::nonce::search(
-            &header,
-            76,
-            |h| bitcoin::reversed(&bitcoin::sha256d(h)),
-            &target::DIFF1_TARGET,
-            || false,
-        )
     }
 }

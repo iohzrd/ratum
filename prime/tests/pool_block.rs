@@ -1,8 +1,8 @@
 //! The cases that need a real proof of work: a share the pool accepts, credits, refuses
 //! to credit twice, and turns into a block it relays to its node.
 //!
-//! Finding a hash under the difficulty-1 target takes about 2^32 attempts, so these are
-//! ignored by default:
+//! Finding a BLAKE2b hash under the difficulty-1 target takes about 2^32 attempts, so these
+//! are ignored by default:
 //!
 //! ```text
 //! cargo test --release --test pool_block -- --ignored --test-threads 1
@@ -20,7 +20,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use support::work::{self, Tagging, Work};
 use support::{FakeNode, Gateway, Pool, PoolArgs, TempDir, script_for_address};
 
-const VERSION: u32 = 0x2000_0000;
+/// The bytes of a serialized version 2 header.
+const HEADER: usize = ratum::header::HEADER_V2_SIZE;
 // Difficulty 1, the smallest the test pool accepts (`PoolArgs` defaults to `--min-diff 1`).
 const TARGET_BYTE: u8 = 0;
 const USERNAME: &str = "alice.rig1";
@@ -84,7 +85,7 @@ fn solved() -> &'static (u32, u32) {
 fn find_nonce_with_retries(w: &Work, from: u32) -> (u32, u32) {
     let target = target::target_for_pot(TARGET_BYTE);
     for offset in 0..8u32 {
-        if let Some(nonce) = w.find_nonce(VERSION, from + offset, TARGET_BYTE, &target) {
+        if let Some(nonce) = w.find_nonce(from + offset, TARGET_BYTE, &target) {
             return (from + offset, nonce);
         }
     }
@@ -142,7 +143,7 @@ fn a_solved_share_is_accepted_and_written_to_the_ledger() {
     assert_eq!(fields.len(), 4, "at, difficulty, identity, hash: {:?}", ledger[0]);
     assert_eq!(fields[1], "1", "difficulty 1");
     assert_eq!(fields[2], "alice", "the worker name is not part of the identity");
-    let hash = w.hash(VERSION, share.ntime, share.nonce, TARGET_BYTE);
+    let hash = w.hash(share.ntime, share.nonce, TARGET_BYTE);
     assert_eq!(fields[3], hex::encode(hash), "the line records the work itself");
 }
 
@@ -191,10 +192,10 @@ fn a_block_with_no_other_transactions_is_relayed_at_once() {
     let block = node.wait_for_submission(Duration::from_secs(10)).expect("the block was relayed");
     let raw = hex::decode(block).expect("block hex");
 
-    let header = w.header(VERSION, ntime, nonce, TARGET_BYTE);
-    assert_eq!(&raw[..80], &header, "the block carries the header the pool verified");
-    assert_eq!(raw[80], 1, "one transaction: the coinbase");
-    assert_eq!(&raw[81..], &w.full_coinbase(TARGET_BYTE)[..]);
+    let header = w.header(ntime, nonce, TARGET_BYTE).serialize();
+    assert_eq!(&raw[..HEADER], &header, "the block carries the header the pool verified");
+    assert_eq!(raw[HEADER], 1, "one transaction: the coinbase");
+    assert_eq!(&raw[HEADER + 1..], &w.full_coinbase(TARGET_BYTE)[..]);
     pool.expect_line("BLOCK at height 840000");
 }
 
@@ -265,12 +266,12 @@ fn a_block_with_transactions_is_asked_for_and_then_relayed() {
     let block = node.wait_for_submission(Duration::from_secs(10)).expect("the block was relayed");
     let raw = hex::decode(block).expect("block hex");
     let (ntime, nonce) = *solved();
-    assert_eq!(&raw[..80], &w.header(VERSION, ntime, nonce, TARGET_BYTE));
-    assert_eq!(raw[80], 3, "coinbase and two transactions");
+    assert_eq!(&raw[..HEADER], &w.header(ntime, nonce, TARGET_BYTE).serialize());
+    assert_eq!(raw[HEADER], 3, "coinbase and two transactions");
 
     let coinbase = w.full_coinbase(TARGET_BYTE);
-    let mut at = 81 + coinbase.len();
-    assert_eq!(&raw[81..at], &coinbase[..]);
+    let mut at = HEADER + 1 + coinbase.len();
+    assert_eq!(&raw[HEADER + 1..at], &coinbase[..]);
     for tx in &txns {
         assert_eq!(&raw[at..at + tx.len()], &tx[..], "each transaction is carried verbatim");
         at += tx.len();
@@ -340,30 +341,22 @@ fn a_share_that_only_claims_to_be_a_block_is_still_only_a_share() {
     assert_eq!(pool.ledger_lines().len(), 1, "the share is still credited");
 }
 
+/// The pool builds the header from the job and the miner's nonce space, so rolling a field
+/// the miner sets, or the time-offset selector, changes the hash it arrives at.
 #[test]
-#[ignore = "searches ~2^32 BLAKE2b hashes; run with --release -- --ignored"]
-fn a_version_2_share_is_verified_with_blake2b() {
+#[ignore = "searches ~2^32 hashes; run with --release -- --ignored"]
+fn a_share_is_hashed_from_every_field_the_miner_sets() {
     let node = FakeNode::start();
-    let pool = started("v2", &node);
+    let pool = started("hashed-fields", &node);
     let mut gateway = ready(&pool);
 
     let (w, _) = work_with_transactions();
-    let extranonce = [0x11u8; 12];
-    let target = target::target_for_pot(TARGET_BYTE);
-    let (from, _) = *solved();
-
-    let (ntime, nonce) = (0..8u32)
-        .find_map(|offset| {
-            w.find_nonce_v2(from + offset, TARGET_BYTE, extranonce, &target)
-                .map(|nonce| (from + offset, nonce))
-        })
-        .expect("no version 2 nonce met difficulty 1 in eight passes");
-
-    let share = w.submit_v2(USERNAME, ntime, nonce, TARGET_BYTE, extranonce);
+    let share = solved_share(&w, false);
     let response = submit(&mut gateway, &share);
     assert_eq!(response.verdict, ShareVerdict::Accepted, "{response:?}");
 
-    let header = w.header_v2(ntime, nonce, TARGET_BYTE, extranonce);
+    let (ntime, nonce) = *solved();
+    let header = w.header(ntime, nonce, TARGET_BYTE);
     let ledger = pool.ledger_lines();
     assert_eq!(ledger.len(), 1, "{ledger:?}");
     assert!(
@@ -372,13 +365,9 @@ fn a_version_2_share_is_verified_with_blake2b() {
         ledger[0]
     );
 
-    // The pool builds the header from the job and the miner's nonce space, so rolling a
-    // field the miner sets changes the hash it arrives at.
     let mut wrong_field = share.clone();
     wrong_field.job_id = 1;
-    if let Some(b) = wrong_field.blake2b.as_mut() {
-        b.sia_nonce[4] = b.sia_nonce[4].wrapping_add(1); // m_nonce2
-    }
+    wrong_field.blake2b.sia_nonce[4] = wrong_field.blake2b.sia_nonce[4].wrapping_add(1); // m_nonce2
     assert_eq!(
         submit(&mut gateway, &wrong_field).verdict,
         ShareVerdict::Rejected(RejectReason::HighHash),

@@ -5,24 +5,29 @@
 //! share queue, the pool's validation requests, and reconnection. The timing values are the C
 //! gateway's (`datum_protocol.c`, `datum_gateway.c`).
 
+use crate::config::Config;
 use crate::job::Job;
+use crate::tally::Tally;
 use crate::template::Notify;
 use log::{debug, error, info, warn};
 use ratum::datum::client::Client;
-use ratum::datum::framing::{self, Header, HeaderKeys};
+use ratum::datum::framing::{self, Header};
 use ratum::datum::handshake::KeyPairs;
 use ratum::datum::messages::{
     ClientConfig, CoinbaserRequest, CoinbaserResponse, ShareResponse, ShareVerdict, server_subcmd,
 };
-use ratum::datum::share::{Blake2bSection, CoinbaseSection, JobSection, PowSubmit};
+use ratum::datum::share::{self, Blake2bSection, CoinbaseSection, JobSection, PowSubmit};
 use ratum::datum::validation::{self, ShortTxnList, Status, TxnBundle};
+use ratum::header::HeaderV2;
+use ratum::io::read_exact_deadline;
+use ratum::target;
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-pub const USER_AGENT_VERSION: &str = "v0.4.1-beta";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a coinbaser request waits for its response (`datum_protocol_coinbaser_fetch`).
 pub const COINBASER_WAIT: Duration = Duration::from_secs(5);
@@ -36,8 +41,6 @@ const READ_POLL: Duration = Duration::from_millis(5);
 /// Every mining message ends with this many random bytes at most (the C gateway pads each
 /// with 1 to 80 or 1 to 100), so a message's length does not identify its contents.
 const MINING_PAD_MAX: usize = 100;
-/// The pool's share username field, in bytes.
-const MAX_USERNAME_BYTES: usize = 384;
 
 /// The pool's 0x99 configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,16 +55,13 @@ impl PoolConfig {
     fn from_message(c: ClientConfig) -> Self {
         // The C gateway rounds a minimum difficulty that is not a power of two up to the
         // next one.
-        let min_difficulty = if c.min_difficulty.is_power_of_two() || c.min_difficulty == 0 {
-            c.min_difficulty
-        } else {
-            let rounded = (1u64 << (63 - c.min_difficulty.leading_zeros())) << 1;
+        let min_difficulty = target::pow2_ceil(c.min_difficulty);
+        if min_difficulty != c.min_difficulty {
             warn!(
-                "pool minimum difficulty {} is not a power of two; using {rounded}",
+                "pool minimum difficulty {} is not a power of two; using {min_difficulty}",
                 c.min_difficulty
             );
-            rounded
-        };
+        }
         PoolConfig {
             payout_script: c.payout_script,
             prime_id: c.prime_id,
@@ -74,11 +74,8 @@ impl PoolConfig {
 /// The statistics the API reports.
 #[derive(Clone, Debug, Default)]
 pub struct Stats {
-    pub accepted_count: u64,
-    pub accepted_diff: u64,
-    pub rejected_count: u64,
-    pub rejected_diff: u64,
-    pub connected_since: Option<Instant>,
+    pub accepted: Tally,
+    pub rejected: Tally,
     pub motd: String,
 }
 
@@ -91,8 +88,8 @@ pub struct QueuedShare {
     pub subsidy_only: bool,
     pub quickdiff: bool,
     pub target_byte: u8,
-    /// The 164-byte header the miner produced.
-    pub header: [u8; 164],
+    /// The header the miner produced.
+    pub header: HeaderV2,
     pub username: String,
 }
 
@@ -100,22 +97,22 @@ pub struct QueuedShare {
 pub struct CoinbaserRequestState {
     pub value: u64,
     pub prev_hash: [u8; 32],
-    /// The template's `reduced_data` rule: outputs over the RDTS script limit are left out.
-    pub reduced_data: bool,
     pub response: Mutex<Option<CoinbaserResponse>>,
     pub done: Condvar,
     /// Set when a newer request replaced this one; the waiter returns at once.
-    pub superseded: std::sync::atomic::AtomicBool,
+    pub superseded: AtomicBool,
 }
 
 /// What other threads share with the DATUM thread.
 pub struct Shared {
     /// The configuration from the pool; `None` until it arrives and again after a disconnect.
-    pub config: Mutex<Option<PoolConfig>>,
+    /// The thread is active (holds a connection past the configuration) exactly while this
+    /// is `Some`.
+    config: Mutex<Option<PoolConfig>>,
     /// The last minimum difficulty the pool sent, kept across a disconnect as the C gateway
     /// keeps `override_vardiff_min`, so vardiff does not fall under the pool's floor while
     /// reconnecting. Zero until a configuration has arrived.
-    min_difficulty: Mutex<u64>,
+    min_difficulty: AtomicU64,
     pub stats: Mutex<Stats>,
     queue: Mutex<VecDeque<QueuedShare>>,
     /// The most shares the queue holds; more are refused with an error, as the C gateway's
@@ -127,36 +124,69 @@ pub struct Shared {
     /// The template thread's notifications: raised on the pool's blocknotify, a rebuild is
     /// requested when the pool's configuration arrives or the connection ends.
     pub notify: Arc<Notify>,
-    /// Whether the thread holds a connection past the configuration.
-    pub active: Mutex<bool>,
+    /// Consecutive sessions that did not reach the configuration, which
+    /// `pooled_mining_only` reads; a session that did resets it to one.
+    pub failures: AtomicU32,
 }
 
 impl Shared {
     pub fn new(slots: usize, queue_capacity: usize, notify: Arc<Notify>) -> Self {
         Shared {
             config: Mutex::new(None),
-            min_difficulty: Mutex::new(0),
+            min_difficulty: AtomicU64::new(0),
             stats: Mutex::new(Stats::default()),
             queue: Mutex::new(VecDeque::new()),
             queue_capacity: queue_capacity.max(64),
             coinbaser: Mutex::new(None),
             slots: Mutex::new(vec![None; slots]),
             notify,
-            active: Mutex::new(false),
+            failures: AtomicU32::new(0),
         }
     }
 
+    /// Whether the thread holds a connection past the configuration.
     pub fn is_active(&self) -> bool {
-        *ratum::lock(&self.active)
+        ratum::lock(&self.config).is_some()
     }
 
     pub fn pool_config(&self) -> Option<PoolConfig> {
         ratum::lock(&self.config).clone()
     }
 
+    /// The connected pool's payout script.
+    pub fn payout_script(&self) -> Option<Vec<u8>> {
+        ratum::lock(&self.config).as_ref().map(|c| c.payout_script.clone())
+    }
+
     /// The pool's minimum difficulty, or 0 before one has been received.
     pub fn min_difficulty(&self) -> u64 {
-        *ratum::lock(&self.min_difficulty)
+        self.min_difficulty.load(Ordering::Relaxed)
+    }
+
+    /// The pool's configuration arrived: the previous one, if any.
+    fn set_config(&self, config: PoolConfig) -> Option<PoolConfig> {
+        self.min_difficulty.store(config.min_difficulty, Ordering::Relaxed);
+        ratum::lock(&self.config).replace(config)
+    }
+
+    /// The connection ended: the configuration, the coinbaser request awaiting a response
+    /// and the queued shares are discarded. Whether the thread was active.
+    fn disconnected(&self) -> bool {
+        let was_active = ratum::lock(&self.config).take().is_some();
+        if let Some(state) = ratum::lock(&self.coinbaser).take() {
+            state.done.notify_all();
+        }
+        ratum::lock(&self.queue).clear();
+        was_active
+    }
+
+    /// The job in a DATUM slot, for the pool's validation requests.
+    fn slot(&self, index: u8) -> Result<Arc<Job>, (u8, Status)> {
+        let slots = ratum::lock(&self.slots);
+        if index as usize >= slots.len() {
+            return Err((validation::JOB_INDEX_INVALID, Status::BadJobIndex));
+        }
+        slots[index as usize].clone().ok_or((index, Status::JobEmpty))
     }
 
     pub fn submit(&self, share: QueuedShare) {
@@ -174,34 +204,27 @@ impl Shared {
 
     /// Ask the pool for the payout split of a job and wait up to `COINBASER_WAIT` for it.
     /// `None` when the pool is not connected, did not respond, or responded for another value.
-    /// `reduced_data` leaves outputs over the RDTS script limit out of the response. A newer
-    /// request replaces this one as the request awaiting a response.
-    pub fn fetch_coinbaser(
-        &self,
-        value: u64,
-        prev_hash: [u8; 32],
-        reduced_data: bool,
-    ) -> Option<CoinbaserResponse> {
+    /// A newer request replaces this one as the request awaiting a response.
+    pub fn fetch_coinbaser(&self, value: u64, prev_hash: [u8; 32]) -> Option<CoinbaserResponse> {
         if !self.is_active() || value < COINBASER_MIN_VALUE {
             return None;
         }
         let state = Arc::new(CoinbaserRequestState {
             value,
             prev_hash,
-            reduced_data,
             response: Mutex::new(None),
             done: Condvar::new(),
-            superseded: std::sync::atomic::AtomicBool::new(false),
+            superseded: AtomicBool::new(false),
         });
         if let Some(old) = ratum::lock(&self.coinbaser).replace(Arc::clone(&state)) {
-            old.superseded.store(true, std::sync::atomic::Ordering::SeqCst);
+            old.superseded.store(true, Ordering::SeqCst);
             old.done.notify_all();
         }
         let guard = ratum::lock(&state.response);
         let (guard, _) = state
             .done
             .wait_timeout_while(guard, COINBASER_WAIT, |r| {
-                r.is_none() && !state.superseded.load(std::sync::atomic::Ordering::SeqCst)
+                r.is_none() && !state.superseded.load(Ordering::SeqCst)
             })
             .unwrap_or_else(|p| p.into_inner());
         let response = guard.clone();
@@ -218,7 +241,7 @@ impl Shared {
                 warn!("coinbaser responded for {} sats, not the {value} requested", r.value);
                 None
             }
-            None if state.superseded.load(std::sync::atomic::Ordering::SeqCst) => {
+            None if state.superseded.load(Ordering::SeqCst) => {
                 debug!("coinbaser request superseded by a newer template's");
                 None
             }
@@ -248,10 +271,32 @@ pub struct Settings {
     pub pool_address: String,
 }
 
+impl Settings {
+    /// The settings `datum.*` and `mining.pool_address` give; `datum.pool_pubkey` has been
+    /// checked by `Config::parse`.
+    pub fn from_config(config: &Config) -> Self {
+        let (pool_sign_pk, pool_box_pk) =
+            parse_pool_pubkey(&config.datum.pool_pubkey).expect("validated");
+        Settings {
+            host: config.datum.pool_host.clone(),
+            port: config.datum.pool_port,
+            pool_sign_pk,
+            pool_box_pk,
+            global_timeout: Duration::from_secs(config.datum.protocol_global_timeout),
+            share_ack_timeout: SHARE_ACK_TIMEOUT,
+            share_ack_grace: SHARE_ACK_GRACE,
+            user_agent: user_agent(),
+            pass_full_users: config.datum.pool_pass_full_users,
+            pass_workers: config.datum.pool_pass_workers,
+            pool_address: config.mining.pool_address.clone(),
+        }
+    }
+}
+
 /// The username a share is sent under (`datum_protocol.c`): the gateway's own address when
 /// neither pass flag is set or the miner sent none; the miner's own username when full
 /// usernames pass and it does not begin with `.`; otherwise the gateway's address with the
-/// miner's username appended as `.worker`. At most `MAX_USERNAME_BYTES` bytes.
+/// miner's username appended as `.worker`. At most `share::MAX_USERNAME` bytes.
 pub fn wire_username(settings: &Settings, username: &str) -> String {
     let full = if (!settings.pass_full_users && !settings.pass_workers) || username.is_empty() {
         settings.pool_address.clone()
@@ -261,7 +306,7 @@ pub fn wire_username(settings: &Settings, username: &str) -> String {
         let dot = if username.starts_with('.') { "" } else { "." };
         format!("{}{dot}{username}", settings.pool_address)
     };
-    let mut end = full.len().min(MAX_USERNAME_BYTES);
+    let mut end = full.len().min(share::MAX_USERNAME);
     while !full.is_char_boundary(end) {
         end -= 1;
     }
@@ -277,9 +322,9 @@ pub fn parse_pool_pubkey(s: &str) -> Result<([u8; 32], [u8; 32]), String> {
     Ok((bytes[..32].try_into().unwrap(), bytes[32..].try_into().unwrap()))
 }
 
-/// The user agent the hello carries: the protocol version, then the build.
+/// The user agent the hello carries: this crate's name and version, then the git commit.
 pub fn user_agent() -> String {
-    format!("{USER_AGENT_VERSION}/{}", crate::GIT_COMMIT)
+    format!("ratum-gateway/{}/{}", env!("CARGO_PKG_VERSION"), ratum::GIT_COMMIT)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -313,6 +358,8 @@ struct Session<'a> {
     sent_job: Vec<Option<SentSections>>,
     /// The coinbaser request this session has sent and is awaiting; a request is sent once.
     requested: Option<Arc<CoinbaserRequestState>>,
+    /// Header bytes received so far of the frame being read.
+    pending_header: Vec<u8>,
 }
 
 /// The sections the pool holds for the job in a slot (`server_has_job`,
@@ -328,6 +375,16 @@ struct SentSections {
 impl SentSections {
     fn new(serial: u64) -> Self {
         SentSections { serial, job: false, coinbases: [false; 8], subsidy_only: false }
+    }
+
+    /// Whether the pool holds `coinbase_id`'s section; marks it held.
+    fn coinbase_known(&mut self, coinbase_id: u8) -> bool {
+        let slot = if coinbase_id == share::COINBASE_ID_SUBSIDY_ONLY {
+            &mut self.subsidy_only
+        } else {
+            &mut self.coinbases[coinbase_id as usize & 7]
+        };
+        std::mem::replace(slot, true)
     }
 }
 
@@ -365,33 +422,27 @@ impl<'a> Session<'a> {
         let mut stream = connect(settings)?;
         stream.set_read_timeout(Some(READ_POLL))?;
         stream.set_write_timeout(Some(Duration::from_secs(30)))?;
-        let nk = rand_u32();
-        let mut client = Client::with_key_pairs(identity.clone(), KeyPairs::generate(), nk);
+        let mut client = Client::with_key_pairs(identity.clone(), KeyPairs::generate(), rand_u32());
         let hello = client.hello(&settings.pool_box_pk, &settings.user_agent);
         stream.write_all(&hello)?;
         stream.flush()?;
 
-        // The response header is masked with the unadvanced server-to-client key;
-        // `read_handshake_response` unmasks it itself.
+        // `read_handshake_response` takes the frame as sent and unmasks the header itself;
+        // it is peeked here for the body's length only.
         let started = Instant::now();
-        let head = read_exact_deadline(&mut stream, 4, started, settings.global_timeout)?;
-        let key = HeaderKeys::from_nk(nk).server_to_client;
-        let peeked = Header::from_bytes(
-            (u32::from_le_bytes(head.clone().try_into().unwrap()) ^ key).to_le_bytes(),
-        );
-        if peeked.cmd_len as usize > framing::MAX_CMD_DATA_SIZE as usize {
+        let mut frame = read_exact_deadline(&mut stream, 4, started, settings.global_timeout)?;
+        let peeked = client.peek_handshake_header(frame[..].try_into().expect("four bytes"));
+        if peeked.cmd_len > framing::MAX_CMD_DATA_SIZE {
             return Err(
                 io::Error::new(io::ErrorKind::InvalidData, "handshake frame too large").into()
             );
         }
-        let body = read_exact_deadline(
+        frame.extend(read_exact_deadline(
             &mut stream,
             peeked.cmd_len as usize,
             started,
             settings.global_timeout,
-        )?;
-        let mut frame = head;
-        frame.extend_from_slice(&body);
+        )?);
         client.read_handshake_response(&frame, &settings.pool_sign_pk)?;
         info!("DATUM Server MOTD: {}", client.motd());
 
@@ -407,6 +458,7 @@ impl<'a> Session<'a> {
             last_share_accepted: None,
             sent_job: vec![None; slots],
             requested: None,
+            pending_header: Vec::with_capacity(4),
         })
     }
 
@@ -432,8 +484,33 @@ impl<'a> Session<'a> {
         Ok(())
     }
 
+    /// The next frame's header, accumulated across the short read timeout so the pending
+    /// sends run between polls; `None` until four bytes have arrived.
+    fn poll_header(&mut self) -> Result<Option<Header>, SessionError> {
+        let mut byte = [0u8; 4];
+        match self.stream.read(&mut byte[..4 - self.pending_header.len()]) {
+            Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into()),
+            Ok(n) => self.pending_header.extend_from_slice(&byte[..n]),
+            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e.into()),
+        }
+        if self.pending_header.len() < 4 {
+            return Ok(None);
+        }
+        let header = self.client.unmask_header(self.pending_header[..].try_into().unwrap());
+        self.pending_header.clear();
+        if header.cmd_len > framing::MAX_CMD_DATA_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "frame exceeds the protocol limit",
+            )
+            .into());
+        }
+        Ok(Some(header))
+    }
+
     fn run(&mut self) -> Result<(), SessionError> {
-        let mut pending_header: Vec<u8> = Vec::with_capacity(4);
         loop {
             if self.last_server_msg.elapsed() >= self.settings.global_timeout {
                 return Err(SessionError::GlobalTimeout(self.settings.global_timeout));
@@ -447,31 +524,7 @@ impl<'a> Session<'a> {
 
             self.send_pending()?;
 
-            // Read one frame header, accumulating across the short read timeout.
-            let mut byte = [0u8; 4];
-            match self.stream.read(&mut byte[..4 - pending_header.len()]) {
-                Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into()),
-                Ok(n) => pending_header.extend_from_slice(&byte[..n]),
-                Err(e)
-                    if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) =>
-                {
-                    continue;
-                }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e.into()),
-            }
-            if pending_header.len() < 4 {
-                continue;
-            }
-            let header = self.client.unmask_header(pending_header[..].try_into().unwrap());
-            pending_header.clear();
-            if header.cmd_len as usize > framing::MAX_CMD_DATA_SIZE as usize {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "frame exceeds the protocol limit",
-                )
-                .into());
-            }
+            let Some(header) = self.poll_header()? else { continue };
             // The global timeout covers a partly received body too, as the C main loop's
             // check does on every partial read.
             let body = read_exact_deadline(
@@ -480,16 +533,12 @@ impl<'a> Session<'a> {
                 self.last_server_msg,
                 self.settings.global_timeout,
             )?;
-            let plain = match self.client.decrypt(header, &body) {
-                Ok(p) => p,
-                Err(e) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("could not decrypt cmd {}: {e}", header.proto_cmd),
-                    )
-                    .into());
-                }
-            };
+            let plain = self.client.decrypt(header, &body).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("could not decrypt cmd {}: {e}", header.proto_cmd),
+                )
+            })?;
             self.last_server_msg = Instant::now();
             match header.proto_cmd {
                 framing::cmd::HELLO_OR_PING => {}
@@ -511,29 +560,7 @@ impl<'a> Session<'a> {
                     return Ok(());
                 }
                 match ClientConfig::decode(plain) {
-                    Some(c) => {
-                        let config = PoolConfig::from_message(c);
-                        info!(
-                            "DATUM pool configuration: prime_id {:#010x}, tag {:?}, min diff {}, payout script {}",
-                            config.prime_id,
-                            config.coinbase_tag,
-                            config.min_difficulty,
-                            hex::encode(&config.payout_script)
-                        );
-                        *ratum::lock(&self.shared.min_difficulty) = config.min_difficulty;
-                        let previous = ratum::lock(&self.shared.config).replace(config.clone());
-                        *ratum::lock(&self.shared.active) = true;
-                        if previous.is_none() {
-                            let mut st = ratum::lock(&self.shared.stats);
-                            st.connected_since = Some(Instant::now());
-                            st.motd = self.client.motd().to_string();
-                        }
-                        // The jobs being served were built without this configuration (or
-                        // with an older one): rebuild them now rather than at the next poll.
-                        if previous.as_ref() != Some(&config) {
-                            self.shared.notify.rebuild();
-                        }
-                    }
+                    Some(c) => self.on_config(PoolConfig::from_message(c)),
                     None => error!("malformed pool configuration; ignored"),
                 }
             }
@@ -542,18 +569,7 @@ impl<'a> Session<'a> {
                     warn!("coinbaser response with no request waiting");
                     return Ok(());
                 };
-                let skip = |script: &[u8]| {
-                    let over =
-                        state.reduced_data && !ratum::bitcoin::output_script_size_is_valid(script);
-                    if over {
-                        warn!(
-                            "Coinbaser sent a {} byte output script, over the reduced_data limit. Leaving that output out of the generation txn.",
-                            script.len()
-                        );
-                    }
-                    over
-                };
-                let r = match CoinbaserResponse::decode_with(plain, &skip) {
+                let r = match CoinbaserResponse::decode(plain) {
                     Some(r) => {
                         debug!(
                             "coinbaser response: {} sats, id {}, {} outputs",
@@ -591,90 +607,66 @@ impl<'a> Session<'a> {
         Ok(())
     }
 
+    fn on_config(&mut self, config: PoolConfig) {
+        info!(
+            "DATUM pool configuration: prime_id {:#010x}, tag {:?}, min diff {}, payout script {}",
+            config.prime_id,
+            config.coinbase_tag,
+            config.min_difficulty,
+            hex::encode(&config.payout_script)
+        );
+        let previous = self.shared.set_config(config.clone());
+        if previous.is_none() {
+            ratum::lock(&self.shared.stats).motd = self.client.motd().to_string();
+        }
+        // The jobs being served were built without this configuration (or with an older
+        // one): rebuild them now rather than at the next poll.
+        if previous.as_ref() != Some(&config) {
+            self.shared.notify.rebuild();
+        }
+    }
+
     fn on_share_response(&mut self, r: ShareResponse) {
-        let mut st = ratum::lock(&self.shared.stats);
-        let pool_min = ratum::lock(&self.shared.config).as_ref().map_or(1, |c| c.min_difficulty);
-        let diff = if r.target_byte == 0xff { pool_min } else { 1u64 << (r.target_byte & 63) };
+        let diff = if r.target_byte == 0xff {
+            self.shared.min_difficulty().max(1)
+        } else {
+            target::diff_for_pot(r.target_byte)
+        };
+        let accepted =
+            matches!(r.verdict, ShareVerdict::Accepted | ShareVerdict::AcceptedTentatively);
+        {
+            let mut st = ratum::lock(&self.shared.stats);
+            if accepted { &mut st.accepted } else { &mut st.rejected }.add(diff);
+        }
+        let what = format!("job {} nonce {:08x} diff {diff}", r.job_id, r.nonce);
         match r.verdict {
-            ShareVerdict::Accepted | ShareVerdict::AcceptedTentatively => {
-                st.accepted_count += 1;
-                st.accepted_diff = st.accepted_diff.saturating_add(diff);
-                self.last_share_accepted = Some(Instant::now());
-                debug!(
-                    "DATUM share accepted: job {} nonce {:08x} diff {diff}{}",
-                    r.job_id,
-                    r.nonce,
-                    if r.verdict == ShareVerdict::AcceptedTentatively {
-                        " (tentatively)"
-                    } else {
-                        ""
-                    }
-                );
+            ShareVerdict::Accepted => debug!("DATUM share accepted: {what}"),
+            ShareVerdict::AcceptedTentatively => {
+                debug!("DATUM share accepted: {what} (tentatively)")
             }
             ShareVerdict::Rejected(reason) => {
-                st.rejected_count += 1;
-                st.rejected_diff = st.rejected_diff.saturating_add(diff);
-                warn!(
-                    "DATUM share rejected: job {} nonce {:08x} diff {diff}: {reason:?} ({})",
-                    r.job_id, r.nonce, reason as u16
-                );
+                warn!("DATUM share rejected: {what}: {reason:?} ({})", reason as u16)
             }
             ShareVerdict::RejectedUnknown(code) => {
-                st.rejected_count += 1;
-                st.rejected_diff = st.rejected_diff.saturating_add(diff);
-                warn!(
-                    "DATUM share rejected: job {} nonce {:08x} diff {diff}: reason code {code} (not one this build names)",
-                    r.job_id, r.nonce
-                );
+                warn!("DATUM share rejected: {what}: reason code {code} (not one this build names)")
             }
+        }
+        if accepted {
+            self.last_share_accepted = Some(Instant::now());
         }
     }
 
     fn on_validation(&mut self, plain: &[u8]) -> Result<(), SessionError> {
         let Some(&sub) = plain.get(1) else { return Ok(()) };
         let job_index = plain.get(2).copied();
-        let slots = ratum::lock(&self.shared.slots).clone();
-        let lookup = |idx: Option<u8>| -> Result<Arc<Job>, (u8, Status)> {
-            let idx = idx.ok_or((validation::JOB_INDEX_INVALID, Status::BadRequest))?;
-            if idx as usize >= slots.len() {
-                return Err((validation::JOB_INDEX_INVALID, Status::BadJobIndex));
-            }
-            slots[idx as usize].clone().ok_or((idx, Status::JobEmpty))
-        };
-        match sub {
+        let lookup = job_index
+            .ok_or((validation::JOB_INDEX_INVALID, Status::BadRequest))
+            .and_then(|i| self.shared.slot(i));
+        let response = match sub {
             validation::request::SHORT_TXN_LIST => {
-                let msg = match lookup(job_index) {
-                    Ok(job) => {
-                        let hashes = job.template.txn_hashes();
-                        if hashes.len() > validation::MAX_SHORT_LIST_TXNS as usize {
-                            ShortTxnList {
-                                job_index: job.datum_slot,
-                                status: Status::TooManyTxns,
-                                txn_count: 0,
-                                short_ids: vec![],
-                                crosscheck: None,
-                            }
-                        } else {
-                            let key = validation::short_id_key(
-                                &self.identity.sign_pk,
-                                &self.settings.pool_sign_pk,
-                            );
-                            ShortTxnList {
-                                job_index: job.datum_slot,
-                                status: Status::Ok,
-                                txn_count: hashes.len() as u16,
-                                short_ids: hashes
-                                    .iter()
-                                    .map(|h| validation::short_id(h, &key))
-                                    .collect(),
-                                crosscheck: if hashes.is_empty() {
-                                    None
-                                } else {
-                                    Some(validation::crosscheck(&hashes))
-                                },
-                            }
-                        }
-                    }
+                info!("pool requested the short transaction list of job {job_index:?}");
+                match lookup {
+                    Ok(job) => self.short_txn_list(&job),
                     Err((idx, status)) => ShortTxnList {
                         job_index: idx,
                         status,
@@ -682,87 +674,77 @@ impl<'a> Session<'a> {
                         short_ids: vec![],
                         crosscheck: None,
                     },
-                };
-                info!("pool requested the short transaction list of job {job_index:?}");
-                self.send_mining(&msg.encode())
+                }
+                .encode()
             }
-            validation::request::TXNS => {
-                let msg = match lookup(job_index) {
+            validation::request::TXNS | validation::request::BLOCK_TXNS => {
+                let all = sub == validation::request::BLOCK_TXNS;
+                let selector =
+                    if all { validation::response::BLOCK_TXNS } else { validation::response::TXNS };
+                let bundle = match lookup {
                     Ok(job) => {
-                        let count = plain
-                            .get(3..5)
-                            .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)
-                            .unwrap_or(0);
                         let txns = &job.template.txns;
-                        let mut ids = Vec::with_capacity(count);
-                        let mut bad = count == 0 || count > txns.len();
-                        for i in 0..count {
-                            match plain.get(5 + 2 * i..7 + 2 * i) {
-                                Some(b) => {
-                                    let id = u16::from_le_bytes([b[0], b[1]]) as usize;
-                                    if id >= txns.len() {
-                                        bad = true;
-                                        break;
-                                    }
-                                    ids.push(id);
-                                }
-                                None => {
-                                    bad = true;
-                                    break;
-                                }
-                            }
-                        }
-                        if bad {
-                            TxnBundle {
-                                selector: validation::response::TXNS,
-                                job_index: job.datum_slot,
-                                status: Status::BadRequest,
-                                txns: vec![],
-                            }
+                        let ids = if all {
+                            Some((0..txns.len()).collect())
                         } else {
-                            TxnBundle {
-                                selector: validation::response::TXNS,
+                            requested_ids(plain, txns.len())
+                        };
+                        match ids {
+                            Some(ids) => TxnBundle {
+                                selector,
                                 job_index: job.datum_slot,
                                 status: Status::Ok,
                                 txns: ids.iter().map(|&i| txns[i].raw.clone()).collect(),
-                            }
+                            },
+                            None => TxnBundle {
+                                selector,
+                                job_index: job.datum_slot,
+                                status: Status::BadRequest,
+                                txns: vec![],
+                            },
                         }
                     }
-                    Err((idx, status)) => TxnBundle {
-                        selector: validation::response::TXNS,
-                        job_index: idx,
-                        status,
-                        txns: vec![],
-                    },
-                };
-                info!("pool requested {} transactions of job {job_index:?}", msg.txns.len());
-                self.send_mining(&msg.encode())
-            }
-            validation::request::BLOCK_TXNS => {
-                let msg = match lookup(job_index) {
-                    Ok(job) => TxnBundle {
-                        selector: validation::response::BLOCK_TXNS,
-                        job_index: job.datum_slot,
-                        status: Status::Ok,
-                        txns: job.template.txns.iter().map(|t| t.raw.clone()).collect(),
-                    },
-                    Err((idx, status)) => TxnBundle {
-                        selector: validation::response::BLOCK_TXNS,
-                        job_index: idx,
-                        status,
-                        txns: vec![],
-                    },
+                    Err((idx, status)) => {
+                        TxnBundle { selector, job_index: idx, status, txns: vec![] }
+                    }
                 };
                 info!(
-                    "pool requested the block transactions of job {job_index:?}: sending {}",
-                    msg.txns.len()
+                    "pool requested {} of job {job_index:?}: sending {}",
+                    if all { "the block transactions" } else { "transactions" },
+                    bundle.txns.len()
                 );
-                self.send_mining(&msg.encode())
+                bundle.encode()
             }
             other => {
                 warn!("unknown validation request {other:#04x}");
-                Ok(())
+                return Ok(());
             }
+        };
+        self.send_mining(&response)
+    }
+
+    fn short_txn_list(&self, job: &Job) -> ShortTxnList {
+        let hashes = job.template.witness_hashes();
+        if hashes.len() > validation::MAX_SHORT_LIST_TXNS as usize {
+            return ShortTxnList {
+                job_index: job.datum_slot,
+                status: Status::TooManyTxns,
+                txn_count: 0,
+                short_ids: vec![],
+                crosscheck: None,
+            };
+        }
+        let key = validation::short_id_key(&self.identity.sign_pk, &self.settings.pool_sign_pk);
+        ShortTxnList {
+            job_index: job.datum_slot,
+            status: Status::Ok,
+            txn_count: hashes.len() as u16,
+            short_ids: hashes.iter().map(|h| validation::short_id(h, &key)).collect(),
+            crosscheck: if hashes.is_empty() {
+                None
+            } else {
+                Some(validation::crosscheck(&hashes))
+            },
         }
     }
 
@@ -777,92 +759,69 @@ impl<'a> Session<'a> {
             self.send_mining(&req.encode())?;
             self.requested = Some(state);
         }
-        loop {
-            let share = ratum::lock(&self.shared.queue).pop_front();
-            let Some(share) = share else { break };
+        let batch = std::mem::take(&mut *ratum::lock(&self.shared.queue));
+        for share in batch {
             self.send_share(share)?;
         }
         Ok(())
     }
 
+    /// The job and coinbase sections the pool does not yet hold for this share's job.
+    fn sections_for(
+        &mut self,
+        share: &QueuedShare,
+    ) -> (Option<JobSection>, Option<CoinbaseSection>) {
+        let job = &share.job;
+        let sent =
+            self.sent_job[job.datum_slot as usize].get_or_insert(SentSections::new(job.serial));
+        if sent.serial != job.serial {
+            *sent = SentSections::new(job.serial);
+        }
+        let job_section = (!std::mem::replace(&mut sent.job, true)).then(|| JobSection {
+            prev_hash: job.template.prev_hash,
+            target_byte_index: job.target_pot_index as u16,
+            nbits: job.template.nbits_bytes,
+            coinbaser_id: job.coinbaser_id,
+            height: job.template.height,
+            coinbase_value: job.template.coinbase_value,
+            txn_count: job.template.txns.len() as u32,
+            txn_total_weight: job.template.totals.weight,
+            txn_total_size: job.template.totals.size,
+            txn_total_sigops: job.template.totals.sigops,
+            merkle_branches: job.merkle_branches.clone(),
+        });
+        let coinbase_section = (!sent.coinbase_known(share.coinbase_id)).then(|| {
+            let c = job.coinbase(share.coinbase_id).expect("checked by the caller");
+            CoinbaseSection {
+                coinbase_id: share.coinbase_id,
+                coinb1: c.coinb1.clone(),
+                coinb2: c.coinb2.clone(),
+            }
+        });
+        (job_section, coinbase_section)
+    }
+
     fn send_share(&mut self, share: QueuedShare) -> Result<(), SessionError> {
         let job = &share.job;
-        let slot = job.datum_slot as usize;
         // The slot must still hold this job; a share for a job that has been replaced in
         // its slot cannot be described to the pool.
-        let current = ratum::lock(&self.shared.slots)[slot].as_ref().map(|j| j.serial);
+        let current =
+            ratum::lock(&self.shared.slots)[job.datum_slot as usize].as_ref().map(|j| j.serial);
         if current != Some(job.serial) {
             debug!("share for job {} whose DATUM slot was reused; not sent", job.serial);
             return Ok(());
         }
-        let Some(h) = ratum::header::HeaderV2::deserialize(&share.header) else {
-            warn!("share header is not a version 2 header; not sent");
-            return Ok(());
-        };
-        if h.asic_profile() != 0 {
-            warn!("share header has ASIC profile {}; not sent", h.asic_profile());
-            return Ok(());
-        }
-        if h.extranonce[..4] != [0u8; 4] {
+        let h = &share.header;
+        let Some(extranonce) = share::share_extranonce(&h.extranonce) else {
             warn!("share header extranonce does not begin with four zero bytes; not sent");
             return Ok(());
+        };
+        if job.coinbase(share.coinbase_id).is_none() {
+            warn!("share names coinbase {} which the job does not have", share.coinbase_id);
+            return Ok(());
         }
-
-        let coinbase = match job.coinbase(share.coinbase_id) {
-            Some(c) => c,
-            None => {
-                warn!("share names coinbase {} which the job does not have", share.coinbase_id);
-                return Ok(());
-            }
-        };
-
-        let sent = self.sent_job[slot].get_or_insert(SentSections::new(job.serial));
-        if sent.serial != job.serial {
-            *sent = SentSections::new(job.serial);
-        }
-        let job_section = if !sent.job {
-            sent.job = true;
-            Some(JobSection {
-                prev_hash: job.template.prev_hash,
-                target_byte_index: job.target_pot_index as u16,
-                nbits: job.template.nbits_bytes,
-                coinbaser_id: job.coinbaser_id,
-                height: job.template.height,
-                coinbase_value: job.template.coinbase_value,
-                txn_count: job.template.txns.len() as u32,
-                txn_total_weight: job.template.txn_total_weight,
-                txn_total_size: job.template.txn_total_size,
-                txn_total_sigops: job.template.txn_total_sigops,
-                merkle_branches: job.merkle_branches.clone(),
-            })
-        } else {
-            None
-        };
-        let sent_coinbase = if share.coinbase_id == 0xff {
-            &mut sent.subsidy_only
-        } else {
-            &mut sent.coinbases[share.coinbase_id as usize & 7]
-        };
-        let coinbase_section = if !*sent_coinbase {
-            *sent_coinbase = true;
-            Some(CoinbaseSection {
-                coinbase_id: share.coinbase_id,
-                coinb1: coinbase.coinb1.clone(),
-                coinb2: coinbase.coinb2.clone(),
-            })
-        } else {
-            None
-        };
-
-        let mut sia_nonce = [0u8; 8];
-        sia_nonce[..4].copy_from_slice(&h.nonce.to_le_bytes());
-        sia_nonce[4..].copy_from_slice(&h.nonce2.to_le_bytes());
-        let mut sia_ntime = [0u8; 8];
-        sia_ntime[..4].copy_from_slice(&h.time_offset.to_le_bytes());
-        sia_ntime[4..].copy_from_slice(&h.nonce3.to_le_bytes());
-        let time_on_wire = u32::from_le_bytes(share.header[68..72].try_into().unwrap());
-        let use_time_offset = h.flags & ratum::header::FLAG_USE_TIME_OFFSET != 0;
-
+        let (job_section, coinbase_section) = self.sections_for(&share);
+        let blake2b = Blake2bSection::from_header(h);
         let submit = PowSubmit {
             job_id: job.datum_slot,
             coinbase_id: share.coinbase_id,
@@ -870,15 +829,15 @@ impl<'a> Session<'a> {
             subsidy_only: share.subsidy_only,
             quickdiff: share.quickdiff,
             target_byte: share.target_byte,
-            ntime: time_on_wire,
+            ntime: blake2b.time_on_wire,
             nonce: h.nonce,
-            version: u32::from_le_bytes(share.header[0..4].try_into().unwrap()),
-            extranonce: h.extranonce[4..].to_vec(),
+            version: ratum::header::V2_FLAG | h.version as u32,
+            extranonce,
             username: wire_username(self.settings, &share.username),
-            use_time_offset,
+            use_time_offset: h.flags & ratum::header::FLAG_USE_TIME_OFFSET != 0,
             job: job_section,
             coinbase: coinbase_section,
-            blake2b: Some(Blake2bSection { sia_ntime, sia_nonce, time_on_wire }),
+            blake2b,
         };
         debug!(
             "DATUM share: slot {} coinbase {} diff 2^{} user {:?}{}",
@@ -901,67 +860,46 @@ impl<'a> Session<'a> {
     }
 }
 
+/// The transaction indexes a `TXNS` request names, in order; `None` when the count is zero,
+/// over the job's, or an index is.
+fn requested_ids(plain: &[u8], txn_count: usize) -> Option<Vec<usize>> {
+    let count = u16::from_le_bytes([*plain.get(3)?, *plain.get(4)?]) as usize;
+    if count == 0 || count > txn_count {
+        return None;
+    }
+    let ids: Vec<usize> = plain
+        .get(5..5 + 2 * count)?
+        .chunks(2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)
+        .collect();
+    ids.iter().all(|&i| i < txn_count).then_some(ids)
+}
+
 fn rand_u32() -> u32 {
     let mut b = [0u8; 4];
     dryoc::rng::copy_randombytes(&mut b);
     u32::from_le_bytes(b)
 }
 
-/// Read exactly `n` bytes, with `deadline` bounding the whole read.
-fn read_exact_deadline(
-    s: &mut TcpStream,
-    n: usize,
-    started: Instant,
-    deadline: Duration,
-) -> io::Result<Vec<u8>> {
-    let mut buf = vec![0u8; n];
-    let mut got = 0usize;
-    while got < n {
-        if started.elapsed() > deadline {
-            return Err(io::Error::new(io::ErrorKind::TimedOut, "read exceeded its deadline"));
-        }
-        match s.read(&mut buf[got..]) {
-            Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed")),
-            Ok(k) => got += k,
-            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(buf)
-}
-
 /// Run sessions until the process ends. After every session a rebuild is requested so the
-/// template thread stops serving pooled jobs; `failures` counts consecutive sessions that did
-/// not reach the configuration, which `pooled_mining_only` reads.
-pub fn run_forever(
-    settings: Settings,
-    shared: Arc<Shared>,
-    identity: KeyPairs,
-    failures: Arc<Mutex<u32>>,
-) {
+/// template thread stops serving pooled jobs; `Shared::failures` counts consecutive sessions
+/// that did not reach the configuration.
+pub fn run_forever(settings: Settings, shared: Arc<Shared>, identity: KeyPairs) {
     loop {
         info!("connecting to DATUM pool {}:{}", settings.host, settings.port);
         let outcome = match Session::open(&settings, &shared, &identity) {
             Ok(mut session) => session.run(),
             Err(e) => Err(e),
         };
-        let was_active = shared.is_active();
-        *ratum::lock(&shared.active) = false;
-        *ratum::lock(&shared.config) = None;
-        if let Some(state) = ratum::lock(&shared.coinbaser).take() {
-            state.done.notify_all();
-        }
-        ratum::lock(&shared.queue).clear();
+        let was_active = shared.disconnected();
         if let Err(e) = outcome {
             error!("DATUM connection ended: {e}");
         }
-        {
-            let mut f = ratum::lock(&failures);
-            *f = if was_active { 1 } else { f.saturating_add(1) };
-        }
         if was_active {
+            shared.failures.store(1, Ordering::Relaxed);
             shared.notify.rebuild();
+        } else {
+            shared.failures.fetch_add(1, Ordering::Relaxed);
         }
         let delay = Duration::from_millis(5000 + u64::from(rand_u32() % 15001));
         info!("reconnecting to the pool in {:.1}s", delay.as_secs_f64());
@@ -1005,6 +943,16 @@ mod tests {
         assert_eq!(sent.len(), 384);
         assert_eq!(sent.chars().count(), 192);
     }
+
+    #[test]
+    fn requested_ids_are_bounds_checked() {
+        let mut plain = vec![0x50, validation::request::TXNS, 0, 2, 0, 1, 0, 3, 0];
+        assert_eq!(requested_ids(&plain, 4), Some(vec![1, 3]));
+        assert_eq!(requested_ids(&plain, 3), None, "index 3 is out of range");
+        plain[3] = 0;
+        assert_eq!(requested_ids(&plain, 4), None, "a count of zero");
+        assert_eq!(requested_ids(&[0x50, 0x02, 0, 5, 0, 1], 4), None, "truncated");
+    }
 }
 
 /// The session against a stand-in pool on a local socket: the handshake, the configuration,
@@ -1012,15 +960,18 @@ mod tests {
 #[cfg(test)]
 mod session_tests {
     use super::*;
-    use crate::config::Config;
     use crate::job::{Builder, COINBASE_SUBSIDY_ONLY, Job};
-    use crate::template::{Template, Wake};
+    use crate::template::Wake;
+    use crate::template::tests::{config, template};
     use ratum::datum::framing::cmd;
     use ratum::datum::handshake::{Channel, Session as PoolSession, accept, open_hello};
     use ratum::datum::messages::{
         CoinbaseOutput, CoinbaserResponse, RejectReason, ShareResponse, client_subcmd,
     };
+    use ratum::io::read_frame;
     use std::net::TcpListener;
+
+    const TEST_DEADLINE: Duration = Duration::from_secs(10);
 
     /// The pool end of one connection, past the handshake.
     struct Pool {
@@ -1029,34 +980,16 @@ mod session_tests {
     }
 
     impl Pool {
-        fn read_all(&mut self, n: usize) -> Option<Vec<u8>> {
-            let mut buf = vec![0u8; n];
-            let mut got = 0;
-            let started = Instant::now();
-            while got < n {
-                if started.elapsed() > Duration::from_secs(10) {
-                    return None;
-                }
-                match self.stream.read(&mut buf[got..]) {
-                    Ok(0) => return None,
-                    Ok(k) => got += k,
-                    Err(e)
-                        if matches!(
-                            e.kind(),
-                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                        ) => {}
-                    Err(_) => return None,
-                }
-            }
-            Some(buf)
-        }
-
         /// The next mining message's plaintext, or `None` when the gateway is gone.
         fn read_mining(&mut self) -> Option<Vec<u8>> {
             loop {
-                let head = self.read_all(4)?;
-                let header = self.session.unmask_header(head.try_into().unwrap());
-                let body = self.read_all(header.cmd_len as usize)?;
+                let (header, body) = read_frame(
+                    &mut self.stream,
+                    |b| self.session.unmask_header(b),
+                    Instant::now(),
+                    TEST_DEADLINE,
+                )
+                .ok()?;
                 let plain = self.session.decrypt(header, &body).expect("gateway frame decrypts");
                 if header.proto_cmd == cmd::MINING {
                     return Some(plain);
@@ -1120,7 +1053,7 @@ mod session_tests {
             port,
             pool_sign_pk: keys.sign_pk,
             pool_box_pk: keys.box_pk,
-            global_timeout: Duration::from_secs(10),
+            global_timeout: TEST_DEADLINE,
             share_ack_timeout: SHARE_ACK_TIMEOUT,
             share_ack_grace: SHARE_ACK_GRACE,
             user_agent: "test".into(),
@@ -1133,16 +1066,9 @@ mod session_tests {
             stream.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
             // The hello is read with the pre-handshake keys, before a session exists.
             let mut pre = Channel::before_handshake();
-            let head = read_exact_deadline(&mut stream, 4, Instant::now(), Duration::from_secs(10))
-                .expect("hello header");
-            let header = pre.unmask_header(head.try_into().unwrap());
-            let body = read_exact_deadline(
-                &mut stream,
-                header.cmd_len as usize,
-                Instant::now(),
-                Duration::from_secs(10),
-            )
-            .expect("hello body");
+            let (header, body) =
+                read_frame(&mut stream, |b| pre.unmask_header(b), Instant::now(), TEST_DEADLINE)
+                    .expect("hello");
             let hello = open_hello(header, &body, &keys).expect("hello opens");
             let (response, session) = accept(hello, &keys, "test motd").unwrap();
             stream.write_all(&response).unwrap();
@@ -1174,45 +1100,14 @@ mod session_tests {
     fn wait_for(what: &str, cond: impl Fn() -> bool) {
         let started = Instant::now();
         while !cond() {
-            assert!(started.elapsed() < Duration::from_secs(10), "timed out waiting for {what}");
+            assert!(started.elapsed() < TEST_DEADLINE, "timed out waiting for {what}");
             std::thread::sleep(Duration::from_millis(5));
         }
     }
 
     fn job(shared: &Shared, slot: u8) -> Arc<Job> {
-        let config = Config::parse(
-            r#"{"bitcoind": {"rpcuser":"u","rpcpassword":"p","rpcurl":"http://127.0.0.1:1"},
-                "mining": {"pool_address":"bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080",
-                           "blake2b_activation_height": 20, "blake2b_headline": "x"},
-                "datum": {"pool_host": "", "pooled_mining_only": false, "protocol_job_slots": 6}}"#,
-        )
-        .unwrap();
-        let mut wc = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
-        wc.extend_from_slice(&[0u8; 32]);
-        let template = Arc::new(Template {
-            height: 21,
-            coinbase_value: 5_000_000_000,
-            txn_total_fee: 0,
-            mintime: 1_700_000_000,
-            curtime: 1_700_000_100,
-            sizelimit: 4_000_000,
-            weightlimit: 4_000_000,
-            sigoplimit: 80_000,
-            version: 0x2000_0000,
-            bits: "207fffff".into(),
-            nbits: 0x207f_ffff,
-            nbits_bytes: [0xff, 0xff, 0x7f, 0x20],
-            prev_hash_hex: "00".repeat(32),
-            prev_hash: [0u8; 32],
-            target_hex: "7f".repeat(32),
-            witness_commitment: wc,
-            reduced_data: false,
-            txns: vec![],
-            txn_total_weight: 0,
-            txn_total_size: 0,
-            txn_total_sigops: 0,
-        });
-        let mut builder = Builder::new(Arc::new(config));
+        let template = Arc::new(template());
+        let mut builder = Builder::new(Arc::new(config()));
         let mut job = None;
         // The builder assigns slots in order; build until the wanted one.
         for _ in 0..=slot {
@@ -1227,22 +1122,9 @@ mod session_tests {
     }
 
     fn queued(job: &Arc<Job>, coinbase_id: u8, nonce: u32, username: &str) -> QueuedShare {
-        let header = job
-            .header(
-                coinbase_id,
-                10,
-                [0u8; 16],
-                nonce
-                    .to_le_bytes()
-                    .iter()
-                    .chain(&[0u8; 4])
-                    .copied()
-                    .collect::<Vec<_>>()
-                    .try_into()
-                    .unwrap(),
-                [0u8; 8],
-            )
-            .unwrap();
+        let mut sia_nonce = [0u8; 8];
+        sia_nonce[..4].copy_from_slice(&nonce.to_le_bytes());
+        let header = job.header(coinbase_id, 10, [0u8; 16], sia_nonce, [0u8; 8]).unwrap();
         QueuedShare {
             job: Arc::clone(job),
             coinbase_id,
@@ -1250,7 +1132,7 @@ mod session_tests {
             subsidy_only: coinbase_id == COINBASE_SUBSIDY_ONLY,
             quickdiff: false,
             target_byte: 10,
-            header: header.serialize(),
+            header,
             username: username.into(),
         }
     }
@@ -1267,9 +1149,7 @@ mod session_tests {
         assert_eq!(shared.pool_config(), Some(pool_config()));
         assert_eq!(shared.min_difficulty(), 1024);
         assert_eq!(notify.wait(Duration::from_secs(1)), Wake::Rebuild);
-        let st = ratum::lock(&shared.stats).clone();
-        assert!(st.connected_since.is_some());
-        assert_eq!(st.motd, "test motd");
+        assert_eq!(ratum::lock(&shared.stats).motd, "test motd");
         pool.join().unwrap();
         assert!(matches!(session.join().unwrap(), SessionError::Io(_)));
     }
@@ -1315,6 +1195,8 @@ mod session_tests {
             assert!(first.coinbase.is_some(), "and its coinbase");
             assert_eq!(first.coinbase.as_ref().unwrap().coinbase_id, 0);
             assert_eq!(first.username, "bc1qminer.rig");
+            assert_eq!(first.nonce, 1);
+            assert_eq!(first.blake2b.nonce_fields(), (1, 0));
             p.answer(&first, ShareVerdict::Accepted);
             let second = p.share();
             assert!(second.job.is_none(), "the pool holds the job section");
@@ -1365,8 +1247,8 @@ mod session_tests {
         pool.join().unwrap();
         session.join().unwrap();
         let st = ratum::lock(&shared.stats).clone();
-        assert_eq!((st.accepted_count, st.rejected_count), (1, 2));
-        assert_eq!(st.accepted_diff, 1024);
+        assert_eq!((st.accepted.count, st.rejected.count), (1, 2));
+        assert_eq!(st.accepted.diff, 1024);
     }
 
     #[test]
@@ -1383,7 +1265,7 @@ mod session_tests {
         let old = job(&shared, 0);
         let stale = queued(&old, 0, 1, "bc1qminer");
         // A newer job took slot 0 before the share was sent.
-        let mut builder = Builder::new(Arc::new(Config::parse(r#"{"bitcoind": {"rpcuser":"u","rpcpassword":"p","rpcurl":"http://127.0.0.1:1"}, "mining": {"pool_address":"bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080", "blake2b_activation_height": 20, "blake2b_headline": "x"}, "datum": {"pool_host": "", "pooled_mining_only": false, "protocol_job_slots": 6}}"#).unwrap()));
+        let mut builder = Builder::new(Arc::new(config()));
         let mut newer =
             builder.build(Arc::clone(&old.template), false, Some(&pool_config()), None).unwrap();
         newer.serial = old.serial + 4;
@@ -1414,10 +1296,10 @@ mod session_tests {
         let (shared, _) = shared();
         let session = run_session(settings, Arc::clone(&shared));
         wait_for("the configuration", || shared.is_active());
-        let response = shared.fetch_coinbaser(5_000_000_000, [0u8; 32], false).expect("a response");
+        let response = shared.fetch_coinbaser(5_000_000_000, [0u8; 32]).expect("a response");
         assert_eq!(response.coinbaser_id, 3);
         assert_eq!(response.outputs.len(), 1);
-        assert!(shared.fetch_coinbaser(1, [0u8; 32], false).is_none(), "under the minimum value");
+        assert!(shared.fetch_coinbaser(1, [0u8; 32]).is_none(), "under the minimum value");
         pool.join().unwrap();
         session.join().unwrap();
     }

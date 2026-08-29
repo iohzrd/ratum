@@ -7,15 +7,16 @@
 use crate::server::{Resolver, Server, unix_now};
 use log::warn;
 use ratum::datum::messages::MAX_COINBASER_OUTPUTS;
+use ratum::http;
 use ratum::lock;
 use std::collections::HashMap;
-use std::io::Cursor;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use tiny_http::{Header, Method, Request, Response, Server as HttpServer};
+use std::sync::{Arc, LazyLock};
+use tiny_http::{Method, Request, Server as HttpServer};
 
-const INDEX_HTML: &str = include_str!("stats.html");
+static INDEX_HTML: LazyLock<String> =
+    LazyLock::new(|| ratum::web::assemble(include_str!("stats.html")));
 
 /// Bind `listen` and serve the stats interface on a thread. Returns the bound address (so a
 /// `:0` port resolves to the real one) or an error if the address cannot be bound, which the
@@ -23,42 +24,25 @@ const INDEX_HTML: &str = include_str!("stats.html");
 pub(crate) fn spawn(server: Arc<Server>, listen: &str) -> Result<SocketAddr, String> {
     let http = HttpServer::http(listen).map_err(|e| e.to_string())?;
     let addr = http.server_addr().to_ip().ok_or("no socket address")?;
-    std::thread::Builder::new()
-        .name("stats".to_string())
-        .spawn(move || {
-            for request in http.incoming_requests() {
-                if let Err(e) = handle(&server, request) {
-                    warn!("stats: could not send a response: {e}");
-                }
-            }
-        })
-        .map_err(|e| e.to_string())?;
+    http::serve("stats", http, move |request| {
+        if let Err(e) = handle(&server, request) {
+            warn!("stats: could not send a response: {e}");
+        }
+    });
     Ok(addr)
 }
 
 fn handle(server: &Server, request: Request) -> std::io::Result<()> {
     if *request.method() != Method::Get {
-        return request.respond(text(405, "method not allowed"));
+        return request.respond(http::method_not_allowed());
     }
-    // Discard any query string; the paths carry no parameters.
-    let path = request.url().split('?').next().unwrap_or("/");
-    match path {
-        "/" | "/index.html" => request.respond(page(INDEX_HTML, "text/html; charset=utf-8")),
-        "/stats.json" => request.respond(page(&snapshot(server), "application/json")),
-        _ => request.respond(text(404, "not found")),
+    // The paths carry no parameters.
+    let (path, _) = http::path_and_query(&request);
+    match path.as_str() {
+        "/" | "/index.html" => request.respond(http::html(INDEX_HTML.clone())),
+        "/stats.json" => request.respond(http::body(snapshot(server), "application/json")),
+        _ => request.respond(http::not_found()),
     }
-}
-
-fn page(body: &str, content_type: &str) -> Response<Cursor<Vec<u8>>> {
-    Response::from_string(body).with_header(header("Content-Type", content_type))
-}
-
-fn text(code: u16, body: &str) -> Response<Cursor<Vec<u8>>> {
-    Response::from_string(body).with_status_code(code)
-}
-
-fn header(name: &str, value: &str) -> Header {
-    Header::from_bytes(name.as_bytes(), value.as_bytes()).expect("static header is valid")
 }
 
 /// The JSON snapshot. Every field is read from the shared state; no secret (the node

@@ -551,7 +551,7 @@ fn work_on_an_off_tip_job_is_not_refused_as_stale_when_it_meets_the_network_targ
     let base = now();
     let ntime = (0..64)
         .map(|offset| base + offset)
-        .find(|&t| target::meets_target(&work.hash(0x2000_0000, t, 0, 0), &network))
+        .find(|&t| target::meets_target(&work.hash(t, 0, 0), &network))
         .expect("a time whose share meets the network target within 64 tries");
 
     let share = work.submit("miner.rig", ntime, 0, 0);

@@ -65,53 +65,39 @@ pub struct Stratum {
     pub username_modifiers: crate::username::Modifiers,
 }
 
-/// A JSON object of objects as `Vec`s of pairs, in document order.
+/// A JSON object read into pairs in document order, which `serde_json`'s map types do not
+/// keep.
+pub struct Ordered<V>(pub Vec<(String, V)>);
+
+impl<'de, V: Deserialize<'de>> Deserialize<'de> for Ordered<V> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::{MapAccess, Visitor};
+        use std::marker::PhantomData;
+
+        struct Pairs<V>(PhantomData<V>);
+        impl<'de, V: Deserialize<'de>> Visitor<'de> for Pairs<V> {
+            type Value = Ordered<V>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an object")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<Self::Value, A::Error> {
+                let mut v = Vec::new();
+                while let Some(pair) = m.next_entry::<String, V>()? {
+                    v.push(pair);
+                }
+                Ok(Ordered(v))
+            }
+        }
+        d.deserialize_map(Pairs(PhantomData))
+    }
+}
+
+/// `stratum.username_modifiers`: an object of objects, both levels in document order.
 fn deserialize_modifiers<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> Result<crate::username::Modifiers, D::Error> {
-    use serde::de::{MapAccess, Visitor};
-    use std::fmt;
-
-    struct Ranges;
-    impl<'de> Visitor<'de> for Ranges {
-        type Value = Vec<(String, f64)>;
-        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            f.write_str("an object of address: proportion")
-        }
-        fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<Self::Value, A::Error> {
-            let mut v = Vec::new();
-            while let Some((k, p)) = m.next_entry::<String, f64>()? {
-                v.push((k, p));
-            }
-            Ok(v)
-        }
-    }
-    struct Mods;
-    impl<'de> Visitor<'de> for Mods {
-        type Value = crate::username::Modifiers;
-        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            f.write_str("an object of modifier name: ranges")
-        }
-        fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<Self::Value, A::Error> {
-            let mut v = Vec::new();
-            while let Some(k) = m.next_key::<String>()? {
-                let ranges = m.next_value_seed(RangesSeed)?;
-                v.push((k, ranges));
-            }
-            Ok(v)
-        }
-    }
-    struct RangesSeed;
-    impl<'de> serde::de::DeserializeSeed<'de> for RangesSeed {
-        type Value = Vec<(String, f64)>;
-        fn deserialize<D2: serde::Deserializer<'de>>(
-            self,
-            d: D2,
-        ) -> Result<Self::Value, D2::Error> {
-            d.deserialize_map(Ranges)
-        }
-    }
-    d.deserialize_map(Mods)
+    let mods = Ordered::<Ordered<f64>>::deserialize(d)?;
+    Ok(mods.0.into_iter().map(|(name, ranges)| (name, ranges.0)).collect())
 }
 
 impl Default for Stratum {
@@ -164,7 +150,7 @@ impl Default for Mining {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Api {
     pub admin_password: String,
@@ -172,8 +158,23 @@ pub struct Api {
     pub listen_addr: String,
     pub listen_port: u16,
     pub miner_listen_addr: String,
+    /// The password-less miner lookup page; 0 disables it.
     pub miner_listen_port: u16,
     pub modify_conf: bool,
+}
+
+impl Default for Api {
+    fn default() -> Self {
+        Self {
+            admin_password: String::new(),
+            allow_insecure_auth: false,
+            listen_addr: String::new(),
+            listen_port: 0,
+            miner_listen_addr: String::new(),
+            miner_listen_port: 8000,
+            modify_conf: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -189,7 +190,8 @@ pub struct Logger {
     pub log_to_stderr: bool,
     pub log_to_file: bool,
     pub log_file: String,
-    pub log_rotate_daily: bool,
+    /// Accepted for the C gateway's file and not applied: `Some` when the file sets it.
+    pub log_rotate_daily: Option<bool>,
     pub log_calling_function: bool,
     pub log_level_console: u8,
     pub log_level_file: u8,
@@ -202,7 +204,7 @@ impl Default for Logger {
             log_to_stderr: false,
             log_to_file: false,
             log_file: String::new(),
-            log_rotate_daily: true,
+            log_rotate_daily: None,
             log_calling_function: true,
             log_level_console: 2,
             log_level_file: 1,
@@ -215,13 +217,17 @@ impl Default for Logger {
 pub struct Datum {
     pub pool_host: String,
     pub pool_port: u16,
+    /// The pool's web page (`https://pool.example`), which the status and miner pages link
+    /// the pool to when it is set. Not a C gateway key; the DATUM host need not serve a page.
+    pub pool_url: String,
     pub pool_pubkey: String,
     pub pool_pass_workers: bool,
     pub protocol_job_slots: usize,
     pub pool_pass_full_users: bool,
     pub gateway_fee_bps: u32,
     pub gateway_fee_address: String,
-    pub always_pay_self: bool,
+    /// Accepted for the C gateway's file and not applied: `Some` when the file sets it.
+    pub always_pay_self: Option<bool>,
     pub pooled_mining_only: bool,
     pub protocol_global_timeout: u64,
 }
@@ -231,13 +237,14 @@ impl Default for Datum {
         Datum {
             pool_host: "datum-beta1.mine.ocean.xyz".into(),
             pool_port: 28915,
+            pool_url: String::new(),
             pool_pubkey: "f21f2f0ef0aa1970468f22bad9bb7f4535146f8e4a8f646bebc93da3d89b1406f40d032f09a417d94dc068055df654937922d2c89522e3e8f6f0e649de473003".into(),
             pool_pass_workers: true,
             protocol_job_slots: 256,
             pool_pass_full_users: true,
             gateway_fee_bps: 0,
             gateway_fee_address: String::new(),
-            always_pay_self: true,
+            always_pay_self: None,
             pooled_mining_only: true,
             protocol_global_timeout: 60,
         }
@@ -258,6 +265,9 @@ pub struct Config {
     /// file configures exists, since the file is parsed before it can.
     #[serde(skip)]
     pub warnings: Vec<(log::Level, String)>,
+    /// The output script `mining.pool_address` pays to, decoded once by `validate`.
+    #[serde(skip)]
+    pub pool_output_script: Vec<u8>,
 }
 
 /// The largest coinbase tag space: what fits in a 100-byte scriptSig beside the height push,
@@ -274,11 +284,21 @@ impl Config {
     /// The C gateway's post-parse checks (`datum_read_config`), with the same outcomes: a
     /// clamped value is clamped, a refused one is an error naming the key.
     fn validate(&mut self) -> Result<(), String> {
+        self.validate_bitcoind()?;
+        self.validate_stratum()?;
+        self.validate_mining()?;
+        self.validate_api();
+        self.validate_datum()?;
+        self.validate_username_modifiers()
+    }
+
+    fn warn(&mut self, message: impl Into<String>) {
+        self.warnings.push((log::Level::Warn, message.into()));
+    }
+
+    fn validate_bitcoind(&mut self) -> Result<(), String> {
         if self.bitcoind.rpcurl.is_empty() {
             return Err("Required configuration option (bitcoind.rpcurl) not found".into());
-        }
-        if self.mining.pool_address.is_empty() {
-            return Err("Required configuration option (mining.pool_address) not found".into());
         }
         if !self.bitcoind.rpcuser.is_empty() {
             if self.bitcoind.rpcpassword.is_empty() {
@@ -288,64 +308,91 @@ impl Config {
             return Err("Either bitcoind.rpcuser (and bitcoind.rpcpassword) or bitcoind.rpccookiefile is required.".into());
         }
         self.bitcoind.work_update_seconds = self.bitcoind.work_update_seconds.clamp(5, 120);
-        if self.stratum.max_threads > 64 {
+        Ok(())
+    }
+
+    fn validate_stratum(&mut self) -> Result<(), String> {
+        let s = &self.stratum;
+        if s.max_threads > 64 {
             return Err("stratum.max_threads must be at most 64".into());
         }
-        if self.stratum.max_clients_per_thread > 4096 {
+        if s.max_clients_per_thread > 4096 {
             return Err("stratum.max_clients_per_thread must be at most 4096".into());
         }
-        if self.stratum.max_clients > self.stratum.max_clients_per_thread * self.stratum.max_threads
-        {
+        if s.max_clients > s.max_clients_per_thread * s.max_threads {
             return Err("stratum.max_clients exceeds max_clients_per_thread * max_threads".into());
         }
-        let tags =
-            self.mining.coinbase_tag_primary.len() + self.mining.coinbase_tag_secondary.len();
-        if tags > 88
-            || self.mining.coinbase_tag_primary.len() > 60
-            || self.mining.coinbase_tag_secondary.len() > 60
-        {
-            return Err("mining.coinbase_tag_primary and mining.coinbase_tag_secondary must be at most 60 bytes each and 88 bytes together".into());
-        }
-        if self.stratum.vardiff_min == 0 {
+        if s.vardiff_min == 0 {
             return Err("stratum.vardiff_min must be at least 1".into());
         }
-        if !self.stratum.vardiff_min.is_power_of_two() {
-            let rounded = 1u64 << (63 - self.stratum.vardiff_min.leading_zeros());
-            self.warnings.push((
-                log::Level::Warn,
-                format!(
-                    "stratum.vardiff_min {} is not a power of two; using {rounded}",
-                    self.stratum.vardiff_min
-                ),
-            ));
-            self.stratum.vardiff_min = rounded;
-        }
-        if self.stratum.vardiff_target_shares_min < 1 {
+        if s.vardiff_target_shares_min < 1 {
             return Err("stratum.vardiff_target_shares_min must be at least 1".into());
         }
-        if self.stratum.vardiff_quickdiff_count < 4 {
+        if s.vardiff_quickdiff_count < 4 {
             return Err("stratum.vardiff_quickdiff_count must be at least 4".into());
         }
-        if self.stratum.vardiff_quickdiff_delta < 3 {
+        if s.vardiff_quickdiff_delta < 3 {
             return Err("stratum.vardiff_quickdiff_delta must be at least 3".into());
         }
-        if self.mining.blake2b_activation_height == 0 {
+        if !(60..=150).contains(&s.share_stale_seconds) {
+            return Err("stratum.share_stale_seconds must be 60..150".into());
+        }
+        if !s.vardiff_min.is_power_of_two() {
+            let rounded = ratum::target::pow2_floor(s.vardiff_min);
+            let was = s.vardiff_min;
+            self.stratum.vardiff_min = rounded;
+            self.warn(format!("stratum.vardiff_min {was} is not a power of two; using {rounded}"));
+        }
+        if self.stratum.trust_proxy != -1 {
+            self.warn("stratum.trust_proxy is set but the PROXY protocol is not supported; a connection that sends a PROXY line is closed");
+        }
+        Ok(())
+    }
+
+    fn validate_mining(&mut self) -> Result<(), String> {
+        let m = &self.mining;
+        if m.pool_address.is_empty() {
+            return Err("Required configuration option (mining.pool_address) not found".into());
+        }
+        let tags = m.coinbase_tag_primary.len() + m.coinbase_tag_secondary.len();
+        if tags > 88 || m.coinbase_tag_primary.len() > 60 || m.coinbase_tag_secondary.len() > 60 {
+            return Err("mining.coinbase_tag_primary and mining.coinbase_tag_secondary must be at most 60 bytes each and 88 bytes together".into());
+        }
+        if m.blake2b_activation_height == 0 {
             return Err("mining.blake2b_activation_height must be set. It is the first height at which a version 2 (BLAKE2b) block is valid on the network being mined.".into());
         }
-        if self.mining.blake2b_headline.is_empty() {
+        if m.blake2b_headline.is_empty() {
             return Err("mining.blake2b_headline must be set. It is the text the network requires in the coinbase of the activation block.".into());
         }
-        if self.mining.blake2b_headline.len() > MAX_COINBASE_TAG_SPACE {
+        if m.blake2b_headline.len() > MAX_COINBASE_TAG_SPACE {
             return Err(format!(
                 "mining.blake2b_headline is {} bytes; at most {MAX_COINBASE_TAG_SPACE} fit in the coinbase",
-                self.mining.blake2b_headline.len()
+                m.blake2b_headline.len()
             ));
         }
-        if !(1..=256).contains(&self.datum.protocol_job_slots) {
-            return Err("datum.protocol_job_slots must be 1..256".into());
+        self.pool_output_script = crate::address::to_output_script(&m.pool_address)
+            .ok_or("mining.pool_address is not an address a coinbase output can pay")?;
+        Ok(())
+    }
+
+    fn validate_api(&mut self) {
+        if self.api.allow_insecure_auth {
+            self.warn(
+                "api.allow_insecure_auth has no effect: the API uses HTTP Basic authentication",
+            );
         }
-        if !(60..=150).contains(&self.stratum.share_stale_seconds) {
-            return Err("stratum.share_stale_seconds must be 60..150".into());
+        if self.api.modify_conf {
+            self.warn("api.modify_conf is set but the configuration is not editable over HTTP");
+        }
+        if self.logger.log_rotate_daily.is_some() {
+            self.warn("logger.log_rotate_daily has no effect: the log file is reopened on SIGHUP, which logrotate sends");
+        }
+    }
+
+    fn validate_datum(&mut self) -> Result<(), String> {
+        let d = &self.datum;
+        if !(1..=256).contains(&d.protocol_job_slots) {
+            return Err("datum.protocol_job_slots must be 1..256".into());
         }
         // The C gateway's check counts one job per work update. A new tip builds three jobs
         // here (empty, priority, coinbaser) where C builds one and rewrites its coinbase, so
@@ -353,67 +400,54 @@ impl Config {
         let min_slots = EXTRA_JOBS_PER_TIP
             + (self.stratum.share_stale_seconds + self.bitcoind.work_update_seconds)
                 .div_ceil(self.bitcoind.work_update_seconds);
-        if (self.datum.protocol_job_slots as u64) < min_slots {
+        if (d.protocol_job_slots as u64) < min_slots {
             return Err(format!(
                 "datum.protocol_job_slots must be at least {min_slots} for stratum.share_stale_seconds {} and bitcoind.work_update_seconds {}",
                 self.stratum.share_stale_seconds, self.bitcoind.work_update_seconds
             ));
         }
-        if self.stratum.trust_proxy != -1 {
-            self.warnings.push((
-                log::Level::Warn,
-                "stratum.trust_proxy is set but the PROXY protocol is not supported; a connection that sends a PROXY line is closed".into(),
-            ));
-        }
-        if self.api.allow_insecure_auth {
-            self.warnings.push((
-                log::Level::Warn,
-                "api.allow_insecure_auth has no effect: the API uses HTTP Basic authentication"
-                    .into(),
-            ));
-        }
-        if self.api.modify_conf {
-            self.warnings.push((
-                log::Level::Warn,
-                "api.modify_conf is set but the configuration is not editable over HTTP".into(),
-            ));
-        }
-        if self.datum.protocol_global_timeout < self.bitcoind.work_update_seconds + 5 {
+        if d.protocol_global_timeout < self.bitcoind.work_update_seconds + 5 {
             return Err(
                 "datum.protocol_global_timeout must be at least bitcoind.work_update_seconds + 5"
                     .into(),
             );
         }
-        if self.datum.pooled_mining_only && self.datum.pool_host.is_empty() {
+        if d.pooled_mining_only && d.pool_host.is_empty() {
             return Err("datum.pooled_mining_only requires datum.pool_host".into());
         }
-        if self.datum.gateway_fee_bps > 10000 {
+        if d.gateway_fee_bps > 10000 {
             return Err("datum.gateway_fee_bps must be 0..10000".into());
         }
-        if self.datum.gateway_fee_bps > 0 {
-            if !self.datum.pool_pass_full_users {
+        if d.gateway_fee_bps > 0 {
+            if !d.pool_pass_full_users {
                 return Err("datum.gateway_fee_bps requires datum.pool_pass_full_users, since a fee share is credited to the fee address in place of the miner's own username".into());
             }
-            if !self.datum.gateway_fee_address.is_empty()
-                && !crate::address::is_valid(&self.datum.gateway_fee_address)
+            if !d.gateway_fee_address.is_empty()
+                && !crate::address::is_valid(&d.gateway_fee_address)
             {
                 return Err(
                     "datum.gateway_fee_address is not an address a coinbase output can pay".into(),
                 );
             }
-            if self.datum.pool_host.is_empty() {
-                self.warnings.push((
-                    log::Level::Warn,
-                    "datum.gateway_fee_bps is set but datum.pool_host is empty; a fee applies only to pooled shares".into(),
-                ));
-            }
+        }
+        if !d.pool_host.is_empty() {
+            crate::datum::parse_pool_pubkey(&d.pool_pubkey)
+                .map_err(|e| format!("datum.pool_pubkey: {e}"))?;
+        }
+        if d.gateway_fee_bps > 0 && d.pool_host.is_empty() {
+            self.warn("datum.gateway_fee_bps is set but datum.pool_host is empty; a fee applies only to pooled shares");
         }
         if self.stratum.require_address_username && !self.datum.pool_pass_full_users {
-            self.warnings.push((
-                log::Level::Warn,
-                "stratum.require_address_username is set but datum.pool_pass_full_users is not, so the pool never receives the address the username was checked for".into(),
-            ));
+            self.warn("stratum.require_address_username is set but datum.pool_pass_full_users is not, so the pool never receives the address the username was checked for");
         }
+        if self.datum.always_pay_self.is_some() {
+            self.warn("datum.always_pay_self has no effect: the coinbase always pays the pool script the split leaves");
+        }
+        Ok(())
+    }
+
+    fn validate_username_modifiers(&mut self) -> Result<(), String> {
+        let mut notes = Vec::new();
         for (modname, ranges) in &self.stratum.username_modifiers {
             let mut sum = 0f64;
             let mut covered = false;
@@ -430,7 +464,7 @@ impl Config {
             // The C gateway's `datum_config_parse_username_mods`: shares past the last range
             // go to mining.pool_address, which is reported and not refused.
             if !covered {
-                self.warnings.push((
+                notes.push((
                     log::Level::Error,
                     format!(
                         "Username modifier '{modname}' is configured to not distribute {}% of shares!",
@@ -439,14 +473,30 @@ impl Config {
                 ));
             }
         }
-        if !self.datum.pool_host.is_empty() {
-            crate::datum::parse_pool_pubkey(&self.datum.pool_pubkey)
-                .map_err(|e| format!("datum.pool_pubkey: {e}"))?;
-        }
-        if !crate::address::is_valid(&self.mining.pool_address) {
-            return Err("mining.pool_address is not an address a coinbase output can pay".into());
-        }
+        self.warnings.extend(notes);
         Ok(())
+    }
+
+    /// The window after a job's creation in which a share on it is accepted.
+    pub fn stale_window(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.stratum.share_stale_seconds + self.bitcoind.work_update_seconds,
+        )
+    }
+
+    /// The most shares one stratum thread's clients send within the stale window, sixteen
+    /// times over: the C gateway's sizing of the share queue.
+    pub fn share_queue_capacity(&self) -> usize {
+        let s = &self.stratum;
+        s.max_clients_per_thread
+            * s.vardiff_target_shares_min as usize
+            * (s.share_stale_seconds / 60) as usize
+            * 16
+    }
+
+    /// `share_queue_capacity` for every stratum thread: the duplicate-share table's size.
+    pub fn dupe_table_capacity(&self) -> usize {
+        self.share_queue_capacity() * self.stratum.max_threads
     }
 
     /// The address fee shares are credited to: `datum.gateway_fee_address`, or the
@@ -479,9 +529,20 @@ mod tests {
         let c = Config::parse(&minimal()).unwrap();
         assert_eq!(c.stratum.listen_port, 23334);
         assert_eq!(c.stratum.vardiff_min, 16384);
+        assert_eq!(c.api.miner_listen_port, 8000);
         assert_eq!(c.bitcoind.work_update_seconds, 40);
         assert!(!c.datum.pooled_mining_only);
         assert_eq!(c.fee_address(), "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080");
+    }
+
+    #[test]
+    fn the_pool_url_is_empty_unless_set() {
+        assert_eq!(Config::parse(&minimal()).unwrap().datum.pool_url, "");
+        let text = minimal().replace(
+            "\"pooled_mining_only\": false",
+            "\"pooled_mining_only\": false, \"pool_url\": \"https://pool.example\"",
+        );
+        assert_eq!(Config::parse(&text).unwrap().datum.pool_url, "https://pool.example");
     }
 
     #[test]

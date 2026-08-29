@@ -4,51 +4,13 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>RATUM Gateway</title>
+<!--shared-css-->
 <style>
-  :root {
-    --bg: #0f1115; --card: #181b22; --line: #262b34; --fg: #e6e8ec;
-    --muted: #9aa3b2; --accent: #6ea8fe; --good: #4ade80; --warn: #f0a04b;
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
-    font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  }
-  h1 { font-size: 1.25rem; margin: 0; }
-  header { display: flex; justify-content: space-between; align-items: baseline;
-           flex-wrap: wrap; gap: .5rem; border-bottom: 1px solid var(--line);
-           padding-bottom: .75rem; margin-bottom: 1rem; }
-  .motd { color: var(--muted); }
-  .right { text-align: right; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-          gap: .75rem; margin-bottom: 1.25rem; }
-  .card { background: var(--card); border: 1px solid var(--line); border-radius: 8px;
-          padding: .75rem .9rem; }
-  .card .label { color: var(--muted); font-size: .8rem; text-transform: uppercase;
-                 letter-spacing: .04em; }
-  .card .value { font-size: 1.15rem; margin-top: .2rem; word-break: break-all; }
-  table { width: 100%; border-collapse: collapse; }
-  th, td { text-align: left; padding: .45rem .6rem; border-bottom: 1px solid var(--line);
-           vertical-align: top; }
   th.key { width: 11rem; }
-  th { color: var(--muted); font-weight: 600; font-size: .8rem; text-transform: uppercase; }
-  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
-  section { margin: 1.5rem 0; }
-  h2 { font-size: 1rem; color: var(--muted); margin: 0 0 .6rem; }
-  p { margin: .4rem 0; color: var(--muted); }
-  pre { background: var(--card); border: 1px solid var(--line); border-radius: 8px;
-        padding: .8rem; overflow-x: auto; margin: .5rem 0 0; color: var(--fg); }
-  code { color: var(--accent); }
-  a { color: var(--accent); }
-  .stale { color: var(--warn); }
   input { background: var(--card); color: var(--fg); border: 1px solid var(--line);
           border-radius: 4px; padding: .3rem .5rem; font: inherit; width: 100%;
           max-width: 40rem; }
-  button { background: var(--card); color: var(--fg); border: 1px solid var(--line);
-           border-radius: 4px; padding: .3rem .8rem; font: inherit; cursor: pointer;
-           margin-top: .5rem; }
-  button:hover { border-color: var(--accent); }
-  footer { color: var(--muted); margin-top: 1rem; font-size: .8rem; }
+  button { padding: .3rem .8rem; margin-top: .5rem; }
 </style>
 </head>
 <body>
@@ -119,31 +81,20 @@
   </div>
 </footer>
 
+<!--shared-js-->
 <script>
-function num(n) { return n == null ? "-" : Number(n).toLocaleString(); }
-function esc(s) { return String(s == null ? "" : s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 function secs(s) { return s == null || s < 0 ? "-" : Math.round(s) + "s"; }
-function ths(t) { return t == null ? "-" : Number(t).toFixed(3) + " TH/s"; }
-function card(label, value) {
-  return `<div class="card"><div class="label">${label}</div><div class="value">${value}</div></div>`;
-}
 
 const addr = new URLSearchParams(location.search).get("addr") || "";
 document.getElementById("addr").value = addr;
 
-async function tick() {
-  let s;
-  try {
-    const q = addr ? `?addr=${encodeURIComponent(addr)}&format=json` : "?format=json";
-    const r = await fetch(q, {cache: "no-store"});
-    s = await r.json();
-  } catch (e) {
-    document.getElementById("updated").innerHTML = '<span class="stale">unreachable</span>';
-    return;
-  }
+poll(() => addr ? `?addr=${encodeURIComponent(addr)}&format=json` : "?format=json", s => {
 
   document.getElementById("url").textContent = `stratum+tcp://${location.hostname || "localhost"}:${s.stratum_port}`;
-  const pool = s.pool_host ? esc(s.pool_host) : "none (non-pooled: every block pays this gateway's address)";
+  // The DATUM host, linked to the pool's page when datum.pool_url names one.
+  const pool = !s.pool_host ? "none (non-pooled: every block pays this gateway's address)"
+    : s.pool_url ? `<a href="${esc(s.pool_url)}" target="_blank" rel="noopener">${esc(s.pool_host)}</a>`
+    : esc(s.pool_host);
   document.getElementById("fee").textContent = s.fee_bps
     ? `Gateway fee ${(s.fee_bps / 100).toFixed(2)}% (${s.fee_bps} bps) · pool ${s.pool_host || "none"}`
     : `No gateway fee · pool ${s.pool_host || "none"}`;
@@ -152,10 +103,10 @@ async function tick() {
     ["Fee address", `<code>${esc(s.fee_address)}</code>`],
     ["What it pays for", "The node, the bandwidth and the Stratum service this gateway provides."],
     ["Paying no fee", "Run your own node and your own gateway and point it at the pool directly. The pool charges nothing, and a gateway you run yourself has no fee to charge you."],
-    ["Pool", `<code>${pool}</code>`],
+    ["Pool", pool],
   ] : [
     ["Fee", "None. Every share is sent to the pool under the address you submitted."],
-    ["Pool", `<code>${pool}</code>`],
+    ["Pool", pool],
   ];
   document.querySelector("#feetable tbody").innerHTML =
     feeRows.map(([k, v]) => `<tr><th class="key">${k}</th><td>${v}</td></tr>`).join("");
@@ -198,11 +149,8 @@ async function tick() {
       <td class="num">${ths(c.hashrate_ths)}</td>
     </tr>`).join("") || '<tr><td colspan="7" class="motd">no connection is subscribed under this address</td></tr>';
   }
-  document.getElementById("updated").textContent = "updated " + new Date().toLocaleTimeString();
-}
-
-tick();
-setInterval(tick, 5000);
+  updated();
+});
 </script>
 </body>
 </html>

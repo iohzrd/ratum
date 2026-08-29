@@ -3,7 +3,6 @@ name = "ratum-gateway"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
-build = "../build.rs"
 
 [dependencies]
 ratum = { path = "../core" }

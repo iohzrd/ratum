@@ -169,6 +169,14 @@ impl Client {
         self.channel.unmask_header(bytes)
     }
 
+    /// The handshake response's header, unmasked with the unadvanced server-to-client key
+    /// without advancing it: `read_handshake_response` unmasks the same bytes itself. For
+    /// reading the response's length before the body arrives.
+    pub fn peek_handshake_header(&self, bytes: [u8; 4]) -> Header {
+        let key = HeaderKeys::from_nk(self.nk).server_to_client;
+        Header::from_bytes((u32::from_le_bytes(bytes) ^ key).to_le_bytes())
+    }
+
     /// Decrypt one message from the pool, checking its session signature when it carries one.
     /// The header flags select the form, as `datum_protocol_server_msg` does: channel
     /// encryption when only `is_encrypted_channel` is set, a sealed box to the session key

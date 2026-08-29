@@ -1,6 +1,6 @@
 //! Building the work a gateway would send: a coinbase split in two around the extranonce,
-//! the job that describes it, and the header built from them (the coinbase's merkle root and
-//! the job's fields).
+//! the job that describes it, and the version 2 header built from them (the coinbase's
+//! merkle root and the job's fields).
 //!
 //! The pool rebuilds all of this from the share and compares; anything these helpers get
 //! wrong produces a rejection, which is what makes them useful as a test fixture.
@@ -31,7 +31,8 @@ pub struct Work {
     pub cb: CoinbaseSection,
     pub job: JobSection,
     pub pot_index: usize,
-    pub extranonce: Vec<u8>,
+    /// The twelve extranonce bytes a share sends, restored into the header's 16-byte field.
+    pub extranonce: [u8; share::EXTRANONCE_SIZE],
     pub payout_script: Vec<u8>,
 }
 
@@ -64,14 +65,15 @@ impl Work {
             cb,
             job,
             pot_index,
-            extranonce: vec![7u8; share::EXTRANONCE_SIZE],
+            extranonce: [7u8; share::EXTRANONCE_SIZE],
             payout_script: payout_script.to_vec(),
         }
     }
 
-    /// The coinbase as the pool rebuilds it: extranonce spliced in, target byte written.
+    /// The coinbase as the pool rebuilds it: twelve zero bytes where the upstream format
+    /// splices the extranonce (the header carries it instead), and the target byte written.
     pub fn full_coinbase(&self, target_byte: u8) -> Vec<u8> {
-        let mut full = self.cb.assemble(&self.extranonce);
+        let mut full = self.cb.assemble(&[0u8; share::EXTRANONCE_SIZE]);
         full[self.pot_index] = target_byte;
         full
     }
@@ -81,76 +83,19 @@ impl Work {
         bitcoin::merkle_root(&bitcoin::sha256d(&coinbase), &self.job.merkle_branches)
     }
 
-    pub fn header(&self, version: u32, ntime: u32, nonce: u32, target_byte: u8) -> [u8; 80] {
-        bitcoin::serialize_header(
-            version,
-            &self.job.prev_hash,
-            &self.merkle_root(target_byte),
-            ntime,
-            &self.job.nbits,
-            nonce,
-        )
-    }
-
-    /// The hash the pool will compute, in the order it compares against a target.
-    pub fn hash(&self, version: u32, ntime: u32, nonce: u32, target_byte: u8) -> [u8; 32] {
-        let header = self.header(version, ntime, nonce, target_byte);
-        bitcoin::reversed(&bitcoin::sha256d(&header))
-    }
-
-    /// A share for this work, with every field the pool checks filled in.
-    pub fn submit(&self, username: &str, ntime: u32, nonce: u32, target_byte: u8) -> PowSubmit {
-        PowSubmit {
-            job_id: 0,
-            coinbase_id: self.cb.coinbase_id,
-            is_block: false,
-            subsidy_only: false,
-            quickdiff: false,
-            target_byte,
-            ntime,
-            nonce,
-            version: 0x2000_0000,
-            extranonce: self.extranonce.clone(),
-            username: username.to_string(),
-            job: Some(self.job.clone()),
-            coinbase: Some(self.cb.clone()),
-            use_time_offset: false,
-            blake2b: None,
-        }
-    }
-
-    /// The coinbase for a version 2 share: the pool splices twelve zero bytes where a
-    /// version 1 share carries its extranonce, because a version 2 header carries its own.
-    pub fn full_coinbase_v2(&self, target_byte: u8) -> Vec<u8> {
-        let mut full = self.cb.assemble(&[0u8; share::EXTRANONCE_SIZE]);
-        full[self.pot_index] = target_byte;
-        full
-    }
-
-    pub fn merkle_root_v2(&self, target_byte: u8) -> [u8; 32] {
-        let coinbase = self.full_coinbase_v2(target_byte);
-        bitcoin::merkle_root(&bitcoin::sha256d(&coinbase), &self.job.merkle_branches)
-    }
-
     /// A profile-0 header for this work: the layout a Sia-dialect ASIC hashes, with no
     /// time offset, no merge-mining commitment (`mm_rhs` zero) and a zero XOR key.
-    pub fn header_v2(
-        &self,
-        ntime: u32,
-        nonce: u32,
-        target_byte: u8,
-        extranonce: [u8; share::EXTRANONCE_SIZE],
-    ) -> HeaderV2 {
+    pub fn header(&self, ntime: u32, nonce: u32, target_byte: u8) -> HeaderV2 {
         HeaderV2 {
             version: 0x2000_0000,
             prev_block: self.job.prev_hash,
-            merkle_root: self.merkle_root_v2(target_byte),
+            merkle_root: self.merkle_root(target_byte),
             time: ntime,
             bits: u32::from_le_bytes(self.job.nbits),
             nonce,
             nonce2: 0,
             nonce3: 0,
-            extranonce: share::header_extranonce(&extranonce).expect("twelve bytes"),
+            extranonce: share::header_extranonce(&self.extranonce).expect("twelve bytes"),
             time_offset: 0,
             txcount: self.job.txn_count as u16 + 1,
             flags: 0,
@@ -161,16 +106,14 @@ impl Work {
         }
     }
 
-    /// A version 2 share: the fields the miner sets are sent, and the pool builds the header from
-    /// them and the job. `header_v2` above is the header the pool should build.
-    pub fn submit_v2(
-        &self,
-        username: &str,
-        ntime: u32,
-        nonce: u32,
-        target_byte: u8,
-        extranonce: [u8; share::EXTRANONCE_SIZE],
-    ) -> PowSubmit {
+    /// The hash the pool will compute, in the order it compares against a target.
+    pub fn hash(&self, ntime: u32, nonce: u32, target_byte: u8) -> [u8; 32] {
+        self.header(ntime, nonce, target_byte).hash_components().result
+    }
+
+    /// A share for this work: the fields the miner sets are sent, and the pool builds the
+    /// header from them and the job. `header` above is the header the pool should build.
+    pub fn submit(&self, username: &str, ntime: u32, nonce: u32, target_byte: u8) -> PowSubmit {
         PowSubmit {
             job_id: 0,
             coinbase_id: self.cb.coinbase_id,
@@ -181,12 +124,12 @@ impl Work {
             ntime,
             nonce,
             version: ratum::header::V2_FLAG | 0x2000_0000,
-            extranonce: extranonce.to_vec(),
+            extranonce: self.extranonce.to_vec(),
             username: username.to_string(),
             job: Some(self.job.clone()),
             coinbase: Some(self.cb.clone()),
             use_time_offset: false,
-            blake2b: Some(Self::blake2b_section_of(ntime, nonce)),
+            blake2b: Self::blake2b_section_of(ntime, nonce),
         }
     }
 
@@ -198,39 +141,15 @@ impl Work {
         share::Blake2bSection { sia_ntime: [0u8; 8], sia_nonce, time_on_wire: ntime }
     }
 
-    /// Search for a version 2 nonce. Only the four nonce bytes of the 80-byte ASIC input
-    /// change, so everything before it is computed once, the same layout the hardware hashes.
-    pub fn find_nonce_v2(
-        &self,
-        ntime: u32,
-        target_byte: u8,
-        extranonce: [u8; share::EXTRANONCE_SIZE],
-        target: &[u8; 32],
-    ) -> Option<u32> {
-        let header = self.header_v2(ntime, 0, target_byte, extranonce);
+    /// Search the nonce space for a hash that meets `target`. Only the four nonce bytes of
+    /// the 80-byte ASIC input change, so everything before it is computed once, the same
+    /// layout the hardware hashes.
+    pub fn find_nonce(&self, ntime: u32, target_byte: u8, target: &[u8; 32]) -> Option<u32> {
+        let header = self.header(ntime, 0, target_byte);
         let pre = header.precompute();
         let input = header.asic_input_with(&pre.hash1, &pre.h2);
-        // The version 2 proof of work is compared as it comes out of BLAKE2b, not
-        // reversed the way a SHA256d block hash is.
+        // The proof of work is compared as it comes out of BLAKE2b, not reversed the way a
+        // SHA256d block hash is.
         ratum::nonce::search(&input, 32, ratum::header::blake2b_256, target, || false)
-    }
-
-    /// Search the nonce space for a hash that meets `target`. Only the 4-byte nonce changes,
-    /// so the merkle root is computed once.
-    pub fn find_nonce(
-        &self,
-        version: u32,
-        ntime: u32,
-        target_byte: u8,
-        target: &[u8; 32],
-    ) -> Option<u32> {
-        let header = self.header(version, ntime, 0, target_byte);
-        ratum::nonce::search(
-            &header,
-            76,
-            |h| bitcoin::reversed(&bitcoin::sha256d(h)),
-            target,
-            || false,
-        )
     }
 }

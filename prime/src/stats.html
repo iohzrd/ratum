@@ -4,53 +4,16 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>RATUM Prime</title>
+<!--shared-css-->
 <style>
-  :root {
-    --bg: #0f1115; --card: #181b22; --line: #262b34; --fg: #e6e8ec;
-    --muted: #9aa3b2; --accent: #6ea8fe; --good: #4ade80;
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
-    font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  }
-  h1 { font-size: 1.25rem; margin: 0; }
-  header { display: flex; justify-content: space-between; align-items: baseline;
-           flex-wrap: wrap; gap: .5rem; border-bottom: 1px solid var(--line);
-           padding-bottom: .75rem; margin-bottom: 1rem; }
-  .motd { color: var(--muted); }
-  .right { text-align: right; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-          gap: .75rem; margin-bottom: 1.25rem; }
-  .card { background: var(--card); border: 1px solid var(--line); border-radius: 8px;
-          padding: .75rem .9rem; }
-  .card .label { color: var(--muted); font-size: .8rem; text-transform: uppercase;
-                 letter-spacing: .04em; }
-  .card .value { font-size: 1.15rem; margin-top: .2rem; word-break: break-all; }
-  table { width: 100%; border-collapse: collapse; }
-  th, td { text-align: left; padding: .45rem .6rem; border-bottom: 1px solid var(--line); }
-  th { color: var(--muted); font-weight: 600; font-size: .8rem; text-transform: uppercase; }
-  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  th.key { width: 11rem; }
   .bar { position: relative; }
   .bar > span { position: absolute; inset: 0; background: rgba(110,168,254,.16);
                 border-radius: 3px; }
   .bar > em { position: relative; font-style: normal; }
-  footer { color: var(--muted); margin-top: 1rem; font-size: .8rem; }
-  a { color: var(--accent); }
-  .stale { color: #f0a04b; }
-  .unpayable { color: #f0a04b; }
+  .unpayable { color: var(--warn); }
   .unpayable td { opacity: .75; }
-  .tag { margin-left: .5rem; padding: .05rem .4rem; border-radius: .25rem;
-         font-size: .75rem; color: #f0a04b; border: 1px solid #f0a04b; }
-  .chain { display: none; margin-left: .5rem; padding: .1rem .5rem; border-radius: .25rem;
-    font-size: .8rem; font-weight: normal; vertical-align: middle;
-    color: #f0a04b; border: 1px solid #f0a04b; }
-  section { margin: 1.5rem 0; }
-  h2 { font-size: 1rem; color: var(--muted); margin: 0 0 .6rem; }
-  p { margin: .4rem 0; color: var(--muted); }
-  pre { background: var(--card); border: 1px solid var(--line); border-radius: 8px;
-        padding: .8rem; overflow-x: auto; margin: .5rem 0 0; color: var(--fg); }
-  code { color: var(--accent); }
+  .chain { display: none; }
 </style>
 </head>
 <body>
@@ -130,21 +93,15 @@
 <footer>Read-only. Refreshes every 5 s. <span id="fee"></span>
   <div style="margin-top:.5rem">For the Bitcoin Knots BLAKE2b hardfork chain.
     <a href="https://github.com/iohzrd/ratum" target="_blank" rel="noopener">iohzrd/ratum</a> ·
-    <a href="https://github.com/iohzrd/datum_gateway" target="_blank" rel="noopener">iohzrd/datum_gateway</a>
   </div>
 </footer>
 
+<!--shared-js-->
 <script>
 const SATS = 100000000;
 function btc(sats) {
   if (sats == null) return "-";
   return (sats / SATS).toLocaleString(undefined, {minimumFractionDigits: 8, maximumFractionDigits: 8}) + " BTC";
-}
-function num(n) { return n == null ? "-" : Number(n).toLocaleString(); }
-function esc(s) { return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
-
-function card(label, value) {
-  return `<div class="card"><div class="label">${label}</div><div class="value">${value}</div></div>`;
 }
 
 // The host and port a gateway should use. `advertise` (operator-set) wins: a trailing :port in
@@ -162,15 +119,7 @@ function poolEndpoint(pool) {
   return { host: location.hostname || "127.0.0.1", port: pool.datum_port };
 }
 
-async function tick() {
-  let s;
-  try {
-    const r = await fetch("stats.json", {cache: "no-store"});
-    s = await r.json();
-  } catch (e) {
-    document.getElementById("updated").innerHTML = '<span class="stale">unreachable</span>';
-    return;
-  }
+poll(() => "stats.json", s => {
   // The subtitle shows a custom message of the day; hide it when it is empty or repeats the title.
   // The header shows the chain name unless it is mainnet, so a test pool is not taken for
   // a mainnet one.
@@ -233,15 +182,11 @@ async function tick() {
   document.querySelector("#miners tbody").innerHTML =
     rows || '<tr><td colspan="4" class="motd">no shares in the window yet</td></tr>';
 
-  const when = new Date((s.generated_at || 0) * 1000);
-  document.getElementById("updated").textContent = "updated " + when.toLocaleTimeString();
+  updated(new Date((s.generated_at || 0) * 1000));
 
   // The build the pool is running: package version and the git commit it was compiled from.
   document.getElementById("version").textContent = s.pool.version || "";
-}
-
-tick();
-setInterval(tick, 5000);
+});
 </script>
 </body>
 </html>

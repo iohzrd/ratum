@@ -1,8 +1,6 @@
 use crate::cursor::{Cursor, Truncated};
 use sha2::{Digest, Sha256};
 
-pub const HEADER_SIZE: usize = 80;
-
 pub fn sha256d(data: &[u8]) -> [u8; 32] {
     let first = Sha256::digest(data);
     Sha256::digest(first).into()
@@ -113,24 +111,6 @@ pub fn merkle_root_of(txids: &[[u8; 32]]) -> Option<([u8; 32], bool)> {
         level = next;
     }
     Some((level[0], mutated))
-}
-
-pub fn serialize_header(
-    version: u32,
-    prev_hash: &[u8; 32],
-    merkle_root: &[u8; 32],
-    ntime: u32,
-    nbits: &[u8; 4],
-    nonce: u32,
-) -> [u8; HEADER_SIZE] {
-    let mut h = [0u8; HEADER_SIZE];
-    h[0..4].copy_from_slice(&version.to_le_bytes());
-    h[4..36].copy_from_slice(prev_hash);
-    h[36..68].copy_from_slice(merkle_root);
-    h[68..72].copy_from_slice(&ntime.to_le_bytes());
-    h[72..76].copy_from_slice(nbits);
-    h[76..80].copy_from_slice(&nonce.to_le_bytes());
-    h
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -339,6 +319,23 @@ pub fn encode_compact_size(n: u64) -> Vec<u8> {
     }
 }
 
+/// A script data push: a direct push for up to 75 bytes, `OP_PUSHDATA1` up to 255.
+pub fn encode_push(data: &[u8]) -> Vec<u8> {
+    debug_assert!(data.len() <= 255);
+    let mut out =
+        if data.len() <= 75 { vec![data.len() as u8] } else { vec![0x4c, data.len() as u8] };
+    out.extend_from_slice(data);
+    out
+}
+
+/// A serialized transaction output: the value, the script length, the script.
+pub fn encode_output(value: u64, script: &[u8]) -> Vec<u8> {
+    let mut v = value.to_le_bytes().to_vec();
+    v.extend_from_slice(&encode_compact_size(script.len() as u64));
+    v.extend_from_slice(script);
+    v
+}
+
 /// Serialize a block for `submitblock`: the header, the transaction count, then the coinbase
 /// followed by the rest of the transactions in order.
 pub fn serialize_block(header: &[u8], coinbase: &[u8], other_txns: &[Vec<u8>]) -> Vec<u8> {
@@ -354,7 +351,18 @@ pub fn serialize_block(header: &[u8], coinbase: &[u8], other_txns: &[Vec<u8>]) -
 
 #[cfg(test)]
 mod tests {
-    use super::{encode_compact_size, serialize_block};
+    use super::{encode_compact_size, encode_output, encode_push, serialize_block};
+
+    #[test]
+    fn pushes_and_outputs() {
+        assert_eq!(encode_push(&[1, 2]), vec![2, 1, 2]);
+        let long = [7u8; 80];
+        let p = encode_push(&long);
+        assert_eq!(&p[..2], &[0x4c, 80]);
+        assert_eq!(p.len(), 82);
+        let o = encode_output(1, &[0x6a]);
+        assert_eq!(o, vec![1, 0, 0, 0, 0, 0, 0, 0, 1, 0x6a]);
+    }
 
     #[test]
     fn compact_size_boundaries() {
@@ -368,13 +376,13 @@ mod tests {
 
     #[test]
     fn serializes_a_coinbase_only_block() {
-        let header = [0xaa; 80];
+        let header = [0xaa; 164];
         let coinbase = vec![0xbb; 100];
         let block = serialize_block(&header, &coinbase, &[]);
-        assert_eq!(block.len(), 80 + 1 + 100);
-        assert_eq!(&block[..80], &header);
-        assert_eq!(block[80], 1);
-        assert_eq!(&block[81..], &coinbase[..]);
+        assert_eq!(block.len(), 164 + 1 + 100);
+        assert_eq!(&block[..164], &header);
+        assert_eq!(block[164], 1);
+        assert_eq!(&block[165..], &coinbase[..]);
     }
 
     #[test]
@@ -388,14 +396,14 @@ mod tests {
 
     #[test]
     fn serializes_a_block_with_a_multibyte_transaction_count() {
-        let header = [0xaa; 80];
+        let header = [0xaa; 164];
         let coinbase = vec![0xbb; 30];
         let others: Vec<Vec<u8>> = (0..300).map(|i| vec![i as u8; 4]).collect();
         let block = serialize_block(&header, &coinbase, &others);
-        assert_eq!(&block[..80], &header);
-        assert_eq!(&block[80..83], &[0xfd, 0x2d, 0x01], "301 transactions as a CompactSize");
-        assert_eq!(&block[83..113], &coinbase[..]);
-        assert_eq!(block.len(), 80 + 3 + 30 + 300 * 4);
+        assert_eq!(&block[..164], &header);
+        assert_eq!(&block[164..167], &[0xfd, 0x2d, 0x01], "301 transactions as a CompactSize");
+        assert_eq!(&block[167..197], &coinbase[..]);
+        assert_eq!(block.len(), 164 + 3 + 30 + 300 * 4);
     }
 
     #[test]
@@ -497,24 +505,6 @@ mod tests {
         step[..32].copy_from_slice(&b0);
         step[32..].copy_from_slice(&cb);
         assert_ne!(merkle_root(&cb, &[b0]), sha256d(&step));
-    }
-
-    #[test]
-    fn header_field_offsets() {
-        let h = serialize_header(
-            0x2000_0004,
-            &[0xaa; 32],
-            &[0xbb; 32],
-            0x6543_2100,
-            &[0xff, 0xff, 0x00, 0x1d],
-            0xdead_beef,
-        );
-        assert_eq!(&h[0..4], &0x2000_0004u32.to_le_bytes());
-        assert_eq!(&h[4..36], &[0xaa; 32]);
-        assert_eq!(&h[36..68], &[0xbb; 32]);
-        assert_eq!(&h[68..72], &0x6543_2100u32.to_le_bytes());
-        assert_eq!(&h[72..76], &[0xff, 0xff, 0x00, 0x1d]);
-        assert_eq!(&h[76..80], &0xdead_beefu32.to_le_bytes());
     }
 
     #[test]

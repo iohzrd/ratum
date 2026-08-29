@@ -13,9 +13,11 @@ mod datum;
 mod dupes;
 mod job;
 mod logger;
+mod publish;
 mod signals;
 mod stratum;
 mod submit;
+mod tally;
 mod template;
 mod username;
 mod vardiff;
@@ -27,9 +29,6 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-pub const GIT_COMMIT: &str = env!("RATUM_GIT_COMMIT");
-pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("RATUM_GIT_COMMIT"), ")");
-
 /// How often the watch loop runs. It relays SIGUSR1 to the template thread, which the C
 /// gateway's template loop reads every 2.5 ms, so the tick is short.
 const WATCH_TICK: Duration = Duration::from_millis(20);
@@ -37,13 +36,24 @@ const WATCH_TICK: Duration = Duration::from_millis(20);
 const STATS_INTERVAL: Duration = Duration::from_secs(300);
 /// After this long without a first job the watch loop reports it, then every 5 s.
 const FIRST_JOB_PATIENCE: Duration = Duration::from_secs(25);
+/// How long the first jobs wait for the pool connection, so they are pooled ones.
+const POOL_CONNECT_WAIT: Duration = Duration::from_secs(15);
 
 #[derive(Parser)]
-#[command(name = "ratum-gateway", version = VERSION, about = "DATUM Gateway for the Bitcoin Knots BLAKE2b hardfork")]
+#[command(name = "ratum-gateway", version = ratum::VERSION, about = "DATUM Gateway for the Bitcoin Knots BLAKE2b hardfork")]
 struct Cli {
     /// The configuration file (the C gateway's JSON schema).
     #[arg(short = 'c', long = "config", default_value = "datum_gateway_config.json")]
     config: String,
+}
+
+/// What every thread shares.
+#[derive(Clone)]
+struct Runtime {
+    config: Arc<Config>,
+    node: ratum::rpc::Client,
+    notify: Arc<template::Notify>,
+    shared: Arc<datum::Shared>,
 }
 
 /// A panic on any thread ends the process, as the C gateway's `panic_from_thread` does, so a
@@ -57,31 +67,6 @@ fn install_panic_exit() {
         log::logger().flush();
         std::process::exit(1);
     }));
-}
-
-/// Build the full job for `t` (with the coinbaser's split when there is one) and publish it.
-fn publish_full_job(
-    builder: &Mutex<job::Builder>,
-    server: &stratum::Server,
-    t: &Arc<template::Template>,
-    pool: Option<&datum::PoolConfig>,
-    coinbaser: Option<ratum::datum::messages::CoinbaserResponse>,
-) {
-    match ratum::lock(builder).build(Arc::clone(t), false, pool, coinbaser) {
-        Ok(job) => {
-            let job = Arc::new(job);
-            server.publish(Arc::clone(&job), false);
-            info!(
-                "Stratum job {} ready: height {}, {} coinbaser outputs, {}pooled (sent to {} subscribers)",
-                job.job_id,
-                job.template.height,
-                job.coinbaser_outputs.len(),
-                if job.is_datum_job { "" } else { "not " },
-                server.subscriber_count()
-            );
-        }
-        Err(e) => error!("could not build the stratum job: {e}"),
-    }
 }
 
 fn warn_about_open_file_limit(max_clients: usize) {
@@ -104,281 +89,129 @@ fn warn_about_open_file_limit(max_clients: usize) {
     }
 }
 
-fn main() {
-    let cli = Cli::parse();
-    let text = match std::fs::read_to_string(&cli.config) {
+/// The configuration file, or exit 1 with the reason on stderr (the logger it configures
+/// does not exist yet).
+fn load_config(path: &str) -> Config {
+    let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("Error reading config file {}: {e}. Check --help", cli.config);
+            eprintln!("Error reading config file {path}: {e}. Check --help");
             std::process::exit(1);
         }
     };
-    let config = match Config::parse(&text) {
-        Ok(c) => Arc::new(c),
+    match Config::parse(&text) {
+        Ok(c) => c,
         Err(e) => {
             eprintln!("Error reading config file: {e}");
             std::process::exit(1);
         }
-    };
-    let notes = logger::init(&config.logger);
-    info!("ratum-gateway {VERSION} starting");
-    for (level, message) in notes.iter().chain(&config.warnings) {
-        log::log!(*level, "{message}");
     }
-    install_panic_exit();
-    signals::install();
-    warn_about_open_file_limit(config.stratum.max_clients);
+}
 
-    let node = if !config.bitcoind.rpcuser.is_empty() {
-        ratum::rpc::Client::new(
-            &config.bitcoind.rpcurl,
-            &config.bitcoind.rpcuser,
-            &config.bitcoind.rpcpassword,
-        )
+/// The node client `bitcoind.*` names, or exit 1.
+fn connect_node(config: &Config) -> ratum::rpc::Client {
+    let b = &config.bitcoind;
+    let node = if !b.rpcuser.is_empty() {
+        ratum::rpc::Client::new(&b.rpcurl, &b.rpcuser, &b.rpcpassword)
     } else {
-        ratum::rpc::Client::with_cookie(
-            &config.bitcoind.rpcurl,
-            config.bitcoind.rpccookiefile.clone().into(),
-        )
+        ratum::rpc::Client::with_cookie(&b.rpcurl, b.rpccookiefile.clone().into())
     };
-    let node = match node {
-        Ok(n) => n,
-        Err(e) => {
-            error!("bitcoind.rpcurl: {e}");
-            std::process::exit(1);
-        }
-    };
+    node.unwrap_or_else(|e| {
+        error!("bitcoind.rpcurl: {e}");
+        std::process::exit(1);
+    })
+}
 
-    if config.datum.gateway_fee_bps > 0 {
-        info!(
-            "Gateway fee: {} basis points ({:.2}%) of submitted share work, credited to {}",
-            config.datum.gateway_fee_bps,
-            config.datum.gateway_fee_bps as f64 / 100.0,
-            config.fee_address()
-        );
-    }
-
-    let notify = Arc::new(template::Notify::default());
-    // The share queue's size is the C gateway's: per-thread clients times the shares each
-    // sends in a stale window, sixteen times over.
-    let queue_capacity = config.stratum.max_clients_per_thread
-        * config.stratum.vardiff_target_shares_min as usize
-        * (config.stratum.share_stale_seconds / 60) as usize
-        * 16;
-    let shared = Arc::new(datum::Shared::new(
-        config.datum.protocol_job_slots,
-        queue_capacity,
-        Arc::clone(&notify),
-    ));
-    let failures = Arc::new(Mutex::new(0u32));
-    let pooled = !config.datum.pool_host.is_empty();
+/// Start the DATUM thread and wait up to `POOL_CONNECT_WAIT` for its configuration.
+fn start_datum(rt: &Runtime) {
     let identity = ratum::datum::handshake::KeyPairs::generate();
-    if pooled {
-        let (sign_pk, box_pk) =
-            datum::parse_pool_pubkey(&config.datum.pool_pubkey).expect("validated");
-        info!(
-            "DATUM gateway identity: {}{}",
-            hex::encode(identity.sign_pk),
-            hex::encode(identity.box_pk)
-        );
-        let settings = datum::Settings {
-            host: config.datum.pool_host.clone(),
-            port: config.datum.pool_port,
-            pool_sign_pk: sign_pk,
-            pool_box_pk: box_pk,
-            global_timeout: Duration::from_secs(config.datum.protocol_global_timeout),
-            share_ack_timeout: datum::SHARE_ACK_TIMEOUT,
-            share_ack_grace: datum::SHARE_ACK_GRACE,
-            user_agent: datum::user_agent(),
-            pass_full_users: config.datum.pool_pass_full_users,
-            pass_workers: config.datum.pool_pass_workers,
-            pool_address: config.mining.pool_address.clone(),
-        };
-        let (shared2, identity2, failures2) =
-            (Arc::clone(&shared), identity.clone(), Arc::clone(&failures));
-        std::thread::Builder::new()
-            .name("datum".into())
-            .spawn(move || datum::run_forever(settings, shared2, identity2, failures2))
-            .expect("datum thread");
-        // Give the pool connection up to 15 seconds so the first jobs are pooled ones.
-        let started = Instant::now();
-        let mut last_report = 0;
-        while started.elapsed() < Duration::from_secs(15) && !shared.is_active() {
-            std::thread::sleep(Duration::from_millis(250));
-            let waited = started.elapsed().as_secs();
-            if waited != last_report {
-                last_report = waited;
-                info!("Waiting for the DATUM pool connection ({waited}s)");
-            }
-        }
-        if !shared.is_active() && config.datum.pooled_mining_only {
-            error!(
-                "Could not connect to the DATUM pool within 15 seconds; datum.pooled_mining_only is set, so no work is served until it connects"
-            );
-        }
-    } else {
-        info!("NON-POOLED MINING: datum.pool_host is empty; every block pays mining.pool_address");
-    }
-
-    let server = stratum::Server::new(
-        Arc::clone(&config),
-        Arc::clone(&shared),
-        node.clone(),
-        Arc::clone(&notify),
+    info!(
+        "DATUM gateway identity: {}{}",
+        hex::encode(identity.sign_pk),
+        hex::encode(identity.box_pk)
     );
-    let template_status = Arc::new(Mutex::new(template::Status::default()));
-
-    if config.bitcoind.notify_fallback {
-        let (n, notify2) = (node.clone(), Arc::clone(&notify));
-        std::thread::Builder::new()
-            .name("notify-fallback".into())
-            .spawn(move || template::fallback_notifier(n, notify2))
-            .expect("fallback notifier thread");
+    let settings = datum::Settings::from_config(&rt.config);
+    let shared = Arc::clone(&rt.shared);
+    std::thread::Builder::new()
+        .name("datum".into())
+        .spawn(move || datum::run_forever(settings, shared, identity))
+        .expect("datum thread");
+    let started = Instant::now();
+    let mut last_report = 0;
+    while started.elapsed() < POOL_CONNECT_WAIT && !rt.shared.is_active() {
+        std::thread::sleep(Duration::from_millis(250));
+        let waited = started.elapsed().as_secs();
+        if waited != last_report {
+            last_report = waited;
+            info!("Waiting for the DATUM pool connection ({waited}s)");
+        }
     }
-
-    api::start(Arc::new(api::Context {
-        server: Arc::clone(&server),
-        template_status: Arc::clone(&template_status),
-        started: Instant::now(),
-        csrf: api::csrf_token(),
-    }));
-
-    // The template thread: builds jobs from each template and publishes them. The stratum
-    // listener starts with the first job, as the C gateway's does.
-    {
-        let (server, config2, shared2, notify2, status2) = (
-            Arc::clone(&server),
-            Arc::clone(&config),
-            Arc::clone(&shared),
-            Arc::clone(&notify),
-            Arc::clone(&template_status),
+    if !rt.shared.is_active() && rt.config.datum.pooled_mining_only {
+        error!(
+            "Could not connect to the DATUM pool within {} seconds; datum.pooled_mining_only is set, so no work is served until it connects",
+            POOL_CONNECT_WAIT.as_secs()
         );
-        let node2 = node.clone();
-        std::thread::Builder::new()
-            .name("template".into())
-            .spawn(move || {
-                let builder = Arc::new(Mutex::new(job::Builder::new(Arc::clone(&config2))));
-                // Counts the templates passed in; a coinbaser response for any but the
-                // latest is discarded.
-                let template_serial = Arc::new(std::sync::atomic::AtomicU64::new(0));
-                let mut listener_started = false;
-                let payout_script = {
-                    let shared = Arc::clone(&shared2);
-                    let config = Arc::clone(&config2);
-                    move || {
-                        shared.pool_config().map_or_else(
-                            || {
-                                address::to_output_script(&config.mining.pool_address)
-                                    .unwrap_or_default()
-                            },
-                            |p| p.payout_script,
-                        )
-                    }
-                };
-                template::run(
-                    node2,
-                    Arc::clone(&config2),
-                    notify2,
-                    status2,
-                    payout_script,
-                    |t, new_block| {
-                        let serial = template_serial.fetch_add(1, Ordering::SeqCst) + 1;
-                        let pool = shared2.pool_config();
-                        if new_block {
-                            // The C gateway's sequence on a new tip: empty (subsidy-only) work
-                            // at once, then full work with the blank coinbase, then the job
-                            // with the pool's payout split once the coinbaser responds. Miners
-                            // are never left on subsidy-only work while the request is open.
-                            match ratum::lock(&builder).build(
-                                Arc::clone(&t),
-                                true,
-                                pool.as_ref(),
-                                None,
-                            ) {
-                                Ok(job) => server.publish(Arc::new(job), true),
-                                Err(e) => error!("could not build the new-block job: {e}"),
-                            }
-                            std::thread::sleep(Duration::from_millis(50));
-                            if pool.is_some() {
-                                match ratum::lock(&builder).build(
-                                    Arc::clone(&t),
-                                    false,
-                                    pool.as_ref(),
-                                    None,
-                                ) {
-                                    Ok(job) => server.publish(Arc::new(job), false),
-                                    Err(e) => error!("could not build the priority job: {e}"),
-                                }
-                            }
-                        }
-                        if pool.is_none() {
-                            publish_full_job(&builder, &server, &t, None, None);
-                        } else {
-                            // The coinbaser wait (up to COINBASER_WAIT) runs on its own thread,
-                            // as the C gateway's coinbaser thread does, so this thread keeps
-                            // polling the node and answering block notifications meanwhile.
-                            let (builder, server, shared, t, template_serial) = (
-                                Arc::clone(&builder),
-                                Arc::clone(&server),
-                                Arc::clone(&shared2),
-                                Arc::clone(&t),
-                                Arc::clone(&template_serial),
-                            );
-                            let spawned = std::thread::Builder::new()
-                                .name("coinbaser".into())
-                                .spawn(move || {
-                                    let coinbaser = shared.fetch_coinbaser(
-                                        t.coinbase_value,
-                                        t.prev_hash,
-                                        t.reduced_data,
-                                    );
-                                    if template_serial.load(Ordering::SeqCst) != serial {
-                                        info!(
-                                            "coinbaser response for a superseded template; not used"
-                                        );
-                                        return;
-                                    }
-                                    let pool = shared.pool_config();
-                                    // On a new tip the blank full job is already out; without a
-                                    // coinbaser there is nothing to replace it with.
-                                    if new_block && pool.is_some() && coinbaser.is_none() {
-                                        return;
-                                    }
-                                    publish_full_job(
-                                        &builder,
-                                        &server,
-                                        &t,
-                                        pool.as_ref(),
-                                        coinbaser,
-                                    );
-                                });
-                            if let Err(e) = spawned {
-                                error!("could not start the coinbaser thread: {e}");
-                            }
-                        }
-                        if !listener_started {
-                            listener_started = true;
-                            let server = Arc::clone(&server);
-                            std::thread::Builder::new()
-                                .name("stratum-listener".into())
-                                .spawn(move || {
-                                    if let Err(e) = stratum::listen(server) {
-                                        error!("stratum listener: {e}");
-                                        std::process::exit(1);
-                                    }
-                                })
-                                .expect("stratum listener thread");
-                        }
-                    },
-                );
-            })
-            .expect("template thread");
     }
+}
 
-    // The watch loop: the pooled_mining_only check (new connections are refused whenever the
-    // pool is not connected, as the C accept loop does; connected miners are disconnected
-    // after two connection attempts that did not reach the pool's configuration), the signal
-    // flags, the first-job diagnostic, the statistics line.
+/// The template thread: builds jobs from each template and publishes them. The stratum
+/// listener starts with the first job, as the C gateway's does.
+fn start_template_thread(
+    rt: &Runtime,
+    server: Arc<stratum::Server>,
+    status: Arc<Mutex<template::Status>>,
+) {
+    let rt = rt.clone();
+    std::thread::Builder::new()
+        .name("template".into())
+        .spawn(move || {
+            let publisher = publish::Publisher::new(
+                job::Builder::new(Arc::clone(&rt.config)),
+                Arc::clone(&server),
+                Arc::clone(&rt.shared),
+            );
+            let mut listener_started = false;
+            let payout_script = {
+                let rt = rt.clone();
+                move || {
+                    rt.shared
+                        .payout_script()
+                        .unwrap_or_else(|| rt.config.pool_output_script.clone())
+                }
+            };
+            template::run(
+                rt.node.clone(),
+                Arc::clone(&rt.config),
+                Arc::clone(&rt.notify),
+                status,
+                payout_script,
+                |t, new_block| {
+                    publisher.on_template(t, new_block);
+                    if !listener_started {
+                        listener_started = true;
+                        let server = Arc::clone(&server);
+                        std::thread::Builder::new()
+                            .name("stratum-listener".into())
+                            .spawn(move || {
+                                if let Err(e) = stratum::listen(server) {
+                                    error!("stratum listener: {e}");
+                                    std::process::exit(1);
+                                }
+                            })
+                            .expect("stratum listener thread");
+                    }
+                },
+            );
+        })
+        .expect("template thread");
+}
+
+/// The watch loop: the pooled_mining_only check (new connections are refused whenever the
+/// pool is not connected, as the C accept loop does; connected miners are disconnected
+/// after two connection attempts that did not reach the pool's configuration), the signal
+/// flags, the first-job diagnostic, the statistics line.
+fn watch_loop(rt: &Runtime, server: &stratum::Server) -> ! {
+    let pooled = !rt.config.datum.pool_host.is_empty();
     let started = Instant::now();
     let mut warned = false;
     let mut last_stats = Instant::now();
@@ -387,7 +220,7 @@ fn main() {
         std::thread::sleep(WATCH_TICK);
         if signals::BLOCK.swap(false, Ordering::Relaxed) {
             info!("SIGUSR1 received: block notification");
-            notify.raise();
+            rt.notify.raise();
         }
         if logger::REOPEN.swap(false, Ordering::Relaxed) {
             match logger::reopen() {
@@ -408,23 +241,23 @@ fn main() {
         }
         if last_stats.elapsed() >= STATS_INTERVAL {
             last_stats = Instant::now();
-            let n = server.subscriber_count();
+            let s = server.summary();
             info!(
-                "Server stats: {n} client{} / {:.2} Th/s",
-                if n == 1 { "" } else { "s" },
-                server.total_hashrate_ths()
+                "Server stats: {} client{} / {:.2} Th/s",
+                s.subscribed,
+                if s.subscribed == 1 { "" } else { "s" },
+                s.hashrate_ths
             );
         }
         if !pooled {
             continue;
         }
-        let active = shared.is_active();
-        let fails = *ratum::lock(&failures);
+        let active = rt.shared.is_active();
         if active {
-            *ratum::lock(&failures) = 0;
+            rt.shared.failures.store(0, Ordering::Relaxed);
         }
-        let reject = config.datum.pooled_mining_only && !active;
-        if reject && fails >= 2 && !warned {
+        let reject = rt.config.datum.pooled_mining_only && !active;
+        if reject && rt.shared.failures.load(Ordering::Relaxed) >= 2 && !warned {
             warn!(
                 "The DATUM pool is unreachable and datum.pooled_mining_only is set: disconnecting stratum clients until it is reached again"
             );
@@ -436,4 +269,65 @@ fn main() {
         }
         server.rejecting.store(reject, Ordering::Relaxed);
     }
+}
+
+fn main() {
+    let cli = Cli::parse();
+    let config = Arc::new(load_config(&cli.config));
+    let notes = logger::init(&config.logger);
+    info!("ratum-gateway {} starting", ratum::VERSION);
+    for (level, message) in notes.iter().chain(&config.warnings) {
+        log::log!(*level, "{message}");
+    }
+    install_panic_exit();
+    signals::install();
+    warn_about_open_file_limit(config.stratum.max_clients);
+    let node = connect_node(&config);
+
+    if config.datum.gateway_fee_bps > 0 {
+        info!(
+            "Gateway fee: {} basis points ({:.2}%) of submitted share work, credited to {}",
+            config.datum.gateway_fee_bps,
+            config.datum.gateway_fee_bps as f64 / 100.0,
+            config.fee_address()
+        );
+    }
+
+    let notify = Arc::new(template::Notify::default());
+    let shared = Arc::new(datum::Shared::new(
+        config.datum.protocol_job_slots,
+        config.share_queue_capacity(),
+        Arc::clone(&notify),
+    ));
+    let rt = Runtime { config, node, notify, shared };
+    if rt.config.datum.pool_host.is_empty() {
+        info!("NON-POOLED MINING: datum.pool_host is empty; every block pays mining.pool_address");
+    } else {
+        start_datum(&rt);
+    }
+
+    let server = stratum::Server::new(
+        Arc::clone(&rt.config),
+        Arc::clone(&rt.shared),
+        rt.node.clone(),
+        Arc::clone(&rt.notify),
+    );
+    let template_status = Arc::new(Mutex::new(template::Status::default()));
+
+    if rt.config.bitcoind.notify_fallback {
+        let (node, notify) = (rt.node.clone(), Arc::clone(&rt.notify));
+        std::thread::Builder::new()
+            .name("notify-fallback".into())
+            .spawn(move || template::fallback_notifier(node, notify))
+            .expect("fallback notifier thread");
+    }
+
+    api::start(Arc::new(api::Context {
+        server: Arc::clone(&server),
+        template_status: Arc::clone(&template_status),
+        started: Instant::now(),
+        csrf: api::csrf_token(),
+    }));
+    start_template_thread(&rt, Arc::clone(&server), template_status);
+    watch_loop(&rt, &server)
 }

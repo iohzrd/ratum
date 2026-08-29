@@ -7,15 +7,16 @@ use crate::config::Config;
 use crate::datum::PoolConfig;
 use crate::template::Template;
 use ratum::datum::messages::{CoinbaseOutput, CoinbaserResponse};
+use ratum::datum::share::EXTRANONCE_SIZE;
 use ratum::header::{self, HeaderV2};
 use ratum::target::{self, Target};
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-pub const MAX_JOBS: usize = 256;
+pub use ratum::datum::share::{COINBASE_ID_SUBSIDY_ONLY as COINBASE_SUBSIDY_ONLY, MAX_JOBS};
 pub const JOB_INDEX_XOR: u16 = 0xC0DE;
-pub const COINBASE_SUBSIDY_ONLY: u8 = 0xff;
 
 pub struct Job {
     /// Counts every job built; its low byte is the ring index.
@@ -40,6 +41,9 @@ pub struct Job {
     pub is_new_block: bool,
     pub created: Instant,
     pub stale_prevblock: AtomicBool,
+    /// `commitment` by `(coinbase id, PoT byte)`: the same pair is requested by every
+    /// connection at that difficulty, on every notify and every share.
+    commitments: Mutex<HashMap<(u8, u8), Commitment>>,
 }
 
 #[derive(Clone, Debug)]
@@ -47,6 +51,14 @@ pub struct Commitment {
     pub merkle_root: [u8; 32],
     pub h2: [u8; 32],
     pub txcount: u16,
+}
+
+/// One output of the generation transaction as the API reports it: the pool's split, then
+/// the remainder to the pool script.
+pub struct PayoutRow {
+    pub value: u64,
+    pub script: Vec<u8>,
+    pub remainder: bool,
 }
 
 impl Job {
@@ -64,7 +76,7 @@ impl Job {
 
     /// The transaction a share commits to: the coinbase with the PoT byte written in.
     pub fn full_coinbase(&self, id: u8, pot: u8) -> Option<Vec<u8>> {
-        let mut tx = self.coinbase(id)?.assemble(&[0u8; 12]);
+        let mut tx = self.coinbase(id)?.assemble(&[0u8; EXTRANONCE_SIZE]);
         *tx.get_mut(self.target_pot_index)? = pot;
         Some(tx)
     }
@@ -84,6 +96,9 @@ impl Job {
     }
 
     pub fn commitment(&self, id: u8, pot: u8) -> Option<Commitment> {
+        if let Some(c) = ratum::lock(&self.commitments).get(&(id, pot)) {
+            return Some(c.clone());
+        }
         let tx = self.full_coinbase(id, pot)?;
         let cb_hash = ratum::bitcoin::sha256d(&tx);
         let subsidy_only = id == COINBASE_SUBSIDY_ONLY;
@@ -91,7 +106,9 @@ impl Job {
         let merkle_root = ratum::bitcoin::merkle_root(&cb_hash, branches);
         let txcount = if subsidy_only { 1 } else { self.template.txns.len() as u16 + 1 };
         let h2 = self.header_base(merkle_root, txcount).precompute().h2;
-        Some(Commitment { merkle_root, h2, txcount })
+        let c = Commitment { merkle_root, h2, txcount };
+        ratum::lock(&self.commitments).insert((id, pot), c.clone());
+        Some(c)
     }
 
     /// The header a share names, from the fields the miner set.
@@ -111,6 +128,25 @@ impl Job {
         h.time_offset = u32::from_le_bytes(sia_ntime[..4].try_into().unwrap());
         h.nonce3 = u32::from_le_bytes(sia_ntime[4..].try_into().unwrap());
         Some(h)
+    }
+
+    /// What the generation transaction pays: the coinbaser's outputs, then the remainder to
+    /// the pool script when they do not take the whole value.
+    pub fn payout_rows(&self) -> Vec<PayoutRow> {
+        let mut rows: Vec<PayoutRow> = self
+            .coinbaser_outputs
+            .iter()
+            .map(|o| PayoutRow { value: o.value, script: o.script.clone(), remainder: false })
+            .collect();
+        let paid: u64 = self.coinbaser_outputs.iter().map(|o| o.value).sum();
+        if paid < self.template.coinbase_value {
+            rows.push(PayoutRow {
+                value: self.template.coinbase_value - paid,
+                script: self.pool_addr_script.clone(),
+                remainder: true,
+            });
+        }
+        rows
     }
 }
 
@@ -147,6 +183,29 @@ pub fn merkle_branches(txids: &[[u8; 32]]) -> Vec<[u8; 32]> {
     branches
 }
 
+/// Why a job could not be built. The first two hold for every template until the pool's
+/// configuration or the file changes; the others are the template's.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum BuildError {
+    #[error("pool payout script of {0} bytes")]
+    PayoutScriptSize(usize),
+    #[error("{0}")]
+    Tagging(String),
+    #[error("{0} merkle branches; the protocol carries at most 24")]
+    TooManyBranches(usize),
+    #[error("the template's bits do not decode")]
+    BadBits,
+}
+
+/// The seven coinbases of a job and what they share.
+struct CoinbaseSet {
+    coinbases: Vec<Coinbase>,
+    subsidy_only: Coinbase,
+    target_pot_index: usize,
+    /// The coinbaser outputs the widest size class included.
+    widest: Vec<CoinbaseOutput>,
+}
+
 pub struct Builder {
     serial: u64,
     enprefix: u16,
@@ -168,7 +227,7 @@ impl Builder {
         new_block: bool,
         pool: Option<&PoolConfig>,
         coinbaser: Option<CoinbaserResponse>,
-    ) -> Result<Job, String> {
+    ) -> Result<Job, BuildError> {
         let c = &self.config;
         let serial = self.serial;
         self.serial += 1;
@@ -181,15 +240,10 @@ impl Builder {
 
         let (pool_addr_script, prime_id, tag_primary) = match pool {
             Some(p) => (p.payout_script.clone(), p.prime_id, p.coinbase_tag.as_str()),
-            None => (
-                crate::address::to_output_script(&c.mining.pool_address)
-                    .ok_or("mining.pool_address is not an address")?,
-                0,
-                c.mining.coinbase_tag_primary.as_str(),
-            ),
+            None => (c.pool_output_script.clone(), 0, c.mining.coinbase_tag_primary.as_str()),
         };
         if pool_addr_script.is_empty() || pool_addr_script.len() > 64 {
-            return Err(format!("pool payout script of {} bytes", pool_addr_script.len()));
+            return Err(BuildError::PayoutScriptSize(pool_addr_script.len()));
         }
         let (script, pot_in_script) = coinbase::script_sig(&coinbase::Tagging {
             height: template.height,
@@ -200,7 +254,8 @@ impl Builder {
             unique_id: (c.mining.coinbase_unique_id & 0xffff) as u16,
             prime_id,
             datum_active: pool.is_some(),
-        })?;
+        })
+        .map_err(BuildError::Tagging)?;
         if template.height == c.mining.blake2b_activation_height && new_block {
             log::info!(
                 "Height {} activates BLAKE2b: putting the headline in the coinbase instead of the tags",
@@ -208,79 +263,14 @@ impl Builder {
             );
         }
 
-        let (coinbaser_id, outputs): (u8, Vec<CoinbaseOutput>) = match coinbaser {
-            Some(r) => {
-                let mut kept = Vec::with_capacity(r.outputs.len());
-                for o in r.outputs {
-                    if template.reduced_data
-                        && !ratum::bitcoin::output_script_size_is_valid(&o.script)
-                    {
-                        log::warn!(
-                            "Coinbaser sent a {} byte output script, over the reduced_data limit for block {}. Leaving that output out of the generation txn.",
-                            o.script.len(),
-                            template.height
-                        );
-                        continue;
-                    }
-                    kept.push(o);
-                }
-                (r.coinbaser_id, kept)
-            }
-            None => (0, Vec::new()),
-        };
-
-        let base = |outs: &[CoinbaseOutput], budget: usize, force: bool, wc: bool| {
-            coinbase::build(&coinbase::Params {
-                script_sig: &script,
-                pot_index_in_script: pot_in_script,
-                enprefix,
-                witness_commitment: if wc { Some(&template.witness_commitment) } else { None },
-                pool_script: &pool_addr_script,
-                coinbase_value: if wc {
-                    template.coinbase_value
-                } else {
-                    template.coinbase_value - template.txn_total_fee
-                },
-                outputs: outs,
-                output_budget: budget,
-                force_op_return_extranonce: force,
-            })
-        };
-        let (subsidy_only, pot_index_subsidy, _) = base(&[], 0, false, false);
-        let mut coinbases = Vec::with_capacity(6);
-        let mut target_pot_index = None;
-        let mut widest: Vec<CoinbaseOutput> = Vec::new();
-        for ty in 0..6usize {
-            let force = coinbase::TYPE_FORCES_OP_RETURN[ty];
-            let fixed = 119
-                + pool_addr_script.len()
-                + script.len()
-                + if force || script.len() > 85 { 10 } else { 0 };
-            let budget = if ty == 0 || outputs.is_empty() {
-                0
-            } else {
-                coinbase::fit_to_template(coinbase::TYPE_MAX_SIZE[ty], fixed, &template)
-            };
-            let (cb, pot, included) = base(&outputs, budget, force, true);
-            match target_pot_index {
-                None => target_pot_index = Some(pot),
-                Some(p) => debug_assert_eq!(p, pot),
-            }
-            if included.len() > widest.len() {
-                widest = included;
-            }
-            coinbases.push(cb);
-        }
-        let target_pot_index = target_pot_index.unwrap_or(pot_index_subsidy);
-        debug_assert_eq!(target_pot_index, pot_index_subsidy);
+        let (coinbaser_id, outputs) = filter_coinbaser(&template, coinbaser);
+        let set =
+            coinbase_set(&template, &script, pot_in_script, enprefix, &pool_addr_script, &outputs);
 
         let txids: Vec<[u8; 32]> = template.txns.iter().map(|t| t.txid).collect();
         let merkle_branches = merkle_branches(&txids);
         if merkle_branches.len() > ratum::datum::share::MAX_MERKLE_BRANCHES {
-            return Err(format!(
-                "{} merkle branches; the protocol carries at most 24",
-                merkle_branches.len()
-            ));
+            return Err(BuildError::TooManyBranches(merkle_branches.len()));
         }
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()) as u32;
         let job_id =
@@ -291,22 +281,138 @@ impl Builder {
             job_id,
             datum_slot,
             ntime_hex: hex::encode(template.curtime.to_le_bytes()),
-            block_target: target::bits_to_target(template.nbits)
-                .ok_or("the template's bits do not decode")?,
+            block_target: target::bits_to_target(template.nbits).ok_or(BuildError::BadBits)?,
             prevblock_hidden: header::prevblock_hidden(&template.prev_hash),
             merkle_branches,
-            target_pot_index,
-            coinbases,
-            subsidy_only,
+            target_pot_index: set.target_pot_index,
+            coinbases: set.coinbases,
+            subsidy_only: set.subsidy_only,
             coinbaser_id,
-            coinbaser_outputs: widest,
+            coinbaser_outputs: set.widest,
             pool_addr_script,
             is_datum_job: pool.is_some(),
             is_new_block: new_block,
             created: Instant::now(),
             stale_prevblock: AtomicBool::new(false),
+            commitments: Mutex::new(HashMap::new()),
             template,
         })
+    }
+}
+
+/// The coinbaser's id and outputs, less any output script over the `reduced_data` limit when
+/// the template enforces it.
+fn filter_coinbaser(
+    template: &Template,
+    coinbaser: Option<CoinbaserResponse>,
+) -> (u8, Vec<CoinbaseOutput>) {
+    let Some(r) = coinbaser else { return (0, Vec::new()) };
+    let (kept, dropped): (Vec<_>, Vec<_>) = r.outputs.into_iter().partition(|o| {
+        !template.reduced_data || ratum::bitcoin::output_script_size_is_valid(&o.script)
+    });
+    for o in dropped {
+        log::warn!(
+            "Coinbaser sent a {} byte output script, over the reduced_data limit for block {}. Leaving that output out of the generation txn.",
+            o.script.len(),
+            template.height
+        );
+    }
+    (r.coinbaser_id, kept)
+}
+
+/// The subsidy-only coinbase and the six size classes (`MAX_COINBASE_TYPES`), with the PoT
+/// byte at one offset in all of them.
+fn coinbase_set(
+    template: &Template,
+    script: &[u8],
+    pot_in_script: usize,
+    enprefix: u16,
+    pool_script: &[u8],
+    outputs: &[CoinbaseOutput],
+) -> CoinbaseSet {
+    let params = |outs, budget, force, subsidy_only| coinbase::Params {
+        script_sig: script,
+        pot_index_in_script: pot_in_script,
+        enprefix,
+        witness_commitment: if subsidy_only { None } else { Some(&template.witness_commitment) },
+        pool_script,
+        coinbase_value: if subsidy_only {
+            template.coinbase_value - template.totals.fee
+        } else {
+            template.coinbase_value
+        },
+        outputs: outs,
+        output_budget: budget,
+        force_op_return_extranonce: force,
+    };
+    let (subsidy_only, target_pot_index, _) = coinbase::build(&params(&[], 0, false, true));
+    let mut coinbases = Vec::with_capacity(coinbase::TYPE_MAX_SIZE.len());
+    let mut widest: Vec<CoinbaseOutput> = Vec::new();
+    for (ty, &max_size) in coinbase::TYPE_MAX_SIZE.iter().enumerate() {
+        let force = coinbase::TYPE_FORCES_OP_RETURN[ty];
+        let fixed = 119
+            + pool_script.len()
+            + script.len()
+            + if force || script.len() > 85 { 10 } else { 0 };
+        let budget = if ty == 0 || outputs.is_empty() {
+            0
+        } else {
+            coinbase::fit_to_template(max_size, fixed, template)
+        };
+        let (cb, pot, included) = coinbase::build(&params(outputs, budget, force, false));
+        debug_assert_eq!(pot, target_pot_index);
+        if included.len() > widest.len() {
+            widest = included;
+        }
+        coinbases.push(cb);
+    }
+    CoinbaseSet { coinbases, subsidy_only, target_pot_index, widest }
+}
+
+/// What a stratum job id names: the 14-character job id, the job's global index, and the
+/// suffix and prefix the notify added.
+///
+/// ```text
+/// {job_id}{cb:02x}      a standard job, with the coinbase class the miner is served
+/// Q{job_id}{cb:02x}     a quick-raise job, whose difficulty the connection keeps apart
+/// N{job_id}ff           new-block empty work, on the subsidy-only coinbase
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JobRef {
+    pub global_index: u8,
+    pub quickdiff: bool,
+    pub empty: bool,
+    pub coinbase: u8,
+}
+
+impl JobRef {
+    /// The id `mining.notify` carries for `job`.
+    pub fn notify_id(&self, job: &Job) -> String {
+        let cb = self.coinbase;
+        if self.quickdiff {
+            format!("Q{}{cb:02x}", job.job_id)
+        } else if self.empty {
+            format!("N{}ff", job.job_id)
+        } else {
+            format!("{}{cb:02x}", job.job_id)
+        }
+    }
+
+    /// Parse the id a `mining.submit` names; also the 14-character job id it carries.
+    pub fn parse(s: &str) -> Option<(JobRef, &str)> {
+        let (quickdiff, empty, rest) = match s.len() {
+            16 => (false, false, s),
+            17 if s.starts_with('Q') => (true, false, &s[1..]),
+            17 if s.starts_with('N') => (false, true, &s[1..]),
+            _ => return None,
+        };
+        let job_id = &rest[..14];
+        let global_index = global_index_of(job_id)?;
+        let coinbase = u8::from_str_radix(&rest[14..16], 16).ok()?;
+        if empty && coinbase != COINBASE_SUBSIDY_ONLY {
+            return None;
+        }
+        Some((JobRef { global_index, quickdiff, empty, coinbase }, job_id))
     }
 }
 
@@ -315,6 +421,21 @@ pub fn global_index_of(job_id: &str) -> Option<u8> {
     let raw = u16::from_str_radix(job_id.get(10..14)?, 16).ok()?;
     let idx = raw ^ JOB_INDEX_XOR;
     if idx as usize >= MAX_JOBS { None } else { Some(idx as u8) }
+}
+
+/// An eight-byte Sia stratum field: sixteen hex characters, or eight for a 32-bit value the
+/// miner sent alone, which fills the low four bytes.
+pub fn parse_sia_field(s: &str) -> Option<[u8; 8]> {
+    match s.len() {
+        16 => hex::decode(s).ok()?.try_into().ok(),
+        8 => {
+            let v = u32::from_str_radix(s, 16).ok()?;
+            let mut out = [0u8; 8];
+            out[..4].copy_from_slice(&v.to_le_bytes());
+            Some(out)
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -341,5 +462,31 @@ mod tests {
         let id = format!("{:08x}{:02x}{:04x}", 0x6625a3d5u32, 0x3c, 0x3c ^ JOB_INDEX_XOR);
         assert_eq!(global_index_of(&id), Some(0x3c));
         assert_eq!(global_index_of("short"), None);
+    }
+
+    #[test]
+    fn job_refs_round_trip_through_the_notify_id() {
+        let job_id = format!("{:08x}{:02x}{:04x}", 0x6625a3d5u32, 0x3c, 0x3c ^ JOB_INDEX_XOR);
+        let job = crate::template::tests::job_with_id(&job_id);
+        for r in [
+            JobRef { global_index: 0x3c, quickdiff: false, empty: false, coinbase: 2 },
+            JobRef { global_index: 0x3c, quickdiff: true, empty: false, coinbase: 5 },
+            JobRef { global_index: 0x3c, quickdiff: false, empty: true, coinbase: 0xff },
+        ] {
+            let id = r.notify_id(&job);
+            let (parsed, carried) = JobRef::parse(&id).unwrap();
+            assert_eq!(parsed, r, "{id}");
+            assert_eq!(carried, job_id);
+        }
+        assert_eq!(JobRef::parse("N6625a3d53cc0e202"), None, "empty work is subsidy-only");
+        assert_eq!(JobRef::parse("X6625a3d53cc0e2ff"), None);
+        assert_eq!(JobRef::parse("6625a3d53cc0e2"), None);
+    }
+
+    #[test]
+    fn sia_fields_take_both_widths() {
+        assert_eq!(parse_sia_field("0100000002000000"), Some([1, 0, 0, 0, 2, 0, 0, 0]));
+        assert_eq!(parse_sia_field("00000001"), Some([1, 0, 0, 0, 0, 0, 0, 0]));
+        assert_eq!(parse_sia_field("0001"), None);
     }
 }

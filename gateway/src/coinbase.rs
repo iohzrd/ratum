@@ -16,8 +16,9 @@
 //! OP_RETURN output instead, and coinb1 then ends inside that output's script.
 
 use crate::template::Template;
-use ratum::bitcoin::encode_compact_size;
+use ratum::bitcoin::{encode_compact_size, encode_output, encode_push};
 use ratum::datum::messages::CoinbaseOutput;
+use ratum::datum::share::EXTRANONCE_SIZE;
 
 /// The scriptSig length up to which the extranonce push fits inside it (100 - 15).
 const SCRIPT_SIG_ROOM_FOR_EXTRANONCE: usize = 85;
@@ -29,9 +30,9 @@ pub struct Coinbase {
 }
 
 impl Coinbase {
-    /// The transaction with `middle` (twelve bytes) between the halves.
-    pub fn assemble(&self, middle: &[u8; 12]) -> Vec<u8> {
-        let mut tx = Vec::with_capacity(self.coinb1.len() + 12 + self.coinb2.len());
+    /// The transaction with `middle` (the extranonce bytes) between the halves.
+    pub fn assemble(&self, middle: &[u8; EXTRANONCE_SIZE]) -> Vec<u8> {
+        let mut tx = Vec::with_capacity(self.coinb1.len() + EXTRANONCE_SIZE + self.coinb2.len());
         tx.extend_from_slice(&self.coinb1);
         tx.extend_from_slice(middle);
         tx.extend_from_slice(&self.coinb2);
@@ -75,13 +76,6 @@ pub fn height_push(height: u32) -> Vec<u8> {
     }
 }
 
-fn push(data: &[u8]) -> Vec<u8> {
-    let mut out =
-        if data.len() <= 75 { vec![data.len() as u8] } else { vec![0x4c, data.len() as u8] };
-    out.extend_from_slice(data);
-    out
-}
-
 /// The scriptSig without the extranonce push, and the offset of the PoT placeholder in it.
 pub fn script_sig(t: &Tagging<'_>) -> Result<(Vec<u8>, usize), String> {
     let mut script = height_push(t.height);
@@ -93,7 +87,7 @@ pub fn script_sig(t: &Tagging<'_>) -> Result<(Vec<u8>, usize), String> {
                 crate::config::MAX_COINBASE_TAG_SPACE
             ));
         }
-        script.extend_from_slice(&push(t.headline.as_bytes()));
+        script.extend_from_slice(&encode_push(t.headline.as_bytes()));
     } else {
         let tag0 = t.tag_primary.as_bytes();
         let mut tag1 = t.tag_secondary.as_bytes();
@@ -129,7 +123,7 @@ pub fn script_sig(t: &Tagging<'_>) -> Result<(Vec<u8>, usize), String> {
                 data.extend_from_slice(tag1);
                 data.push(0x00);
             }
-            script.extend_from_slice(&push(&data));
+            script.extend_from_slice(&encode_push(&data));
         } else {
             script.extend_from_slice(&[0x01, 0x00]);
         }
@@ -162,13 +156,6 @@ pub struct Params<'a> {
     /// The bytes available for `outputs`; each costs its script length plus nine.
     pub output_budget: usize,
     pub force_op_return_extranonce: bool,
-}
-
-fn output(value: u64, script: &[u8]) -> Vec<u8> {
-    let mut v = value.to_le_bytes().to_vec();
-    v.extend_from_slice(&encode_compact_size(script.len() as u64));
-    v.extend_from_slice(script);
-    v
 }
 
 /// Build a coinbase. Returns it, the offset of the PoT byte in the assembled transaction, and
@@ -219,15 +206,15 @@ pub fn build(p: &Params<'_>) -> (Coinbase, usize, Vec<CoinbaseOutput>) {
         coinb1.extend_from_slice(&p.enprefix.to_be_bytes());
     }
     for o in &included {
-        coinb2.extend_from_slice(&output(o.value, &o.script));
+        coinb2.extend_from_slice(&encode_output(o.value, &o.script));
     }
     if p.coinbase_value > paid {
-        coinb2.extend_from_slice(&output(p.coinbase_value - paid, p.pool_script));
+        coinb2.extend_from_slice(&encode_output(p.coinbase_value - paid, p.pool_script));
     } else {
-        coinb2.extend_from_slice(&output(0, &[0x6a, 0x01, 0x00]));
+        coinb2.extend_from_slice(&encode_output(0, &[0x6a, 0x01, 0x00]));
     }
     if let Some(wc) = p.witness_commitment {
-        coinb2.extend_from_slice(&output(0, wc));
+        coinb2.extend_from_slice(&encode_output(0, wc));
     }
     coinb2.extend_from_slice(&[0u8; 4]);
     (Coinbase { coinb1, coinb2 }, pot_index, included)
@@ -245,12 +232,12 @@ pub const DEFAULT_TYPE: u8 = 2;
 pub fn fit_to_template(max_size: usize, fixed_bytes: usize, t: &Template) -> usize {
     let i = fixed_bytes + max_size;
     let mut msz = max_size.saturating_sub(fixed_bytes);
-    let size_used = t.txn_total_size as u64 + 85 + 84 + 36;
+    let size_used = t.totals.size as u64 + 85 + 84 + 36;
     if i as u64 + size_used > t.sizelimit {
         let room = t.sizelimit.saturating_sub(size_used) as usize;
         msz = msz.min(room.saturating_sub(fixed_bytes));
     }
-    let weight_used = t.txn_total_weight as u64 + 340 + 336 + 36;
+    let weight_used = t.totals.weight as u64 + 340 + 336 + 36;
     if 4 * i as u64 + weight_used > t.weightlimit {
         let room = (t.weightlimit.saturating_sub(weight_used) >> 2) as usize;
         msz = msz.min(room.saturating_sub(fixed_bytes));

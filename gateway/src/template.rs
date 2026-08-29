@@ -14,15 +14,24 @@ pub struct Txn {
     pub raw: Vec<u8>,
     /// The txid in internal byte order.
     pub txid: [u8; 32],
-    /// The witness hash in internal byte order.
-    pub hash: [u8; 32],
+    /// The witness hash (GBT `hash`) in internal byte order: what the short transaction
+    /// list identifies transactions by, distinct from `txid`, which the merkle root commits to.
+    pub witness_hash: [u8; 32],
+}
+
+/// The sums over the template's transactions, which the job section carries.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TxnTotals {
+    pub fee: u64,
+    pub weight: u32,
+    pub size: u32,
+    pub sigops: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct Template {
     pub height: u32,
     pub coinbase_value: u64,
-    pub txn_total_fee: u64,
     pub mintime: u64,
     pub curtime: u64,
     pub sizelimit: u64,
@@ -41,14 +50,12 @@ pub struct Template {
     pub witness_commitment: Vec<u8>,
     pub reduced_data: bool,
     pub txns: Vec<Txn>,
-    pub txn_total_weight: u32,
-    pub txn_total_size: u32,
-    pub txn_total_sigops: u32,
+    pub totals: TxnTotals,
 }
 
 impl Template {
-    pub fn txn_hashes(&self) -> Vec<[u8; 32]> {
-        self.txns.iter().map(|t| t.hash).collect()
+    pub fn witness_hashes(&self) -> Vec<[u8; 32]> {
+        self.txns.iter().map(|t| t.witness_hash).collect()
     }
 }
 
@@ -80,6 +87,11 @@ fn str_field<'a>(
     }
 }
 
+fn hash_field(v: &serde_json::Value, key: &'static str) -> Result<[u8; 32], TemplateError> {
+    ratum::header::u256_from_display_hex(str_field(v, key, 64..=64)?)
+        .ok_or(TemplateError::Missing(key))
+}
+
 fn rule_present(v: &serde_json::Value, rule: &str) -> bool {
     v["rules"].as_array().is_some_and(|a| a.iter().any(|r| r.as_str() == Some(rule)))
 }
@@ -100,6 +112,19 @@ pub fn parse(
     payout_script: &[u8],
     announced: &mut Announced,
 ) -> Result<Template, TemplateError> {
+    let reduced_data = check_rules(v, config, payout_script, announced)?;
+    decode(v, reduced_data)
+}
+
+/// The consensus checks: the BLAKE2b headline the node will enforce at the activation block,
+/// the `!blake2b` rule against the configured activation height, and the payout script
+/// against the `reduced_data` rule. Returns whether `reduced_data` is in force.
+fn check_rules(
+    v: &serde_json::Value,
+    config: &Config,
+    payout_script: &[u8],
+    announced: &mut Announced,
+) -> Result<bool, TemplateError> {
     let height = u64_field(v, "height")? as u32;
     let activation = config.mining.blake2b_activation_height;
 
@@ -171,7 +196,12 @@ pub fn parse(
         }
         return Err(TemplateError::Refused("payout script over the reduced_data limit".into()));
     }
+    Ok(reduced_data)
+}
 
+/// The template's fields and transactions, as the JSON carries them.
+fn decode(v: &serde_json::Value, reduced_data: bool) -> Result<Template, TemplateError> {
+    let height = u64_field(v, "height")? as u32;
     let coinbase_value = u64_field(v, "coinbasevalue")?;
     let mintime = u64_field(v, "mintime")?;
     let sigoplimit = u64_field(v, "sigoplimit")?;
@@ -186,44 +216,36 @@ pub fn parse(
     let witness_commitment =
         hex::decode(wc_hex).map_err(|_| TemplateError::Missing("default_witness_commitment"))?;
     let nbits = u32::from_str_radix(&bits, 16).map_err(|_| TemplateError::Missing("bits"))?;
-    let prev_hash = ratum::header::u256_from_display_hex(&prev_hash_hex)
-        .ok_or(TemplateError::Missing("previousblockhash"))?;
+    let prev_hash = hash_field(v, "previousblockhash")?;
 
     let list = v["transactions"].as_array().ok_or(TemplateError::Missing("transactions"))?;
     if list.len() > MAX_TXNS {
         return Err(TemplateError::TooManyTxns);
     }
     let mut txns = Vec::with_capacity(list.len());
-    let (mut total_fee, mut total_weight, mut total_size, mut total_sigops) =
-        (0u64, 0u64, 0u64, 0u64);
+    let (mut fee, mut weight, mut size, mut sigops) = (0u64, 0u64, 0u64, 0u64);
     for t in list {
-        let txid = ratum::header::u256_from_display_hex(str_field(t, "txid", 64..=64)?)
-            .ok_or(TemplateError::Missing("txid"))?;
-        let hash = ratum::header::u256_from_display_hex(str_field(t, "hash", 64..=64)?)
-            .ok_or(TemplateError::Missing("hash"))?;
-        let fee = match t["fee"].as_i64() {
-            Some(f) if f >= 0 => f as u64,
+        let txid = hash_field(t, "txid")?;
+        let witness_hash = hash_field(t, "hash")?;
+        match t["fee"].as_i64() {
+            Some(f) if f >= 0 => fee += f as u64,
             _ => {
                 return Err(TemplateError::Refused(
                     "Missing or unknown fee in a GBT transaction; the coinbase value cannot be derived without it".into(),
                 ));
             }
-        };
-        let sigops = t["sigops"].as_u64().unwrap_or(0);
-        let weight = t["weight"].as_u64().unwrap_or(0);
+        }
+        sigops += t["sigops"].as_u64().unwrap_or(0);
+        weight += t["weight"].as_u64().unwrap_or(0);
         let raw = hex::decode(t["data"].as_str().ok_or(TemplateError::Missing("data"))?)
             .map_err(|_| TemplateError::Missing("data"))?;
-        total_fee += fee;
-        total_weight += weight;
-        total_size += raw.len() as u64;
-        total_sigops += sigops;
-        txns.push(Txn { raw, txid, hash });
+        size += raw.len() as u64;
+        txns.push(Txn { raw, txid, witness_hash });
     }
 
     Ok(Template {
         height,
         coinbase_value,
-        txn_total_fee: total_fee,
         mintime,
         curtime,
         sizelimit,
@@ -239,9 +261,7 @@ pub fn parse(
         witness_commitment,
         reduced_data,
         txns,
-        txn_total_weight: total_weight as u32,
-        txn_total_size: total_size as u32,
-        txn_total_sigops: total_sigops as u32,
+        totals: TxnTotals { fee, weight: weight as u32, size: size as u32, sigops: sigops as u32 },
     })
 }
 
@@ -349,6 +369,142 @@ pub struct Status {
     pub error: Option<String>,
 }
 
+/// How long after a block notification the thread polls for the announced tip before it
+/// stops expecting one.
+const NOTIFY_PATIENCE: Duration = Duration::from_secs(4);
+/// A notification within this long of a block change is that block announced again.
+const REPEAT_WINDOW: Duration = Duration::from_millis(2500);
+
+/// What the poller does with a template.
+#[derive(Debug, PartialEq, Eq)]
+enum Action {
+    /// Build jobs; with `new_block` the empty job first, with `clean_jobs`.
+    Build { new_block: bool },
+    /// Below the activation height: no work.
+    Skip,
+    /// The tip a notification announced has not reached the template: poll again shortly.
+    Retry,
+}
+
+/// The template thread's state across polls (`datum_gateway_template_thread`).
+struct Poller {
+    config: Arc<Config>,
+    status: Arc<Mutex<Status>>,
+    announced: Announced,
+    last_prev: Option<String>,
+    below_height_reported: Option<u32>,
+    was_notified: bool,
+    notified_at: Instant,
+    last_block_change: Option<Instant>,
+    /// A rebuild request (the pool connection came or went) is handled as a new block: clean
+    /// empty work, then the full job, as the C gateway's `notify_othercause` does, so miners
+    /// abandon work built on the previous payout script.
+    force_clean: bool,
+    /// A refused template is reported once per reason (the C gateway logs it on every poll).
+    last_refusal: Option<String>,
+}
+
+impl Poller {
+    /// Fetch and parse a template, or the reason there is none, which is reported and
+    /// recorded in the status.
+    fn poll(&mut self, node: &rpc::Client, payout_script: &[u8]) -> Option<Template> {
+        let raw = match fetch(node) {
+            Ok(v) => v,
+            Err(e) => {
+                ratum::lock(&self.status).error = Some("Could not fetch new template!".into());
+                error!("Could not fetch new template from {}! ({e})", self.config.bitcoind.rpcurl);
+                return None;
+            }
+        };
+        match parse(&raw, &self.config, payout_script, &mut self.announced) {
+            Ok(t) => {
+                ratum::lock(&self.status).error = None;
+                self.last_refusal = None;
+                Some(t)
+            }
+            Err(TemplateError::Refused(why)) => {
+                ratum::lock(&self.status).error = Some(why.clone());
+                if self.last_refusal.as_deref() != Some(why.as_str()) {
+                    error!("template refused: {why}");
+                    self.last_refusal = Some(why);
+                } else {
+                    debug!("template refused: {why}");
+                }
+                None
+            }
+            Err(e) => {
+                ratum::lock(&self.status).error = Some(e.to_string());
+                error!("{e}");
+                None
+            }
+        }
+    }
+
+    /// What to do with a template the node returned.
+    fn classify(&mut self, template: &Template) -> Action {
+        let tip_changed = self.last_prev.as_deref() != Some(template.prev_hash_hex.as_str());
+        let new_block = tip_changed || self.force_clean;
+        self.force_clean = false;
+        let activation = self.config.mining.blake2b_activation_height;
+        if template.height < activation {
+            if self.below_height_reported != Some(template.height) {
+                self.below_height_reported = Some(template.height);
+                warn!(
+                    "Block {} is below the BLAKE2b activation height ({activation}); this gateway mines no other proof of work, so no work will be served until the chain reaches it.",
+                    template.height
+                );
+            }
+            self.last_prev = Some(template.prev_hash_hex.clone());
+            self.was_notified = false;
+            return Action::Skip;
+        }
+        if tip_changed {
+            info!("NEW NETWORK BLOCK: {} ({})", template.prev_hash_hex, template.height);
+            self.last_prev = Some(template.prev_hash_hex.clone());
+            self.last_block_change = Some(Instant::now());
+            self.was_notified = false;
+        } else if new_block {
+            info!("Rebuilding work on block {} with clean jobs", template.height);
+        } else if self.was_notified {
+            if self.notified_at.elapsed() > NOTIFY_PATIENCE {
+                warn!(
+                    "We received a new block notification, however after 16 attempts we did not see a new block."
+                );
+                self.was_notified = false;
+            }
+            return Action::Retry;
+        }
+        Action::Build { new_block }
+    }
+
+    /// Act on what `notify` delivered while waiting.
+    fn on_wake(&mut self, wake: Wake) {
+        match wake {
+            // A notification naming the tip already served, or any notification within
+            // `REPEAT_WINDOW` of a block change, is the same block announced again (the
+            // node's poll, the pool, and the gateway's own submission each raise one).
+            Wake::Block(Some(hash)) if self.last_prev.as_deref() == Some(hash.as_str()) => {
+                debug!("block notification for the tip already served ({hash}); ignored");
+            }
+            Wake::Block(_)
+                if self.last_block_change.is_some_and(|t| t.elapsed() < REPEAT_WINDOW) =>
+            {
+                debug!("block notification within 2.5 s of the last block change; ignored");
+            }
+            Wake::Block(_) => {
+                info!("NEW NETWORK BLOCK NOTIFICATION RECEIVED");
+                self.was_notified = true;
+                self.notified_at = Instant::now();
+            }
+            Wake::Rebuild => {
+                debug!("Urgent work update triggered");
+                self.force_clean = true;
+            }
+            Wake::Timeout => {}
+        }
+    }
+}
+
 /// The template thread: fetch, parse, hand to `on_template`, sleep `work_update_seconds` or
 /// until a notification. `on_template(template, new_block)` builds and publishes jobs.
 pub fn run(
@@ -359,146 +515,96 @@ pub fn run(
     payout_script: impl Fn() -> Vec<u8>,
     mut on_template: impl FnMut(Arc<Template>, bool),
 ) {
-    let mut announced = Announced::default();
-    let mut last_prev: Option<String> = None;
-    let mut below_height_reported: Option<u32> = None;
     let interval = Duration::from_secs(config.bitcoind.work_update_seconds);
-    let mut was_notified = false;
-    let mut notified_at = Instant::now();
-    let mut last_block_change: Option<Instant> = None;
-    // A rebuild request (the pool connection came or went) takes the new-block path: clean
-    // empty work, then the full job, as the C gateway's `notify_othercause` does, so miners
-    // abandon work built on the previous payout script.
-    let mut force_clean = false;
-    // A refused template is reported once per reason (the C gateway logs it on every poll).
-    let mut last_refusal: Option<String> = None;
+    let mut p = Poller {
+        config,
+        status,
+        announced: Announced::default(),
+        last_prev: None,
+        below_height_reported: None,
+        was_notified: false,
+        notified_at: Instant::now(),
+        last_block_change: None,
+        force_clean: false,
+        last_refusal: None,
+    };
     loop {
-        let raw = match fetch(&node) {
-            Ok(v) => v,
-            Err(e) => {
-                ratum::lock(&status).error = Some("Could not fetch new template!".into());
-                error!("Could not fetch new template from {}! ({e})", config.bitcoind.rpcurl);
-                std::thread::sleep(Duration::from_secs(1));
-                continue;
-            }
+        let Some(template) = p.poll(&node, &payout_script()) else {
+            std::thread::sleep(Duration::from_secs(1));
+            continue;
         };
-        let template = match parse(&raw, &config, &payout_script(), &mut announced) {
-            Ok(t) => t,
-            Err(TemplateError::Refused(why)) => {
-                ratum::lock(&status).error = Some(why.clone());
-                if last_refusal.as_deref() != Some(why.as_str()) {
-                    error!("template refused: {why}");
-                    last_refusal = Some(why);
-                } else {
-                    debug!("template refused: {why}");
-                }
-                std::thread::sleep(Duration::from_secs(1));
-                continue;
-            }
-            Err(e) => {
-                ratum::lock(&status).error = Some(e.to_string());
-                error!("{e}");
-                std::thread::sleep(Duration::from_secs(1));
-                continue;
-            }
-        };
-        ratum::lock(&status).error = None;
-        last_refusal = None;
-
-        let tip_changed = last_prev.as_deref() != Some(template.prev_hash_hex.as_str());
-        let new_block = tip_changed || force_clean;
-        force_clean = false;
-        if template.height < config.mining.blake2b_activation_height {
-            if below_height_reported != Some(template.height) {
-                below_height_reported = Some(template.height);
-                warn!(
-                    "Block {} is below the BLAKE2b activation height ({}); this gateway mines no other proof of work, so no work will be served until the chain reaches it.",
-                    template.height, config.mining.blake2b_activation_height
-                );
-            }
-            last_prev = Some(template.prev_hash_hex.clone());
-            was_notified = false;
-        } else {
-            if tip_changed {
-                info!("NEW NETWORK BLOCK: {} ({})", template.prev_hash_hex, template.height);
-                last_prev = Some(template.prev_hash_hex.clone());
-                last_block_change = Some(Instant::now());
-                was_notified = false;
-            } else if new_block {
-                info!("Rebuilding work on block {} with clean jobs", template.height);
-            } else if was_notified {
-                // The tip a notification announced has not reached the template yet: poll
-                // again below without rebuilding the job on an unchanged template.
+        match p.classify(&template) {
+            Action::Skip => {}
+            Action::Retry => {
                 std::thread::sleep(Duration::from_millis(250));
-                if notified_at.elapsed() > Duration::from_secs(4) {
-                    warn!(
-                        "We received a new block notification, however after 16 attempts we did not see a new block."
-                    );
-                    was_notified = false;
-                }
                 continue;
             }
-            let t = Arc::new(template);
-            if new_block {
+            Action::Build { new_block } => {
+                let t = Arc::new(template);
                 info!(
-                    "Updating priority stratum job for block {}: {:.8} BTC, {} txns, {} bytes",
+                    "Updating {} stratum job for block {}: {:.8} BTC, {} txns, {} bytes",
+                    if new_block { "priority" } else { "standard" },
                     t.height,
                     t.coinbase_value as f64 / 1e8,
                     t.txns.len(),
-                    t.txn_total_size
+                    t.totals.size
                 );
-            } else {
-                info!(
-                    "Updating standard stratum job for block {}: {:.8} BTC, {} txns, {} bytes",
-                    t.height,
-                    t.coinbase_value as f64 / 1e8,
-                    t.txns.len(),
-                    t.txn_total_size
-                );
+                on_template(t, new_block);
             }
-            on_template(t, new_block);
         }
-
-        match notify.wait(interval) {
-            // A notification naming the tip already served, or any notification within
-            // 2.5 s of a block change, is the same block announced again (the node's poll,
-            // the pool, and the gateway's own submission each raise one).
-            Wake::Block(Some(hash)) if last_prev.as_deref() == Some(hash.as_str()) => {
-                debug!("block notification for the tip already served ({hash}); ignored");
-            }
-            Wake::Block(_)
-                if last_block_change.is_some_and(|t| t.elapsed() < Duration::from_millis(2500)) =>
-            {
-                debug!("block notification within 2.5 s of the last block change; ignored");
-            }
-            Wake::Block(_) => {
-                info!("NEW NETWORK BLOCK NOTIFICATION RECEIVED");
-                was_notified = true;
-                notified_at = Instant::now();
-            }
-            Wake::Rebuild => {
-                debug!("Urgent work update triggered");
-                force_clean = true;
-            }
-            Wake::Timeout => {}
-        }
+        p.on_wake(notify.wait(interval));
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn config() -> Config {
+    /// A configuration with the required keys, non-pooled, six job slots.
+    pub(crate) fn config() -> Config {
         Config::parse(
             r#"{
               "bitcoind": {"rpcuser":"u","rpcpassword":"p","rpcurl":"http://127.0.0.1:1"},
               "mining": {"pool_address":"bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080",
                          "blake2b_activation_height": 20, "blake2b_headline": "Catbus"},
-              "datum": {"pool_host": "", "pooled_mining_only": false}
+              "datum": {"pool_host": "", "pooled_mining_only": false, "protocol_job_slots": 6}
             }"#,
         )
         .unwrap()
+    }
+
+    /// A regtest template at height 21 with no transactions.
+    pub(crate) fn template() -> Template {
+        let mut wc = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+        wc.extend_from_slice(&[0u8; 32]);
+        Template {
+            height: 21,
+            coinbase_value: 5_000_000_000,
+            mintime: 1_700_000_000,
+            curtime: 1_700_000_100,
+            sizelimit: 4_000_000,
+            weightlimit: 4_000_000,
+            sigoplimit: 80_000,
+            version: 0x2000_0000,
+            bits: "207fffff".into(),
+            nbits: 0x207f_ffff,
+            nbits_bytes: [0xff, 0xff, 0x7f, 0x20],
+            prev_hash_hex: "00".repeat(32),
+            prev_hash: [0u8; 32],
+            target_hex: "7f".repeat(32),
+            witness_commitment: wc,
+            reduced_data: false,
+            txns: vec![],
+            totals: TxnTotals::default(),
+        }
+    }
+
+    /// A non-pooled job on `template()` whose id is `job_id`.
+    pub(crate) fn job_with_id(job_id: &str) -> crate::job::Job {
+        let mut b = crate::job::Builder::new(Arc::new(config()));
+        let mut job = b.build(Arc::new(template()), false, None, None).unwrap();
+        job.job_id = job_id.to_string();
+        job
     }
 
     fn gbt(height: u64, rules: &[&str], headline: Option<&str>) -> serde_json::Value {
@@ -553,6 +659,24 @@ mod tests {
     }
 
     #[test]
+    fn decodes_transactions_without_the_rule_checks() {
+        let mut v = gbt(21, &[], None);
+        v["transactions"] = serde_json::json!([{
+            "txid": "11".repeat(32), "hash": "22".repeat(32), "fee": 1000, "sigops": 4,
+            "weight": 400, "data": "0100",
+        }]);
+        let t = decode(&v, true).unwrap();
+        assert!(t.reduced_data);
+        assert_eq!(t.txns.len(), 1);
+        assert_eq!(t.totals.fee, 1000);
+        assert_eq!(t.totals.sigops, 4);
+        assert_eq!(t.totals.weight, 400);
+        assert_eq!(t.totals.size, 2);
+        v["transactions"][0]["fee"] = serde_json::json!(-1);
+        assert!(matches!(decode(&v, false), Err(TemplateError::Refused(_))));
+    }
+
+    #[test]
     fn refuses_a_wrong_headline_and_a_rule_mismatch() {
         let mut a = Announced::default();
         let e =
@@ -571,5 +695,58 @@ mod tests {
         let v = gbt(21, &["segwit", "!blake2b", "reduced_data"], None);
         assert!(parse(&v, &config(), &[0; 35], &mut a).is_err());
         assert!(parse(&v, &config(), &[0; 34], &mut a).is_ok());
+    }
+
+    fn poller() -> Poller {
+        Poller {
+            config: Arc::new(config()),
+            status: Arc::new(Mutex::new(Status::default())),
+            announced: Announced::default(),
+            last_prev: None,
+            below_height_reported: None,
+            was_notified: false,
+            notified_at: Instant::now(),
+            last_block_change: None,
+            force_clean: false,
+            last_refusal: None,
+        }
+    }
+
+    #[test]
+    fn a_new_tip_builds_clean_and_the_same_tip_builds_standard() {
+        let mut p = poller();
+        let t = template();
+        assert_eq!(p.classify(&t), Action::Build { new_block: true });
+        assert_eq!(p.classify(&t), Action::Build { new_block: false });
+        p.on_wake(Wake::Rebuild);
+        assert_eq!(p.classify(&t), Action::Build { new_block: true }, "a rebuild is clean");
+        let mut below = template();
+        below.height = 19;
+        assert_eq!(p.classify(&below), Action::Skip);
+    }
+
+    #[test]
+    fn a_notification_for_an_unseen_tip_retries_until_it_arrives_or_expires() {
+        let mut p = poller();
+        let t = template();
+        p.classify(&t);
+        p.on_wake(Wake::Block(Some(t.prev_hash_hex.clone())));
+        assert_eq!(p.classify(&t), Action::Build { new_block: false }, "the tip served: ignored");
+        p.last_block_change = Some(Instant::now() - Duration::from_secs(10));
+        p.on_wake(Wake::Block(None));
+        assert_eq!(p.classify(&t), Action::Retry);
+        p.notified_at = Instant::now() - NOTIFY_PATIENCE - Duration::from_secs(1);
+        assert_eq!(
+            p.classify(&t),
+            Action::Retry,
+            "the attempt at which patience ends still retries"
+        );
+        assert_eq!(p.classify(&t), Action::Build { new_block: false });
+        let mut next = template();
+        next.prev_hash_hex = "11".repeat(32);
+        p.on_wake(Wake::Block(None));
+        assert_eq!(p.classify(&next), Action::Build { new_block: true });
+        p.on_wake(Wake::Block(None));
+        assert_eq!(p.classify(&next), Action::Build { new_block: false }, "within 2.5 s: ignored");
     }
 }

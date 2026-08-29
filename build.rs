@@ -1,8 +1,8 @@
 //! Records the git commit the source was built from, so a running binary can report which
-//! revision it is. Shared by every workspace crate (`build = "../build.rs"`); Cargo runs it
-//! with the crate's own directory as the working directory. The value is set as the
-//! `RATUM_GIT_COMMIT` compile-time environment variable and read by `ratum::VERSION` and
-//! `ratum-gateway`'s `VERSION`. It is "unknown" when the source is not a git
+//! revision it is. The `ratum` library's build script (`core/Cargo.toml`: `build =
+//! "../build.rs"`); Cargo runs it with `core/` as the working directory. The value is set as
+//! the `RATUM_GIT_COMMIT` compile-time environment variable and read by `ratum::VERSION` and
+//! `ratum::GIT_COMMIT`, which every binary reports. It is "unknown" when the source is not a git
 //! checkout (a release tarball) or `git` is not installed, so a build never fails over it.
 //! A build outside the checkout that knows the commit (a container build whose context has
 //! no `.git`, see `ratum-deploy/Dockerfile.pool`) passes it in as `RATUM_GIT_COMMIT` in the

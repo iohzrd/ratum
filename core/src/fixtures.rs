@@ -3,7 +3,7 @@
 //! the integration tests must use that layout byte for byte, so it is written once here
 //! rather than once per test tree. The pool binary does not use this module.
 
-use crate::bitcoin::encode_compact_size;
+use crate::bitcoin::{encode_compact_size, encode_output, encode_push};
 use crate::datum::messages::CoinbaseOutput;
 use crate::datum::share::{self, CoinbaseSection};
 
@@ -14,16 +14,11 @@ pub fn p2wpkh(b: u8) -> Vec<u8> {
 }
 
 pub fn push(data: &[u8]) -> Vec<u8> {
-    let mut v = vec![data.len() as u8];
-    v.extend_from_slice(data);
-    v
+    encode_push(data)
 }
 
 pub fn out(value: u64, script: &[u8]) -> Vec<u8> {
-    let mut v = value.to_le_bytes().to_vec();
-    v.extend_from_slice(&encode_compact_size(script.len() as u64));
-    v.extend_from_slice(script);
-    v
+    encode_output(value, script)
 }
 
 /// How the coinbase identifies the pool: the tag push the pool searches for, then the 7-byte

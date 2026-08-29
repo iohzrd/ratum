@@ -184,7 +184,11 @@ fn random_share(rng: &mut Rng) -> PowSubmit {
             })
         },
         use_time_offset: rng.byte() & 1 == 1,
-        blake2b: None,
+        blake2b: Blake2bSection {
+            sia_ntime: rng.bytes(8).try_into().unwrap(),
+            sia_nonce: rng.bytes(8).try_into().unwrap(),
+            time_on_wire: rng.next() as u32,
+        },
     }
 }
 
@@ -204,22 +208,16 @@ fn shares_round_trip_whatever_their_fields() {
 }
 
 #[test]
-fn a_version_2_share_carries_its_blake2b_section_intact() {
+fn a_share_carries_its_blake2b_section_intact() {
     let mut rng = Rng::new(0x0102_0304_0506_0708);
     for _ in 0..200 {
         let mut share = random_share(&mut rng);
-        share.blake2b = Some(Blake2bSection {
-            sia_ntime: rng.bytes(8).try_into().unwrap(),
-            sia_nonce: rng.bytes(8).try_into().unwrap(),
-            time_on_wire: rng.next() as u32,
-        });
         if let Some(cb) = &mut share.coinbase {
             cb.coinbase_id = share.coinbase_id;
         }
         let bytes = share.encode();
-        let back = PowSubmit::decode(&bytes).expect("a version 2 share must decode");
-        assert_eq!(back, share);
-        assert!(back.is_v2());
+        let back = PowSubmit::decode(&bytes).expect("a share must decode");
+        assert_eq!(back.blake2b, share.blake2b);
     }
 }
 
@@ -340,7 +338,7 @@ fn the_version_2_flag_is_not_part_of_the_version() {
 
     let mut without_flag = HeaderV2::default().serialize();
     without_flag[3] &= 0x7f;
-    assert_eq!(HeaderV2::deserialize(&without_flag), None, "a v1 header is not a v2 header");
+    assert_eq!(HeaderV2::deserialize(&without_flag), None, "the flag bit clear is refused");
 }
 
 #[test]

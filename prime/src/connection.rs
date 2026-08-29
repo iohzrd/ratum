@@ -11,6 +11,7 @@ use ratum::datum::messages::{
 };
 use ratum::datum::share::PowSubmit;
 use ratum::datum::validation::{self, TxnBundle};
+use ratum::io::read_exact_deadline;
 use ratum::{lock, rpc};
 use ratum_prime::ledger;
 use ratum_prime::verify::{Accepted, Verifier};
@@ -30,39 +31,6 @@ use std::time::{Duration, Instant};
 /// coinbase would have to overpay, which the node refuses. So this tolerance need not be
 /// narrow.
 const COINBASE_VALUE_TOLERANCE: f64 = 2.0;
-
-/// Read exactly `n` bytes, returning `Err(TimedOut)` once `started.elapsed()` exceeds
-/// `deadline`. Unlike `read_exact`, whose per-read timeout is reset by every byte, this bounds
-/// the wall-clock time across the whole read so a byte-at-a-time peer cannot hold the
-/// connection open. The caller passes one `started` shared across several reads to bound them
-/// together.
-fn read_exact_with_deadline(
-    s: &mut TcpStream,
-    n: usize,
-    started: Instant,
-    deadline: Duration,
-) -> io::Result<Vec<u8>> {
-    let mut buf = vec![0u8; n];
-    let mut got = 0usize;
-    while got < n {
-        if started.elapsed() > deadline {
-            return Err(io::Error::new(io::ErrorKind::TimedOut, "handshake exceeded its deadline"));
-        }
-        match s.read(&mut buf[got..]) {
-            Ok(0) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "connection closed mid-handshake",
-                ));
-            }
-            Ok(k) => got += k,
-            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(buf)
-}
 
 /// Read a frame body of `n` bytes off a connection past its handshake.
 ///
@@ -156,8 +124,7 @@ pub(crate) fn handle(mut stream: TcpStream, server: &Server) -> io::Result<()> {
 
     let handshake_started = Instant::now();
     let mut rx = KeyRatchet::hello();
-    let header_bytes =
-        read_exact_with_deadline(&mut stream, 4, handshake_started, HANDSHAKE_DEADLINE)?;
+    let header_bytes = read_exact_deadline(&mut stream, 4, handshake_started, HANDSHAKE_DEADLINE)?;
     let header = rx.unmask(header_bytes.try_into().unwrap());
     debug!(
         "[{peer}] hello header: cmd={} len={} signed={} encrypted_pubkey={}",
@@ -166,7 +133,7 @@ pub(crate) fn handle(mut stream: TcpStream, server: &Server) -> io::Result<()> {
     if header.cmd_len as usize > MAX_HELLO_FRAME {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "hello frame too large"));
     }
-    let payload = read_exact_with_deadline(
+    let payload = read_exact_deadline(
         &mut stream,
         header.cmd_len as usize,
         handshake_started,
@@ -452,11 +419,13 @@ impl Connection<'_> {
                 if matches!(
                     e,
                     ratum::datum::share::Error::BadBlake2bSection
+                        | ratum::datum::share::Error::MissingBlake2bSection
                         | ratum::datum::share::Error::BadExtranonceSize(_)
                 ) {
                     warn!(
                         "[{peer}]      a share this pool cannot read indicates a gateway \
-                         built against a different revision of the protocol; the two \
+                         built against a different revision of the protocol (an upstream \
+                         DATUM gateway sends no BLAKE2b section); the pool and the gateway \
                          are released together"
                     );
                 }
@@ -728,9 +697,9 @@ fn read_header(stream: &mut TcpStream, hdr: &mut [u8; 4]) -> io::Result<Framing>
 }
 
 fn block_matches_header(a: &Accepted, txns: &[Vec<u8>]) -> Result<(), String> {
-    let committed: [u8; 32] = a.work.header[36..68]
-        .try_into()
-        .map_err(|_| "the header is too short to hold a merkle root".to_string())?;
+    let committed = ratum::header::HeaderV2::deserialize(&a.work.header)
+        .ok_or_else(|| "the header does not deserialize".to_string())?
+        .merkle_root;
 
     let mut ids = Vec::with_capacity(txns.len() + 1);
     ids.push(ratum::bitcoin::sha256d(&a.work.coinbase_tx));
@@ -869,7 +838,7 @@ mod tests {
         let (mut server, _) = listener.accept().unwrap();
         server.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
         let started = Instant::now();
-        let r = read_exact_with_deadline(&mut server, 4, started, Duration::from_millis(200));
+        let r = read_exact_deadline(&mut server, 4, started, Duration::from_millis(200));
         assert_eq!(r.unwrap_err().kind(), io::ErrorKind::TimedOut);
         assert!(started.elapsed() < Duration::from_secs(2), "it returns near the deadline");
         sender.join().unwrap();
@@ -888,8 +857,8 @@ mod tests {
         });
         let (mut server, _) = listener.accept().unwrap();
         server.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
-        let got = read_exact_with_deadline(&mut server, 4, Instant::now(), Duration::from_secs(5))
-            .unwrap();
+        let got =
+            read_exact_deadline(&mut server, 4, Instant::now(), Duration::from_secs(5)).unwrap();
         assert_eq!(got, vec![1, 2, 3, 4]);
         sender.join().unwrap();
     }

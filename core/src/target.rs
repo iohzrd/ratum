@@ -95,6 +95,22 @@ pub fn floor_pot(diff: u64) -> u8 {
     if diff == 0 { 0 } else { (63 - diff.leading_zeros()) as u8 }
 }
 
+/// The difficulty a PoT exponent names, `2^exponent`. Masked to 63 because it is also called
+/// on target bytes that have not been checked yet.
+pub fn diff_for_pot(exponent: u8) -> u64 {
+    1u64 << (exponent & 63)
+}
+
+/// The largest power of two at most `v`; 0 for 0.
+pub fn pow2_floor(v: u64) -> u64 {
+    if v == 0 { 0 } else { 1u64 << (63 - v.leading_zeros()) }
+}
+
+/// The smallest power of two at least `v`; 0 for 0, and 2^63 for a value above it.
+pub fn pow2_ceil(v: u64) -> u64 {
+    if v == 0 { 0 } else { v.checked_next_power_of_two().unwrap_or(1u64 << 63) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,5 +228,21 @@ mod tests {
         assert_eq!(floor_pot(4096), 12);
         assert_eq!(floor_pot(4097), 12);
         assert_eq!(floor_pot(u64::MAX), 63);
+        assert_eq!(diff_for_pot(14), 16384);
+        assert_eq!(diff_for_pot(0), 1);
+        assert_eq!(diff_for_pot(64), 1, "masked");
+    }
+
+    #[test]
+    fn powers_of_two_round_both_ways() {
+        assert_eq!(pow2_floor(0), 0);
+        assert_eq!(pow2_floor(1), 1);
+        assert_eq!(pow2_floor(4097), 4096);
+        assert_eq!(pow2_floor(u64::MAX), 1 << 63);
+        assert_eq!(pow2_ceil(0), 0);
+        assert_eq!(pow2_ceil(1), 1);
+        assert_eq!(pow2_ceil(4096), 4096);
+        assert_eq!(pow2_ceil(4097), 8192);
+        assert_eq!(pow2_ceil(u64::MAX), 1 << 63);
     }
 }

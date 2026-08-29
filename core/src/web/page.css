@@ -1,0 +1,48 @@
+  :root {
+    --bg: #0f1115; --card: #181b22; --line: #262b34; --fg: #e6e8ec;
+    --muted: #9aa3b2; --accent: #6ea8fe; --good: #4ade80; --warn: #f0a04b; --bad: #f87171;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  h1 { font-size: 1.25rem; margin: 0; }
+  header { display: flex; justify-content: space-between; align-items: baseline;
+           flex-wrap: wrap; gap: .5rem; border-bottom: 1px solid var(--line);
+           padding-bottom: .75rem; margin-bottom: 1rem; }
+  .motd { color: var(--muted); }
+  .right { text-align: right; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+          gap: .75rem; margin-bottom: 1.25rem; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 8px;
+          padding: .75rem .9rem; }
+  .card .label { color: var(--muted); font-size: .8rem; text-transform: uppercase;
+                 letter-spacing: .04em; }
+  .card .value { font-size: 1.15rem; margin-top: .2rem; word-break: break-all; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: .45rem .6rem; border-bottom: 1px solid var(--line);
+           vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: .8rem; text-transform: uppercase; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  td.mono { word-break: break-all; }
+  section { margin: 1.5rem 0; }
+  h2 { font-size: 1rem; color: var(--muted); margin: 0 0 .6rem; }
+  p { margin: .4rem 0; color: var(--muted); }
+  pre { background: var(--card); border: 1px solid var(--line); border-radius: 8px;
+        padding: .8rem; overflow-x: auto; margin: .5rem 0 0; color: var(--fg); }
+  code { color: var(--accent); }
+  a { color: var(--accent); }
+  footer { color: var(--muted); margin-top: 1rem; font-size: .8rem; }
+  .stale { color: var(--warn); }
+  .good { color: var(--good); }
+  .bad { color: var(--bad); }
+  .tag { margin-left: .5rem; padding: .05rem .4rem; border-radius: .25rem;
+         font-size: .75rem; color: var(--warn); border: 1px solid var(--warn); }
+  .chain { margin-left: .5rem; padding: .1rem .5rem; border-radius: .25rem;
+    font-size: .8rem; font-weight: normal; vertical-align: middle;
+    color: var(--warn); border: 1px solid var(--warn); }
+  button { background: var(--card); color: var(--fg); border: 1px solid var(--line);
+           border-radius: 4px; padding: .1rem .5rem; font: inherit; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  form { display: inline; }

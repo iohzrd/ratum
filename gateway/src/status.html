@@ -4,55 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>RATUM Gateway</title>
+<!--shared-css-->
 <style>
-  :root {
-    --bg: #0f1115; --card: #181b22; --line: #262b34; --fg: #e6e8ec;
-    --muted: #9aa3b2; --accent: #6ea8fe; --good: #4ade80; --warn: #f0a04b; --bad: #f87171;
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
-    font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  }
-  h1 { font-size: 1.25rem; margin: 0; }
-  header { display: flex; justify-content: space-between; align-items: baseline;
-           flex-wrap: wrap; gap: .5rem; border-bottom: 1px solid var(--line);
-           padding-bottom: .75rem; margin-bottom: 1rem; }
-  .motd { color: var(--muted); }
-  .right { text-align: right; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-          gap: .75rem; margin-bottom: 1.25rem; }
-  .card { background: var(--card); border: 1px solid var(--line); border-radius: 8px;
-          padding: .75rem .9rem; }
-  .card .label { color: var(--muted); font-size: .8rem; text-transform: uppercase;
-                 letter-spacing: .04em; }
-  .card .value { font-size: 1.15rem; margin-top: .2rem; word-break: break-all; }
-  table { width: 100%; border-collapse: collapse; }
-  th, td { text-align: left; padding: .45rem .6rem; border-bottom: 1px solid var(--line);
-           vertical-align: top; }
-  th { color: var(--muted); font-weight: 600; font-size: .8rem; text-transform: uppercase; }
-  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
-  td.mono { word-break: break-all; }
   th.key { width: 14rem; }
-  footer { color: var(--muted); margin-top: 1rem; font-size: .8rem; }
-  a { color: var(--accent); }
-  .stale { color: var(--warn); }
-  .good { color: var(--good); }
-  .bad { color: var(--bad); }
-  .tag { margin-left: .5rem; padding: .05rem .4rem; border-radius: .25rem;
-         font-size: .75rem; color: var(--warn); border: 1px solid var(--warn); }
   .zeros { color: var(--muted); }
-  .chain { margin-left: .5rem; padding: .1rem .5rem; border-radius: .25rem;
-    font-size: .8rem; font-weight: normal; vertical-align: middle;
-    color: var(--warn); border: 1px solid var(--warn); }
-  section { margin: 1.5rem 0; }
-  h2 { font-size: 1rem; color: var(--muted); margin: 0 0 .6rem; }
-  p { margin: .4rem 0; color: var(--muted); }
-  code { color: var(--accent); }
-  button { background: var(--card); color: var(--fg); border: 1px solid var(--line);
-           border-radius: 4px; padding: .1rem .5rem; font: inherit; cursor: pointer; }
-  button:hover { border-color: var(--accent); }
-  form { display: inline; }
 </style>
 </head>
 <body>
@@ -120,15 +75,10 @@
   </div>
 </footer>
 
+<!--shared-js-->
 <script>
-function num(n) { return n == null ? "-" : Number(n).toLocaleString(); }
-function esc(s) { return String(s == null ? "" : s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 function btc(b) { return b == null ? "-" : Number(b).toLocaleString(undefined, {minimumFractionDigits: 8, maximumFractionDigits: 8}) + " BTC"; }
 function secs(s) { return s == null || s < 0 ? "-" : Math.round(s) + "s ago"; }
-function ths(t) { return t == null ? "-" : Number(t).toFixed(3) + " TH/s"; }
-function card(label, value) {
-  return `<div class="card"><div class="label">${label}</div><div class="value">${value}</div></div>`;
-}
 function row(k, v) { return `<tr><th class="key">${k}</th><td class="mono">${v}</td></tr>`; }
 // A hash with its leading zeros dimmed, as the C gateway's page shows the target.
 function hash(h) {
@@ -137,15 +87,7 @@ function hash(h) {
   return `<span class="zeros">${esc(m[1])}</span>${esc(m[2])}`;
 }
 
-async function tick() {
-  let s;
-  try {
-    const r = await fetch("stats.json", {cache: "no-store"});
-    s = await r.json();
-  } catch (e) {
-    document.getElementById("updated").innerHTML = '<span class="stale">unreachable</span>';
-    return;
-  }
+poll(() => "stats.json", s => {
 
   const st = document.getElementById("status");
   st.textContent = s.status;
@@ -181,7 +123,7 @@ async function tick() {
   document.getElementById("cards").innerHTML = cards.join("");
 
   const poolRows = s.pool_host ? [
-    row("Host", esc(s.pool_host)),
+    row("Host", s.pool_url ? `<a href="${esc(s.pool_url)}" target="_blank" rel="noopener">${esc(s.pool_host)}</a>` : esc(s.pool_host)),
     row("Tag / secondary tag", `${esc(s.pool_tag)}${s.secondary_tag ? " / " + esc(s.secondary_tag) : ""}`),
     row("Public key", esc(s.pool_pubkey)),
     row("Minimum difficulty", num(s.pool_min_diff)),
@@ -205,7 +147,7 @@ async function tick() {
 
   let clientRows;
   if (s.clients == null) {
-    clientRows = `<tr><td colspan="12" class="motd">The client list needs the admin password: <a href="clients">log in</a>, then return here.</td></tr>`;
+    clientRows = `<tr><td colspan="12" class="motd">The client list needs the admin password: <a href="login">log in</a>.</td></tr>`;
   } else if (s.clients.length === 0) {
     clientRows = '<tr><td colspan="12" class="motd">no clients connected</td></tr>';
   } else {
@@ -231,11 +173,8 @@ async function tick() {
   document.querySelector("#coinbaser tbody").innerHTML =
     outs || '<tr><td colspan="2" class="motd">no job yet</td></tr>';
 
-  document.getElementById("updated").textContent = "updated " + new Date().toLocaleTimeString();
-}
-
-tick();
-setInterval(tick, 5000);
+  updated();
+});
 </script>
 </body>
 </html>

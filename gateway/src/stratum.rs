@@ -5,7 +5,8 @@ use crate::address;
 use crate::config::Config;
 use crate::datum::{self, QueuedShare};
 use crate::dupes::Dupes;
-use crate::job::{COINBASE_SUBSIDY_ONLY, Job, MAX_JOBS};
+use crate::job::{COINBASE_SUBSIDY_ONLY, Job, JobRef, MAX_JOBS, parse_sia_field};
+use crate::tally::Tally;
 use crate::username::{self, FeeMeter};
 use crate::vardiff::{self, Vardiff};
 use log::{debug, error, info, warn};
@@ -14,7 +15,7 @@ use serde_json::{Value, json};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const CLIENT_BUFFER: usize = 16384 * 3 + 1024;
@@ -25,7 +26,8 @@ const STAT_CYCLE: Duration = Duration::from_secs(60);
 /// Difficulty to TH/s: `diff * 2^32 / 1e12` per second.
 const DIFF_TO_THS: f64 = 0.004294967296;
 
-/// What a share's job lookup and header build produced.
+/// A stratum error: the code and the text of the `error` array.
+#[derive(Clone, Copy)]
 struct Reject(i64, &'static str);
 
 const UNKNOWN_WORK: Reject = Reject(20, "unknown-work");
@@ -34,21 +36,33 @@ const STALE_PREVBLK: Reject = Reject(21, "stale-prevblk");
 const DUPLICATE: Reject = Reject(22, "duplicate");
 const HIGH_HASH: Reject = Reject(23, "high-hash");
 const UNAUTHORIZED_WORKER: Reject = Reject(24, "unauthorized-worker");
+const METHOD_NOT_FOUND: Reject = Reject(-3, "Method not found");
+
+/// Why a connection was closed.
+#[derive(Debug, thiserror::Error)]
+enum Disconnect {
+    #[error("{0}")]
+    Io(#[from] io::Error),
+    #[error("{0}")]
+    Protocol(String),
+    #[error("idle: {0}")]
+    Idle(&'static str),
+    #[error("kill request")]
+    Killed,
+}
 
 /// The jobs the server holds: the ring by global index and the one new connections get.
 #[derive(Default)]
 pub struct Jobs {
     pub ring: Vec<Option<Arc<Job>>>,
     pub current: Option<Arc<Job>>,
-    /// Counts publications; a connection compares it with the one it last sent.
-    pub generation: u64,
-    /// Whether the current job is to be sent with `clean_jobs`.
-    pub clean: bool,
-    /// Whether the current job is new-block empty work (subsidy-only coinbase).
+    /// Whether the current job is new-block empty work (subsidy-only coinbase), sent with
+    /// `clean_jobs`.
     pub empty: bool,
 }
 
-/// Per-connection statistics, for the API.
+/// Per-connection statistics, for the API. Written by the connection at the events that
+/// change them.
 #[derive(Clone, Debug, Default)]
 pub struct ClientStats {
     pub remote: String,
@@ -57,15 +71,10 @@ pub struct ClientStats {
     pub username: String,
     pub subscribed: bool,
     pub subscribed_at: Option<Instant>,
-    pub sid: u32,
-    pub authorized: bool,
     pub current_diff: u64,
-    pub accepted_count: u64,
-    pub accepted_diff: u64,
-    pub rejected_count: u64,
-    pub rejected_diff: u64,
-    pub fee_count: u64,
-    pub fee_diff: u64,
+    pub accepted: Tally,
+    pub rejected: Tally,
+    pub fee: Tally,
     pub last_accepted: Option<Instant>,
     pub coinbase_selection: u8,
     /// The completed window's accepted difficulty and its length, for the hashrate.
@@ -90,20 +99,29 @@ pub struct ClientEntry {
     pub stats: Mutex<ClientStats>,
 }
 
+/// What one pass over the client list yields.
+#[derive(Default)]
+pub struct ClientSummary {
+    pub connections: usize,
+    pub subscribed: usize,
+    pub hashrate_ths: f64,
+}
+
 pub struct Server {
     pub config: Arc<Config>,
     pub datum: Arc<datum::Shared>,
     pub node: ratum::rpc::Client,
     pub notify: Arc<crate::template::Notify>,
     pub jobs: Mutex<Jobs>,
-    pub job_signal: Condvar,
-    pub clients: Mutex<Vec<Arc<ClientEntry>>>,
+    /// Counts publications; a connection compares it with the one it last sent.
+    generation: AtomicU64,
+    clients: Mutex<Vec<Arc<ClientEntry>>>,
     dupes: Mutex<Dupes>,
     next_unique_id: AtomicU64,
     /// Set while `pooled_mining_only` and the pool is not connected: connections are refused.
     pub rejecting: AtomicBool,
-    pub fee_share_count: AtomicU64,
-    pub fee_share_diff: AtomicU64,
+    /// The shares credited to the fee address.
+    pub fee: Mutex<Tally>,
     pub extra_nodes: Vec<ratum::rpc::Client>,
     pub listening: AtomicBool,
 }
@@ -115,14 +133,6 @@ impl Server {
         node: ratum::rpc::Client,
         notify: Arc<crate::template::Notify>,
     ) -> Arc<Self> {
-        let s = &config.stratum;
-        let capacity = s.max_clients_per_thread as u64
-            * s.vardiff_target_shares_min
-            * (s.share_stale_seconds / 60)
-            * 16
-            * s.max_threads as u64;
-        let accept_window =
-            Duration::from_secs(s.share_stale_seconds + config.bitcoind.work_update_seconds);
         let extra_nodes = config
             .extra_block_submissions
             .urls
@@ -135,19 +145,19 @@ impl Server {
                 c
             })
             .collect();
+        let dupes = Dupes::new(config.dupe_table_capacity(), config.stale_window());
         Arc::new(Server {
             config,
             datum,
             node,
             notify,
             jobs: Mutex::new(Jobs { ring: vec![None; MAX_JOBS], ..Default::default() }),
-            job_signal: Condvar::new(),
+            generation: AtomicU64::new(0),
             clients: Mutex::new(Vec::new()),
-            dupes: Mutex::new(Dupes::new(capacity as usize, accept_window)),
+            dupes: Mutex::new(dupes),
             next_unique_id: AtomicU64::new(1),
             rejecting: AtomicBool::new(false),
-            fee_share_count: AtomicU64::new(0),
-            fee_share_diff: AtomicU64::new(0),
+            fee: Mutex::new(Tally::default()),
             extra_nodes,
             listening: AtomicBool::new(false),
         })
@@ -174,31 +184,53 @@ impl Server {
         }
         j.ring[job.global_index as usize] = Some(Arc::clone(&job));
         j.current = Some(job);
-        j.generation += 1;
-        j.clean = empty;
         j.empty = empty;
-        drop(j);
-        self.job_signal.notify_all();
+        self.generation.fetch_add(1, Ordering::Release);
     }
 
     pub fn current_job(&self) -> Option<Arc<Job>> {
         ratum::lock(&self.jobs).current.clone()
     }
 
-    pub fn subscriber_count(&self) -> usize {
-        ratum::lock(&self.clients).iter().filter(|c| ratum::lock(&c.stats).subscribed).count()
+    /// The current job, whether it is empty work, and the generation it was published at.
+    fn current_for_send(&self) -> (Option<Arc<Job>>, bool, u64) {
+        let j = ratum::lock(&self.jobs);
+        (j.current.clone(), j.empty, self.generation.load(Ordering::Acquire))
     }
 
     pub fn connection_count(&self) -> usize {
         ratum::lock(&self.clients).len()
     }
 
-    pub fn total_hashrate_ths(&self) -> f64 {
-        ratum::lock(&self.clients).iter().filter_map(|c| ratum::lock(&c.stats).hashrate_ths()).sum()
+    /// The connection, subscription and hashrate totals in one pass over the client list.
+    pub fn summary(&self) -> ClientSummary {
+        let mut s = ClientSummary::default();
+        for c in ratum::lock(&self.clients).iter() {
+            let st = ratum::lock(&c.stats);
+            s.connections += 1;
+            s.subscribed += usize::from(st.subscribed);
+            s.hashrate_ths += st.hashrate_ths().unwrap_or(0.0);
+        }
+        s
+    }
+
+    pub fn subscriber_count(&self) -> usize {
+        self.summary().subscribed
     }
 
     pub fn client_stats(&self) -> Vec<ClientStats> {
-        ratum::lock(&self.clients).iter().map(|c| ratum::lock(&c.stats).clone()).collect()
+        self.client_stats_where(|_| true)
+    }
+
+    /// The statistics of the clients `keep` selects, filtered before they are copied.
+    pub fn client_stats_where(&self, keep: impl Fn(&ClientStats) -> bool) -> Vec<ClientStats> {
+        ratum::lock(&self.clients)
+            .iter()
+            .filter_map(|c| {
+                let st = ratum::lock(&c.stats);
+                keep(&st).then(|| st.clone())
+            })
+            .collect()
     }
 
     /// Disconnect every client (`datum_stratum_v1_shutdown_all`).
@@ -224,19 +256,21 @@ impl Server {
 /// exists, as the C gateway does.
 pub fn listen(server: Arc<Server>) -> io::Result<()> {
     let s = &server.config.stratum;
-    let addr = if s.listen_addr.is_empty() {
-        format!("[::]:{}", s.listen_port)
-    } else {
-        format!("{}:{}", s.listen_addr, s.listen_port)
-    };
-    let listener = match TcpListener::bind(&addr) {
-        Ok(l) => l,
-        Err(e) if s.listen_addr.is_empty() => {
-            debug!("could not bind {addr} ({e}); binding IPv4 only");
-            TcpListener::bind(format!("0.0.0.0:{}", s.listen_port))?
+    let mut listener = None;
+    let mut last = io::Error::other("no address to bind");
+    for addr in ratum::http::bind_candidates(&s.listen_addr, s.listen_port) {
+        match TcpListener::bind(&addr) {
+            Ok(l) => {
+                listener = Some(l);
+                break;
+            }
+            Err(e) => {
+                debug!("could not bind {addr} ({e})");
+                last = e;
+            }
         }
-        Err(e) => return Err(e),
-    };
+    }
+    let listener = listener.ok_or(last)?;
     info!("Stratum V1 Server Init complete: listening on {}", listener.local_addr()?);
     server.listening.store(true, Ordering::Relaxed);
     let mut last_reject_log = Instant::now() - Duration::from_secs(10);
@@ -267,10 +301,9 @@ pub fn listen(server: Arc<Server>) -> io::Result<()> {
         let server = Arc::clone(&server);
         std::thread::Builder::new()
             .name("stratum-client".into())
-            .spawn(move || {
-                if let Err(e) = Connection::run(server, stream) {
-                    debug!("Stratum client connection closed. ({e})");
-                }
+            .spawn(move || match Connection::run(server, stream) {
+                Ok(()) | Err(Disconnect::Io(_) | Disconnect::Killed | Disconnect::Idle(_)) => {}
+                Err(e @ Disconnect::Protocol(_)) => info!("Stratum client connection closed: {e}"),
             })
             .map_err(|e| {
                 warn!("could not start a client thread: {e}");
@@ -279,6 +312,19 @@ pub fn listen(server: Arc<Server>) -> io::Result<()> {
             .ok();
     }
     Ok(())
+}
+
+/// A `mining.submit` once parsed: the job it names and the fields the miner set.
+struct SubmitRequest {
+    job: Arc<Job>,
+    /// The difficulty the job was served at to this connection.
+    job_diff: u64,
+    job_ref: JobRef,
+    extranonce: [u8; 16],
+    ntime: [u8; 8],
+    nonce: [u8; 8],
+    /// What the miner sent as its username.
+    miner_username: String,
 }
 
 struct Connection {
@@ -290,14 +336,12 @@ struct Connection {
     subscribed: bool,
     authorized: bool,
     username: String,
-    useragent: String,
     vardiff: Vardiff,
     coinbase_selection: u8,
     /// The difficulty each job in the ring was served at to this connection.
     job_diffs: Vec<Option<u64>>,
     sent_generation: u64,
     connected: Instant,
-    subscribed_at: Option<Instant>,
     last_accepted: Option<Instant>,
     /// Hashrate window.
     window_active: u64,
@@ -307,12 +351,15 @@ struct Connection {
 }
 
 impl Connection {
-    fn run(server: Arc<Server>, stream: TcpStream) -> io::Result<()> {
+    fn run(server: Arc<Server>, stream: TcpStream) -> Result<(), Disconnect> {
         let remote = stream.peer_addr().map_or_else(|_| "?".to_string(), |a| a.to_string());
         stream.set_nodelay(true)?;
         stream.set_read_timeout(Some(READ_POLL))?;
         stream.set_write_timeout(Some(Duration::from_secs(30)))?;
         let unique_id = server.next_unique_id.fetch_add(1, Ordering::Relaxed);
+        // The C gateway packs a 22-bit client index and a thread id; here the connection
+        // counter is the whole 32 bits, so two live connections never share extranonce1.
+        let sid = (unique_id as u32) ^ 0xB10C_F00D;
         let entry = Arc::new(ClientEntry {
             kill: AtomicBool::new(false),
             stats: Mutex::new(ClientStats {
@@ -326,24 +373,21 @@ impl Connection {
         ratum::lock(&server.clients).push(Arc::clone(&entry));
         debug!("New Stratum client connected. {remote} ({unique_id})");
         let now = Instant::now();
+        let s = &server.config.stratum;
         let mut c = Connection {
-            server: Arc::clone(&server),
             entry: Arc::clone(&entry),
             stream,
             remote,
-            // The C gateway packs a 22-bit client index and a thread id; here the connection
-            // counter is the whole 32 bits, so two live connections never share extranonce1.
-            sid: (unique_id as u32) ^ 0xB10C_F00D,
+            sid,
             subscribed: false,
             authorized: false,
             username: String::new(),
-            useragent: String::new(),
             vardiff: Vardiff::new(
                 vardiff::Params {
-                    min: server.config.stratum.vardiff_min,
-                    target_shares_min: server.config.stratum.vardiff_target_shares_min,
-                    quickdiff_count: server.config.stratum.vardiff_quickdiff_count,
-                    quickdiff_delta: server.config.stratum.vardiff_quickdiff_delta,
+                    min: s.vardiff_min,
+                    target_shares_min: s.vardiff_target_shares_min,
+                    quickdiff_count: s.vardiff_quickdiff_count,
+                    quickdiff_delta: s.vardiff_quickdiff_delta,
                 },
                 now,
             ),
@@ -351,82 +395,77 @@ impl Connection {
             job_diffs: vec![None; MAX_JOBS],
             sent_generation: 0,
             connected: now,
-            subscribed_at: None,
             last_accepted: None,
             window_active: 0,
             window_started: now,
             fee: FeeMeter::default(),
             next_idle_check: now + Duration::from_secs(10),
+            server: Arc::clone(&server),
         };
         let result = c.serve();
-        let mut clients = ratum::lock(&server.clients);
-        clients.retain(|e| !Arc::ptr_eq(e, &entry));
+        ratum::lock(&server.clients).retain(|e| !Arc::ptr_eq(e, &entry));
+        debug!("Stratum client connection closed. ({:?})", result.as_ref().err());
         result
     }
 
-    fn serve(&mut self) -> io::Result<()> {
+    fn serve(&mut self) -> Result<(), Disconnect> {
         let mut buf = Vec::with_capacity(4096);
         let mut chunk = [0u8; 4096];
         loop {
             if self.entry.kill.load(Ordering::Relaxed) {
-                return Err(io::Error::other("kill request"));
+                return Err(Disconnect::Killed);
             }
-            if self.subscribed {
-                let generation = ratum::lock(&self.server.jobs).generation;
-                if generation != self.sent_generation {
-                    self.send_current_job()?;
-                }
+            if self.subscribed
+                && self.server.generation.load(Ordering::Acquire) != self.sent_generation
+            {
+                self.send_current_job()?;
             }
             self.idle_checks()?;
-            self.update_stats();
+            self.roll_window();
 
             match self.stream.read(&mut chunk) {
-                Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
+                Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into()),
                 Ok(n) => {
                     buf.extend_from_slice(&chunk[..n]);
                     if buf.len() >= CLIENT_BUFFER {
-                        return Err(io::Error::other(
-                            "read buffer overrun before client command break",
+                        return Err(Disconnect::Protocol(
+                            "read buffer overrun before client command break".into(),
                         ));
                     }
                     while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
                         let line: Vec<u8> = buf.drain(..=pos).collect();
                         let line = String::from_utf8_lossy(&line[..line.len() - 1]).into_owned();
-                        let line = line.trim_end_matches('\r');
-                        if let Err(why) = self.handle_line(line) {
-                            return Err(io::Error::other(why));
-                        }
+                        self.handle_line(line.trim_end_matches('\r'))?;
                     }
                 }
                 Err(e)
                     if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e),
+                Err(e) => return Err(e.into()),
             }
         }
     }
 
-    fn update_stats(&mut self) {
-        let mut s = ratum::lock(&self.entry.stats);
-        s.username = self.username.clone();
-        s.useragent = self.useragent.clone();
-        s.subscribed = self.subscribed;
-        s.subscribed_at = self.subscribed_at;
-        s.sid = self.sid;
-        s.authorized = self.authorized;
-        s.current_diff = self.vardiff.current;
-        s.last_accepted = self.last_accepted;
-        s.coinbase_selection = self.coinbase_selection;
-        if self.window_started.elapsed() >= STAT_CYCLE {
-            s.window_diff = self.window_active;
-            s.window = self.window_started.elapsed();
-            s.window_ended = Some(Instant::now());
-            self.window_active = 0;
-            self.window_started = Instant::now();
-        }
+    fn with_stats(&self, f: impl FnOnce(&mut ClientStats)) {
+        f(&mut ratum::lock(&self.entry.stats));
     }
 
-    fn idle_checks(&mut self) -> io::Result<()> {
+    /// Close the hashrate window once it has run `STAT_CYCLE`.
+    fn roll_window(&mut self) {
+        if self.window_started.elapsed() < STAT_CYCLE {
+            return;
+        }
+        let (diff, window) = (self.window_active, self.window_started.elapsed());
+        self.with_stats(|s| {
+            s.window_diff = diff;
+            s.window = window;
+            s.window_ended = Some(Instant::now());
+        });
+        self.window_active = 0;
+        self.window_started = Instant::now();
+    }
+
+    fn idle_checks(&mut self) -> Result<(), Disconnect> {
         if Instant::now() < self.next_idle_check {
             return Ok(());
         }
@@ -434,12 +473,10 @@ impl Connection {
         let s = &self.server.config.stratum;
         let idle =
             |limit: u64, since: Instant| limit != 0 && since.elapsed() > Duration::from_secs(limit);
-        let stats = ratum::lock(&self.entry.stats).clone();
+        let accepted = ratum::lock(&self.entry.stats).accepted.count;
         let reason = if !self.subscribed && idle(s.idle_timeout_no_subscribe, self.connected) {
             Some(("not subscribing", s.idle_timeout_no_subscribe))
-        } else if self.subscribed
-            && stats.accepted_count == 0
-            && idle(s.idle_timeout_no_shares, self.connected)
+        } else if self.subscribed && accepted == 0 && idle(s.idle_timeout_no_shares, self.connected)
         {
             Some(("submitting no accepted share", s.idle_timeout_no_shares))
         } else if self.subscribed
@@ -455,7 +492,7 @@ impl Connection {
                 "Kicking client {} ({}) for {what} for more than {secs} seconds",
                 self.remote, self.username
             );
-            return Err(io::Error::other(format!("idle: {what}")));
+            return Err(Disconnect::Idle(what));
         }
         Ok(())
     }
@@ -465,50 +502,55 @@ impl Connection {
         self.stream.write_all(b"\n")
     }
 
+    /// A response to request `id`: `error` is the stratum error array or null.
+    fn reply(&mut self, id: &str, error: Option<Reject>, result: Value) -> io::Result<()> {
+        let error = match error {
+            Some(Reject(code, text)) => format!("[{code},\"{text}\",null]"),
+            None => "null".to_string(),
+        };
+        self.send_line(&format!("{{\"error\":{error},\"id\":{id},\"result\":{result}}}"))
+    }
+
     fn reply_result(&mut self, id: &str, result: Value) -> io::Result<()> {
-        self.send_line(&format!("{{\"error\":null,\"id\":{id},\"result\":{result}}}"))
+        self.reply(id, None, result)
     }
 
     fn reply_error(&mut self, id: &str, r: Reject) -> io::Result<()> {
-        self.send_line(&format!(
-            "{{\"error\":[{},\"{}\",null],\"id\":{id},\"result\":null}}",
-            r.0, r.1
-        ))
+        self.reply(id, Some(r), Value::Null)
     }
 
     /// Handle one request line. `Err` closes the connection.
-    fn handle_line(&mut self, line: &str) -> Result<(), String> {
+    fn handle_line(&mut self, line: &str) -> Result<(), Disconnect> {
         if line.is_empty() {
             return Ok(());
         }
+        let bad = |why: &str| Disconnect::Protocol(why.to_string());
         if !line.starts_with('{') {
-            return Err("request is not a JSON object".into());
+            return Err(bad("request is not a JSON object"));
         }
-        let v: Value = serde_json::from_str(line).map_err(|e| format!("bad JSON: {e}"))?;
+        let v: Value = serde_json::from_str(line).map_err(|e| bad(&format!("bad JSON: {e}")))?;
         let method = match v.get("method") {
-            None => return Err("no method".into()),
+            None => return Err(bad("no method")),
             Some(Value::String(m)) if !m.is_empty() => m.clone(),
-            Some(Value::String(_)) => return Err("empty method".into()),
-            Some(_) => return Err("method is not a string".into()),
+            Some(Value::String(_)) => return Err(bad("empty method")),
+            Some(_) => return Err(bad("method is not a string")),
         };
         let id = match v.get("id") {
-            None => return Err("no id".into()),
+            None => return Err(bad("no id")),
             Some(id) => id.to_string(),
         };
         if id.is_empty() || id.len() > MAX_REQUEST_ID_CHARS {
-            return Err("id too long".into());
+            return Err(bad("id too long"));
         }
-        let Some(params) = v.get("params") else { return Err("no params".into()) };
-        let r = match method.as_str() {
-            "mining.subscribe" => self.on_subscribe(&id, params),
-            "mining.authorize" => self.on_authorize(&id, params),
-            "mining.configure" => self.on_configure(&id, params),
-            "mining.submit" => self.on_submit(&id, params),
-            _ => self.send_line(&format!(
-                "{{\"error\":[-3,\"Method not found\",null],\"id\":{id},\"result\":null}}"
-            )),
-        };
-        r.map_err(|e| e.to_string())
+        let Some(params) = v.get("params") else { return Err(bad("no params")) };
+        match method.as_str() {
+            "mining.subscribe" => self.on_subscribe(&id, params)?,
+            "mining.authorize" => self.on_authorize(&id, params)?,
+            "mining.configure" => self.on_configure(&id, params)?,
+            "mining.submit" => self.on_submit(&id, params)?,
+            _ => self.reply_error(&id, METHOD_NOT_FOUND)?,
+        }
+        Ok(())
     }
 
     fn on_subscribe(&mut self, id: &str, params: &Value) -> io::Result<()> {
@@ -516,17 +558,15 @@ impl Connection {
             return Ok(());
         }
         let s = &self.server.config.stratum;
-        self.vardiff.current = s.vardiff_min;
-        self.coinbase_selection = crate::coinbase::DEFAULT_TYPE;
-        if let Some(ua) = params.get(0).and_then(Value::as_str) {
-            self.useragent = ua
-                .chars()
-                .filter(|c| c.is_ascii_alphanumeric() || ". -_=@,|/:<>';".contains(*c))
-                .take(127)
-                .collect();
-        }
-        if s.fingerprint_miners && !self.useragent.is_empty() {
-            let ua = self.useragent.as_str();
+        let useragent: String =
+            params.get(0).and_then(Value::as_str).map_or_else(String::new, |ua| {
+                ua.chars()
+                    .filter(|c| c.is_ascii_alphanumeric() || ". -_=@,|/:<>';".contains(*c))
+                    .take(127)
+                    .collect()
+            });
+        if s.fingerprint_miners && !useragent.is_empty() {
+            let ua = useragent.as_str();
             if ua.starts_with("Antminer S21/") {
                 self.coinbase_selection = 5;
             } else if ua.starts_with("PowerPlay-BM/") || ua.starts_with("xminer-1.") {
@@ -536,14 +576,12 @@ impl Connection {
             } else if ua.contains("bosminer-plus-tuner") {
                 self.coinbase_selection = 5;
             } else if ua.starts_with("NiceHash/") {
-                self.vardiff.current = 524_288;
-                self.vardiff.forced_floor = 524_288;
+                self.vardiff.raise_floor(524_288);
                 self.coinbase_selection = 1;
             } else if ua.starts_with("bitaxe") {
                 self.coinbase_selection = 3;
             }
         }
-        self.vardiff.current = self.vardiff.current.max(s.vardiff_min);
         let sid = format!("{:08x}", self.sid);
         self.reply_result(
             id,
@@ -558,15 +596,27 @@ impl Connection {
         )?;
         self.send_difficulty()?;
         self.subscribed = true;
-        self.subscribed_at = Some(Instant::now());
+        let selection = self.coinbase_selection;
+        self.with_stats(|st| {
+            st.useragent = useragent;
+            st.subscribed = true;
+            st.subscribed_at = Some(Instant::now());
+            st.coinbase_selection = selection;
+        });
         self.vardiff.reset_snapshot(Instant::now());
-        self.send_job(true, false)?;
+        let (job, _, generation) = self.server.current_for_send();
+        self.sent_generation = generation;
+        if let Some(job) = job {
+            self.notify(&job, true, false, false)?;
+        }
         Ok(())
     }
 
     fn on_authorize(&mut self, id: &str, params: &Value) -> io::Result<()> {
         let username = params.get(0).and_then(Value::as_str).unwrap_or("NULL");
         self.username = username.chars().take(191).collect();
+        let name = self.username.clone();
+        self.with_stats(|st| st.username = name);
         if self.server.config.stratum.require_address_username
             && !address::username_is_payable(username)
         {
@@ -578,66 +628,54 @@ impl Connection {
                 "Refusing authorization of \"{shown}\" from {}: stratum.require_address_username is set and the username does not begin with an address a coinbase output can pay.",
                 self.remote
             );
-            return self.send_line(&format!(
-                "{{\"error\":[24,\"unauthorized-worker\",null],\"id\":{id},\"result\":false}}"
-            ));
+            return self.reply(id, Some(UNAUTHORIZED_WORKER), Value::Bool(false));
         }
         self.authorized = true;
         self.reply_result(id, Value::Bool(true))
     }
 
-    fn on_configure(&mut self, id: &str, params: &Value) -> io::Result<()> {
+    fn on_configure(&mut self, id: &str, params: &Value) -> Result<(), Disconnect> {
         let Some(list) = params.get(0).and_then(Value::as_array) else {
-            return Err(io::Error::other("mining.configure without an extension list"));
+            return Err(Disconnect::Protocol("mining.configure without an extension list".into()));
         };
         if params.get(1).is_none() {
-            return Err(io::Error::other("mining.configure without options"));
+            return Err(Disconnect::Protocol("mining.configure without options".into()));
         }
         let mut result = serde_json::Map::new();
         for ext in list {
-            match ext.as_str() {
-                Some("version-rolling") => {
-                    result.insert("version-rolling".into(), Value::Bool(false));
-                }
-                Some("minimum-difficulty") => {
-                    result.insert("minimum-difficulty".into(), Value::Bool(false));
-                }
-                _ => {}
+            if let Some(name @ ("version-rolling" | "minimum-difficulty")) = ext.as_str() {
+                result.insert(name.into(), Value::Bool(false));
             }
         }
-        self.reply_result(id, Value::Object(result))
+        Ok(self.reply_result(id, Value::Object(result))?)
     }
 
     fn send_difficulty(&mut self) -> io::Result<()> {
         let d = self.vardiff.mark_sent();
+        self.with_stats(|st| st.current_diff = d);
         self.send_line(&format!(
             "{{\"id\":null,\"method\":\"mining.set_difficulty\",\"params\":[{d}]}}"
         ))
     }
 
-    fn pot_byte(&self, quickdiff: bool, global_index: u8) -> u8 {
-        let diff = if quickdiff {
-            self.vardiff.quickdiff_value
+    /// The difficulty a share on `r`'s job is checked against: the quick-raise value for a
+    /// `Q` job, otherwise what the job was served at.
+    fn served_diff(&self, r: &JobRef) -> Option<u64> {
+        if r.quickdiff {
+            Some(self.vardiff.quickdiff_value())
         } else {
-            self.job_diffs[global_index as usize].unwrap_or(self.vardiff.last_sent.max(1))
-        };
-        target::floor_pot(diff)
+            self.job_diffs[r.global_index as usize]
+        }
     }
 
-    /// Send the server's current job, with the clean flag its publication carries.
+    /// Send the server's current job; new-block empty work is sent with `clean_jobs`.
     fn send_current_job(&mut self) -> io::Result<()> {
-        let (generation, clean, empty) = {
-            let j = ratum::lock(&self.server.jobs);
-            (j.generation, j.clean, j.empty)
-        };
+        let (job, empty, generation) = self.server.current_for_send();
         self.sent_generation = generation;
-        self.send_job(clean, empty)
-    }
-
-    fn send_job(&mut self, clean: bool, new_block: bool) -> io::Result<()> {
-        let Some(job) = self.server.current_job() else { return Ok(()) };
-        self.sent_generation = ratum::lock(&self.server.jobs).generation;
-        self.notify(&job, clean, false, new_block)
+        match job {
+            Some(job) => self.notify(&job, empty, false, empty),
+            None => Ok(()),
+        }
     }
 
     fn notify(
@@ -652,36 +690,30 @@ impl Connection {
             // With `no_quick` the update never requests a quick raise.
             self.vardiff.update(true, Instant::now());
         }
-        let pool_min = self.server.datum.min_difficulty();
-        if job.is_datum_job && self.vardiff.current < pool_min {
-            self.vardiff.current = pool_min;
+        if job.is_datum_job {
+            self.vardiff.hold_at_least(self.server.datum.min_difficulty());
         }
-        if self.vardiff.last_sent != self.vardiff.current {
+        if self.vardiff.change_pending() {
             self.send_difficulty()?;
         }
-        let g = job.global_index as usize;
+        let diff = self.vardiff.job_sent(quickdiff);
         if !quickdiff {
-            self.job_diffs[g] = Some(self.vardiff.last_sent);
-            self.vardiff.quickdiff_active = false;
-        } else {
-            self.vardiff.quickdiff_active = true;
-            self.vardiff.quickdiff_value = self.vardiff.last_sent;
+            self.job_diffs[job.global_index as usize] = Some(diff);
         }
-        let cb_select = if new_block { COINBASE_SUBSIDY_ONLY } else { self.coinbase_selection };
-        let job_id = if quickdiff {
-            format!("Q{}{cb_select:02x}", job.job_id)
-        } else if new_block {
-            format!("N{}ff", job.job_id)
-        } else {
-            format!("{}{cb_select:02x}", job.job_id)
+        let r = JobRef {
+            global_index: job.global_index,
+            quickdiff,
+            empty: new_block,
+            coinbase: if new_block { COINBASE_SUBSIDY_ONLY } else { self.coinbase_selection },
         };
-        let pot = self.pot_byte(quickdiff, job.global_index);
-        let Some(commitment) = job.commitment(cb_select, pot) else {
+        let pot = target::floor_pot(diff.max(1));
+        let Some(commitment) = job.commitment(r.coinbase, pot) else {
             return Err(io::Error::other("job has no coinbase for the selection"));
         };
         let clean_flag = clean || quickdiff || new_block;
         let line = format!(
-            "{{\"id\":null,\"method\":\"mining.notify\",\"params\":[\"{job_id}\",\"{}\",\"000000{}\",\"\",[],\"\",\"{}\",\"{}\",{clean_flag}]}}",
+            "{{\"id\":null,\"method\":\"mining.notify\",\"params\":[\"{}\",\"{}\",\"000000{}\",\"\",[],\"\",\"{}\",\"{}\",{clean_flag}]}}",
+            r.notify_id(job),
             hex::encode(job.prevblock_hidden),
             hex::encode(commitment.h2),
             job.template.bits,
@@ -690,22 +722,23 @@ impl Connection {
         self.send_line(&line)
     }
 
-    fn count_rejected(&mut self, diff: u64) {
-        let mut st = ratum::lock(&self.entry.stats);
-        st.rejected_count += 1;
-        st.rejected_diff = st.rejected_diff.saturating_add(diff);
-    }
-
     fn on_submit(&mut self, id: &str, params: &Value) -> io::Result<()> {
-        let fallback_diff = self.vardiff.last_sent;
-        match self.check_submit(params) {
-            Ok(diff) => {
+        let req = match self.parse_submit(params) {
+            Ok(req) => req,
+            Err((reject, diff)) => {
+                let diff = diff.unwrap_or(self.vardiff.last_sent());
+                self.with_stats(|st| st.rejected.add(diff));
+                return self.reply_error(id, reject);
+            }
+        };
+        let diff = req.job_diff;
+        match self.evaluate(&req) {
+            Ok(()) => {
                 self.reply_result(id, Value::Bool(true))?;
-                {
-                    let mut st = ratum::lock(&self.entry.stats);
-                    st.accepted_count += 1;
-                    st.accepted_diff = st.accepted_diff.saturating_add(diff);
-                }
+                self.with_stats(|st| {
+                    st.accepted.add(diff);
+                    st.last_accepted = Some(Instant::now());
+                });
                 self.vardiff.count_share();
                 self.window_active = self.window_active.saturating_add(diff);
                 self.last_accepted = Some(Instant::now());
@@ -717,92 +750,68 @@ impl Connection {
                 }
                 Ok(())
             }
-            Err((reject, diff)) => {
-                self.count_rejected(diff.unwrap_or(fallback_diff));
+            Err(reject) => {
+                self.with_stats(|st| st.rejected.add(diff));
                 self.reply_error(id, reject)
             }
         }
     }
 
-    /// Check a share and forward it; returns the job difficulty credited or the rejection
-    /// with the difficulty to count it under.
-    fn check_submit(&mut self, params: &Value) -> Result<u64, (Reject, Option<u64>)> {
-        let job_id_param = params.get(1).and_then(Value::as_str).ok_or((UNKNOWN_WORK, None))?;
-        let (job_id, quickdiff, empty_work) = match job_id_param.len() {
-            16 => (job_id_param, false, false),
-            17 if job_id_param.starts_with('Q') => (&job_id_param[1..], true, false),
-            17 if job_id_param.starts_with('N') => (&job_id_param[1..], false, true),
-            _ => return Err((UNKNOWN_WORK, None)),
-        };
-        let global_index = crate::job::global_index_of(job_id).ok_or((UNKNOWN_WORK, None))?;
-        let job = ratum::lock(&self.server.jobs).ring[global_index as usize]
+    /// The request's job and fields; a rejection carries the difficulty to count it under
+    /// once the job is known.
+    fn parse_submit(&self, params: &Value) -> Result<SubmitRequest, (Reject, Option<u64>)> {
+        let unknown = (UNKNOWN_WORK, None);
+        let id_param = params.get(1).and_then(Value::as_str).ok_or(unknown)?;
+        let (job_ref, job_id) = JobRef::parse(id_param).ok_or(unknown)?;
+        let job = ratum::lock(&self.server.jobs).ring[job_ref.global_index as usize]
             .clone()
-            .ok_or((UNKNOWN_WORK, None))?;
+            .ok_or(unknown)?;
         if job.job_id.get(..8) != job_id.get(..8) {
-            return Err((UNKNOWN_WORK, None));
+            return Err(unknown);
         }
-        let job_diff = if quickdiff {
-            self.vardiff.quickdiff_value
-        } else {
-            self.job_diffs[global_index as usize].ok_or((UNKNOWN_WORK, None))?
-        };
-        let rejected = |r: Reject| (r, Some(job_diff));
+        let job_diff = self.served_diff(&job_ref).ok_or(unknown)?;
+        let rejected = (UNKNOWN_WORK, Some(job_diff));
 
-        let en2 = params.get(2).and_then(Value::as_str).ok_or(rejected(UNKNOWN_WORK))?;
+        let en2 = params.get(2).and_then(Value::as_str).ok_or(rejected)?;
         if en2.len() != 16 {
-            return Err(rejected(UNKNOWN_WORK));
+            return Err(rejected);
         }
-        let en2 = hex::decode(en2).map_err(|_| rejected(UNKNOWN_WORK))?;
+        let en2 = hex::decode(en2).map_err(|_| rejected)?;
         let mut extranonce = [0u8; 16];
         extranonce[4..8].copy_from_slice(&self.sid.to_be_bytes());
         extranonce[8..].copy_from_slice(&en2);
-
-        let coinbase_index =
-            u8::from_str_radix(&job_id[14..16], 16).map_err(|_| rejected(UNKNOWN_WORK))?;
-        if empty_work {
-            if coinbase_index != COINBASE_SUBSIDY_ONLY {
-                return Err(rejected(UNKNOWN_WORK));
-            }
-        } else if coinbase_index as usize >= job.coinbases.len() {
-            return Err(rejected(UNKNOWN_WORK));
+        if !job_ref.empty && job_ref.coinbase as usize >= job.coinbases.len() {
+            return Err(rejected);
         }
-
-        let parse8 = |s: &str| -> Option<[u8; 8]> {
-            match s.len() {
-                16 => hex::decode(s).ok()?.try_into().ok(),
-                8 => {
-                    let v = u32::from_str_radix(s, 16).ok()?;
-                    let mut out = [0u8; 8];
-                    out[..4].copy_from_slice(&v.to_le_bytes());
-                    Some(out)
-                }
-                _ => None,
-            }
-        };
         let ntime =
-            params.get(3).and_then(Value::as_str).and_then(parse8).ok_or(rejected(UNKNOWN_WORK))?;
+            params.get(3).and_then(Value::as_str).and_then(parse_sia_field).ok_or(rejected)?;
         let nonce =
-            params.get(4).and_then(Value::as_str).and_then(parse8).ok_or(rejected(UNKNOWN_WORK))?;
+            params.get(4).and_then(Value::as_str).and_then(parse_sia_field).ok_or(rejected)?;
+        let miner_username = params.get(0).and_then(Value::as_str).unwrap_or("NULL").to_string();
+        Ok(SubmitRequest { job, job_diff, job_ref, extranonce, ntime, nonce, miner_username })
+    }
 
-        let pot = self.pot_byte(quickdiff, global_index);
+    /// Build the share's header, submit a block it names, run the checks, and forward it to
+    /// the pool. Returns the rejection, if any, the miner is told.
+    fn evaluate(&mut self, req: &SubmitRequest) -> Result<(), Reject> {
+        let job = &req.job;
+        let r = req.job_ref;
+        let pot = target::floor_pot(req.job_diff);
         let header = job
-            .header(coinbase_index, pot, extranonce, nonce, ntime)
-            .ok_or(rejected(UNKNOWN_WORK))?;
-        let header_bytes = header.serialize();
+            .header(r.coinbase, pot, req.extranonce, req.nonce, req.ntime)
+            .ok_or(UNKNOWN_WORK)?;
         let hash = header.hash_components().result;
 
         // `miner_username` is what the miner sent; `username` is who the share is credited
         // to once a `~modifier` has been applied. stratum.require_address_username checks
         // the miner's own username, as the C gateway does, not the address its modifier names.
-        let miner_username = params.get(0).and_then(Value::as_str).unwrap_or("NULL").to_string();
-        let cfg = &self.server.config;
         let username = username::apply_modifier(
-            &cfg.stratum.username_modifiers,
-            &cfg.mining.pool_address,
-            &miner_username,
+            &self.server.config.stratum.username_modifiers,
+            &self.server.config.mining.pool_address,
+            &req.miner_username,
             &hash,
         )
-        .unwrap_or_else(|| miner_username.clone());
+        .unwrap_or_else(|| req.miner_username.clone());
 
         let is_block = target::meets_target(&hash, &job.block_target);
         if is_block {
@@ -810,32 +819,31 @@ impl Connection {
             for _ in 0..3 {
                 warn!("******** BLOCK FOUND - {display} ********");
             }
-            self.submit_block(&job, coinbase_index, pot, &header_bytes, &display);
+            self.submit_block(job, r.coinbase, pot, &header.serialize(), &display);
         }
 
-        let checked = self.check_share(&job, &hash, pot, &miner_username);
+        let checked = self.check_share(job, &hash, pot, &req.miner_username);
         // A block reaches the pool whatever the checks said: under the miner's own name when
         // a check refused it (the C gateway's attribution), and through the fee accounting
         // like any accepted share when they passed.
         if job.is_datum_job && (is_block || checked.is_ok()) {
-            let wire_username = if checked.is_ok() {
-                self.fee_username(&username, job_diff)
+            let wire_username = if checked.is_ok() && self.fee_charged(req.job_diff) {
+                self.server.config.fee_address().to_string()
             } else {
-                username.clone()
+                username
             };
             self.server.datum.submit(QueuedShare {
-                job: Arc::clone(&job),
-                coinbase_id: coinbase_index,
+                job: Arc::clone(job),
+                coinbase_id: r.coinbase,
                 is_block,
-                subsidy_only: empty_work,
-                quickdiff,
+                subsidy_only: r.empty,
+                quickdiff: r.quickdiff,
                 target_byte: pot,
-                header: header_bytes,
+                header,
                 username: wire_username,
             });
         }
-        checked.map_err(rejected)?;
-        Ok(job_diff)
+        checked
     }
 
     /// The checks an accepted share passes, in the C gateway's order.
@@ -853,9 +861,7 @@ impl Connection {
         if !target::meets_target(hash, &target::target_for_pot(pot)) {
             return Err(HIGH_HASH);
         }
-        let stale =
-            Duration::from_secs(cfg.stratum.share_stale_seconds + cfg.bitcoind.work_update_seconds);
-        if job.created.elapsed() > stale {
+        if job.created.elapsed() > cfg.stale_window() {
             return Err(STALE_WORK);
         }
         if !ratum::lock(&self.server.dupes).insert(*hash, job.created) {
@@ -903,25 +909,18 @@ impl Connection {
         }
     }
 
-    /// The username a pooled share is sent under: the fee address for the share the fee
-    /// meter names (`stratum_fee_username`), the miner's otherwise.
-    fn fee_username(&mut self, username: &str, diff: u64) -> String {
-        let cfg = &self.server.config;
-        let charged = self.fee.charge(diff, u64::from(cfg.datum.gateway_fee_bps), || {
+    /// Whether this share is the fee's (`stratum_fee_username`), recorded when it is.
+    fn fee_charged(&mut self, diff: u64) -> bool {
+        let bps = u64::from(self.server.config.datum.gateway_fee_bps);
+        let charged = self.fee.charge(diff, bps, || {
             let mut b = [0u8; 8];
             dryoc::rng::copy_randombytes(&mut b);
             u64::from_le_bytes(b)
         });
-        if !charged {
-            return username.to_string();
+        if charged {
+            self.with_stats(|st| st.fee.add(diff));
+            ratum::lock(&self.server.fee).add(diff);
         }
-        {
-            let mut st = ratum::lock(&self.entry.stats);
-            st.fee_count += 1;
-            st.fee_diff = st.fee_diff.saturating_add(diff);
-        }
-        self.server.fee_share_count.fetch_add(1, Ordering::Relaxed);
-        self.server.fee_share_diff.fetch_add(diff, Ordering::Relaxed);
-        cfg.fee_address().to_string()
+        charged
     }
 }
