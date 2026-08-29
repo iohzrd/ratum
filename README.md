@@ -26,6 +26,14 @@ tests/e2e/gateway_fee.sh                 # a gateway charging a fee beside one c
 The scripts need a Knots build with the BLAKE2b change (`BITCOIND`, `BITCOIN_CLI`);
 `DATUM_GATEWAY` runs another gateway build instead of this workspace's.
 
+The `gateway` GitHub Actions workflow builds `ratum-gateway` for x86_64 and aarch64 Linux
+(static musl) and x86_64 Windows on every push and pull request (each an artifact of the
+run) and attaches the archives and their SHA-256 sums to a release on a `v*` tag.
+
+`git config core.hooksPath .githooks` enables the pre-commit hook that bumps the workspace
+version's patch component (and `Cargo.lock`) on every commit; a reword-only amend, a commit
+that already changes the version line, and `NO_BUMP=1` are left alone.
+
 ### Configuration
 
 Every setting is a flag; `--config`, or `ratum.toml` in `--data-dir`, may hold them under the
@@ -129,9 +137,12 @@ no work is served; at it the headline replaces the coinbase tags. `RUST_LOG` ove
 - A refused template is logged once per reason.
 
 Not served: `api.modify_conf`, the PROXY protocol (`stratum.trust_proxy`), daily rotation
-(`logger.log_rotate_daily`; send `SIGHUP` from logrotate), `datum.always_pay_self`, the
-per-client pacing of job updates, the testnet fast-forward, `--help`, `--example-conf`,
-`--test` and `/assets`. Set values among these are reported at startup.
+and SIGHUP (`logger.log_rotate_daily`; the file is held open, so rotate it with logrotate's
+`copytruncate`), SIGUSR1 (a `blocknotify` script reaches the gateway through `/NOTIFY` on
+the API port; the node poll and the pool's own notification cover it otherwise), the
+open-file limit warning, `datum.always_pay_self`, the per-client pacing of job updates, the
+testnet fast-forward, `--help`, `--example-conf`, `--test` and `/assets`. Set values among
+these are reported at startup.
 
 ## References
 

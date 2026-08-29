@@ -1,0 +1,36 @@
+#!/bin/sh
+# Bump the workspace version's patch component on every commit.
+#
+# Enable with: git config core.hooksPath .githooks
+#
+# The one version line is `[workspace.package] version` in the root Cargo.toml; every crate
+# inherits it and `ratum::VERSION` reports it. Cargo.lock holds the same number for each
+# workspace member, so it is updated as well (offline, workspace members only) and both are
+# staged into the commit being made.
+#
+# Skipped when nothing is staged (an amend that only rewords; the index is compared to the
+# commit being amended, which holds the previous bump, so the diff cannot show it), when the
+# staged diff already changes the version line (a minor or major bump made by hand), and
+# when NO_BUMP is set. An amend that stages new content is bumped again.
+
+set -eu
+cd "$(git rev-parse --show-toplevel)"
+
+[ -n "${NO_BUMP:-}" ] && exit 0
+git diff --cached --quiet && exit 0
+if git diff --cached -U0 -- Cargo.toml | grep -q '^[+-]version = "'; then
+    exit 0
+fi
+
+current=$(sed -n 's/^version = "\([0-9]*\.[0-9]*\.[0-9]*\)"$/\1/p' Cargo.toml | head -1)
+[ -n "$current" ] || { echo "pre-commit: no version line in Cargo.toml" >&2; exit 1; }
+major=${current%%.*}
+rest=${current#*.}
+minor=${rest%%.*}
+patch=${rest#*.}
+next="$major.$minor.$((patch + 1))"
+
+sed -i "0,/^version = \"$current\"$/s//version = \"$next\"/" Cargo.toml
+cargo update --workspace --offline --quiet
+git add Cargo.toml Cargo.lock
+echo "pre-commit: version $current -> $next"

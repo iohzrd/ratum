@@ -1,0 +1,131 @@
+# Builds ratum-gateway for x86_64 and aarch64 Linux (static musl) and x86_64 Windows on
+# every push and pull request, runs its tests on x86_64 Linux, uploads each binary as a
+# workflow artifact, and on a `v*` tag attaches the archives and their SHA-256 sums to a
+# GitHub release.
+#
+# Static musl so one binary runs beside any node without a matching glibc; the aarch64 build
+# runs natively on the arm runner rather than cross-compiling. TLS is rustls with its
+# default aws-lc-rs provider (minreq selects it), whose C build needs a compiler for the
+# target (musl-tools provides musl-gcc) and, on Windows, CMake and NASM.
+
+name: gateway
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - arch: x86_64
+            runner: windows-2022
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install musl-gcc
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      # aws-lc-sys assembles its Windows build with NASM; CMake is on the runner.
+      - uses: ilammy/setup-nasm@v1
+        if: runner.os == 'Windows'
+
+      # The host-target tests, on x86_64 Linux only: the other runners exercise the same code
+      # and add nothing but time.
+      - name: Test
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: cargo test -p ratum-gateway
+
+      - name: Build
+        env:
+          # The cc crate reads CC_<target> to compile ring's C for the musl target.
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+        run: cargo build --release -p ratum-gateway --target ${{ matrix.target }}
+
+      - name: Package
+        id: package
+        if: runner.os == 'Linux'
+        run: |
+          bin=target/${{ matrix.target }}/release/ratum-gateway
+          strip "$bin"
+          file "$bin"
+          "$bin" --version
+          name=ratum-gateway-$("$bin" --version | awk '{print $2}')-${{ matrix.arch }}-linux-musl
+          mkdir "$name"
+          cp "$bin" "$name/"
+          tar czf "$name.tar.gz" "$name"
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "archive=$name.tar.gz" >> "$GITHUB_OUTPUT"
+
+      # MSVC keeps symbols in a separate .pdb, so the .exe needs no strip; shipped as a zip.
+      - name: Package (Windows)
+        id: package_windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $bin = "target\${{ matrix.target }}\release\ratum-gateway.exe"
+          $version = (& $bin --version).Split(" ")[1]
+          $name = "ratum-gateway-$version-${{ matrix.arch }}-windows"
+          New-Item -ItemType Directory $name | Out-Null
+          Copy-Item $bin "$name\"
+          Compress-Archive -Path $name -DestinationPath "$name.zip"
+          $hash = (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name.zip" | Out-File -Encoding ascii "$name.zip.sha256"
+          "name=$name" >> $env:GITHUB_OUTPUT
+          "archive=$name.zip" >> $env:GITHUB_OUTPUT
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name || steps.package_windows.outputs.name }}
+          path: |
+            ${{ steps.package.outputs.archive || steps.package_windows.outputs.archive }}
+            ${{ steps.package.outputs.archive || steps.package_windows.outputs.archive }}.sha256
+          if-no-files-found: error
+
+  release:
+    name: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true

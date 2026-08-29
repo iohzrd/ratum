@@ -3,7 +3,7 @@
 //! Threads: the template thread polls the node and builds jobs; the stratum server serves
 //! them to mining hardware, one thread per connection; the DATUM thread holds the pool
 //! connection; the API threads serve HTTP. `main` starts them and then runs the watch loop:
-//! the `pooled_mining_only` check, the signal flags, the periodic statistics line.
+//! the `pooled_mining_only` check, the first-job diagnostic, the periodic statistics line.
 
 mod address;
 mod api;
@@ -14,7 +14,6 @@ mod dupes;
 mod job;
 mod logger;
 mod publish;
-mod signals;
 mod stratum;
 mod submit;
 mod tally;
@@ -29,8 +28,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// How often the watch loop runs. It relays SIGUSR1 to the template thread, which the C
-/// gateway's template loop reads every 2.5 ms, so the tick is short.
+/// How often the watch loop runs.
 const WATCH_TICK: Duration = Duration::from_millis(20);
 /// The statistics line's interval (the C gateway's 600 half-second ticks).
 const STATS_INTERVAL: Duration = Duration::from_secs(300);
@@ -67,26 +65,6 @@ fn install_panic_exit() {
         log::logger().flush();
         std::process::exit(1);
     }));
-}
-
-fn warn_about_open_file_limit(max_clients: usize) {
-    let Some((soft, hard)) = signals::open_file_limits() else { return };
-    let max_clients = max_clients as u64;
-    if max_clients > hard {
-        warn!(
-            "*** NOTE *** Max Stratum clients ({max_clients}) exceeds hard open file limit (Soft: {soft} / Hard: {hard})"
-        );
-        warn!(
-            "*** NOTE *** Adjust max open file hard limit or you WILL run into issues before reaching max clients!"
-        );
-    } else if max_clients > soft {
-        warn!(
-            "*** NOTE *** Max Stratum clients ({max_clients}) exceeds open file soft limit (Soft: {soft} / Hard: {hard})"
-        );
-        warn!(
-            "*** NOTE *** You should increase the soft open file limit to prevent issues as you approach max clients!"
-        );
-    }
 }
 
 /// The configuration file, or exit 1 with the reason on stderr (the logger it configures
@@ -208,8 +186,8 @@ fn start_template_thread(
 
 /// The watch loop: the pooled_mining_only check (new connections are refused whenever the
 /// pool is not connected, as the C accept loop does; connected miners are disconnected
-/// after two connection attempts that did not reach the pool's configuration), the signal
-/// flags, the first-job diagnostic, the statistics line.
+/// after two connection attempts that did not reach the pool's configuration), the
+/// first-job diagnostic, the statistics line.
 fn watch_loop(rt: &Runtime, server: &stratum::Server) -> ! {
     let pooled = !rt.config.datum.pool_host.is_empty();
     let started = Instant::now();
@@ -218,17 +196,6 @@ fn watch_loop(rt: &Runtime, server: &stratum::Server) -> ! {
     let mut last_no_job_report = Instant::now();
     loop {
         std::thread::sleep(WATCH_TICK);
-        if signals::BLOCK.swap(false, Ordering::Relaxed) {
-            info!("SIGUSR1 received: block notification");
-            rt.notify.raise();
-        }
-        if logger::REOPEN.swap(false, Ordering::Relaxed) {
-            match logger::reopen() {
-                Ok(true) => info!("SIGHUP received: log file reopened"),
-                Ok(false) => info!("SIGHUP received: no log file to reopen"),
-                Err(e) => error!("SIGHUP received: {e}"),
-            }
-        }
         if server.current_job().is_none()
             && started.elapsed() > FIRST_JOB_PATIENCE
             && last_no_job_report.elapsed() >= Duration::from_secs(5)
@@ -274,14 +241,15 @@ fn watch_loop(rt: &Runtime, server: &stratum::Server) -> ! {
 fn main() {
     let cli = Cli::parse();
     let config = Arc::new(load_config(&cli.config));
-    let notes = logger::init(&config.logger);
+    let notes = logger::init(&config.logger).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    });
     info!("ratum-gateway {} starting", ratum::VERSION);
     for (level, message) in notes.iter().chain(&config.warnings) {
         log::log!(*level, "{message}");
     }
     install_panic_exit();
-    signals::install();
-    warn_about_open_file_limit(config.stratum.max_clients);
     let node = connect_node(&config);
 
     if config.datum.gateway_fee_bps > 0 {

@@ -385,7 +385,7 @@ impl Config {
             self.warn("api.modify_conf is set but the configuration is not editable over HTTP");
         }
         if self.logger.log_rotate_daily.is_some() {
-            self.warn("logger.log_rotate_daily has no effect: the log file is reopened on SIGHUP, which logrotate sends");
+            self.warn("logger.log_rotate_daily has no effect: the file is held open, so rotate it with logrotate's copytruncate");
         }
     }
 

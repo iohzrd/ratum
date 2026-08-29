@@ -1,40 +1,21 @@
 //! The log sinks the `logger` configuration section describes: the console (stdout, or
 //! stderr with `log_to_stderr`) and a file, each with its own level, every record stamped
 //! with a millisecond UTC time and, with `log_calling_function`, the module it came from.
-//! `RUST_LOG` names a level that replaces the console's. SIGHUP (see `signals`) sets
-//! `REOPEN`; `main`'s watch loop then calls `reopen`, which reopens the file by name, which
-//! is what logrotate needs.
+//! `RUST_LOG` names a level that replaces the console's. The file is held open for the
+//! process's life, so rotate it with logrotate's `copytruncate`.
+//!
+//! The logger holds no lock: `&File` implements `Write`, and stdout and stderr lock
+//! themselves for the length of one `write_all`, so each sink writes a record whole.
 
 use log::{Level, LevelFilter, Log, Metadata, Record};
+use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-
-/// Set by the SIGHUP handler; `main`'s watch loop clears it and calls `reopen`.
-pub static REOPEN: AtomicBool = AtomicBool::new(false);
-
-/// The sinks, for `reopen`.
-static SINKS: OnceLock<Arc<Mutex<Sinks>>> = OnceLock::new();
-
-/// Reopen the log file by name. `Ok(false)` when no file sink is configured.
-pub fn reopen() -> Result<bool, String> {
-    let Some(sinks) = SINKS.get() else { return Ok(false) };
-    let mut s = ratum::lock(sinks);
-    let Some((file, _, path)) = &mut s.file else { return Ok(false) };
-    match open(path) {
-        Ok(f) => {
-            *file = f;
-            Ok(true)
-        }
-        Err(e) => Err(format!("cannot reopen log file {path}: {e}")),
-    }
-}
 
 /// The C gateway's levels: 0 all, 1 debug, 2 info, 3 warn, 4 error, 5 fatal. Rust has no
 /// level above error, so 5 keeps errors; anything higher turns the sink off.
-pub fn level_of(n: u8) -> LevelFilter {
+fn level_of(n: u8) -> LevelFilter {
     match n {
         0 => LevelFilter::Trace,
         1 => LevelFilter::Debug,
@@ -45,26 +26,47 @@ pub fn level_of(n: u8) -> LevelFilter {
     }
 }
 
-struct Sinks {
-    console: Option<(Box<dyn Write + Send>, LevelFilter)>,
-    file: Option<(File, LevelFilter, String)>,
+enum Output {
+    Stdout,
+    Stderr,
+    File(File),
+}
+
+/// One destination and the most verbose level it takes.
+struct Sink {
+    output: Output,
+    level: LevelFilter,
+}
+
+impl Sink {
+    /// A write that fails has nowhere to be reported, so its error is discarded.
+    fn write(&self, line: &[u8]) {
+        let _ = match &self.output {
+            Output::Stdout => std::io::stdout().write_all(line),
+            Output::Stderr => std::io::stderr().write_all(line),
+            Output::File(f) => (&*f).write_all(line),
+        };
+    }
+
+    fn flush(&self) {
+        let _ = match &self.output {
+            Output::Stdout => std::io::stdout().flush(),
+            Output::Stderr => std::io::stderr().flush(),
+            Output::File(f) => (&*f).flush(),
+        };
+    }
 }
 
 pub struct Logger {
-    sinks: Arc<Mutex<Sinks>>,
+    sinks: Vec<Sink>,
+    /// The most verbose of the sinks' levels: a record above it goes nowhere.
     max: LevelFilter,
     calling_function: bool,
 }
 
-fn open(path: &str) -> std::io::Result<File> {
-    OpenOptions::new().create(true).append(true).open(path)
-}
-
-/// `YYYY-MM-DD HH:MM:SS.mmm` in UTC, from the civil-from-days conversion of the epoch day.
-fn timestamp() -> String {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-    let secs = now.as_secs();
-    let millis = now.subsec_millis();
+/// `YYYY-MM-DD HH:MM:SS.mmm` for `secs` since the Unix epoch, in UTC, by the civil-from-days
+/// conversion of the epoch day.
+fn format_time(secs: u64, millis: u32) -> String {
     let days = (secs / 86400) as i64;
     let sod = secs % 86400;
     let z = days + 719_468;
@@ -85,6 +87,25 @@ fn timestamp() -> String {
     )
 }
 
+fn now() -> String {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    format_time(now.as_secs(), now.subsec_millis())
+}
+
+impl Logger {
+    /// The line a record is written as: the time, the level, the module when
+    /// `log_calling_function` is set, the message, a newline.
+    fn line(&self, r: &Record) -> String {
+        let mut line = String::with_capacity(96);
+        let _ = write!(line, "{} {:<5} ", now(), r.level());
+        if self.calling_function {
+            let _ = write!(line, "[{}] ", r.target());
+        }
+        let _ = writeln!(line, "{}", r.args());
+        line
+    }
+}
+
 impl Log for Logger {
     fn enabled(&self, m: &Metadata) -> bool {
         m.level() <= self.max
@@ -94,83 +115,62 @@ impl Log for Logger {
         if !self.enabled(r.metadata()) {
             return;
         }
-        let target =
-            if self.calling_function { format!("[{}] ", r.target()) } else { String::new() };
-        let line = format!("{} {:<5} {target}{}\n", timestamp(), r.level(), r.args());
-        let mut s = ratum::lock(&self.sinks);
-        if let Some((w, level)) = &mut s.console
-            && r.level() <= *level
-        {
-            let _ = w.write_all(line.as_bytes());
-        }
-        if let Some((f, level, _)) = &mut s.file
-            && r.level() <= *level
-        {
-            let _ = f.write_all(line.as_bytes());
+        let line = self.line(r);
+        for sink in self.sinks.iter().filter(|s| r.level() <= s.level) {
+            sink.write(line.as_bytes());
         }
     }
 
     fn flush(&self) {
-        let mut s = ratum::lock(&self.sinks);
-        if let Some((w, _)) = &mut s.console {
-            let _ = w.flush();
-        }
-        if let Some((f, _, _)) = &mut s.file {
-            let _ = f.flush();
+        for sink in &self.sinks {
+            sink.flush();
         }
     }
 }
 
-/// Install the logger. Returns what could not be applied, to log once it is installed.
-pub fn init(cfg: &crate::config::Logger) -> Vec<(Level, String)> {
+/// The logger the configuration describes and what could not be applied, to log once it is
+/// installed. `Err` names a log file that cannot be opened.
+fn build(cfg: &crate::config::Logger) -> Result<(Logger, Vec<(Level, String)>), String> {
     let mut notes = Vec::new();
-    let mut console_level = level_of(cfg.log_level_console);
-    if let Ok(spec) = std::env::var("RUST_LOG") {
-        match spec.trim().parse::<LevelFilter>() {
-            Ok(level) => console_level = level,
-            Err(_) => notes.push((
-                Level::Warn,
-                format!("RUST_LOG={spec:?} is not a level name (off, error, warn, info, debug, trace); ignored"),
-            )),
-        }
-    }
-    let console: Option<(Box<dyn Write + Send>, LevelFilter)> = if cfg.log_to_console {
-        let w: Box<dyn Write + Send> = if cfg.log_to_stderr {
-            Box::new(std::io::stderr())
-        } else {
-            Box::new(std::io::stdout())
-        };
-        Some((w, console_level))
-    } else {
-        None
-    };
-    let file = if cfg.log_to_file && !cfg.log_file.is_empty() {
-        match open(&cfg.log_file) {
-            Ok(f) => Some((f, level_of(cfg.log_level_file), cfg.log_file.clone())),
-            // Fatal, as in the C gateway: a configured log file that cannot be written is
-            // a deployment error, not a condition to run without.
-            Err(e) => {
-                eprintln!("cannot open log file {}: {e}", cfg.log_file);
-                std::process::exit(1);
+    let mut sinks = Vec::with_capacity(2);
+
+    if cfg.log_to_console {
+        let mut level = level_of(cfg.log_level_console);
+        if let Ok(spec) = std::env::var("RUST_LOG") {
+            match spec.trim().parse::<LevelFilter>() {
+                Ok(l) => level = l,
+                Err(_) => notes.push((
+                    Level::Warn,
+                    format!("RUST_LOG={spec:?} is not a level name (off, error, warn, info, debug, trace); ignored"),
+                )),
             }
         }
-    } else {
-        None
-    };
-    let max = [
-        console.as_ref().map_or(LevelFilter::Off, |c| c.1),
-        file.as_ref().map_or(LevelFilter::Off, |f| f.1),
-    ]
-    .into_iter()
-    .max()
-    .unwrap_or(LevelFilter::Off);
-    let sinks = Arc::new(Mutex::new(Sinks { console, file }));
-    let _ = SINKS.set(Arc::clone(&sinks));
-    let logger = Logger { sinks, max, calling_function: cfg.log_calling_function };
+        let output = if cfg.log_to_stderr { Output::Stderr } else { Output::Stdout };
+        sinks.push(Sink { output, level });
+    }
+    if cfg.log_to_file && !cfg.log_file.is_empty() {
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&cfg.log_file)
+            .map_err(|e| format!("cannot open log file {}: {e}", cfg.log_file))?;
+        sinks.push(Sink { output: Output::File(file), level: level_of(cfg.log_level_file) });
+    }
+
+    let max = sinks.iter().map(|s| s.level).max().unwrap_or(LevelFilter::Off);
+    Ok((Logger { sinks, max, calling_function: cfg.log_calling_function }, notes))
+}
+
+/// Install the logger. `Err` is the reason it could not be built, which is fatal (as in the
+/// C gateway: a log file that cannot be written is a deployment error, not a condition to
+/// run without); `Ok` carries what could not be applied, to log once it is installed.
+pub fn init(cfg: &crate::config::Logger) -> Result<Vec<(Level, String)>, String> {
+    let (logger, notes) = build(cfg)?;
+    let max = logger.max;
     if log::set_boxed_logger(Box::new(logger)).is_ok() {
         log::set_max_level(max);
     }
-    notes
+    Ok(notes)
 }
 
 #[cfg(test)]
@@ -186,11 +186,39 @@ mod tests {
     }
 
     #[test]
-    fn timestamps_are_utc_civil_dates() {
-        let t = timestamp();
-        assert_eq!(t.len(), 23, "{t}");
-        assert_eq!(&t[4..5], "-");
-        assert_eq!(&t[10..11], " ");
-        assert_eq!(&t[19..20], ".");
+    fn times_are_utc_civil_dates() {
+        assert_eq!(format_time(0, 0), "1970-01-01 00:00:00.000");
+        assert_eq!(format_time(951_782_400, 7), "2000-02-29 00:00:00.007");
+        assert_eq!(format_time(1_700_000_000, 123), "2023-11-14 22:13:20.123");
+        assert_eq!(format_time(4_102_444_799, 999), "2099-12-31 23:59:59.999");
+    }
+
+    /// What a file sink at `Info` writes for one record.
+    fn written(level: Level, target: &str, msg: &str) -> String {
+        let path = std::env::temp_dir()
+            .join(format!("ratum-logger-{}-{level}-{target}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let file = OpenOptions::new().create(true).append(true).open(&path).unwrap();
+        let logger = Logger {
+            sinks: vec![Sink { output: Output::File(file), level: LevelFilter::Info }],
+            max: LevelFilter::Info,
+            calling_function: true,
+        };
+        logger.log(
+            &Record::builder().level(level).target(target).args(format_args!("{msg}")).build(),
+        );
+        logger.flush();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        text
+    }
+
+    #[test]
+    fn a_record_is_one_stamped_line_and_a_level_the_sink_does_not_take_is_dropped() {
+        let line = written(Level::Warn, "stratum", "hello");
+        assert!(line.ends_with(" WARN  [stratum] hello\n"), "{line:?}");
+        assert_eq!(line.len(), 23 + " WARN  [stratum] hello\n".len(), "{line:?}");
+        assert_eq!(&line[4..5], "-");
+        assert_eq!(written(Level::Debug, "stratum", "hidden"), "");
     }
 }

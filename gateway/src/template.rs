@@ -270,7 +270,7 @@ pub fn fetch(node: &rpc::Client) -> Result<serde_json::Value, rpc::Error> {
 }
 
 /// A block notification: from the node's `getbestblockhash` poll, the pool's blocknotify, the
-/// API's `/NOTIFY`, SIGUSR1, or the gateway's own block submission. The node poll and the
+/// API's `/NOTIFY`, or the gateway's own block submission. The node poll and the
 /// gateway's submission carry the hash of the tip they announce, and the template thread
 /// drops a notification for the tip it already serves (the C gateway's
 /// `new_notify_blockhash` check); the others carry no hash and are always acted on. A
