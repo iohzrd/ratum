@@ -5,7 +5,7 @@ miner's own node, builds the block templates and serves stratum to the hardware;
 connects to, which the gateway calls DATUM Prime, dictates where the coinbase pays, verifies
 the shares that come back and relays the blocks. RATUM is a pool for the [Bitcoin Knots BLAKE2b hardfork chain](https://github.com/bitcoinknots/bitcoin/pull/359).
 
-The repository is a Cargo workspace of three crates, one per executable and one library:
+The repository is a Cargo workspace of four crates, one per executable and one library:
 
 - `core/`: the `ratum` library, the code the pool and the gateway share: the DATUM protocol
   (framing, handshake, messages, the share format, validation requests, the client side),
@@ -16,9 +16,9 @@ The repository is a Cargo workspace of three crates, one per executable and one 
   built on.
 - `miner/`: `sia-test-miner`, the CPU miner the end-to-end tests drive; it depends on the
   `ratum` library alone.
-
-RATUM pairs with the DATUM Gateway fork at https://github.com/iohzrd/datum_gateway (branch
-`blake2b`), which sends the version 2 header section.
+- `gateway/`: the `ratum-gateway` binary, a Rust reimplementation of the DATUM Gateway fork at
+  https://github.com/iohzrd/datum_gateway (branch `blake2b`). It reads the C gateway's
+  configuration file unchanged and is what the end-to-end tests run; see `gateway/README.md`.
 
 Every dependency version is set once in the root `Cargo.toml` (`[workspace.dependencies]`), so
 the crates cannot drift apart; the header hash and share format are byte-coupled between the
@@ -28,15 +28,17 @@ the git commit that `--version` reports. `tests/e2e/` holds the scripts that run
 ## Build and test
 
 ```
-cargo build --workspace --release        # target/release/ratum-prime, sia-test-miner
+cargo build --workspace --release        # target/release/ratum-prime, ratum-gateway, sia-test-miner
 cargo test --workspace                   # unit, vectors, decoders, integration vs a stand-in node
 cargo test --workspace --release -- --ignored  # shares and blocks, ~2^32 hashes each
 tests/e2e/full_stack.sh                  # node + gateway + pool + miner: the activation block
 tests/e2e/multi_miner.sh                 # three miners, two gateways: credit and payout split
+tests/e2e/gateway_fee.sh                 # a gateway charging a fee beside one charging none
 ```
 
-The two scripts need a Knots build with the BLAKE2b change and a DATUM Gateway build, whose
-paths they take from `BITCOIND`, `BITCOIN_CLI` and `DATUM_GATEWAY`.
+The three scripts need a Knots build with the BLAKE2b change, whose paths they take from
+`BITCOIND` and `BITCOIN_CLI`. They build and run this workspace's `ratum-gateway`;
+`DATUM_GATEWAY` names another gateway build to run instead (the C gateway, for comparison).
 
 ## Configuration
 

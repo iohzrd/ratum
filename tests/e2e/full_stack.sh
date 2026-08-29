@@ -10,10 +10,11 @@
 #
 # usage: tests/e2e/full_stack.sh [--keep]
 #
-# Needs a Bitcoin Knots build with the BLAKE2b change and a DATUM Gateway build:
+# Needs a Bitcoin Knots build with the BLAKE2b change; the gateway is this workspace's
+# ratum-gateway crate unless DATUM_GATEWAY names another build (the C gateway, say):
 #   BITCOIND        default ~/src/bitcoin/build/bin/bitcoind
 #   BITCOIN_CLI     default ~/src/bitcoin/build/bin/bitcoin-cli
-#   DATUM_GATEWAY   default ~/src/datum_gateway/build/datum_gateway
+#   DATUM_GATEWAY   default the ratum-gateway crate in this workspace, built below
 #   TIMEOUT         seconds to wait for the block, default 900
 #
 # Exits 0 only if the node accepted a block the pool verified.
@@ -22,7 +23,7 @@ set -euo pipefail
 
 BITCOIND=${BITCOIND:-$HOME/src/bitcoin/build/bin/bitcoind}
 BITCOIN_CLI=${BITCOIN_CLI:-$HOME/src/bitcoin/build/bin/bitcoin-cli}
-DATUM_GATEWAY=${DATUM_GATEWAY:-$HOME/src/datum_gateway/build/datum_gateway}
+DATUM_GATEWAY=${DATUM_GATEWAY:-}
 TIMEOUT=${TIMEOUT:-900}
 KEEP=0
 [ "${1:-}" = "--keep" ] && KEEP=1
@@ -91,13 +92,14 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for tool in "$BITCOIND" "$BITCOIN_CLI" "$DATUM_GATEWAY"; do
+for tool in "$BITCOIND" "$BITCOIN_CLI" ${DATUM_GATEWAY:+"$DATUM_GATEWAY"}; do
     [ -x "$tool" ] || fail "$tool is not executable; set BITCOIND, BITCOIN_CLI or DATUM_GATEWAY"
 done
 command -v python3 >/dev/null || fail "python3 is not on PATH"
 
-step "building the pool and the test miner"
-(cd "$ROOT" && cargo build --release --bin ratum-prime --bin sia-test-miner) \
+DATUM_GATEWAY=${DATUM_GATEWAY:-$ROOT/target/release/ratum-gateway}
+step "building the pool, the gateway and the test miner"
+(cd "$ROOT" && cargo build --workspace --release --bin ratum-prime --bin sia-test-miner --bin ratum-gateway) \
     || fail "cargo build"
 
 step "starting a regtest node with BLAKE2b active at height $ACTIVATION_HEIGHT"
@@ -207,9 +209,15 @@ step "mining with sia-test-miner until height $ACTIVATION_HEIGHT (up to ${TIMEOU
 PIDS+=($!)
 
 deadline=$((SECONDS + TIMEOUT))
+started=$SECONDS
+last_report=$SECONDS
 while [ "$SECONDS" -lt "$deadline" ]; do
     height=$("$BITCOIN_CLI" -datadir="$WORK/node" getblockcount 2>/dev/null || echo 0)
     [ "$height" -ge "$ACTIVATION_HEIGHT" ] && break
+    if [ $((SECONDS - last_report)) -ge 30 ]; then
+        last_report=$SECONDS
+        printf '  %4ds: height %s of %s\n' $((SECONDS - started)) "$height" "$ACTIVATION_HEIGHT"
+    fi
     sleep 2
 done
 [ "$height" -ge "$ACTIVATION_HEIGHT" ] \

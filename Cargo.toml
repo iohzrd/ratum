@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["core", "prime", "miner"]
+members = ["core", "prime", "gateway", "miner"]
 
 [workspace.package]
 version = "0.1.0"

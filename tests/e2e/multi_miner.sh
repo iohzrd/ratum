@@ -23,11 +23,12 @@
 #
 # usage: tests/e2e/multi_miner.sh [--keep]
 #
-# Needs a Bitcoin Knots build with the BLAKE2b change and a DATUM Gateway build:
+# Needs a Bitcoin Knots build with the BLAKE2b change; the gateway is this workspace's
+# ratum-gateway crate unless DATUM_GATEWAY names another build (the C gateway, say):
 #   BITCOIND        default ~/src/bitcoin/build/bin/bitcoind
 #   BITCOIN_CLI     default ~/src/bitcoin/build/bin/bitcoin-cli
-#   DATUM_GATEWAY   default ~/src/datum_gateway/build/datum_gateway
-#   SHARE_COUNT     shares to accumulate before checking, default 12
+#   DATUM_GATEWAY   default the ratum-gateway crate in this workspace, built below
+#   SHARE_COUNT     shares to accumulate before checking, default 6
 #   TIMEOUT         seconds to wait for them, default 5400
 #
 # Exits 0 only if every accepted share was credited to the miner that submitted it and every
@@ -37,8 +38,8 @@ set -euo pipefail
 
 BITCOIND=${BITCOIND:-$HOME/src/bitcoin/build/bin/bitcoind}
 BITCOIN_CLI=${BITCOIN_CLI:-$HOME/src/bitcoin/build/bin/bitcoin-cli}
-DATUM_GATEWAY=${DATUM_GATEWAY:-$HOME/src/datum_gateway/build/datum_gateway}
-SHARE_COUNT=${SHARE_COUNT:-12}
+DATUM_GATEWAY=${DATUM_GATEWAY:-}
+SHARE_COUNT=${SHARE_COUNT:-6}
 TIMEOUT=${TIMEOUT:-5400}
 KEEP=0
 [ "${1:-}" = "--keep" ] && KEEP=1
@@ -125,7 +126,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for tool in "$BITCOIND" "$BITCOIN_CLI" "$DATUM_GATEWAY"; do
+for tool in "$BITCOIND" "$BITCOIN_CLI" ${DATUM_GATEWAY:+"$DATUM_GATEWAY"}; do
     [ -x "$tool" ] || fail "$tool is not executable; set BITCOIND, BITCOIN_CLI or DATUM_GATEWAY"
 done
 for tool in jq taskset python3; do
@@ -189,8 +190,9 @@ else:
     sys.exit(1)
 MATCHPY
 
-step "building the pool and the test miner"
-(cd "$ROOT" && cargo build --release --bin ratum-prime --bin sia-test-miner) || fail "cargo build"
+DATUM_GATEWAY=${DATUM_GATEWAY:-$ROOT/target/release/ratum-gateway}
+step "building the pool, the gateway and the test miner"
+(cd "$ROOT" && cargo build --workspace --release --bin ratum-prime --bin sia-test-miner --bin ratum-gateway) || fail "cargo build"
 
 step "starting a regtest node with BLAKE2b active at height $ACTIVATION_HEIGHT"
 mkdir -p "$WORK/node"
@@ -331,12 +333,21 @@ start_miner "$CAROL" "$CAROL_CPUS" carol "$STRATUM_PORT_B"
 # text file the checks below read.
 LEDGER_DB="$WORK/pool/regtest.redb"
 LEDGER="$WORK/pool/shares.txt"
+# A share is 2^32 BLAKE2b hashes (difficulty 1 is the protocol's floor), so each one costs a
+# CPU miner tens of seconds.
 step "accumulating $SHARE_COUNT shares (up to ${TIMEOUT}s)"
 # Wait for the target, and for every miner to hold at least one share, so that the split
 # being checked is a split between three miners rather than however many had found one.
 deadline=$((SECONDS + TIMEOUT))
+started=$SECONDS
+last_report=$SECONDS
 recorded=0
 while [ "$SECONDS" -lt "$deadline" ]; do
+    if [ $((SECONDS - last_report)) -ge 30 ]; then
+        last_report=$SECONDS
+        printf '  %4ds: %s/%s shares accepted at height %s\n' $((SECONDS - started)) "$recorded" "$SHARE_COUNT" \
+            "$("$BITCOIN_CLI" -datadir="$WORK/node" getblockcount 2>/dev/null || echo '?')"
+    fi
     recorded=$(grep -c '<- accepted' "$WORK/pool.log" 2>/dev/null || echo 0)
     if [ "$recorded" -ge "$SHARE_COUNT" ]; then
         all=1
