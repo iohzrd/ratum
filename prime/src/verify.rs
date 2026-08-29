@@ -1,10 +1,10 @@
-use crate::bitcoin::{self, CoinbaseTx};
-use crate::datum::messages::{ClientConfig, CoinbaseOutput, CoinbaserResponse, RejectReason};
-use crate::datum::share::{
+use ratum::bitcoin::{self, CoinbaseTx};
+use ratum::datum::messages::{ClientConfig, CoinbaseOutput, CoinbaserResponse, RejectReason};
+use ratum::datum::share::{
     self, COINBASE_ID_SUBSIDY_ONLY, CoinbaseSection, JobSection, MAX_JOBS, MAX_USERNAME, PowSubmit,
 };
-use crate::header::{self, HeaderV2};
-use crate::target;
+use ratum::header::{self, HeaderV2};
+use ratum::target;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
@@ -246,7 +246,7 @@ impl Verifier {
         // relays and the node rejects.
         let is_block = self.meets_network_target(&work);
 
-        if !crate::lock(&self.replay).accept(work.block_hash) {
+        if !ratum::lock(&self.replay).accept(work.block_hash) {
             return Err(RejectReason::DuplicateWork);
         }
         Ok(Accepted { work, is_block })
@@ -579,7 +579,7 @@ fn check_outputs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bitcoin::TxOut;
+    use ratum::bitcoin::TxOut;
 
     const NOW: u64 = 1_760_000_000;
     const NBITS: [u8; 4] = [0xff, 0xff, 0x7f, 0x20];
@@ -604,7 +604,7 @@ mod tests {
         }
     }
 
-    use crate::fixtures::{self, Tagging, p2wpkh};
+    use ratum::fixtures::{self, Tagging, p2wpkh};
 
     fn coinbase_sections(p: &PoolPolicy, outputs: &[CoinbaseOutput]) -> (CoinbaseSection, usize) {
         let tagging = Tagging { tag: &p.coinbase_tag, prime_id: p.prime_id, headline: None };
@@ -802,7 +802,7 @@ mod tests {
         let (mut v, s) = setup_v2();
         let w = v.rebuild(&s, NOW).unwrap();
         assert!(w.is_v2);
-        assert_eq!(w.header.len(), crate::header::HEADER_V2_SIZE);
+        assert_eq!(w.header.len(), ratum::header::HEADER_V2_SIZE);
         assert_eq!(w.paid_to_split, 150_000_000);
         assert_eq!(w.paid_to_pool, COINBASE_VALUE - 150_000_000);
         let h = built_header(&w);
@@ -816,7 +816,7 @@ mod tests {
         let mut leaf = vec![0u8];
         leaf.extend_from_slice(&coinb1);
         leaf.extend_from_slice(&h.extranonce);
-        assert_eq!(crate::header::blake2b_256(&leaf), h.precompute().hash1);
+        assert_eq!(ratum::header::blake2b_256(&leaf), h.precompute().hash1);
     }
 
     #[test]
@@ -1644,10 +1644,10 @@ mod tests {
             let h = built_header(&w);
             let pre = h.precompute();
             let input = h.asic_input_with(&pre.hash1, &pre.h2);
-            match crate::nonce::search(
+            match ratum::nonce::search(
                 &input,
                 32,
-                crate::header::blake2b_256,
+                ratum::header::blake2b_256,
                 &target::DIFF1_TARGET,
                 || false,
             ) {
@@ -1662,7 +1662,7 @@ mod tests {
     }
 
     fn find_nonce(header: [u8; bitcoin::HEADER_SIZE]) -> Option<u32> {
-        crate::nonce::search(
+        ratum::nonce::search(
             &header,
             76,
             |h| bitcoin::reversed(&bitcoin::sha256d(h)),

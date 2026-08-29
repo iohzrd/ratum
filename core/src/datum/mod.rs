@@ -4,4 +4,3 @@ pub mod handshake;
 pub mod messages;
 pub mod share;
 pub mod validation;
-pub mod verify;

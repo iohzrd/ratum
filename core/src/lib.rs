@@ -1,10 +1,9 @@
 pub mod bitcoin;
-pub mod config;
 pub mod cursor;
 pub mod datum;
+#[cfg(feature = "test-support")]
 pub mod fixtures;
 pub mod header;
-pub mod ledger;
 pub mod nonce;
 pub mod rpc;
 pub mod target;

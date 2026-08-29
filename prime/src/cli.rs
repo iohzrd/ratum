@@ -1,6 +1,6 @@
 //! The command line (clap) and the configuration file, and the helpers `main` resolves each
 //! setting with. clap owns tokenization, `--help`/`--version`, and the refusals for an
-//! unknown flag or a flag without its value; the file is parsed by `ratum::config`. A setting
+//! unknown flag or a flag without its value; the file is parsed by `ratum_prime::config`. A setting
 //! given on the command line overrides the same setting written in the file. `main` applies
 //! each default and validates each meaning, so the messages naming a bad value are in this module.
 
@@ -88,7 +88,7 @@ pub(crate) struct Cli {
 /// The command line and the file it named, ready for `main` to resolve each setting from.
 pub(crate) struct Loaded {
     pub cli: Cli,
-    pub file: ratum::config::Config,
+    pub file: ratum_prime::config::Config,
 }
 
 /// Parse the command line, then read the configuration file it points at: `--config` names
@@ -103,23 +103,23 @@ pub(crate) fn load() -> Loaded {
     };
     let file = match path {
         Some(path) => load_file(&path, cli.config.is_some()),
-        None => ratum::config::Config::default(),
+        None => ratum_prime::config::Config::default(),
     };
     Loaded { cli, file }
 }
 
-fn load_file(path: &Path, required: bool) -> ratum::config::Config {
+fn load_file(path: &Path, required: bool) -> ratum_prime::config::Config {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound && !required => {
-            return ratum::config::Config::default();
+            return ratum_prime::config::Config::default();
         }
         Err(e) => {
             eprintln!("cannot read {}: {e}", path.display());
             std::process::exit(2);
         }
     };
-    match ratum::config::parse(&text) {
+    match ratum_prime::config::parse(&text) {
         Ok(c) => {
             warn_if_readable(path, &c);
             c
@@ -191,7 +191,7 @@ pub(crate) fn resolve_str(cli: Option<String>, file: Option<String>, default: &s
 /// A file holding a password is only better than a command line if it is not readable by
 /// everyone. The pool does not change the permissions; it logs a warning.
 #[cfg(unix)]
-fn warn_if_readable(path: &Path, settings: &ratum::config::Config) {
+fn warn_if_readable(path: &Path, settings: &ratum_prime::config::Config) {
     use std::os::unix::fs::PermissionsExt as _;
     if !settings.holds_a_secret() {
         return;
@@ -208,4 +208,4 @@ fn warn_if_readable(path: &Path, settings: &ratum::config::Config) {
 }
 
 #[cfg(not(unix))]
-fn warn_if_readable(_path: &Path, _settings: &ratum::config::Config) {}
+fn warn_if_readable(_path: &Path, _settings: &ratum_prime::config::Config) {}

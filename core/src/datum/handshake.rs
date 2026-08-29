@@ -242,19 +242,28 @@ impl Channel {
         crypto_box_open_easy_afternm(&mut plain, ciphertext, &self.rx_nonce, precomp)
             .map_err(|_| Error::Decrypt)?;
         framing::increment_nonce(&mut self.rx_nonce);
-
-        if header.is_signed {
-            if plain.len() < CRYPTO_SIGN_BYTES {
-                return Err(Error::Truncated);
-            }
-            let pk = verify_with.ok_or(Error::NoVerifyKey)?;
-            let (signed, sig) = plain.split_at(plain.len() - CRYPTO_SIGN_BYTES);
-            let sig: Signature = sig.try_into().map_err(|_| Error::Truncated)?;
-            crypto_sign_verify_detached(&sig, signed, pk).map_err(|_| Error::BadSignature)?;
-            plain.truncate(plain.len() - CRYPTO_SIGN_BYTES);
-        }
-        Ok(plain)
+        strip_signature(plain, header, verify_with)
     }
+}
+
+/// When `header.is_signed`, verify the detached signature at the end of `plain` against
+/// `verify_with` and remove it; otherwise return `plain` unchanged.
+pub fn strip_signature(
+    mut plain: Vec<u8>,
+    header: Header,
+    verify_with: Option<&SignPublicKey>,
+) -> Result<Vec<u8>, Error> {
+    if header.is_signed {
+        if plain.len() < CRYPTO_SIGN_BYTES {
+            return Err(Error::Truncated);
+        }
+        let pk = verify_with.ok_or(Error::NoVerifyKey)?;
+        let (signed, sig) = plain.split_at(plain.len() - CRYPTO_SIGN_BYTES);
+        let sig: Signature = sig.try_into().map_err(|_| Error::Truncated)?;
+        crypto_sign_verify_detached(&sig, signed, pk).map_err(|_| Error::BadSignature)?;
+        plain.truncate(plain.len() - CRYPTO_SIGN_BYTES);
+    }
+    Ok(plain)
 }
 
 pub struct Session {

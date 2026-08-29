@@ -8,7 +8,9 @@ use dryoc::classic::crypto_sign::{
 };
 use dryoc::constants::{CRYPTO_BOX_SEALBYTES, CRYPTO_SIGN_BYTES};
 
-const HELLO_PAD: usize = 17;
+/// The hello carries 1 to 200 random pad bytes after `nk`, as the C gateway sends, so the
+/// frame length does not identify the user agent.
+const HELLO_PAD_MAX: usize = 200;
 
 /// The client side of the DATUM handshake and channel: what the gateway does.
 ///
@@ -69,7 +71,10 @@ impl Client {
         body.push(0);
         body.push(STRUCT_END);
         body.extend_from_slice(&self.nk.to_le_bytes());
-        body.extend_from_slice(&[0u8; HELLO_PAD]);
+        let mut pad = [0u8; HELLO_PAD_MAX];
+        dryoc::rng::copy_randombytes(&mut pad);
+        let pad_len = 1 + usize::from(pad[0]) % HELLO_PAD_MAX;
+        body.extend_from_slice(&pad[..pad_len]);
 
         let mut sig: Signature = [0u8; CRYPTO_SIGN_BYTES];
         crypto_sign_detached(&mut sig, &body, &self.long_term_keys.sign_sk).expect("sign hello");
@@ -165,8 +170,30 @@ impl Client {
     }
 
     /// Decrypt one message from the pool, checking its session signature when it carries one.
+    /// The header flags select the form, as `datum_protocol_server_msg` does: channel
+    /// encryption when only `is_encrypted_channel` is set, a sealed box to the session key
+    /// when only `is_encrypted_pubkey` is set, and the body as sent when neither or both are
+    /// set. Only the channel form advances the receive nonce.
     pub fn decrypt(&mut self, header: Header, ciphertext: &[u8]) -> Result<Vec<u8>, Error> {
-        self.channel.decrypt(header, ciphertext, self.pool_session_sign_pk.as_ref())
+        let verify = self.pool_session_sign_pk.as_ref();
+        match (header.is_encrypted_channel, header.is_encrypted_pubkey) {
+            (true, false) => self.channel.decrypt(header, ciphertext, verify),
+            (false, true) => {
+                if ciphertext.len() < CRYPTO_BOX_SEALBYTES {
+                    return Err(Error::Truncated);
+                }
+                let mut plain = vec![0u8; ciphertext.len() - CRYPTO_BOX_SEALBYTES];
+                crypto_box_seal_open(
+                    &mut plain,
+                    ciphertext,
+                    &self.session_keys.box_pk,
+                    &self.session_keys.box_sk,
+                )
+                .map_err(|_| Error::Unseal)?;
+                super::handshake::strip_signature(plain, header, verify)
+            }
+            _ => super::handshake::strip_signature(ciphertext.to_vec(), header, verify),
+        }
     }
 }
 
@@ -291,6 +318,35 @@ mod tests {
         assert!(matches!(client.encrypt(framing::cmd::MINING, b"x"), Err(Error::NoChannel)));
         let header = Header { cmd_len: 4, is_encrypted_channel: true, ..Default::default() };
         assert!(matches!(client.decrypt(header, &[0u8; 32]), Err(Error::NoChannel)));
+    }
+
+    #[test]
+    fn a_plain_frame_after_the_handshake_is_read_as_sent_without_advancing_the_nonce() {
+        let pool = KeyPairs::generate();
+        let mut client = Client::new(9);
+        let wire = client.hello(&pool.box_pk, "ua");
+        let hello = server_read_hello(&wire, &pool).unwrap();
+        let (response, mut session) = accept(hello, &pool, "hi").unwrap();
+        client.read_handshake_response(&response, &pool.sign_pk).unwrap();
+
+        // A plaintext PING, as datum_protocol_server_msg passes through undecrypted.
+        let plain =
+            Header { cmd_len: 3, proto_cmd: framing::cmd::HELLO_OR_PING, ..Default::default() };
+        assert_eq!(client.decrypt(plain, b"abc").unwrap(), b"abc");
+
+        // The channel nonce did not move: the next channel frame still decrypts.
+        let wire = session.encrypt(framing::cmd::MINING, b"after", false).unwrap();
+        let header = client.unmask_header(wire[..4].try_into().unwrap());
+        assert_eq!(client.decrypt(header, &wire[4..]).unwrap(), b"after");
+
+        // A signed plaintext frame with a bad signature is refused.
+        let signed = Header {
+            cmd_len: 70,
+            is_signed: true,
+            proto_cmd: framing::cmd::INFO,
+            ..Default::default()
+        };
+        assert!(matches!(client.decrypt(signed, &[0u8; 70]), Err(Error::BadSignature)));
     }
 
     #[test]

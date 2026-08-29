@@ -5,14 +5,32 @@ miner's own node, builds the block templates and serves stratum to the hardware;
 connects to, which the gateway calls DATUM Prime, dictates where the coinbase pays, verifies
 the shares that come back and relays the blocks. RATUM is a pool for the [Bitcoin Knots BLAKE2b hardfork chain](https://github.com/bitcoinknots/bitcoin/pull/359).
 
+The repository is a Cargo workspace of three crates, one per executable and one library:
+
+- `core/`: the `ratum` library, the code the pool and the gateway share: the DATUM protocol
+  (framing, handshake, messages, the share format, validation requests, the client side),
+  the version 2 (BLAKE2b) block header, targets, transaction and coinbase parsing, and the
+  node RPC client. It holds no pool or gateway logic.
+- `prime/`: the `ratum-prime` pool binary, with the pool-only code (`config`, `ledger`,
+  `verify`) as a small library the binary and the integration tests in `prime/tests/` are
+  built on.
+- `miner/`: `sia-test-miner`, the CPU miner the end-to-end tests drive; it depends on the
+  `ratum` library alone.
+
 RATUM pairs with the DATUM Gateway fork at https://github.com/iohzrd/datum_gateway (branch
 `blake2b`), which sends the version 2 header section.
+
+Every dependency version is set once in the root `Cargo.toml` (`[workspace.dependencies]`), so
+the crates cannot drift apart; the header hash and share format are byte-coupled between the
+pool and the gateway. `build.rs` at the root is the build script of every crate; it records
+the git commit that `--version` reports. `tests/e2e/` holds the scripts that run all of it.
 
 ## Build and test
 
 ```
-cargo test                               # unit, vectors, decoders, integration vs a stand-in node
-cargo test --release -- --ignored        # shares and blocks, ~2^32 hashes each
+cargo build --workspace --release        # target/release/ratum-prime, sia-test-miner
+cargo test --workspace                   # unit, vectors, decoders, integration vs a stand-in node
+cargo test --workspace --release -- --ignored  # shares and blocks, ~2^32 hashes each
 tests/e2e/full_stack.sh                  # node + gateway + pool + miner: the activation block
 tests/e2e/multi_miner.sh                 # three miners, two gateways: credit and payout split
 ```

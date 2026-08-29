@@ -151,7 +151,9 @@ impl ShortTxnList {
         }
         let ids = c.take(txn_count as usize * 6, "short ids")?;
         let short_ids = ids
-            .chunks_exact(6)
+            .as_chunks::<6>()
+            .0
+            .iter()
             .map(|c| {
                 let low = u32::from_le_bytes(c[..4].try_into().unwrap());
                 let high = u16::from_le_bytes(c[4..].try_into().unwrap());
@@ -298,15 +300,15 @@ pub fn siphash24(key: &[u8; 16], data: &[u8]) -> u64 {
     let mut v2 = k0 ^ 0x6c79_6765_6e65_7261;
     let mut v3 = k1 ^ 0x7465_6462_7974_6573;
 
-    let mut chunks = data.chunks_exact(8);
-    for c in &mut chunks {
-        let m = u64::from_le_bytes(c.try_into().unwrap());
+    let (chunks, tail) = data.as_chunks::<8>();
+    for c in chunks {
+        let m = u64::from_le_bytes(*c);
         v3 ^= m;
         double_round(&mut v0, &mut v1, &mut v2, &mut v3);
         v0 ^= m;
     }
     let mut b = (data.len() as u64) << 56;
-    for (i, byte) in chunks.remainder().iter().enumerate() {
+    for (i, byte) in tail.iter().enumerate() {
         b |= u64::from(*byte) << (8 * i);
     }
     v3 ^= b;

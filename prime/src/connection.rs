@@ -11,8 +11,9 @@ use ratum::datum::messages::{
 };
 use ratum::datum::share::PowSubmit;
 use ratum::datum::validation::{self, TxnBundle};
-use ratum::datum::verify::{Accepted, Verifier};
-use ratum::{ledger, lock, rpc};
+use ratum::{lock, rpc};
+use ratum_prime::ledger;
+use ratum_prime::verify::{Accepted, Verifier};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;

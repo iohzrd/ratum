@@ -144,10 +144,13 @@ impl Client {
         authorization: String,
         cookie_path: Option<PathBuf>,
     ) -> Result<Self, Error> {
-        // The pool uses plain HTTP to a node on the same host or a private link, so an
-        // `http://` URL with a host:port authority is the whole contract; reject anything else
-        // rather than attempting TLS or a bare host.
-        let rest = url.strip_prefix("http://").ok_or_else(|| Error::BadUrl(url.to_string()))?;
+        // An `http://` or `https://` URL with a host:port authority; a bare host or another
+        // scheme is refused. The node on the same host or a private link is plain HTTP; an
+        // extra block-submission node behind TLS is where `https://` is used.
+        let rest = url
+            .strip_prefix("http://")
+            .or_else(|| url.strip_prefix("https://"))
+            .ok_or_else(|| Error::BadUrl(url.to_string()))?;
         let authority = rest.split('/').next().unwrap_or(rest);
         if authority.is_empty() || !authority.contains(':') {
             return Err(Error::BadUrl(url.to_string()));
@@ -331,7 +334,10 @@ mod tests {
         let c = Client::new("http://node.example:8332/wallet/main", "u", "p").unwrap();
         assert_eq!(c.url, "http://node.example:8332/wallet/main");
 
-        for bad in ["127.0.0.1:18443", "https://127.0.0.1:18443", "http://", "http://nohost"] {
+        let c = Client::new("https://node.example:8332", "u", "p").unwrap();
+        assert_eq!(c.url, "https://node.example:8332");
+
+        for bad in ["127.0.0.1:18443", "ftp://127.0.0.1:18443", "http://", "http://nohost"] {
             assert!(Client::new(bad, "x", "y").is_err(), "{bad:?} should not parse");
         }
     }

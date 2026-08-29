@@ -11,9 +11,9 @@ use ratum::datum::messages::{
     ShareVerdict, client_subcmd, server_subcmd,
 };
 use ratum::datum::share::PowSubmit;
-use ratum::datum::verify::TIP_GRACE_SECS;
-use ratum::ledger::Ledger;
 use ratum::target;
+use ratum_prime::ledger::Ledger;
+use ratum_prime::verify::TIP_GRACE_SECS;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use support::work::{self, Tagging, Work};
 use support::{FakeNode, Pool, PoolArgs, TempDir, script_for_address};
@@ -251,7 +251,7 @@ fn a_coinbase_value_the_node_does_not_recognize_is_refused() {
     let mut gateway = pool.connect();
     let _config = gateway.recv();
     gateway.send_mining(
-        &CoinbaserRequest { value: 21_000_000_00000000, prev_hash: node.tip_internal() }.encode(),
+        &CoinbaserRequest { value: 2_100_000_000_000_000, prev_hash: node.tip_internal() }.encode(),
     );
 
     pool.expect_line("refusing a split");

@@ -93,7 +93,7 @@ pub fn merkle_root_of(txids: &[[u8; 32]]) -> Option<([u8; 32], bool)> {
         // Detect a pair of identical adjacent hashes, before the odd-level duplication below,
         // exactly as Bitcoin Core's ComputeMerkleRoot does. A trailing odd element is not
         // examined here: duplicating it is normal tree construction, not a mutation.
-        for pair in level.chunks_exact(2) {
+        for pair in level.as_chunks::<2>().0 {
             if pair[0] == pair[1] {
                 mutated = true;
                 break;

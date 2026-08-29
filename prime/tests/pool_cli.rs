@@ -44,7 +44,7 @@ fn refuses(extra: &[&str], because: &str) {
 /// file's settings and checks clap accepts each as a known flag.
 #[test]
 fn every_file_setting_is_a_clap_flag() {
-    for flag in ratum::config::Config::flags() {
+    for flag in ratum_prime::config::Config::flags() {
         let output = run_pool(&[flag.as_str(), "x"]);
         let text = printed(&output);
         assert!(
@@ -380,8 +380,8 @@ fn a_node_that_cannot_be_reached_stops_the_pool_before_it_listens() {
 }
 
 #[test]
-fn an_rpc_url_without_an_http_scheme_and_port_is_refused() {
-    for bad in ["127.0.0.1:8332", "https://node:8332", "http://", "http://nohost"] {
+fn an_rpc_url_without_an_http_or_https_scheme_and_port_is_refused() {
+    for bad in ["127.0.0.1:8332", "ftp://node:8332", "http://", "http://nohost"] {
         let argv = args_with(&["--rpc", bad]);
         let borrowed: Vec<&str> = argv.iter().map(String::as_str).collect();
         let output = run_pool(&borrowed);

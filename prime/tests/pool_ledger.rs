@@ -4,7 +4,7 @@
 mod support;
 
 use ratum::datum::messages::{CoinbaserRequest, CoinbaserResponse, server_subcmd};
-use ratum::ledger::Ledger;
+use ratum_prime::ledger::Ledger;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use support::{FakeNode, Pool, PoolArgs, TempDir, printed, run_pool, script_for_address};

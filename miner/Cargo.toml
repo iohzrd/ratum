@@ -1,0 +1,10 @@
+[package]
+name = "sia-test-miner"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+ratum = { path = "../core" }
+hex.workspace = true
+serde_json.workspace = true

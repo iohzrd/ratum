@@ -1,5 +1,5 @@
 //! Fixtures the crate's unit tests and the integration harness share: the coinbase a
-//! gateway would build, in the tagging layout `datum::verify` checks. The unit tests and
+//! gateway would build, in the tagging layout the pool's `ratum_prime::verify` checks. The unit tests and
 //! the integration tests must use that layout byte for byte, so it is written once here
 //! rather than once per test tree. The pool binary does not use this module.
 

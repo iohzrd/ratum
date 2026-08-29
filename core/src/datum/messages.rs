@@ -79,6 +79,9 @@ impl ClientConfig {
             return None;
         }
         let a = c.u8("script length").ok()? as usize;
+        if a > MAX_PAYOUT_SCRIPT {
+            return None;
+        }
         let payout_script = c.take(a, "payout script").ok()?.to_vec();
         let prime_id = c.u32("prime id").ok()?;
         let b = c.u8("tag length").ok()? as usize;
@@ -184,6 +187,12 @@ impl CoinbaserResponse {
     }
 
     pub fn decode(data: &[u8]) -> Option<Self> {
+        Self::decode_with(data, &|_| false)
+    }
+
+    /// Decode, leaving out every output whose script `skip` names, before its value counts
+    /// toward the total (the C gateway's `reduced_data` check in `datum_coinbaser_v2_parse`).
+    pub fn decode_with(data: &[u8], skip: &dyn Fn(&[u8]) -> bool) -> Option<Self> {
         let mut c = Cursor::new(data);
         c.skip_if(server_subcmd::COINBASER);
         let value = c.u64("value").ok()?;
@@ -210,6 +219,9 @@ impl CoinbaserResponse {
                 return None;
             }
             let script = b.take(slen, "output script").ok()?.to_vec();
+            if skip(&script) {
+                continue;
+            }
             total += v;
             outputs.push(CoinbaseOutput { value: v, script });
             if outputs.len() >= MAX_COINBASER_OUTPUTS {
@@ -225,6 +237,8 @@ pub enum ShareVerdict {
     Accepted,
     AcceptedTentatively,
     Rejected(RejectReason),
+    /// Rejected with a reason code this build does not name.
+    RejectedUnknown(u16),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -317,6 +331,7 @@ impl ShareResponse {
             ShareVerdict::Accepted => (share_status::ACCEPTED, 0u16),
             ShareVerdict::AcceptedTentatively => (share_status::ACCEPTED_TENTATIVELY, 0),
             ShareVerdict::Rejected(r) => (share_status::REJECTED, r as u16),
+            ShareVerdict::RejectedUnknown(code) => (share_status::REJECTED, code),
         };
         let mut out = Vec::with_capacity(10);
         out.push(server_subcmd::SHARE_RESPONSE);
@@ -336,7 +351,10 @@ impl ShareResponse {
         let verdict = match status {
             share_status::ACCEPTED => ShareVerdict::Accepted,
             share_status::ACCEPTED_TENTATIVELY => ShareVerdict::AcceptedTentatively,
-            share_status::REJECTED => ShareVerdict::Rejected(RejectReason::from_code(reason)?),
+            share_status::REJECTED => match RejectReason::from_code(reason) {
+                Some(r) => ShareVerdict::Rejected(r),
+                None => ShareVerdict::RejectedUnknown(reason),
+            },
             _ => return None,
         };
         Some(ShareResponse {
@@ -564,7 +582,10 @@ mod tests {
             ShareResponse { verdict: ShareVerdict::Rejected(RejectReason::HighHash), ..base }
                 .encode();
         unknown_reason[2] = 0xfe;
-        assert_eq!(ShareResponse::decode(&unknown_reason), None);
+        // A reason this build does not name is still a rejection, and counted as one.
+        let decoded = ShareResponse::decode(&unknown_reason).unwrap();
+        assert_eq!(decoded.verdict, ShareVerdict::RejectedUnknown(0xfe));
+        assert_eq!(ShareResponse::decode(&decoded.encode()), Some(decoded));
     }
 
     #[test]
