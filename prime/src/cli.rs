@@ -83,6 +83,19 @@ pub(crate) struct Cli {
     /// since it holds the ledger's exclusive lock.
     #[arg(long)]
     pub dump_ledger: bool,
+    /// Mark an owed block (a block whose coinbase paid the window nothing; the hash the pool
+    /// logged and the stats page shows) settled in the ledger (`--ledger` or `--data-dir`),
+    /// print its record, and exit. Run it after paying the amounts from the pool's wallet.
+    /// The pool must not be running, since it holds the ledger's exclusive lock. Without a
+    /// hash, `--settle-block list` prints every owed block instead.
+    #[arg(long)]
+    pub settle_block: Option<String>,
+    /// Remove an owed block (the hash the pool logged) from the ledger (`--ledger` or
+    /// `--data-dir`), print its record, and exit. For a block that was rejected or
+    /// orphaned: the pool's payout script never received its value, so nothing is owed.
+    /// The pool must not be running, since it holds the ledger's exclusive lock.
+    #[arg(long)]
+    pub void_block: Option<String>,
 }
 
 /// The command line and the file it named, ready for `main` to resolve each setting from.

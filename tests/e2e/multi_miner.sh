@@ -348,7 +348,10 @@ while [ "$SECONDS" -lt "$deadline" ]; do
         printf '  %4ds: %s/%s shares accepted at height %s\n' $((SECONDS - started)) "$recorded" "$SHARE_COUNT" \
             "$("$BITCOIN_CLI" -datadir="$WORK/node" getblockcount 2>/dev/null || echo '?')"
     fi
-    recorded=$(grep -c '<- accepted' "$WORK/pool.log" 2>/dev/null || echo 0)
+    # grep -c prints the count even when it is 0 and exits nonzero, so an || fallback
+    # would append a second line; default only a truly empty result.
+    recorded=$(grep -c '<- accepted' "$WORK/pool.log" 2>/dev/null || true)
+    recorded=${recorded:-0}
     if [ "$recorded" -ge "$SHARE_COUNT" ]; then
         all=1
         for miner in "$ALICE" "$BOB" "$CAROL"; do

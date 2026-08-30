@@ -4,9 +4,8 @@
 //! change the pool. It is started only when `--stats-listen` names an address; bind it to
 //! `127.0.0.1` unless it is behind a reverse proxy, since the page is unauthenticated.
 
-use crate::server::{Resolver, Server, unix_now};
+use crate::server::{Resolver, Server, split_after_fee, unix_now};
 use log::warn;
-use ratum::datum::messages::MAX_COINBASER_OUTPUTS;
 use ratum::http;
 use ratum::lock;
 use std::collections::HashMap;
@@ -52,19 +51,52 @@ fn snapshot(server: &Server) -> String {
     let tip = *lock(&server.tip);
     let coinbase_value = *lock(&server.coinbase_value);
     let operator_fee = coinbase_value.map_or(0, |v| server.payout.fee_on(v));
-    let miners_share = coinbase_value.unwrap_or(0).saturating_sub(operator_fee);
 
-    let (total_work, target_work, shares, work_by_identity, split) = {
+    let (total_work, target_work, shares, work_by_identity, split, owed) = {
         let l = lock(&server.ledger);
         (
             l.total_work(),
             l.window(),
             l.len(),
             l.work_by_identity(),
-            l.split(miners_share, server.payout.min_payout, MAX_COINBASER_OUTPUTS),
+            split_after_fee(&l, &server.payout, coinbase_value.unwrap_or(0)),
+            l.owed().to_vec(),
         )
     };
     let payout_sats: HashMap<String, u64> = split.into_iter().collect();
+
+    // Blocks whose coinbase paid the window nothing: what the pool's payout script received
+    // that the window is owed, per block and summed per identity while unsettled. Settlement
+    // is a wallet transaction the operator records with --settle-block.
+    let mut owed_unsettled: u64 = 0;
+    let mut owed_by_identity: HashMap<String, u64> = HashMap::new();
+    let owed_blocks: Vec<serde_json::Value> = owed
+        .iter()
+        .map(|o| {
+            if o.settled_at.is_none() {
+                owed_unsettled += o.total;
+                for (identity, sats) in &o.entries {
+                    *owed_by_identity.entry(identity.clone()).or_insert(0) += sats;
+                }
+            }
+            serde_json::json!({
+                "height": o.height,
+                "block_hash": hex::encode(o.block_hash),
+                "found_at": o.at,
+                "total_sats": o.total,
+                "settled_at": o.settled_at,
+                "miners": o.entries.iter().map(|(identity, sats)| {
+                    serde_json::json!({ "identity": identity, "sats": sats })
+                }).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    let mut owed_by_identity: Vec<(String, u64)> = owed_by_identity.into_iter().collect();
+    owed_by_identity.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let owed_by_identity: Vec<serde_json::Value> = owed_by_identity
+        .into_iter()
+        .map(|(identity, sats)| serde_json::json!({ "identity": identity, "sats": sats }))
+        .collect();
 
     let miners: Vec<serde_json::Value> = work_by_identity
         .iter()
@@ -142,6 +174,11 @@ fn snapshot(server: &Server) -> String {
             "shares": shares,
             "operator_fee_sats": operator_fee,
             "miners": miners,
+        },
+        "owed": {
+            "unsettled_sats": owed_unsettled,
+            "by_identity": owed_by_identity,
+            "blocks": owed_blocks,
         },
         "generated_at": unix_now(),
     });

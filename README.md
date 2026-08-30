@@ -58,9 +58,9 @@ A ledger is stamped with the node's chain and refused on another chain.
 
 A payout is measured over the most recent shares whose difficulties sum to `--window` times
 the network difficulty (8, OCEAN's TIDES rule), never below `--window-floor`. At the BLAKE2b
-activation height Knots resets the target (mainnet, signet, regtest: the previous target
-shifted left 20 bits; testnet3 and testnet4: `nBits` `0x1a00ffff`), so set `--window-floor`
-to hold the intended span of work and keep the whole ledger across the fork.
+activation height Knots resets the target to the previous target shifted left by
+`Blake2bTargetShift` bits (22 on mainnet, 20 elsewhere), so set `--window-floor` to hold
+the intended span of work and keep the whole ledger across the fork.
 
 ### The split
 
@@ -73,6 +73,20 @@ the split is built is left out and its amount goes to the pool's payout script.
 
 `--fee-bps` (0 to 100, default 0) is deducted from the coinbase before the split and paid to
 the pool's payout script as the remainder.
+
+### Owed blocks
+
+A gateway serves a subsidy-only job in the interval between a tip change and the next
+coinbaser split; a block found on one pays its whole value to the pool's payout script and
+the window's miners receive nothing from it. The pool records such a block in the ledger's
+`owed` table at acceptance: the split a coinbaser at that moment would have dictated, minus
+the operator fee. The amounts are logged, shown on the stats page (an "Owed by pool" card
+and table), and included in `/stats.json` under `owed`. Settlement is an ordinary
+transaction from the operator's wallet; afterwards `ratum-prime --settle-block <block-hash>`
+(with `--ledger` or `--data-dir`, pool stopped) marks the record settled, and
+`--settle-block list` prints every record. A recorded block that was rejected or orphaned
+(the pool's payout script never received its value) is removed with
+`--void-block <block-hash>`.
 
 ### Stats interface
 

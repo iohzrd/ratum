@@ -43,15 +43,11 @@ fn ledger_files_in(dir: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(found)
 }
 
-/// Print the ledger as `<unix-seconds> <difficulty> <identity> <share-hash>` lines, oldest
-/// first, then exit. Exports or audits the ledger; the e2e tests read it this way. Opening
-/// takes the ledger's exclusive lock, so the pool must not be running.
-/// The column order `<at> <difficulty> <identity> <share-hash>` is read by
-/// `tests/e2e/multi_miner.sh` (awk fields 2, 3 and 4) and reconstructed from log lines by
-/// `tests/support/pool.rs` `ledger_lines`; a change here changes both.
-fn dump_ledger(location: &LedgerLocation) -> io::Result<()> {
-    use std::fmt::Write as _;
-    let path = match location {
+/// The ledger file a maintenance flag (`--dump-ledger`, `--settle-block`, `--void-block`)
+/// operates on, named in its refusals as `flag`. Opening it takes the exclusive lock, so
+/// the pool must not be running.
+fn ledger_path_for(location: &LedgerLocation, flag: &str) -> io::Result<PathBuf> {
+    Ok(match location {
         LedgerLocation::File(p) => p.clone(),
         // The file is named after the node's chain, which is not asked for here (the node
         // need not be running to read a ledger back), so the directory must hold one ledger.
@@ -72,10 +68,19 @@ fn dump_ledger(location: &LedgerLocation) -> io::Result<()> {
             }
         },
         LedgerLocation::None => {
-            eprintln!("--dump-ledger needs a ledger: give --ledger or --data-dir");
+            eprintln!("{flag} needs a ledger: give --ledger or --data-dir");
             std::process::exit(2);
         }
-    };
+    })
+}
+
+/// Print the ledger as `<unix-seconds> <difficulty> <identity> <share-hash>` lines, oldest
+/// first, then exit. Exports or audits the ledger. The column order is read by
+/// `tests/e2e/multi_miner.sh` (awk fields 2, 3 and 4) and reconstructed from log lines by
+/// `prime/tests/support/pool.rs` `ledger_lines`; a change here changes both.
+fn dump_ledger(location: &LedgerLocation) -> io::Result<()> {
+    use std::fmt::Write as _;
+    let path = ledger_path_for(location, "--dump-ledger")?;
     let (ledger, _) = Ledger::open(&path, u128::MAX, None, None)?;
     let mut out = String::new();
     for share in ledger.dump()? {
@@ -90,6 +95,86 @@ fn dump_ledger(location: &LedgerLocation) -> io::Result<()> {
     }
     print!("{out}");
     Ok(())
+}
+
+/// Print one owed block as `height <h> block <hash> found <unix> total <sats> sats
+/// <settled|unsettled>` and an indented `<identity> <sats>` line per entry.
+fn print_owed(o: &ledger::OwedBlock) {
+    let status = match o.settled_at {
+        Some(at) => format!("settled at {at}"),
+        None => "unsettled".to_string(),
+    };
+    println!(
+        "height {} block {} found {} total {} sats {status}",
+        o.height,
+        hex::encode(o.block_hash),
+        o.at,
+        o.total
+    );
+    for (identity, sats) in &o.entries {
+        println!("  {identity} {sats}");
+    }
+}
+
+/// `--settle-block`: mark an owed block settled (or list them with `list`), then exit; see
+/// the flag's help. The settlement time is wall-clock now.
+fn settle_block(location: &LedgerLocation, arg: &str) -> io::Result<()> {
+    let path = ledger_path_for(location, "--settle-block")?;
+    let (mut ledger, _) = Ledger::open(&path, u128::MAX, None, None)?;
+    if arg == "list" {
+        if ledger.owed().is_empty() {
+            println!("no owed blocks");
+        }
+        for o in ledger.owed() {
+            print_owed(o);
+        }
+        return Ok(());
+    }
+    let hash: [u8; 32] = match hex::decode(arg).ok().and_then(|v| v.try_into().ok()) {
+        Some(h) => h,
+        None => {
+            eprintln!(
+                "--settle-block takes the block hash the pool logged (64 hex digits) or 'list', \
+                 got {arg:?}"
+            );
+            std::process::exit(2);
+        }
+    };
+    match ledger.settle_owed(&hash, server::unix_now())? {
+        Some(o) => {
+            print_owed(&o);
+            Ok(())
+        }
+        None => {
+            eprintln!("no owed block under {arg}; --settle-block list prints them");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// `--void-block`: remove an owed block record, then exit; see the flag's help.
+fn void_block(location: &LedgerLocation, arg: &str) -> io::Result<()> {
+    let path = ledger_path_for(location, "--void-block")?;
+    let (mut ledger, _) = Ledger::open(&path, u128::MAX, None, None)?;
+    let hash: [u8; 32] = match hex::decode(arg).ok().and_then(|v| v.try_into().ok()) {
+        Some(h) => h,
+        None => {
+            eprintln!(
+                "--void-block takes the block hash the pool logged (64 hex digits), got {arg:?}"
+            );
+            std::process::exit(2);
+        }
+    };
+    match ledger.void_owed(&hash)? {
+        Some(o) => {
+            print_owed(&o);
+            Ok(())
+        }
+        None => {
+            eprintln!("no owed block under {arg}; --settle-block list prints them");
+            std::process::exit(2);
+        }
+    }
 }
 
 fn load_or_create_keys(path: &Path) -> io::Result<KeyPairs> {
@@ -293,6 +378,12 @@ fn main() -> io::Result<()> {
 
     if loaded.cli.dump_ledger {
         return dump_ledger(&ledger_location);
+    }
+    if let Some(arg) = &loaded.cli.settle_block {
+        return settle_block(&ledger_location, arg);
+    }
+    if let Some(arg) = &loaded.cli.void_block {
+        return void_block(&ledger_location, arg);
     }
 
     let pool_keys = load_or_create_keys(&key_path)?;

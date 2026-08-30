@@ -1,7 +1,7 @@
 //! One gateway connection: the handshake, then the loop that reads its frames and
 //! responds to its coinbaser requests, shares, and block transactions.
 
-use crate::server::{Payability, Resolver, Server, coinbaser_outputs, unix_now};
+use crate::server::{Payability, Resolver, Server, coinbaser_outputs, owed_for_block, unix_now};
 use log::{debug, error, info, warn};
 use ratum::datum::framing::{self, Header, KeyRatchet};
 use ratum::datum::handshake::{Session, accept, open_hello};
@@ -475,6 +475,16 @@ impl Connection<'_> {
                          network target"
                     );
                 }
+                // A block whose coinbase paid the window nothing (a subsidy-only job, or a
+                // coinbase built with no split): its whole value went to the pool's payout
+                // script, so record the split a coinbaser would have dictated as owed by the
+                // pool. Taken before `record_and_credit` adds the block's own share; the
+                // window is read at acceptance, so it also holds shares credited after this
+                // job was served, an approximation of the split a coinbaser serving the job
+                // would have fixed.
+                if a.is_block && a.work.paid_to_split == 0 {
+                    self.record_owed_block(&a, now);
+                }
                 // A share is credited to an identity only if the coinbase can pay it. The
                 // check is here, after the relay above, so a block is still submitted, and
                 // before the credit, so work is never counted for an identity whose amount
@@ -511,6 +521,45 @@ impl Connection<'_> {
                 }
                 Ok((ShareVerdict::Rejected(reason), None))
             }
+        }
+    }
+
+    /// Compute and record what the pool owes the window for a block whose coinbase paid it
+    /// nothing; see `ledger::OwedBlock`. The amounts are logged either way, so a ledger
+    /// write failure loses the record's durability but never the numbers.
+    fn record_owed_block(&self, a: &Accepted, now: u64) {
+        let peer = self.peer;
+        let value = a.work.paid_to_pool;
+        let Some(owed) = owed_for_block(self.server, a.work.height, a.work.block_hash, value, now)
+        else {
+            warn!(
+                "[{peer}]   ** the block's {value} sats went to the pool's payout script and \
+                 the window names nobody to owe them to"
+            );
+            return;
+        };
+        warn!(
+            "[{peer}]   ** the block's coinbase paid the window nothing; the pool's payout \
+             script received {value} sats of which {} are owed to {} identit{}:",
+            owed.total,
+            owed.entries.len(),
+            if owed.entries.len() == 1 { "y" } else { "ies" },
+        );
+        for (identity, sats) in &owed.entries {
+            warn!("[{peer}]   **   {identity} {sats} sats");
+        }
+        warn!(
+            "[{peer}]   ** recorded as owed by block hash {}; after paying it from the pool's \
+             wallet, run: ratum-prime --settle-block {} (with --ledger or --data-dir, pool \
+             stopped)",
+            hex::encode(a.work.block_hash),
+            hex::encode(a.work.block_hash),
+        );
+        if let Err(e) = lock(&self.server.ledger).record_owed(owed) {
+            error!(
+                "[{peer}]   !! could not record the owed split to the ledger ({e}); the \
+                 amounts above are in this log only"
+            );
         }
     }
 

@@ -28,6 +28,15 @@ const BY_HASH: TableDefinition<&[u8], u64> = TableDefinition::new("by_hash");
 const META: TableDefinition<&str, &str> = TableDefinition::new("meta");
 const META_CHAIN: &str = "chain";
 
+/// Blocks whose coinbase paid the window nothing, keyed by proof-of-work hash. A gateway
+/// serves a subsidy-only job in the interval between a tip change and the next coinbaser
+/// split, and a block found on one pays its whole value to the pool's payout script. The
+/// value the window would have received went to the pool instead, so the split that a
+/// coinbaser would have dictated is recorded here at acceptance: the pool operator owes
+/// each identity its amount, settles it with an ordinary wallet transaction, and marks the
+/// block settled with `--settle-block`. The row value is a packed `OwedBlock`.
+const OWED: TableDefinition<&[u8], &[u8]> = TableDefinition::new("owed");
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Share {
     pub at: u64,
@@ -70,6 +79,71 @@ fn unpack(bytes: &[u8]) -> Option<Share> {
     Some(Share { at, identity, difficulty, hash: Some(hash) })
 }
 
+/// What the pool owes the window for one block whose coinbase paid it nothing: the split a
+/// coinbaser would have dictated at the moment the block was accepted. `settled_at` is the
+/// unix time `--settle-block` recorded the operator's payment, `None` until then.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwedBlock {
+    pub at: u64,
+    pub height: u32,
+    /// The proof-of-work hash, in the byte order targets are compared in (the row key).
+    pub block_hash: [u8; 32],
+    /// The sats the window would have received: the coinbase value minus the operator fee.
+    pub total: u64,
+    pub settled_at: Option<u64>,
+    /// `(identity, sats)` largest first, summing to `total`, from `Ledger::split`.
+    pub entries: Vec<(String, u64)>,
+}
+
+/// Pack an owed block into the row value: at (8, LE), height (4, LE), total (8, LE),
+/// settled_at (8, LE, 0 for unsettled), entry count (2, LE), then per entry the identity
+/// length (2, LE), the identity bytes, and the sats (8, LE).
+fn pack_owed(o: &OwedBlock) -> Vec<u8> {
+    let mut v = Vec::with_capacity(30 + o.entries.iter().map(|(i, _)| 10 + i.len()).sum::<usize>());
+    v.extend_from_slice(&o.at.to_le_bytes());
+    v.extend_from_slice(&o.height.to_le_bytes());
+    v.extend_from_slice(&o.total.to_le_bytes());
+    v.extend_from_slice(&o.settled_at.unwrap_or(0).to_le_bytes());
+    v.extend_from_slice(&(o.entries.len() as u16).to_le_bytes());
+    for (identity, sats) in &o.entries {
+        // The identity is at most `MAX_USERNAME` (384) bytes, enforced by the verifier
+        // before any share is credited, so the u16 length cannot truncate.
+        v.extend_from_slice(&(identity.len() as u16).to_le_bytes());
+        v.extend_from_slice(identity.as_bytes());
+        v.extend_from_slice(&sats.to_le_bytes());
+    }
+    v
+}
+
+fn unpack_owed(hash: &[u8], bytes: &[u8]) -> Option<OwedBlock> {
+    let block_hash: [u8; 32] = hash.try_into().ok()?;
+    if bytes.len() < 30 {
+        return None;
+    }
+    let at = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
+    let height = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
+    let total = u64::from_le_bytes(bytes[12..20].try_into().ok()?);
+    let settled = u64::from_le_bytes(bytes[20..28].try_into().ok()?);
+    let count = u16::from_le_bytes(bytes[28..30].try_into().ok()?);
+    let mut entries = Vec::with_capacity(count as usize);
+    let mut rest = &bytes[30..];
+    for _ in 0..count {
+        let len = u16::from_le_bytes(rest.get(0..2)?.try_into().ok()?) as usize;
+        let identity = String::from_utf8_lossy(rest.get(2..2 + len)?).into_owned();
+        let sats = u64::from_le_bytes(rest.get(2 + len..10 + len)?.try_into().ok()?);
+        entries.push((identity, sats));
+        rest = &rest[10 + len..];
+    }
+    Some(OwedBlock {
+        at,
+        height,
+        block_hash,
+        total,
+        settled_at: (settled != 0).then_some(settled),
+        entries,
+    })
+}
+
 fn to_io(e: impl std::fmt::Display) -> io::Error {
     io::Error::other(e.to_string())
 }
@@ -105,6 +179,9 @@ impl Store {
             // an empty one is simply created stamped.
             let held_shares = !w.open_table(SHARES).map_err(to_io)?.is_empty().map_err(to_io)?;
             w.open_table(BY_HASH).map_err(to_io)?;
+            // Created on open (a ledger written before this table existed gains it here), so
+            // every later read transaction finds it.
+            w.open_table(OWED).map_err(to_io)?;
             let mut meta = w.open_table(META).map_err(to_io)?;
             if let Some(chain) = chain {
                 let stored = meta.get(META_CHAIN).map_err(to_io)?.map(|v| v.value().to_string());
@@ -247,6 +324,50 @@ impl Store {
         Ok(removed)
     }
 
+    /// Write the row for `owed.block_hash`, overwriting one already there. `Ledger` decides
+    /// what the row holds (deduplication, the settle rule); this only stores it.
+    fn write_owed(&mut self, owed: &OwedBlock) -> io::Result<()> {
+        let mut w = self.db.begin_write().map_err(to_io)?;
+        w.set_durability(Durability::Immediate).map_err(to_io)?;
+        w.open_table(OWED)
+            .map_err(to_io)?
+            .insert(owed.block_hash.as_slice(), pack_owed(owed).as_slice())
+            .map_err(to_io)?;
+        w.commit().map_err(to_io)?;
+        Ok(())
+    }
+
+    /// Delete the row under `hash`, if present.
+    fn remove_owed(&mut self, hash: &[u8; 32]) -> io::Result<()> {
+        let mut w = self.db.begin_write().map_err(to_io)?;
+        w.set_durability(Durability::Immediate).map_err(to_io)?;
+        w.open_table(OWED).map_err(to_io)?.remove(hash.as_slice()).map_err(to_io)?;
+        w.commit().map_err(to_io)?;
+        Ok(())
+    }
+
+    /// Every owed block, oldest first.
+    fn read_owed(&self) -> io::Result<Vec<OwedBlock>> {
+        let r = self.db.begin_read().map_err(to_io)?;
+        let table = r.open_table(OWED).map_err(to_io)?;
+        let mut out = Vec::new();
+        for entry in table.iter().map_err(to_io)? {
+            let (hash, value) = entry.map_err(to_io)?;
+            match unpack_owed(hash.value(), value.value()) {
+                Some(owed) => out.push(owed),
+                // The share reader surfaces its corrupt rows through `ReadBack::skipped`;
+                // this is the owed table's equivalent trace.
+                None => log::warn!(
+                    "skipping an owed row ({}) that did not unpack, which an uncorrupted \
+                     database never produces",
+                    hex::encode(hash.value())
+                ),
+            }
+        }
+        out.sort_by_key(|o| (o.at, o.height));
+        Ok(out)
+    }
+
     /// Every stored share, oldest first, for exporting the ledger.
     fn dump(&self) -> io::Result<Vec<Share>> {
         let r = self.db.begin_read().map_err(to_io)?;
@@ -270,6 +391,11 @@ pub struct Ledger {
     total_work: u128,
     window: u128,
     store: Option<Store>,
+    /// Blocks whose coinbase paid the window nothing, oldest first: the store's `OWED`
+    /// table read at open, and the read authority thereafter; every mutation writes the
+    /// store first, then this list. Kept in memory so the stats interface reads it without
+    /// a store transaction, and so a file-less ledger still tracks it.
+    owed: Vec<OwedBlock>,
     /// Whether the newest `MAX_SHARES` shares hold less work than `window`, so the count cap,
     /// not the work-based trim, is bounding the payout set. Set when the count cap first
     /// drops a share and cleared when it stops, so the warning is emitted once per entry into
@@ -286,6 +412,7 @@ impl Ledger {
             total_work: 0,
             window: window.max(1),
             store: None,
+            owed: Vec::new(),
             count_capped: false,
         }
     }
@@ -307,6 +434,7 @@ impl Ledger {
             ledger.push(share);
             ledger.trim();
         }
+        ledger.owed = store.read_owed()?;
         ledger.store = Some(store);
         Ok((ledger, read_back))
     }
@@ -432,6 +560,60 @@ impl Ledger {
             }
         }
         Ok(())
+    }
+
+    /// Record a block whose coinbase paid the window nothing, durably when a store backs the
+    /// ledger. A hash already recorded is left as it is, so a resent block share cannot
+    /// double the debt. The write is durable before the in-memory list is touched, matching
+    /// `record`.
+    pub fn record_owed(&mut self, owed: OwedBlock) -> io::Result<()> {
+        if self.owed.iter().any(|o| o.block_hash == owed.block_hash) {
+            return Ok(());
+        }
+        if let Some(store) = &mut self.store {
+            store.write_owed(&owed)?;
+        }
+        self.owed.push(owed);
+        Ok(())
+    }
+
+    /// Every recorded owed block, oldest first.
+    pub fn owed(&self) -> &[OwedBlock] {
+        &self.owed
+    }
+
+    /// Mark the owed block under `hash` settled at `at`, durably when a store backs the
+    /// ledger. Returns the updated record, or `None` when the hash is not owed. A block
+    /// already settled keeps its original time. `at` is clamped to at least 1 because the
+    /// packed row stores 0 for unsettled.
+    pub fn settle_owed(&mut self, hash: &[u8; 32], at: u64) -> io::Result<Option<OwedBlock>> {
+        let Some(index) = self.owed.iter().position(|o| o.block_hash == *hash) else {
+            return Ok(None);
+        };
+        if self.owed[index].settled_at.is_some() {
+            return Ok(Some(self.owed[index].clone()));
+        }
+        let mut owed = self.owed[index].clone();
+        owed.settled_at = Some(at.max(1));
+        if let Some(store) = &mut self.store {
+            store.write_owed(&owed)?;
+        }
+        self.owed[index] = owed.clone();
+        Ok(Some(owed))
+    }
+
+    /// Remove the owed block under `hash`, durably when a store backs the ledger, for a
+    /// block that was rejected or orphaned: the pool's payout script never received its
+    /// value, so nothing is owed. Returns the removed record, or `None` when the hash is
+    /// not owed.
+    pub fn void_owed(&mut self, hash: &[u8; 32]) -> io::Result<Option<OwedBlock>> {
+        let Some(index) = self.owed.iter().position(|o| o.block_hash == *hash) else {
+            return Ok(None);
+        };
+        if let Some(store) = &mut self.store {
+            store.remove_owed(hash)?;
+        }
+        Ok(Some(self.owed.remove(index)))
     }
 
     /// The summed share difficulty of each identity in the window, largest first.
@@ -1006,5 +1188,88 @@ mod tests {
         let dumped = l.dump().unwrap();
         assert_eq!(dumped.len(), 3, "but the store holds all three");
         assert_eq!(dumped.iter().map(|s| s.at).collect::<Vec<_>>(), vec![1, 2, 3]);
+    }
+
+    fn owed(n: u64, settled: Option<u64>) -> OwedBlock {
+        OwedBlock {
+            at: 100 + n,
+            height: 961_640 + n as u32,
+            block_hash: hash(0xb10c_0000 + n),
+            total: 300 + n,
+            settled_at: settled,
+            entries: vec![("alice".into(), 200 + n), ("bob".into(), 100)],
+        }
+    }
+
+    #[test]
+    fn an_owed_block_round_trips_through_pack() {
+        for o in
+            [owed(1, None), owed(2, Some(4_000)), OwedBlock { entries: vec![], ..owed(3, None) }]
+        {
+            assert_eq!(unpack_owed(&o.block_hash, &pack_owed(&o)), Some(o));
+        }
+    }
+
+    #[test]
+    fn owed_blocks_survive_a_reopen_and_settle_once() {
+        let scratch = Scratch::new("owed");
+        {
+            let (mut l, _) = open(&scratch, u128::MAX, None);
+            l.record_owed(owed(1, None)).unwrap();
+            l.record_owed(owed(2, None)).unwrap();
+            // The same block recorded again does not double the debt.
+            l.record_owed(OwedBlock { total: 9_999, ..owed(1, None) }).unwrap();
+            assert_eq!(l.owed().len(), 2);
+            assert_eq!(l.owed()[0].total, 300 + 1, "the first record stands");
+        }
+        let (mut l, _) = open(&scratch, u128::MAX, None);
+        assert_eq!(l.owed().len(), 2, "read back from the store");
+        assert_eq!(l.owed()[0].entries, vec![("alice".into(), 201), ("bob".into(), 100)]);
+
+        let settled = l.settle_owed(&owed(1, None).block_hash, 5_000).unwrap().unwrap();
+        assert_eq!(settled.settled_at, Some(5_000));
+        assert_eq!(l.owed()[0].settled_at, Some(5_000), "the in-memory copy follows");
+        // Settling again keeps the original time; an unknown hash is None.
+        let again = l.settle_owed(&owed(1, None).block_hash, 6_000).unwrap().unwrap();
+        assert_eq!(again.settled_at, Some(5_000));
+        assert!(l.settle_owed(&hash(0xdead), 6_000).unwrap().is_none());
+        drop(l); // release the store's exclusive lock before reopening
+
+        let (l, _) = open(&scratch, u128::MAX, None);
+        assert_eq!(l.owed()[0].settled_at, Some(5_000), "settlement is durable");
+        assert_eq!(l.owed()[1].settled_at, None);
+    }
+
+    #[test]
+    fn a_voided_owed_block_is_removed_durably() {
+        let scratch = Scratch::new("void");
+        {
+            let (mut l, _) = open(&scratch, u128::MAX, None);
+            l.record_owed(owed(1, None)).unwrap();
+            l.record_owed(owed(2, None)).unwrap();
+            let voided = l.void_owed(&owed(1, None).block_hash).unwrap().unwrap();
+            assert_eq!(voided.total, 300 + 1);
+            assert_eq!(l.owed().len(), 1);
+            assert!(l.void_owed(&owed(1, None).block_hash).unwrap().is_none());
+        }
+        let (l, _) = open(&scratch, u128::MAX, None);
+        assert_eq!(l.owed().len(), 1, "the removal is durable");
+        assert_eq!(l.owed()[0].block_hash, owed(2, None).block_hash);
+
+        let mut fileless = Ledger::new(u128::MAX);
+        fileless.record_owed(owed(3, None)).unwrap();
+        assert!(fileless.void_owed(&owed(3, None).block_hash).unwrap().is_some());
+        assert!(fileless.owed().is_empty());
+    }
+
+    #[test]
+    fn a_file_less_ledger_tracks_owed_blocks_in_memory() {
+        let mut l = Ledger::new(u128::MAX);
+        l.record_owed(owed(1, None)).unwrap();
+        l.record_owed(owed(1, None)).unwrap();
+        assert_eq!(l.owed().len(), 1);
+        let settled = l.settle_owed(&owed(1, None).block_hash, 5_000).unwrap().unwrap();
+        assert_eq!(settled.settled_at, Some(5_000));
+        assert!(l.settle_owed(&hash(0xdead), 5_000).unwrap().is_none());
     }
 }

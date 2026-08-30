@@ -6,7 +6,7 @@ use ratum::bitcoin::output_script_size_is_valid;
 use ratum::datum::handshake::KeyPairs;
 use ratum::datum::messages::{self, CoinbaseOutput};
 use ratum::{lock, rpc};
-use ratum_prime::ledger::Ledger;
+use ratum_prime::ledger::{Ledger, OwedBlock};
 use ratum_prime::verify::{PoolPolicy, ReplayGuard};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -185,6 +185,18 @@ impl PayoutPolicy {
     pub(crate) fn fee_on(&self, value: u64) -> u64 {
         (u128::from(value) * u128::from(self.fee_bps) / 10_000) as u64
     }
+
+    /// The sats the split divides among the miners: `value` minus the operator fee.
+    pub(crate) fn miners_share(&self, value: u64) -> u64 {
+        value - self.fee_on(value)
+    }
+}
+
+/// The split of a coinbase value of `value` sats after the operator fee. The one
+/// computation `coinbaser_outputs`, `owed_for_block` and the stats snapshot share, so a
+/// change to the fee or split parameters reaches all three.
+pub(crate) fn split_after_fee(l: &Ledger, payout: &PayoutPolicy, value: u64) -> Vec<(String, u64)> {
+    l.split(payout.miners_share(value), payout.min_payout, messages::MAX_COINBASER_OUTPUTS)
 }
 
 pub(crate) fn unix_now() -> u64 {
@@ -323,15 +335,9 @@ pub(crate) fn coinbaser_outputs(server: &Server, value: u64) -> (Vec<CoinbaseOut
     // The pool receives the operator fee; what remains is split among the miners. The gateway
     // pays the fee to the pool's payout script as the coinbase remainder (the value minus these
     // dictated outputs), so no output is dictated for it here.
-    let operator_fee = server.payout.fee_on(value);
-    let miners_share = value - operator_fee;
     let (split, shares, work) = {
         let l = lock(&server.ledger);
-        (
-            l.split(miners_share, server.payout.min_payout, messages::MAX_COINBASER_OUTPUTS),
-            l.len(),
-            l.total_work(),
-        )
+        (split_after_fee(&l, &server.payout, value), l.len(), l.total_work())
     };
     let mut outputs = Vec::with_capacity(split.len());
     for (identity, amount) in split {
@@ -353,6 +359,44 @@ pub(crate) fn coinbaser_outputs(server: &Server, value: u64) -> (Vec<CoinbaseOut
         }
     }
     (outputs, shares, work)
+}
+
+/// What the pool owes the window for a block whose coinbase paid it nothing: the split a
+/// coinbaser for `value` would have dictated at this moment, minus the operator fee, which
+/// the pool keeps on any block. An identity a coinbaser would not have paid (no resolvable
+/// script) is left out under the same rule as `coinbaser_outputs`, and its amount stays
+/// with the pool. `None` when nothing is owed (an empty window, amounts the minimum payout
+/// removes entirely, or no payable identity). The caller records the result with
+/// `Ledger::record_owed`; this only computes it.
+pub(crate) fn owed_for_block(
+    server: &Server,
+    height: u32,
+    block_hash: [u8; 32],
+    value: u64,
+    at: u64,
+) -> Option<OwedBlock> {
+    let split = split_after_fee(&lock(&server.ledger), &server.payout, value);
+    let mut entries = Vec::with_capacity(split.len());
+    for (identity, sats) in split {
+        // Cached from the share that first credited the identity, so no RPC call in the
+        // ordinary case; see the matching rule in `coinbaser_outputs`.
+        match Resolver::payability(&server.resolver, &server.node, &identity) {
+            Payability::Script(_) => entries.push((identity, sats)),
+            Payability::Unpayable(why) => warn!(
+                "      {identity} cannot be paid ({why}); its {sats} sats are left out of \
+                 the owed record and stay with the pool"
+            ),
+            Payability::Unknown => warn!(
+                "      {identity} could not be resolved; its {sats} sats are left out of \
+                 the owed record and stay with the pool"
+            ),
+        }
+    }
+    let total: u64 = entries.iter().map(|(_, sats)| *sats).sum();
+    if total == 0 {
+        return None;
+    }
+    Some(OwedBlock { at, height, block_hash, total, settled_at: None, entries })
 }
 
 #[cfg(test)]
@@ -550,6 +594,30 @@ mod tests {
         ));
         // An unresolvable identity is not cached, so the next call asks the node again.
         assert!(Resolver::cached(&server.resolver, "unseen").is_none());
+    }
+
+    #[test]
+    fn owed_for_a_block_is_the_split_minus_the_fee() {
+        let server = server_with_fee(
+            &[("alice", 3), ("bob", 1)],
+            &[("alice", Ok(p2wpkh(0xa1))), ("bob", Ok(p2wpkh(0xb2)))],
+            0,
+            100,
+        );
+        let owed = owed_for_block(&server, 961_866, [0xbb; 32], 1_000_000, 42).unwrap();
+        assert_eq!(owed.height, 961_866);
+        assert_eq!(owed.block_hash, [0xbb; 32]);
+        assert_eq!(owed.at, 42);
+        assert_eq!(owed.settled_at, None);
+        // 1% fee withheld; the identities split the rest as a coinbaser would have.
+        assert_eq!(owed.entries, vec![("alice".into(), 742_500), ("bob".into(), 247_500)]);
+        assert_eq!(owed.total, 990_000);
+    }
+
+    #[test]
+    fn nothing_is_owed_on_an_empty_window() {
+        let server = server_with(&[], &[], 0);
+        assert!(owed_for_block(&server, 961_866, [0xbb; 32], 1_000_000, 42).is_none());
     }
 
     #[test]
