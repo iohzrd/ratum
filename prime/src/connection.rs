@@ -501,7 +501,7 @@ impl Connection<'_> {
             Err(reason) => {
                 debug!("[{peer}]   <- rejected: {reason:?}");
                 if s.is_block
-                    && let Ok(w) = self.verifier.rebuild(s, now)
+                    && let Ok(w) = self.verifier.reconstruct(s, now)
                 {
                     warn!(
                         "[{peer}]   !! pool built header {} coinbase {}",
