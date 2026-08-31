@@ -1,5 +1,72 @@
 # RATUM
 
+## Gateway
+
+`ratum-gateway` builds block templates from a local Knots node, serves version 2 (164-byte) headers to
+BLAKE2b hardware over the Siacoin dialect of Stratum v1, takes the coinbase payout split from
+the pool over DATUM, and submits blocks to the node.
+
+It reimplements the C gateway at https://github.com/iohzrd/datum_gateway (branch `blake2b`)
+and reads its configuration file unchanged; the wire formats are the C gateway's byte for
+byte.
+
+### Build and run
+
+```
+cargo run --bin ratum-gateway -- -c gateway.json
+
+or
+
+cargo build --workspace --release
+target/release/ratum-gateway -c gateway.json
+
+or, if you're using the release
+
+ratum-gateway -c gateway.json
+```
+
+The file is the C gateway's JSON schema with the same defaults. Required: `bitcoind.rpcurl`
+with `rpcuser`/`rpcpassword` or `rpccookiefile`, and `mining.pool_address`. The node's
+template decides when BLAKE2b (version 2) headers apply: until it lists the `!blake2b` rule
+no work is served. `mining.blake2b_activation_height` and `mining.blake2b_headline` are
+ignored. `RUST_LOG` overrides `logger.log_level_console`.
+
+### Differences from the C gateway
+
+- SIGUSR1 is a block notification, as in C (`blocknotify=kill -USR1 <pid>`); `/NOTIFY` on
+  the API port does the same over HTTP. Unix only.
+
+- `api.miner_listen_port` defaults to `8000` (the C gateway leaves the lookup page off).
+- `datum.pool_url` (not a C key; empty by default) names the pool's web page, and the status
+  and miner pages link the pool host to it when it is set.
+- `/clients` and `/coinbaser` are not served: `/login` prompts for `api.admin_password`,
+  after which the status page renders both tables from `/stats.json`. Authentication is
+  HTTP Basic, not Digest: keep the API behind TLS or on a private interface. `/cmd` takes
+  form fields with the page's token and is refused without an admin password.
+- A block share is charged the gateway fee like any other share when it passes the share
+  checks (the C gateway exempts it); a block a check refuses is still sent under the miner's
+  name.
+- One thread per stratum connection; `stratum.max_clients` limits the total and the
+  per-thread settings size the duplicate-share table and share queue. `empty_thread`
+  disconnects every client; `/threads` is not served.
+- The extranonce1 session id is the 32-bit connection counter, so it never repeats for a live
+  connection.
+- A new tip builds three immutable jobs (empty, priority, coinbaser) where C rewrites one, so
+  `datum.protocol_job_slots` must leave two extra slots.
+- The type 2 coinbase puts every output after the OP_RETURN extranonce output and keeps that
+  output with an empty split; it pays the same, the txid differs from C's.
+- `mining.pool_address` and `datum.pool_pubkey` are checked at startup.
+- Log level 5 keeps errors; higher silences the sink. Timestamps are UTC.
+- Every message to the pool is padded, the block-transactions response included.
+- A refused template is logged once per reason.
+
+Not served: `api.modify_conf`, the PROXY protocol (`stratum.trust_proxy`), daily rotation
+and SIGHUP (`logger.log_rotate_daily`; the file is held open, so rotate it with logrotate's
+`copytruncate`), the
+open-file limit warning, `datum.always_pay_self`, the per-client pacing of job updates, the
+testnet fast-forward, `--help`, `--example-conf`, `--test` and `/assets`. Set values among
+these are reported at startup.
+
 ## Prime
 
 RATUM Prime is a DATUM pool for the [Bitcoin Knots BLAKE2b hardfork chain](https://github.com/bitcoinknots/bitcoin/pull/359),
@@ -107,69 +174,6 @@ the next difficulty adjustment (height, countdown, estimated factor). The
 page shows the DATUM address, the public key and a `datum_gateway` config block to point a
 gateway at the pool; `--advertise-address host[:port]` sets the address when the public one
 differs. It is unauthenticated: bind it to `127.0.0.1` unless it is behind a reverse proxy.
-
-## Gateway
-
-`ratum-gateway` builds block templates from a local Knots node, serves version 2 (164-byte) headers to
-BLAKE2b hardware over the Siacoin dialect of Stratum v1, takes the coinbase payout split from
-the pool over DATUM, and submits blocks to the node.
-
-It reimplements the C gateway at https://github.com/iohzrd/datum_gateway (branch `blake2b`)
-and reads its configuration file unchanged; the wire formats are the C gateway's byte for
-byte.
-
-### Build, test, run
-
-```
-cargo build --workspace --release        # target/release/ratum-gateway
-cargo test -p ratum-gateway
-tests/e2e/full_stack.sh                  # node + gateway + pool + miner (needs BITCOIND, BITCOIN_CLI)
-cargo run --bin ratum-gateway -- -c gateway.json
-or
-ratum-gateway -c gateway.json
-```
-
-The file is the C gateway's JSON schema with the same defaults. Required: `bitcoind.rpcurl`
-with `rpcuser`/`rpcpassword` or `rpccookiefile`, and `mining.pool_address`. The node's
-template decides when BLAKE2b (version 2) headers apply: until it lists the `!blake2b` rule
-no work is served. `mining.blake2b_activation_height` and `mining.blake2b_headline` are
-ignored. `RUST_LOG` overrides `logger.log_level_console`.
-
-### Differences from the C gateway
-
-- SIGUSR1 is a block notification, as in C (`blocknotify=kill -USR1 <pid>`); `/NOTIFY` on
-  the API port does the same over HTTP. Unix only.
-
-- `api.miner_listen_port` defaults to `8000` (the C gateway leaves the lookup page off).
-- `datum.pool_url` (not a C key; empty by default) names the pool's web page, and the status
-  and miner pages link the pool host to it when it is set.
-- `/clients` and `/coinbaser` are not served: `/login` prompts for `api.admin_password`,
-  after which the status page renders both tables from `/stats.json`. Authentication is
-  HTTP Basic, not Digest: keep the API behind TLS or on a private interface. `/cmd` takes
-  form fields with the page's token and is refused without an admin password.
-- A block share is charged the gateway fee like any other share when it passes the share
-  checks (the C gateway exempts it); a block a check refuses is still sent under the miner's
-  name.
-- One thread per stratum connection; `stratum.max_clients` limits the total and the
-  per-thread settings size the duplicate-share table and share queue. `empty_thread`
-  disconnects every client; `/threads` is not served.
-- The extranonce1 session id is the 32-bit connection counter, so it never repeats for a live
-  connection.
-- A new tip builds three immutable jobs (empty, priority, coinbaser) where C rewrites one, so
-  `datum.protocol_job_slots` must leave two extra slots.
-- The type 2 coinbase puts every output after the OP_RETURN extranonce output and keeps that
-  output with an empty split; it pays the same, the txid differs from C's.
-- `mining.pool_address` and `datum.pool_pubkey` are checked at startup.
-- Log level 5 keeps errors; higher silences the sink. Timestamps are UTC.
-- Every message to the pool is padded, the block-transactions response included.
-- A refused template is logged once per reason.
-
-Not served: `api.modify_conf`, the PROXY protocol (`stratum.trust_proxy`), daily rotation
-and SIGHUP (`logger.log_rotate_daily`; the file is held open, so rotate it with logrotate's
-`copytruncate`), the
-open-file limit warning, `datum.always_pay_self`, the per-client pacing of job updates, the
-testnet fast-forward, `--help`, `--example-conf`, `--test` and `/assets`. Set values among
-these are reported at startup.
 
 ## References
 
