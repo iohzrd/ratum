@@ -62,32 +62,20 @@
   </div>
 </section>
 
-<section id="owed" style="display:none">
-  <h2>Owed by pool</h2>
-  <p>Blocks whose coinbase paid the whole value to the pool's payout script: found on a
-    subsidy-only job (served in the interval between a tip change and the next payout split),
-    so the window's miners received nothing from them. The amounts below are what the split
-    would have paid, owed by the pool and settled by an ordinary transaction from the pool
-    operator's wallet.</p>
-  <div style="overflow-x:auto">
-    <table id="owed-blocks">
-      <thead><tr>
-        <th>Block</th>
-        <th>Found</th>
-        <th>Miner</th>
-        <th class="num">Owed</th>
-        <th>Status</th>
-      </tr></thead>
-      <tbody></tbody>
-    </table>
-  </div>
-</section>
 
 <section id="connect">
   <h2>Connect a gateway</h2>
   <p>Miners connect through a DATUM gateway, not to the pool directly. Point your gateway at
     this pool, then point your miner's stratum at your gateway.</p>
-  <p>Add this to your <code>datum_gateway</code> config, alongside your own <code>mining</code>
+  <p><strong>This pool accepts two gateways:</strong>
+    <a href="https://github.com/iohzrd/ratum/releases" target="_blank"
+    rel="noopener">ratum-gateway</a> (recommended; prebuilt binaries) and
+    <a href="https://github.com/iohzrd/datum_gateway" target="_blank"
+    rel="noopener">iohzrd/datum_gateway</a> built at the commit this pool allows. Every other
+    build is refused at connection: the datum_gateway builds in circulation construct their
+    coinbase without the pool's payout split, so a block they find pays the miners nothing.
+    Both gateways read the same config file, so switching is a binary swap.</p>
+  <p>Add this to your gateway config, alongside your own <code>mining</code>
     and <code>stratum</code> settings:</p>
   <pre id="gateway-config"></pre>
 
@@ -243,9 +231,6 @@ poll(() => "stats.json", s => {
     card("Payout window", num(s.pool.window_multiple) + "× network difficulty"),
     card("Coinbase tag", esc(s.pool.coinbase_tag) + " / prime " + s.pool.prime_id),
   ];
-  if (s.owed && s.owed.unsettled_sats > 0) {
-    cards.push(card("Owed by pool", btc(s.owed.unsettled_sats)));
-  }
   document.getElementById("cards").innerHTML = cards.join("");
 
   const rows = s.window.miners.map(m => {
@@ -269,7 +254,7 @@ poll(() => "stats.json", s => {
     rows || '<tr><td colspan="5" class="motd">no shares in the window yet</td></tr>';
 
   // The recorded block history, newest first; hidden while there is none. A block whose
-  // coinbase paid the window nothing shows its owed status from the owed table below.
+  // coinbase paid the window nothing shows its owed status (`s.owed` in the JSON).
   const owedByHash = new Map((s.owed ? s.owed.blocks : []).map(b => [b.block_hash, b]));
   document.getElementById("blocks").style.display = blk.recent.length ? "" : "none";
   if (blk.recent.length) {
@@ -293,29 +278,6 @@ poll(() => "stats.json", s => {
         <td>${status}</td>
       </tr>`;
     }).join("");
-  }
-
-  // Blocks whose coinbase paid the window nothing; hidden while there are none. One row per
-  // (block, miner); the block cell spans its miners. Unsettled totals go on a card above.
-  const owed = s.owed || { unsettled_sats: 0, blocks: [] };
-  document.getElementById("owed").style.display = owed.blocks.length ? "" : "none";
-  if (owed.blocks.length) {
-    const owedRows = owed.blocks.map(b => {
-      const span = Math.max(b.miners.length, 1);
-      const blockCell = `<td rowspan="${span}" class="mono" title="${esc(b.block_hash)}">
-        ${num(b.height)}<br><small>${esc(b.block_hash.slice(0, 16))}…</small></td>
-        <td rowspan="${span}">${new Date(b.found_at * 1000).toISOString().slice(0, 16).replace("T", " ")}</td>`;
-      const status = b.settled_at
-        ? `<td rowspan="${span}" class="good">settled</td>`
-        : `<td rowspan="${span}" class="stale">unsettled</td>`;
-      return b.miners.map((m, i) => `<tr>
-        ${i === 0 ? blockCell : ""}
-        <td class="mono">${esc(m.identity)}</td>
-        <td class="num">${btc(m.sats)}</td>
-        ${i === 0 ? status : ""}
-      </tr>`).join("");
-    }).join("");
-    document.querySelector("#owed-blocks tbody").innerHTML = owedRows;
   }
 
   updated(new Date((s.generated_at || 0) * 1000));
