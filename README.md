@@ -132,6 +132,9 @@ consensus for, has been mined. `RUST_LOG` overrides `logger.log_level_console`.
 
 ### Differences from the C gateway
 
+- SIGUSR1 is a block notification, as in C (`blocknotify=kill -USR1 <pid>`); `/NOTIFY` on
+  the API port does the same over HTTP. Unix only.
+
 - `api.miner_listen_port` defaults to `8000` (the C gateway leaves the lookup page off).
 - `datum.pool_url` (not a C key; empty by default) names the pool's web page, and the status
   and miner pages link the pool host to it when it is set.
@@ -158,8 +161,7 @@ consensus for, has been mined. `RUST_LOG` overrides `logger.log_level_console`.
 
 Not served: `api.modify_conf`, the PROXY protocol (`stratum.trust_proxy`), daily rotation
 and SIGHUP (`logger.log_rotate_daily`; the file is held open, so rotate it with logrotate's
-`copytruncate`), SIGUSR1 (a `blocknotify` script reaches the gateway through `/NOTIFY` on
-the API port; the node poll and the pool's own notification cover it otherwise), the
+`copytruncate`), the
 open-file limit warning, `datum.always_pay_self`, the per-client pacing of job updates, the
 testnet fast-forward, `--help`, `--example-conf`, `--test` and `/assets`. Set values among
 these are reported at startup.

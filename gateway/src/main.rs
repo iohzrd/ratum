@@ -14,6 +14,8 @@ mod dupes;
 mod job;
 mod logger;
 mod publish;
+#[cfg(unix)]
+mod signals;
 mod stratum;
 mod submit;
 mod tally;
@@ -267,6 +269,8 @@ fn main() {
         config.share_queue_capacity(),
         Arc::clone(&notify),
     ));
+    #[cfg(unix)]
+    signals::install(Arc::clone(&notify));
     let rt = Runtime { config, node, notify, shared };
     if rt.config.datum.pool_host.is_empty() {
         info!("NON-POOLED MINING: datum.pool_host is empty; every block pays mining.pool_address");

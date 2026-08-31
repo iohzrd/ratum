@@ -3,7 +3,7 @@ resolver = "3"
 members = ["core", "prime", "gateway", "miner"]
 
 [workspace.package]
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 publish = false
 license = "MIT"
@@ -20,6 +20,7 @@ clap = { version = "4.6.6", features = ["derive"] }
 dryoc = "1"
 env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
 hex = "0.4"
+libc = "0.2"
 log = { version = "0.4", features = ["std"] }
 minreq = { version = "3.0.0", features = ["https"] }
 redb = "4.2.0"

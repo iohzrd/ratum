@@ -19,5 +19,8 @@ serde_json.workspace = true
 thiserror.workspace = true
 tiny_http.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 ratum = { path = "../core", features = ["test-support"] }
