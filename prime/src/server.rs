@@ -8,7 +8,7 @@ use ratum::datum::messages::{self, CoinbaseOutput};
 use ratum::{lock, rpc};
 use ratum_prime::ledger::{Ledger, OwedBlock};
 use ratum_prime::verify::{PoolPolicy, ReplayGuard};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -19,12 +19,19 @@ pub(crate) type SharedCoinbaseValue = Arc<Mutex<Option<u64>>>;
 /// is read and again whenever one cannot be. A connection refuses a job claiming an easier
 /// network target than this, so an ordinary share cannot be presented as a block.
 pub(crate) type SharedNextBits = Arc<Mutex<Option<u32>>>;
+/// The tip changes the node watcher observed: `(height, unix seconds first seen)`, oldest
+/// first, capped at `TIP_HISTORY_CAP` entries. The stats interface derives the observed
+/// block spacing (and from it the retarget estimate) from the span between the first and
+/// last entries. A reorg can repeat or lower a height; the reader guards against that.
+pub(crate) type SharedTipHistory = Arc<Mutex<VecDeque<(u32, u64)>>>;
+pub(crate) const TIP_HISTORY_CAP: usize = 64;
 
 pub(crate) fn watch_node(
     node: rpc::Client,
     tip: SharedTip,
     coinbase_value: SharedCoinbaseValue,
     next_bits: SharedNextBits,
+    tip_history: SharedTipHistory,
     interval: Duration,
     expected_chain: Option<rpc::Chain>,
 ) {
@@ -67,6 +74,11 @@ pub(crate) fn watch_node(
                     );
                     last = Some(t.hash);
                     have_template = false;
+                    let mut history = lock(&tip_history);
+                    history.push_back((t.height, unix_now()));
+                    while history.len() > TIP_HISTORY_CAP {
+                        history.pop_front();
+                    }
                 }
                 if !have_template {
                     match node.next_block() {
@@ -134,6 +146,7 @@ pub(crate) struct Server {
     pub(crate) tip: SharedTip,
     pub(crate) coinbase_value: SharedCoinbaseValue,
     pub(crate) next_bits: SharedNextBits,
+    pub(crate) tip_history: SharedTipHistory,
     pub(crate) replay: Arc<Mutex<ReplayGuard>>,
     pub(crate) ledger: Mutex<Ledger>,
     pub(crate) resolver: Mutex<Resolver>,
@@ -443,6 +456,7 @@ mod tests {
             tip: Arc::new(Mutex::new(None)),
             coinbase_value: Arc::new(Mutex::new(None)),
             next_bits: Arc::new(Mutex::new(None)),
+            tip_history: Arc::new(Mutex::new(VecDeque::new())),
             replay: Arc::new(Mutex::new(ReplayGuard::default())),
             ledger: Mutex::new(ledger),
             resolver: Mutex::new(resolver),

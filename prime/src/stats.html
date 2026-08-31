@@ -35,6 +35,7 @@
   <table id="miners">
     <thead><tr>
       <th>Miner</th>
+      <th class="num">Hashrate</th>
       <th class="num">Work</th>
       <th class="num">Share</th>
       <th class="num">Next payout</th>
@@ -42,6 +43,24 @@
     <tbody></tbody>
   </table>
 </div>
+
+<section id="blocks" style="display:none">
+  <h2>Recent blocks</h2>
+  <div style="overflow-x:auto">
+    <table id="blocks-table">
+      <thead><tr>
+        <th class="num">Height</th>
+        <th>Hash</th>
+        <th>Found (UTC)</th>
+        <th>Finder</th>
+        <th class="num">To miners</th>
+        <th class="num">To pool</th>
+        <th>Payout</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</section>
 
 <section id="owed" style="display:none">
   <h2>Owed by pool</h2>
@@ -125,6 +144,28 @@ function btc(sats) {
   return (sats / SATS).toLocaleString(undefined, {minimumFractionDigits: 8, maximumFractionDigits: 8}) + " BTC";
 }
 
+// An approximate hashes-per-second figure with a unit chosen to keep 1 to 3 integer digits.
+function hashrate(hs) {
+  if (hs == null) return "-";
+  const units = ["H/s", "kH/s", "MH/s", "GH/s", "TH/s", "PH/s", "EH/s"];
+  let i = 0;
+  while (hs >= 1000 && i < units.length - 1) { hs /= 1000; i += 1; }
+  return hs.toLocaleString(undefined, {maximumFractionDigits: hs < 10 ? 2 : 1}) + " " + units[i];
+}
+
+// A rough duration: seconds below 90 s, minutes below 90 min, hours below 48 h, then days.
+function duration(secs) {
+  if (secs == null || !isFinite(secs) || secs <= 0) return "-";
+  if (secs < 90) return Math.round(secs) + " s";
+  if (secs < 5400) return Math.round(secs / 60) + " min";
+  if (secs < 172800) return (secs / 3600).toFixed(1) + " h";
+  return (secs / 86400).toFixed(1) + " d";
+}
+
+function utcTime(unix) {
+  return new Date(unix * 1000).toISOString().slice(0, 16).replace("T", " ");
+}
+
 // The host and port a gateway should use. `advertise` (operator-set) wins: a trailing :port in
 // it overrides the DATUM port, otherwise it is a bare host. Unset falls back to the address
 // this page was reached on.
@@ -170,7 +211,25 @@ poll(() => "stats.json", s => {
   }};
   document.getElementById("gateway-config").textContent = JSON.stringify(cfg, null, 2);
 
+  // At the pool's current hashrate, one block is expected every difficulty × 2^32 / rate
+  // seconds. Blank until both figures exist.
+  const poolHs = s.hashrate && s.hashrate.pool_hs;
+  const expectedSecs = poolHs > 0 && s.network.difficulty > 0
+    ? s.network.difficulty * 4294967296 / poolHs : null;
+  const blk = s.blocks || { found: 0, luck_percent: null, recent: [] };
+  const rt = s.network.retarget;
+
   const cards = [
+    card("Pool hashrate", s.hashrate == null ? "-"
+      : `~${hashrate(s.hashrate.pool_hs)}`),
+    card("Expected block time", expectedSecs == null ? "-" : "~" + duration(expectedSecs)),
+    card("Blocks found", num(blk.found) + (blk.luck_percent == null ? ""
+      : ` · luck ${blk.luck_percent.toFixed(0)}%`)),
+    card("Retarget", rt == null ? "-"
+      : `${num(rt.blocks_remaining)} blocks`
+        + (s.network.observed_block_seconds == null ? ""
+          : ` (~${duration(rt.blocks_remaining * s.network.observed_block_seconds)})`)
+        + (rt.estimated_factor == null ? "" : ` · est ×${rt.estimated_factor.toFixed(2)}`)),
     card("Tip height", num(s.network.tip_height)),
     card("Network difficulty", s.network.difficulty == null ? "-" : Number(s.network.difficulty).toLocaleString()),
     card("Coinbase value", btc(s.network.coinbase_value)),
@@ -196,15 +255,45 @@ poll(() => "stats.json", s => {
     // pool began refusing them, or under a node that could not be reached at the time.
     const unpayable = m.payable === false;
     const tag = unpayable ? `<span class="tag" title="${esc(m.unpayable_reason || "")}">unpayable</span>` : "";
+    // hashrate_hs averages the last s.hashrate.span_seconds; an identity idle that long
+    // shows "-" rather than a misleading zero next to its window share.
     return `<tr class="${unpayable ? "unpayable" : ""}">
       <td>${esc(m.identity)}${tag}</td>
+      <td class="num">${m.hashrate_hs > 0 ? "~" + hashrate(m.hashrate_hs) : "-"}</td>
       <td class="num">${num(m.work)}</td>
       <td class="num bar"><span style="width:${Math.min(m.share_percent,100)}%"></span><em>${pct}%</em></td>
       <td class="num">${unpayable ? "not paid" : btc(m.payout_sats)}</td>
     </tr>`;
   }).join("");
   document.querySelector("#miners tbody").innerHTML =
-    rows || '<tr><td colspan="4" class="motd">no shares in the window yet</td></tr>';
+    rows || '<tr><td colspan="5" class="motd">no shares in the window yet</td></tr>';
+
+  // The recorded block history, newest first; hidden while there is none. A block whose
+  // coinbase paid the window nothing shows its owed status from the owed table below.
+  const owedByHash = new Map((s.owed ? s.owed.blocks : []).map(b => [b.block_hash, b]));
+  document.getElementById("blocks").style.display = blk.recent.length ? "" : "none";
+  if (blk.recent.length) {
+    document.querySelector("#blocks-table tbody").innerHTML = blk.recent.map(b => {
+      let status;
+      if (b.paid_to_split > 0) {
+        status = '<span class="good">split in coinbase</span>';
+      } else {
+        const o = owedByHash.get(b.block_hash);
+        status = o == null ? "pool"
+          : o.settled_at ? '<span class="good">owed, settled</span>'
+          : '<span class="stale">owed by pool</span>';
+      }
+      return `<tr>
+        <td class="num">${num(b.height)}</td>
+        <td class="mono" title="${esc(b.block_hash)}">${esc(b.block_hash.slice(0, 16))}…</td>
+        <td>${utcTime(b.found_at)}</td>
+        <td class="mono">${esc(b.finder)}</td>
+        <td class="num">${btc(b.paid_to_split)}</td>
+        <td class="num">${btc(b.paid_to_pool)}</td>
+        <td>${status}</td>
+      </tr>`;
+    }).join("");
+  }
 
   // Blocks whose coinbase paid the window nothing; hidden while there are none. One row per
   // (block, miner); the block cell spans its miners. Unsettled totals go on a card above.

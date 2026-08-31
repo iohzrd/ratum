@@ -741,7 +741,7 @@ checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
 name = "ratum"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "base64",
  "blake2",
@@ -760,7 +760,7 @@ dependencies = [
 
 [[package]]
 name = "ratum-gateway"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "base64",
  "bech32",
@@ -778,7 +778,7 @@ dependencies = [
 
 [[package]]
 name = "ratum-prime"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "bytes",
  "clap",
@@ -1006,7 +1006,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "sia-test-miner"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "hex",
  "ratum",

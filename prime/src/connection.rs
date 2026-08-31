@@ -475,6 +475,12 @@ impl Connection<'_> {
                          network target"
                     );
                 }
+                // Every accepted block enters the ledger's block history, whoever found it
+                // and however its coinbase paid: the stats interface renders the list and
+                // derives the luck figure from it.
+                if a.is_block {
+                    self.record_found_block(&a, s, now);
+                }
                 // A block whose coinbase paid the window nothing (a subsidy-only job, or a
                 // coinbase built with no split): its whole value went to the pool's payout
                 // script, so record the split a coinbaser would have dictated as owed by the
@@ -521,6 +527,32 @@ impl Connection<'_> {
                 }
                 Ok((ShareVerdict::Rejected(reason), None))
             }
+        }
+    }
+
+    /// Record the accepted block in the ledger's block history; see `ledger::FoundBlock`.
+    /// The difficulty and cumulative work are read at acceptance, before
+    /// `record_and_credit` adds the block's own share, so the difference between
+    /// consecutive records is exactly the work between them.
+    fn record_found_block(&self, a: &Accepted, s: &PowSubmit, now: u64) {
+        let difficulty = lock(&self.server.tip).map_or(0.0, |t| t.difficulty);
+        let mut l = lock(&self.server.ledger);
+        let block = ledger::FoundBlock {
+            at: now,
+            height: a.work.height,
+            block_hash: a.work.block_hash,
+            paid_to_split: a.work.paid_to_split,
+            paid_to_pool: a.work.paid_to_pool,
+            finder: ledger::identity_of(&s.username).to_string(),
+            difficulty,
+            cumulative_work: l.cumulative_work(),
+        };
+        if let Err(e) = l.record_block(block) {
+            error!(
+                "[{}]   !! could not record the block to the ledger's history ({e}); the \
+                 block itself was already relayed",
+                self.peer
+            );
         }
     }
 

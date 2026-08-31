@@ -13,8 +13,9 @@ use ratum_prime::ledger::{self, Ledger};
 use ratum_prime::verify::{PoolPolicy, ReplayGuard};
 use server::{
     OpenConnectionGuard, PayoutPolicy, Resolved, Resolver, Server, SharedCoinbaseValue,
-    SharedNextBits, SharedTip, resolve_address, watch_node,
+    SharedNextBits, SharedTip, SharedTipHistory, resolve_address, watch_node,
 };
+use std::collections::VecDeque;
 use std::io;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -546,12 +547,14 @@ fn main() -> io::Result<()> {
         Some(t) => ledger::window_for_difficulty(t.difficulty, window_multiple, window_floor),
         None => window_floor,
     };
+    let tip_history: SharedTipHistory = Arc::new(Mutex::new(VecDeque::new()));
     {
         let (watcher, shared) = (node.clone(), Arc::clone(&tip));
         let shared_value = Arc::clone(&coinbase_value);
         let shared_bits = Arc::clone(&next_bits);
+        let shared_history = Arc::clone(&tip_history);
         std::thread::spawn(move || {
-            watch_node(watcher, shared, shared_value, shared_bits, poll, chain)
+            watch_node(watcher, shared, shared_value, shared_bits, shared_history, poll, chain)
         });
         info!(
             "watching the node at {url}: waiting on each new block, \
@@ -664,6 +667,7 @@ fn main() -> io::Result<()> {
         pool_keys,
         coinbase_value: Arc::clone(&coinbase_value),
         next_bits,
+        tip_history,
         motd,
         node,
         tip,

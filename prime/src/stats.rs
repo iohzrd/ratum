@@ -8,6 +8,7 @@ use crate::server::{Resolver, Server, split_after_fee, unix_now};
 use log::warn;
 use ratum::http;
 use ratum::lock;
+use ratum_prime::ledger::FoundBlock;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
@@ -16,6 +17,57 @@ use tiny_http::{Method, Request, Server as HttpServer};
 
 static INDEX_HTML: LazyLock<String> =
     LazyLock::new(|| ratum::web::assemble(include_str!("stats.html")));
+
+/// The span the hashrate estimate averages over. Long enough that a miner at the minimum
+/// share difficulty has several shares accepted within it; short enough that the estimate
+/// reflects a rig starting or stopping within minutes.
+const HASHRATE_SPAN_SECS: u64 = 600;
+
+/// Expected hashes per unit of share difficulty: difficulty 1 is the 0x1d00ffff target,
+/// 2^32 hashes on average. The BLAKE2b fork keeps the compact-target encoding, so the
+/// constant is unchanged.
+const HASHES_PER_DIFFICULTY: f64 = 4_294_967_296.0;
+
+/// `work` difficulty units over `secs` seconds as hashes per second.
+fn hashes_per_second(work: u128, secs: u64) -> f64 {
+    if secs == 0 {
+        return 0.0;
+    }
+    work as f64 * HASHES_PER_DIFFICULTY / secs as f64
+}
+
+/// Blocks per difficulty period and the block spacing the chain targets, for the retarget
+/// estimate. The next adjustment is at the next multiple of the interval, and the factor is
+/// the target spacing over the observed spacing, bounded to the consensus limit of 4 either
+/// way.
+const RETARGET_INTERVAL: u32 = 2016;
+const TARGET_BLOCK_SECS: f64 = 600.0;
+
+/// How many of the newest recorded blocks the snapshot lists.
+const RECENT_BLOCKS: usize = 50;
+
+/// Blocks found per block expected, as a percent, over the recorded block history: for each
+/// pair of consecutive records, the work between them over the difficulty at the later one
+/// is the blocks expected in that span. The span before the first record has no start mark,
+/// so measurement begins there; `None` until two blocks are recorded. Also returns how many
+/// found blocks the figure covers.
+fn luck_percent(blocks: &[FoundBlock]) -> (Option<f64>, u32) {
+    let mut expected = 0.0f64;
+    let mut counted = 0u32;
+    for pair in blocks.windows(2) {
+        let (prev, b) = (&pair[0], &pair[1]);
+        // A record with no difficulty (the tip was unknown at acceptance) or a counter
+        // reset (a ledger replaced under a kept history) cannot contribute a span.
+        if b.difficulty > 0.0 && b.cumulative_work >= prev.cumulative_work {
+            expected += (b.cumulative_work - prev.cumulative_work) as f64 / b.difficulty;
+            counted += 1;
+        }
+    }
+    if counted == 0 || expected <= 0.0 {
+        return (None, 0);
+    }
+    (Some(f64::from(counted) / expected * 100.0), counted)
+}
 
 /// Bind `listen` and serve the stats interface on a thread. Returns the bound address (so a
 /// `:0` port resolves to the real one) or an error if the address cannot be bound, which the
@@ -52,7 +104,8 @@ fn snapshot(server: &Server) -> String {
     let coinbase_value = *lock(&server.coinbase_value);
     let operator_fee = coinbase_value.map_or(0, |v| server.payout.fee_on(v));
 
-    let (total_work, target_work, shares, work_by_identity, split, owed) = {
+    let hashrate_cutoff = unix_now().saturating_sub(HASHRATE_SPAN_SECS);
+    let (total_work, target_work, shares, work_by_identity, split, owed, recent, blocks) = {
         let l = lock(&server.ledger);
         (
             l.total_work(),
@@ -61,9 +114,44 @@ fn snapshot(server: &Server) -> String {
             l.work_by_identity(),
             split_after_fee(&l, &server.payout, coinbase_value.unwrap_or(0)),
             l.owed().to_vec(),
+            l.work_since(hashrate_cutoff),
+            l.blocks().to_vec(),
         )
     };
     let payout_sats: HashMap<String, u64> = split.into_iter().collect();
+    let (recent_work, recent_by_identity) = recent;
+
+    // The recorded block history: the newest for the page's table, and the luck figure over
+    // the whole record.
+    let (luck, luck_blocks) = luck_percent(&blocks);
+    let recent_blocks: Vec<serde_json::Value> = blocks
+        .iter()
+        .rev()
+        .take(RECENT_BLOCKS)
+        .map(|b| {
+            serde_json::json!({
+                "height": b.height,
+                "block_hash": hex::encode(b.block_hash),
+                "found_at": b.at,
+                "paid_to_split": b.paid_to_split,
+                "paid_to_pool": b.paid_to_pool,
+                "finder": b.finder,
+            })
+        })
+        .collect();
+
+    // The observed block spacing, from the span of tip changes the node watcher has seen
+    // (at most `TIP_HISTORY_CAP`); `None` until it has seen two. A reorg can lower the
+    // later height, which the guard discards rather than divides by.
+    let observed_block_secs = {
+        let history = lock(&server.tip_history);
+        match (history.front(), history.back()) {
+            (Some(&(h0, t0)), Some(&(h1, t1))) if h1 > h0 && t1 > t0 => {
+                Some((t1 - t0) as f64 / f64::from(h1 - h0))
+            }
+            _ => None,
+        }
+    };
 
     // Blocks whose coinbase paid the window nothing: what the pool's payout script received
     // that the window is owed, per block and summed per identity while unsettled. Settlement
@@ -116,6 +204,12 @@ fn snapshot(server: &Server) -> String {
                 "identity": identity,
                 "work": work.to_string(),
                 "share_percent": share_percent,
+                // Approximate, from the shares accepted from this identity in the last
+                // `hashrate.span_seconds`: zero for one idle that long.
+                "hashrate_hs": hashes_per_second(
+                    recent_by_identity.get(identity).copied().unwrap_or(0),
+                    HASHRATE_SPAN_SECS,
+                ),
                 // What the split allocates. An identity that is not payable is not paid it:
                 // the amount is left in the coinbase remainder, which the gateway pays to the
                 // pool's payout script.
@@ -133,6 +227,13 @@ fn snapshot(server: &Server) -> String {
             "tip_hash": hex::encode(ratum::bitcoin::reversed(&t.hash)),
             "difficulty": t.difficulty,
             "coinbase_value": coinbase_value,
+            "observed_block_seconds": observed_block_secs,
+            "retarget": {
+                "height": (t.height / RETARGET_INTERVAL + 1) * RETARGET_INTERVAL,
+                "blocks_remaining": RETARGET_INTERVAL - t.height % RETARGET_INTERVAL,
+                "estimated_factor": observed_block_secs
+                    .map(|s| (TARGET_BLOCK_SECS / s).clamp(0.25, 4.0)),
+            },
         }),
         None => serde_json::json!({
             "chain": serde_json::Value::Null,
@@ -168,6 +269,13 @@ fn snapshot(server: &Server) -> String {
             "open": server.open_connections.load(Ordering::Relaxed),
             "max": server.max_connections,
         },
+        // Approximate, from accepted-share difficulty over the span: work that was not
+        // accepted as a share (stale or rejected work, a rig's partial interval) is not
+        // counted.
+        "hashrate": {
+            "span_seconds": HASHRATE_SPAN_SECS,
+            "pool_hs": hashes_per_second(recent_work, HASHRATE_SPAN_SECS),
+        },
         "window": {
             "work": total_work.to_string(),
             "target_work": target_work.to_string(),
@@ -180,7 +288,54 @@ fn snapshot(server: &Server) -> String {
             "by_identity": owed_by_identity,
             "blocks": owed_blocks,
         },
+        // The recorded block history begins when this pool version first ran; blocks found
+        // before that are not listed and not in the luck figure.
+        "blocks": {
+            "found": blocks.len(),
+            "luck_percent": luck,
+            "luck_blocks": luck_blocks,
+            "recent": recent_blocks,
+        },
         "generated_at": unix_now(),
     });
     snapshot.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn block(n: u8, cumulative_work: u128, difficulty: f64) -> FoundBlock {
+        FoundBlock {
+            at: u64::from(n),
+            height: u32::from(n),
+            block_hash: [n; 32],
+            paid_to_split: 0,
+            paid_to_pool: 0,
+            finder: "a".into(),
+            difficulty,
+            cumulative_work,
+        }
+    }
+
+    #[test]
+    fn luck_is_found_over_expected_between_consecutive_blocks() {
+        // Spans of 100 and 200 work at difficulty 100: 1 and 2 blocks expected, 2 found.
+        let blocks = [block(1, 0, 100.0), block(2, 100, 100.0), block(3, 300, 100.0)];
+        let (luck, counted) = luck_percent(&blocks);
+        assert_eq!(counted, 2, "the span before the first block has no start mark");
+        assert!((luck.unwrap() - 2.0 / 3.0 * 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn luck_needs_two_blocks_and_skips_unusable_spans() {
+        assert_eq!(luck_percent(&[]), (None, 0));
+        assert_eq!(luck_percent(&[block(1, 100, 100.0)]), (None, 0));
+        // A record with no difficulty, and one whose counter decreased (a replaced
+        // ledger), contribute no span.
+        let broken = [block(1, 0, 0.0), block(2, 100, 0.0)];
+        assert_eq!(luck_percent(&broken), (None, 0));
+        let reset = [block(1, 500, 100.0), block(2, 100, 100.0)];
+        assert_eq!(luck_percent(&reset), (None, 0));
+    }
 }

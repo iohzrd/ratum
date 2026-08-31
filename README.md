@@ -92,7 +92,13 @@ transaction from the operator's wallet; afterwards `ratum-prime --settle-block <
 
 `--stats-listen <address>` serves a read-only page at `/` and its snapshot at `/stats.json`:
 the tip, the coinbase value, the fee, the connected gateways, the build (`--version` prints the
-same string) and each miner's share of the window with `payable` and `unpayable_reason`. The
+same string), an approximate hashrate (accepted-share difficulty over the last 10 minutes,
+at 2^32 hashes per difficulty unit, for the pool and per miner) and each miner's share of the
+window with `payable` and `unpayable_reason`. Every accepted block is recorded in the
+ledger's `blocks` table and listed with its coinbase amounts and finder; from the record and
+a cumulative work counter the page derives a luck figure (blocks found over blocks
+expected), and from the observed block spacing an expected time to the pool's next block and
+the next difficulty adjustment (height, countdown, estimated factor). The
 page shows the DATUM address, the public key and a `datum_gateway` config block to point a
 gateway at the pool; `--advertise-address host[:port]` sets the address when the public one
 differs. It is unauthenticated: bind it to `127.0.0.1` unless it is behind a reverse proxy.

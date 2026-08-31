@@ -27,6 +27,17 @@ const BY_HASH: TableDefinition<&[u8], u64> = TableDefinition::new("by_hash");
 /// otherwise be paid from a mainnet coinbase.
 const META: TableDefinition<&str, &str> = TableDefinition::new("meta");
 const META_CHAIN: &str = "chain";
+/// The summed difficulty of every share ever stored, as a decimal string, written in the
+/// same transaction as each share. Unlike the window it never trims and survives retention,
+/// so the expected-blocks denominator of the luck figure covers the whole recorded history.
+const META_CUMULATIVE_WORK: &str = "cumulative_work";
+
+/// Every block the pool accepted and relayed, keyed by proof-of-work hash. The row value is
+/// a packed `FoundBlock`: when, the height, what the coinbase paid to the split and to the
+/// pool, who found it, the network difficulty and the cumulative work at acceptance (the
+/// last two are what the luck figure is computed from). Blocks are rare, so no retention
+/// applies.
+const BLOCKS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("blocks");
 
 /// Blocks whose coinbase paid the window nothing, keyed by proof-of-work hash. A gateway
 /// serves a subsidy-only job in the interval between a tip change and the next coinbaser
@@ -144,6 +155,59 @@ fn unpack_owed(hash: &[u8], bytes: &[u8]) -> Option<OwedBlock> {
     })
 }
 
+/// One block the pool accepted: what its coinbase paid and the state the luck figure needs.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FoundBlock {
+    pub at: u64,
+    pub height: u32,
+    /// The proof-of-work hash, in the byte order targets are compared in (the row key).
+    pub block_hash: [u8; 32],
+    /// What the coinbase paid to the dictated split outputs and to the pool's payout script.
+    /// `paid_to_split == 0` is a block the window received nothing from (its record in the
+    /// `owed` table carries the amounts the pool owes for it).
+    pub paid_to_split: u64,
+    pub paid_to_pool: u64,
+    /// The identity credited with the block's share.
+    pub finder: String,
+    /// The network difficulty when the block was accepted, 0.0 if the tip was unknown.
+    pub difficulty: f64,
+    /// `Ledger::cumulative_work` when the block was accepted. The work between two
+    /// consecutive blocks over the difficulty is the blocks expected in that span.
+    pub cumulative_work: u128,
+}
+
+/// Pack a found block into the row value: at (8, LE), height (4, LE), paid_to_split (8, LE),
+/// paid_to_pool (8, LE), difficulty (8, LE, f64 bits), cumulative_work (16, LE), then the
+/// finder identity.
+fn pack_block(b: &FoundBlock) -> Vec<u8> {
+    let mut v = Vec::with_capacity(52 + b.finder.len());
+    v.extend_from_slice(&b.at.to_le_bytes());
+    v.extend_from_slice(&b.height.to_le_bytes());
+    v.extend_from_slice(&b.paid_to_split.to_le_bytes());
+    v.extend_from_slice(&b.paid_to_pool.to_le_bytes());
+    v.extend_from_slice(&b.difficulty.to_bits().to_le_bytes());
+    v.extend_from_slice(&b.cumulative_work.to_le_bytes());
+    v.extend_from_slice(b.finder.as_bytes());
+    v
+}
+
+fn unpack_block(hash: &[u8], bytes: &[u8]) -> Option<FoundBlock> {
+    let block_hash: [u8; 32] = hash.try_into().ok()?;
+    if bytes.len() < 52 {
+        return None;
+    }
+    Some(FoundBlock {
+        at: u64::from_le_bytes(bytes[0..8].try_into().ok()?),
+        height: u32::from_le_bytes(bytes[8..12].try_into().ok()?),
+        block_hash,
+        paid_to_split: u64::from_le_bytes(bytes[12..20].try_into().ok()?),
+        paid_to_pool: u64::from_le_bytes(bytes[20..28].try_into().ok()?),
+        difficulty: f64::from_bits(u64::from_le_bytes(bytes[28..36].try_into().ok()?)),
+        cumulative_work: u128::from_le_bytes(bytes[36..52].try_into().ok()?),
+        finder: String::from_utf8_lossy(&bytes[52..]).into_owned(),
+    })
+}
+
 fn to_io(e: impl std::fmt::Display) -> io::Error {
     io::Error::other(e.to_string())
 }
@@ -157,6 +221,9 @@ struct Store {
     next_seq: u64,
     /// The count of most recent shares to retain, or `None` to keep every one.
     retain_bound: Option<u64>,
+    /// Mirror of `META_CUMULATIVE_WORK`: the summed difficulty of every share ever stored,
+    /// advanced in the same transaction as each share insert.
+    cumulative_work: u128,
 }
 
 impl Store {
@@ -173,15 +240,17 @@ impl Store {
         // where the sequence continues.
         let w = db.begin_write().map_err(to_io)?;
         let mut stamped = false;
+        let cumulative_work: u128;
         {
             // Whether shares were recorded before this open: an unstamped ledger holding
             // some is one written before stamps existed and adopted now, which is reported;
             // an empty one is simply created stamped.
             let held_shares = !w.open_table(SHARES).map_err(to_io)?.is_empty().map_err(to_io)?;
             w.open_table(BY_HASH).map_err(to_io)?;
-            // Created on open (a ledger written before this table existed gains it here), so
-            // every later read transaction finds it.
+            // Created on open (a ledger written before these tables existed gains them
+            // here), so every later read transaction finds them.
             w.open_table(OWED).map_err(to_io)?;
+            w.open_table(BLOCKS).map_err(to_io)?;
             let mut meta = w.open_table(META).map_err(to_io)?;
             if let Some(chain) = chain {
                 let stored = meta.get(META_CHAIN).map_err(to_io)?.map(|v| v.value().to_string());
@@ -204,6 +273,13 @@ impl Store {
                     }
                 }
             }
+            // A ledger written before the counter existed starts it at 0: history before
+            // that is absent from the luck denominator rather than estimated.
+            cumulative_work = meta
+                .get(META_CUMULATIVE_WORK)
+                .map_err(to_io)?
+                .and_then(|v| v.value().parse().ok())
+                .unwrap_or(0);
         }
         w.commit().map_err(to_io)?;
         let next_seq = {
@@ -212,7 +288,7 @@ impl Store {
             shares.last().map_err(to_io)?.map(|(k, _)| k.value() + 1).unwrap_or(0)
         };
         let retain = keep.map(|k| (k.max(1) as u64).saturating_mul(SHARES_PER_KEEP_UNIT));
-        Ok((Store { db, next_seq, retain_bound: retain }, stamped))
+        Ok((Store { db, next_seq, retain_bound: retain, cumulative_work }, stamped))
     }
 
     /// The chain stamp, or `None` for a ledger written before stamps existed.
@@ -228,6 +304,7 @@ impl Store {
     /// `Ok(false)` means it was already stored by an earlier insert.
     fn insert(&mut self, share: &Share) -> io::Result<bool> {
         let hash = share.hash.expect("a recorded share has a hash");
+        let cumulative = self.cumulative_work + u128::from(share.difficulty);
         let mut w = self.db.begin_write().map_err(to_io)?;
         w.set_durability(Durability::Immediate).map_err(to_io)?;
         let inserted = {
@@ -241,12 +318,19 @@ impl Store {
                     .insert(seq, pack(share).as_slice())
                     .map_err(to_io)?;
                 by_hash.insert(hash.as_slice(), seq).map_err(to_io)?;
+                // In the same transaction as the share, so the counter and the stored
+                // shares cannot diverge.
+                w.open_table(META)
+                    .map_err(to_io)?
+                    .insert(META_CUMULATIVE_WORK, cumulative.to_string().as_str())
+                    .map_err(to_io)?;
                 true
             }
         };
         w.commit().map_err(to_io)?;
         if inserted {
             self.next_seq += 1;
+            self.cumulative_work = cumulative;
         }
         Ok(inserted)
     }
@@ -324,6 +408,46 @@ impl Store {
         Ok(removed)
     }
 
+    /// Write the row for `block.block_hash`, if absent. Returns whether it was written: a
+    /// resent block share finds its row present and cannot duplicate the record.
+    fn insert_block(&mut self, block: &FoundBlock) -> io::Result<bool> {
+        let mut w = self.db.begin_write().map_err(to_io)?;
+        w.set_durability(Durability::Immediate).map_err(to_io)?;
+        let inserted = {
+            let mut table = w.open_table(BLOCKS).map_err(to_io)?;
+            if table.get(block.block_hash.as_slice()).map_err(to_io)?.is_some() {
+                false
+            } else {
+                table
+                    .insert(block.block_hash.as_slice(), pack_block(block).as_slice())
+                    .map_err(to_io)?;
+                true
+            }
+        };
+        w.commit().map_err(to_io)?;
+        Ok(inserted)
+    }
+
+    /// Every found block, oldest first.
+    fn read_blocks(&self) -> io::Result<Vec<FoundBlock>> {
+        let r = self.db.begin_read().map_err(to_io)?;
+        let table = r.open_table(BLOCKS).map_err(to_io)?;
+        let mut out = Vec::new();
+        for entry in table.iter().map_err(to_io)? {
+            let (hash, value) = entry.map_err(to_io)?;
+            match unpack_block(hash.value(), value.value()) {
+                Some(block) => out.push(block),
+                None => log::warn!(
+                    "skipping a block row ({}) that did not unpack, which an uncorrupted \
+                     database never produces",
+                    hex::encode(hash.value())
+                ),
+            }
+        }
+        out.sort_by_key(|b| (b.at, b.height));
+        Ok(out)
+    }
+
     /// Write the row for `owed.block_hash`, overwriting one already there. `Ledger` decides
     /// what the row holds (deduplication, the settle rule); this only stores it.
     fn write_owed(&mut self, owed: &OwedBlock) -> io::Result<()> {
@@ -396,6 +520,12 @@ pub struct Ledger {
     /// store first, then this list. Kept in memory so the stats interface reads it without
     /// a store transaction, and so a file-less ledger still tracks it.
     owed: Vec<OwedBlock>,
+    /// Every block the pool accepted, oldest first: the store's `BLOCKS` table read at open
+    /// and appended by `record_block`, held in memory for the same reasons as `owed`.
+    blocks: Vec<FoundBlock>,
+    /// The summed difficulty of every share ever recorded; never trimmed. Mirrors the
+    /// store's `META_CUMULATIVE_WORK` (a file-less ledger counts from its start).
+    cumulative_work: u128,
     /// Whether the newest `MAX_SHARES` shares hold less work than `window`, so the count cap,
     /// not the work-based trim, is bounding the payout set. Set when the count cap first
     /// drops a share and cleared when it stops, so the warning is emitted once per entry into
@@ -413,6 +543,8 @@ impl Ledger {
             window: window.max(1),
             store: None,
             owed: Vec::new(),
+            blocks: Vec::new(),
+            cumulative_work: 0,
             count_capped: false,
         }
     }
@@ -435,6 +567,8 @@ impl Ledger {
             ledger.trim();
         }
         ledger.owed = store.read_owed()?;
+        ledger.blocks = store.read_blocks()?;
+        ledger.cumulative_work = store.cumulative_work;
         ledger.store = Some(store);
         Ok((ledger, read_back))
     }
@@ -547,6 +681,10 @@ impl Ledger {
                 return Ok(());
             }
         }
+        // Counted exactly when the share is newly credited: a store-backed ledger mirrors
+        // the counter its insert just advanced, a file-less one counts from its start.
+        // `push` is excluded because `open` and `refill` replay stored shares through it.
+        self.cumulative_work += u128::from(difficulty);
         self.push(share);
         self.trim();
         // Past this point the share is durable and credited. Retention is separate; a
@@ -560,6 +698,33 @@ impl Ledger {
             }
         }
         Ok(())
+    }
+
+    /// The summed difficulty of every share ever recorded, the luck figure's denominator
+    /// together with each recorded block's snapshot of it.
+    pub fn cumulative_work(&self) -> u128 {
+        self.cumulative_work
+    }
+
+    /// Record a block the pool accepted, durably when a store backs the ledger. A hash
+    /// already recorded is left as it is, so a resent block share cannot duplicate the
+    /// record. The write is durable before the in-memory list is touched, matching `record`.
+    pub fn record_block(&mut self, block: FoundBlock) -> io::Result<()> {
+        if self.blocks.iter().any(|b| b.block_hash == block.block_hash) {
+            return Ok(());
+        }
+        if let Some(store) = &mut self.store
+            && !store.insert_block(&block)?
+        {
+            return Ok(());
+        }
+        self.blocks.push(block);
+        Ok(())
+    }
+
+    /// Every recorded block, oldest first.
+    pub fn blocks(&self) -> &[FoundBlock] {
+        &self.blocks
     }
 
     /// Record a block whose coinbase paid the window nothing, durably when a store backs the
@@ -614,6 +779,25 @@ impl Ledger {
             store.remove_owed(hash)?;
         }
         Ok(Some(self.owed.remove(index)))
+    }
+
+    /// The summed difficulty of the window's shares recorded at or after `cutoff`, in total
+    /// and per identity, for a hashrate estimate over a recent span. Walks the window
+    /// newest-first and stops at the first older share, so it reads only the span it
+    /// reports; `at` values are written in recording order, so a backwards wall-clock step
+    /// can only exclude shares at the start of the span, never miscount inside it. A span
+    /// longer than the window reads the whole window.
+    pub fn work_since(&self, cutoff: u64) -> (u128, HashMap<String, u128>) {
+        let mut total = 0u128;
+        let mut by_identity: HashMap<String, u128> = HashMap::new();
+        for s in self.shares.iter().rev() {
+            if s.at < cutoff {
+                break;
+            }
+            total += u128::from(s.difficulty);
+            *by_identity.entry(s.identity.clone()).or_insert(0) += u128::from(s.difficulty);
+        }
+        (total, by_identity)
     }
 
     /// The summed share difficulty of each identity in the window, largest first.
@@ -1271,5 +1455,78 @@ mod tests {
         let settled = l.settle_owed(&owed(1, None).block_hash, 5_000).unwrap().unwrap();
         assert_eq!(settled.settled_at, Some(5_000));
         assert!(l.settle_owed(&hash(0xdead), 5_000).unwrap().is_none());
+    }
+
+    fn found(n: u64, cumulative_work: u128) -> FoundBlock {
+        FoundBlock {
+            at: 100 + n,
+            height: 961_640 + n as u32,
+            block_hash: hash(0xf00_0000 + n),
+            paid_to_split: n * 10,
+            paid_to_pool: 5,
+            finder: "alice".into(),
+            difficulty: 100.5,
+            cumulative_work,
+        }
+    }
+
+    #[test]
+    fn a_found_block_round_trips_through_pack() {
+        for b in
+            [found(1, 0), found(2, u128::MAX), FoundBlock { finder: String::new(), ..found(3, 7) }]
+        {
+            assert_eq!(unpack_block(&b.block_hash, &pack_block(&b)), Some(b));
+        }
+    }
+
+    #[test]
+    fn found_blocks_and_cumulative_work_survive_a_reopen() {
+        let scratch = Scratch::new("blocks");
+        {
+            let (mut l, _) = open(&scratch, u128::MAX, None);
+            l.record(1, "alice", 16, &hash(1)).unwrap();
+            l.record(2, "bob", 32, &hash(2)).unwrap();
+            // The same hash again is not credited and not counted again.
+            l.record(3, "bob", 32, &hash(2)).unwrap();
+            assert_eq!(l.cumulative_work(), 48);
+            l.record_block(found(1, 48)).unwrap();
+            // The same block recorded again does not duplicate the history.
+            l.record_block(FoundBlock { paid_to_pool: 9_999, ..found(1, 48) }).unwrap();
+            assert_eq!(l.blocks().len(), 1);
+        }
+        let (mut l, _) = open(&scratch, u128::MAX, None);
+        assert_eq!(l.cumulative_work(), 48, "the counter is read back from the store");
+        assert_eq!(l.blocks(), &[found(1, 48)], "the first record is retained");
+        l.record(4, "carol", 16, &hash(3)).unwrap();
+        assert_eq!(l.cumulative_work(), 64, "and continues from the stored value");
+    }
+
+    #[test]
+    fn a_file_less_ledger_counts_cumulative_work_from_its_start() {
+        let mut l = Ledger::new(u128::MAX);
+        l.record(1, "alice", 16, &hash(1)).unwrap();
+        l.record(2, "alice", 32, &hash(2)).unwrap();
+        assert_eq!(l.cumulative_work(), 48);
+        l.record_block(found(1, 48)).unwrap();
+        l.record_block(found(1, 48)).unwrap();
+        assert_eq!(l.blocks().len(), 1);
+    }
+
+    #[test]
+    fn work_since_sums_only_the_shares_at_or_after_the_cutoff() {
+        let mut l = Ledger::new(u128::MAX);
+        l.record(100, "alice", 16, &hash(1)).unwrap();
+        l.record(200, "alice", 16, &hash(2)).unwrap();
+        l.record(200, "bob", 32, &hash(3)).unwrap();
+        let (total, by_identity) = l.work_since(150);
+        assert_eq!(total, 48);
+        assert_eq!(by_identity.get("alice"), Some(&16));
+        assert_eq!(by_identity.get("bob"), Some(&32));
+        let (all, _) = l.work_since(0);
+        assert_eq!(all, 64, "a cutoff before every share reads the whole window");
+        let (none, empty) = l.work_since(300);
+        assert_eq!((none, empty.len()), (0, 0), "a cutoff after every share reads none");
+        // The cutoff itself is included: the span is [cutoff, now].
+        assert_eq!(l.work_since(200).0, 48);
     }
 }
