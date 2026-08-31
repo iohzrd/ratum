@@ -3,7 +3,7 @@ resolver = "3"
 members = ["core", "prime", "gateway", "miner"]
 
 [workspace.package]
-version = "0.1.8"
+version = "0.1.9"
 edition = "2024"
 publish = false
 license = "MIT"

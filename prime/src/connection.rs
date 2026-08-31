@@ -147,6 +147,13 @@ pub(crate) fn handle(mut stream: TcpStream, server: &Server) -> io::Result<()> {
             return Ok(());
         }
     };
+    if !agent_allowed(&server.allowed_agents, &hello.user_agent) {
+        warn!(
+            "[{peer}] hello refused: agent {:?} matches none of the allowed prefixes {:?}",
+            hello.user_agent, server.allowed_agents
+        );
+        return Ok(());
+    }
     info!(
         "[{peer}] hello ok: ua={:?} nk={:#010x} client={} session={}",
         hello.user_agent,
@@ -898,8 +905,27 @@ fn describe_share(s: &PowSubmit) -> String {
     )
 }
 
+/// Whether a hello's user agent matches the allowed prefixes; an empty list allows every
+/// agent. A prefix match, not equality, so a list entry names a build family
+/// ("ratum-gateway/") or one exact build ("ratum-gateway/0.1.7/1eb08f1").
+fn agent_allowed(allowed: &[String], user_agent: &str) -> bool {
+    allowed.is_empty() || allowed.iter().any(|p| user_agent.starts_with(p))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn agents_are_allowed_by_prefix_and_an_empty_list_allows_all() {
+        use super::agent_allowed;
+        let none: Vec<String> = Vec::new();
+        assert!(agent_allowed(&none, "v0.4.1-beta/deadbeef"));
+        let list = vec!["ratum-gateway/".to_string(), "v0.4.1-beta/fa61d81".to_string()];
+        assert!(agent_allowed(&list, "ratum-gateway/0.1.7/1eb08f1"));
+        assert!(agent_allowed(&list, "v0.4.1-beta/fa61d81"));
+        assert!(!agent_allowed(&list, "v0.4.1-beta/a1fbb293"));
+        assert!(!agent_allowed(&list, ""));
+    }
+
     use super::*;
     use std::net::{TcpListener, TcpStream};
 

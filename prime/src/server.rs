@@ -142,6 +142,8 @@ pub(crate) fn watch_node(
 pub(crate) struct Server {
     pub(crate) pool_keys: KeyPairs,
     pub(crate) motd: String,
+    /// User-agent prefixes a hello must match; empty accepts every agent (`--allow-agent`).
+    pub(crate) allowed_agents: Vec<String>,
     pub(crate) node: rpc::Client,
     pub(crate) tip: SharedTip,
     pub(crate) coinbase_value: SharedCoinbaseValue,
@@ -452,6 +454,7 @@ mod tests {
         Server {
             pool_keys: KeyPairs::generate(),
             motd: String::new(),
+            allowed_agents: Vec::new(),
             node: rpc::Client::new("http://127.0.0.1:1", "u", "p").unwrap(),
             tip: Arc::new(Mutex::new(None)),
             coinbase_value: Arc::new(Mutex::new(None)),

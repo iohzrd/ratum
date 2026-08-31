@@ -944,7 +944,11 @@ mod tests {
         let (mut v, s) = setup_hard();
         v.set_next_target(Some(0x1a008d4f));
         let a = v.verify(&s, NOW).unwrap();
-        assert!(!a.is_block, "hash {} is above the 1a008d4f target", hex::encode(a.work.block_hash));
+        assert!(
+            !a.is_block,
+            "hash {} is above the 1a008d4f target",
+            hex::encode(a.work.block_hash)
+        );
         let mut v2 = setup_hard().0;
         v2.set_next_target(Some(0x2100ffff));
         let b = v2.verify(&s, NOW).unwrap();

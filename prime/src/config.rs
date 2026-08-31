@@ -56,6 +56,7 @@ settings! {
     data_dir: String,
     key: String,
     motd: String,
+    allow_agent: String,
     min_diff: u64,
     max_connections: usize,
     payout_address: String,

@@ -40,6 +40,10 @@ pub(crate) struct Cli {
     pub key: Option<String>,
     #[arg(long)]
     pub motd: Option<String>,
+    /// Comma-separated user-agent prefixes a gateway's hello must match (e.g.
+    /// "ratum-gateway/"). Empty (the default) accepts every agent.
+    #[arg(long)]
+    pub allow_agent: Option<String>,
     #[arg(long)]
     pub min_diff: Option<String>,
     #[arg(long)]

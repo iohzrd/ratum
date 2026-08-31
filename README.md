@@ -49,6 +49,11 @@ min-payout = 546                # smallest output written; a miner under it leav
 
 `RUST_LOG` selects the level (`info` default; `debug` adds every frame and share).
 
+`--allow-agent` (comma-separated prefixes, e.g. `ratum-gateway/`) refuses at hello any
+gateway whose user agent matches none of them; empty (the default) accepts every agent.
+The agent is self-reported: this fences out builds known to mishandle the coinbaser (their
+blocks pay no split), it does not authenticate anyone.
+
 ### Ledger and window
 
 Every accepted share is written to a [redb](https://github.com/cberner/redb) database before

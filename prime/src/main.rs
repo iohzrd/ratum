@@ -256,6 +256,12 @@ fn main() -> io::Result<()> {
     let data_dir = c.data_dir.clone().or(f.data_dir);
     let key_path = c.key.clone().or(f.key);
     let motd = cli::resolve_str(c.motd.clone(), f.motd, "RATUM Prime");
+    let allowed_agents: Vec<String> = cli::resolve_str(c.allow_agent.clone(), f.allow_agent, "")
+        .split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect();
     let min_difficulty = cli::resolve::<u64>(
         c.min_diff.as_deref(),
         f.min_diff,
@@ -642,12 +648,18 @@ fn main() -> io::Result<()> {
         Arc::new(Mutex::new(guard))
     };
 
+    if !allowed_agents.is_empty() {
+        info!(
+            "gateway user agents restricted to the prefixes {allowed_agents:?}; others are refused at hello"
+        );
+    }
     let server = Arc::new(Server {
         pool_keys,
         coinbase_value: Arc::clone(&coinbase_value),
         next_bits,
         tip_history,
         motd,
+        allowed_agents,
         node,
         tip,
         replay,
