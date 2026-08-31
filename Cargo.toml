@@ -3,9 +3,10 @@ resolver = "3"
 members = ["core", "prime", "gateway", "miner"]
 
 [workspace.package]
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 publish = false
+license = "MIT"
 
 # One version of every dependency for both crates: the pool and the gateway are one release,
 # and the header hash and share format are byte-coupled between them.
