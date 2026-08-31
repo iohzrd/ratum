@@ -48,6 +48,9 @@ pub struct Template {
     pub prev_hash: [u8; 32],
     pub target_hex: String,
     pub witness_commitment: Vec<u8>,
+    /// Whether the node listed the `!blake2b` rule: a version 2 (BLAKE2b) header is
+    /// required. Without it no work is served; this gateway builds no version 1 headers.
+    pub v2: bool,
     pub reduced_data: bool,
     pub txns: Vec<Txn>,
     pub totals: TxnTotals,
@@ -99,7 +102,6 @@ fn rule_present(v: &serde_json::Value, rule: &str) -> bool {
 /// What the parser reports once per height so a repeated template does not repeat a message.
 #[derive(Default)]
 pub struct Announced {
-    rules: Option<u32>,
     payout: Option<u32>,
 }
 
@@ -107,44 +109,21 @@ pub struct Announced {
 /// `payout_script` is the pool payout script the `reduced_data` check sizes.
 pub fn parse(
     v: &serde_json::Value,
-    config: &Config,
     payout_script: &[u8],
     announced: &mut Announced,
 ) -> Result<Template, TemplateError> {
-    let reduced_data = check_rules(v, config, payout_script, announced)?;
+    let reduced_data = check_rules(v, payout_script, announced)?;
     decode(v, reduced_data)
 }
 
-/// The consensus checks: the `!blake2b` rule against the configured activation height, and
-/// the payout script against the `reduced_data` rule. Returns whether `reduced_data` is in
-/// force.
+/// The consensus check: the payout script against the `reduced_data` rule. Returns whether
+/// `reduced_data` is in force.
 fn check_rules(
     v: &serde_json::Value,
-    config: &Config,
     payout_script: &[u8],
     announced: &mut Announced,
 ) -> Result<bool, TemplateError> {
     let height = u64_field(v, "height")? as u32;
-    let activation = config.mining.blake2b_activation_height;
-
-    let expected = height >= activation;
-    let node_v2 = rule_present(v, "!blake2b");
-    if expected != node_v2 {
-        if announced.rules != Some(height) {
-            announced.rules = Some(height);
-            if node_v2 {
-                error!(
-                    "Node requires the BLAKE2b (version 2) header for block {height}, but mining.blake2b_activation_height is {activation}, below which this Gateway serves no work. The configured height is too high."
-                );
-            } else {
-                error!(
-                    "Node does not list the !blake2b rule for block {height}, but mining.blake2b_activation_height is {activation}, so this Gateway would build a version 2 header that the node rejects as bad-version-sha256d. The configured height is too low."
-                );
-            }
-        }
-        return Err(TemplateError::Refused(format!("BLAKE2b rule mismatch at block {height}")));
-    }
-
     let reduced_data = rule_present(v, "reduced_data");
     if reduced_data && !ratum::bitcoin::output_script_size_is_valid(payout_script) {
         if announced.payout != Some(height) {
@@ -177,6 +156,7 @@ fn decode(v: &serde_json::Value, reduced_data: bool) -> Result<Template, Templat
         hex::decode(wc_hex).map_err(|_| TemplateError::Missing("default_witness_commitment"))?;
     let nbits = u32::from_str_radix(&bits, 16).map_err(|_| TemplateError::Missing("bits"))?;
     let prev_hash = hash_field(v, "previousblockhash")?;
+    let v2 = rule_present(v, "!blake2b");
 
     let list = v["transactions"].as_array().ok_or(TemplateError::Missing("transactions"))?;
     if list.len() > MAX_TXNS {
@@ -219,6 +199,7 @@ fn decode(v: &serde_json::Value, reduced_data: bool) -> Result<Template, Templat
         prev_hash,
         target_hex,
         witness_commitment,
+        v2,
         reduced_data,
         txns,
         totals: TxnTotals { fee, weight: weight as u32, size: size as u32, sigops: sigops as u32 },
@@ -340,7 +321,7 @@ const REPEAT_WINDOW: Duration = Duration::from_millis(2500);
 enum Action {
     /// Build jobs; with `new_block` the empty job first, with `clean_jobs`.
     Build { new_block: bool },
-    /// Below the activation height: no work.
+    /// The node does not list the `!blake2b` rule: no work.
     Skip,
     /// The tip a notification announced has not reached the template: poll again shortly.
     Retry,
@@ -352,7 +333,7 @@ struct Poller {
     status: Arc<Mutex<Status>>,
     announced: Announced,
     last_prev: Option<String>,
-    below_height_reported: Option<u32>,
+    no_v2_rule_reported: Option<u32>,
     was_notified: bool,
     notified_at: Instant,
     last_block_change: Option<Instant>,
@@ -376,7 +357,7 @@ impl Poller {
                 return None;
             }
         };
-        match parse(&raw, &self.config, payout_script, &mut self.announced) {
+        match parse(&raw, payout_script, &mut self.announced) {
             Ok(t) => {
                 ratum::lock(&self.status).error = None;
                 self.last_refusal = None;
@@ -405,12 +386,11 @@ impl Poller {
         let tip_changed = self.last_prev.as_deref() != Some(template.prev_hash_hex.as_str());
         let new_block = tip_changed || self.force_clean;
         self.force_clean = false;
-        let activation = self.config.mining.blake2b_activation_height;
-        if template.height < activation {
-            if self.below_height_reported != Some(template.height) {
-                self.below_height_reported = Some(template.height);
+        if !template.v2 {
+            if self.no_v2_rule_reported != Some(template.height) {
+                self.no_v2_rule_reported = Some(template.height);
                 warn!(
-                    "Block {} is below the BLAKE2b activation height ({activation}); this gateway mines no other proof of work, so no work will be served until the chain reaches it.",
+                    "Node does not list the !blake2b rule for block {}; this gateway builds only version 2 (BLAKE2b) headers, so no work will be served until the rule is active.",
                     template.height
                 );
             }
@@ -481,7 +461,7 @@ pub fn run(
         status,
         announced: Announced::default(),
         last_prev: None,
-        below_height_reported: None,
+        no_v2_rule_reported: None,
         was_notified: false,
         notified_at: Instant::now(),
         last_block_change: None,
@@ -525,8 +505,7 @@ pub(crate) mod tests {
         Config::parse(
             r#"{
               "bitcoind": {"rpcuser":"u","rpcpassword":"p","rpcurl":"http://127.0.0.1:1"},
-              "mining": {"pool_address":"bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080",
-                         "blake2b_activation_height": 20},
+              "mining": {"pool_address":"bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"},
               "datum": {"pool_host": "", "pooled_mining_only": false, "protocol_job_slots": 6}
             }"#,
         )
@@ -553,6 +532,7 @@ pub(crate) mod tests {
             prev_hash: [0u8; 32],
             target_hex: "7f".repeat(32),
             witness_commitment: wc,
+            v2: true,
             reduced_data: false,
             txns: vec![],
             totals: TxnTotals::default(),
@@ -602,14 +582,16 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn parses_an_activation_template() {
+    fn parses_a_template() {
         let mut a = Announced::default();
-        let t = parse(&gbt(20, &["segwit", "!blake2b"]), &config(), &[0; 22], &mut a).unwrap();
+        let t = parse(&gbt(20, &["segwit", "!blake2b"]), &[0; 22], &mut a).unwrap();
         assert_eq!(t.height, 20);
         assert_eq!(t.nbits, 0x207fffff);
         assert_eq!(t.nbits_bytes, [0xff, 0xff, 0x7f, 0x20]);
         assert_eq!(t.prev_hash[31], 0x0f);
         assert_eq!(t.witness_commitment.len(), 38);
+        assert!(t.v2);
+        assert!(!parse(&gbt(20, &["segwit"]), &[0; 22], &mut a).unwrap().v2);
     }
 
     #[test]
@@ -631,21 +613,11 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn refuses_a_rule_mismatch() {
-        let mut a = Announced::default();
-        let e = parse(&gbt(21, &["segwit"]), &config(), &[0; 22], &mut a);
-        assert!(matches!(e, Err(TemplateError::Refused(_))));
-        let e = parse(&gbt(19, &["segwit", "!blake2b"]), &config(), &[0; 22], &mut a);
-        assert!(matches!(e, Err(TemplateError::Refused(_))));
-        assert!(parse(&gbt(19, &["segwit"]), &config(), &[0; 22], &mut a).is_ok());
-    }
-
-    #[test]
     fn reduced_data_refuses_an_oversized_payout_script() {
         let mut a = Announced::default();
         let v = gbt(21, &["segwit", "!blake2b", "reduced_data"]);
-        assert!(parse(&v, &config(), &[0; 35], &mut a).is_err());
-        assert!(parse(&v, &config(), &[0; 34], &mut a).is_ok());
+        assert!(parse(&v, &[0; 35], &mut a).is_err());
+        assert!(parse(&v, &[0; 34], &mut a).is_ok());
     }
 
     fn poller() -> Poller {
@@ -654,7 +626,7 @@ pub(crate) mod tests {
             status: Arc::new(Mutex::new(Status::default())),
             announced: Announced::default(),
             last_prev: None,
-            below_height_reported: None,
+            no_v2_rule_reported: None,
             was_notified: false,
             notified_at: Instant::now(),
             last_block_change: None,
@@ -671,9 +643,9 @@ pub(crate) mod tests {
         assert_eq!(p.classify(&t), Action::Build { new_block: false });
         p.on_wake(Wake::Rebuild);
         assert_eq!(p.classify(&t), Action::Build { new_block: true }, "a rebuild is clean");
-        let mut below = template();
-        below.height = 19;
-        assert_eq!(p.classify(&below), Action::Skip);
+        let mut no_rule = template();
+        no_rule.v2 = false;
+        assert_eq!(p.classify(&no_rule), Action::Skip);
     }
 
     #[test]

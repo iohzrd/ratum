@@ -1,8 +1,7 @@
 //! The configuration file: the same JSON schema as the C gateway's `datum_gateway_config.json`,
 //! so a deployment can swap the binary without changing its file. Every key is optional
-//! except the ones the C gateway requires (`bitcoind.rpcurl`, `mining.pool_address`,
-//! `mining.blake2b_activation_height`). Unknown keys are ignored,
-//! as the C gateway ignores them.
+//! except the ones the C gateway requires (`bitcoind.rpcurl`, `mining.pool_address`).
+//! Unknown keys are ignored, as the C gateway ignores them.
 
 use serde::Deserialize;
 
@@ -131,7 +130,6 @@ pub struct Mining {
     pub coinbase_tag_primary: String,
     pub coinbase_tag_secondary: String,
     pub coinbase_unique_id: u32,
-    pub blake2b_activation_height: u32,
     pub save_submitblocks_dir: String,
 }
 
@@ -142,7 +140,6 @@ impl Default for Mining {
             coinbase_tag_primary: "DATUM Gateway".into(),
             coinbase_tag_secondary: "DATUM User".into(),
             coinbase_unique_id: 4242,
-            blake2b_activation_height: 0,
             save_submitblocks_dir: String::new(),
         }
     }
@@ -356,9 +353,6 @@ impl Config {
         if tags > 88 || m.coinbase_tag_primary.len() > 60 || m.coinbase_tag_secondary.len() > 60 {
             return Err("mining.coinbase_tag_primary and mining.coinbase_tag_secondary must be at most 60 bytes each and 88 bytes together".into());
         }
-        if m.blake2b_activation_height == 0 {
-            return Err("mining.blake2b_activation_height must be set. It is the first height at which a version 2 (BLAKE2b) block is valid on the network being mined.".into());
-        }
         self.pool_output_script = crate::address::to_output_script(&m.pool_address)
             .ok_or("mining.pool_address is not an address a coinbase output can pay")?;
         Ok(())
@@ -506,8 +500,7 @@ mod tests {
     fn minimal() -> String {
         r#"{
           "bitcoind": {"rpcuser":"u","rpcpassword":"p","rpcurl":"http://127.0.0.1:18443"},
-          "mining": {"pool_address":"bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080",
-                     "blake2b_activation_height": 20},
+          "mining": {"pool_address":"bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"},
           "datum": {"pool_host": "", "pooled_mining_only": false}
         }"#
         .to_string()
@@ -532,14 +525,6 @@ mod tests {
             "\"pooled_mining_only\": false, \"pool_url\": \"https://pool.example\"",
         );
         assert_eq!(Config::parse(&text).unwrap().datum.pool_url, "https://pool.example");
-    }
-
-    #[test]
-    fn refuses_a_missing_activation_height() {
-        let text =
-            minimal().replace(",\n                     \"blake2b_activation_height\": 20", "");
-        let e = Config::parse(&text).unwrap_err();
-        assert!(e.contains("blake2b_activation_height"), "{e}");
     }
 
     #[test]

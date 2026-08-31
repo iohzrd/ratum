@@ -177,8 +177,7 @@ cat > "$WORK/gateway.json" <<EOF
   "mining": {
     "pool_address": "$MINER_ADDRESS",
     "coinbase_tag_primary": "RATUM",
-    "coinbase_tag_secondary": "e2e",
-    "blake2b_activation_height": $ACTIVATION_HEIGHT
+    "coinbase_tag_secondary": "e2e"
   },
   "api": { "admin_password": "", "listen_port": $API_PORT, "modify_conf": false },
   "logger": { "log_to_console": true, "log_to_file": false, "log_level_console": 1 },

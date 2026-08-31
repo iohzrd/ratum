@@ -197,8 +197,7 @@ start_gateway() {
   "mining": {
     "pool_address": "$GATEWAY_ADDRESS",
     "coinbase_tag_primary": "RATUM",
-    "coinbase_tag_secondary": "$name",
-    "blake2b_activation_height": $ACTIVATION_HEIGHT
+    "coinbase_tag_secondary": "$name"
   },
   "api": { "admin_password": "", "listen_port": $api_port, "modify_conf": false },
   "logger": { "log_to_console": true, "log_to_file": false, "log_level_console": 1 },
