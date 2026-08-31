@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# Mine the activation block through the whole stack, on regtest.
+# Mine the first post-activation block through the whole stack, on regtest.
 #
 #   bitcoind (Knots, BLAKE2b branch) <- RPC - datum_gateway - DATUM -> ratum-prime - RPC -> bitcoind
 #                                                  ^ sia-test-miner
 #
 # The pool's own tests cover the pool. This covers the parts only the real programs can:
-# that the gateway accepts what the pool dictates, that a share the pool verifies is a
-# block the node accepts, and that the activation block carries the headline.
+# that the gateway accepts what the pool dictates and that a share the pool verifies is a
+# block the node accepts. The node itself mines through the activation height first, as
+# happened on mainnet; the stack serves only version 2 work.
 #
 # usage: tests/e2e/full_stack.sh [--keep]
 #
@@ -32,7 +33,6 @@ KEEP=0
 # rather than a one-byte push, and the node requires OP_N. Activating above 16 keeps the
 # test on the encoding real heights use.
 ACTIVATION_HEIGHT=20
-HEADLINE="RATUM full stack test"
 POOL_ADDRESS=bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080
 MINER_ADDRESS=bcrt1qzyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3lgth6c
 
@@ -116,7 +116,7 @@ rpcpassword=ratumtest
 rpcbind=127.0.0.1
 rpcport=$RPC_PORT
 testactivationheight=blake2b@$ACTIVATION_HEIGHT
-blake2b_headline=$HEADLINE
+blake2b_headline=RATUM e2e headline
 EOF
 "$BITCOIND" -datadir="$WORK/node" > "$WORK/bitcoind.log" 2>&1 &
 PIDS+=($!)
@@ -128,11 +128,12 @@ done
 "$BITCOIN_CLI" -datadir="$WORK/node" getblockchaininfo >/dev/null \
     || fail "the node never responded on port $RPC_PORT"
 
-step "mining $((ACTIVATION_HEIGHT - 1)) blocks before the fork, with SHA256d"
-"$BITCOIN_CLI" -datadir="$WORK/node" generatetoaddress $((ACTIVATION_HEIGHT - 1)) "$POOL_ADDRESS" \
+step "mining $ACTIVATION_HEIGHT blocks with the node, through the activation"
+"$BITCOIN_CLI" -datadir="$WORK/node" generatetoaddress "$ACTIVATION_HEIGHT" "$POOL_ADDRESS" \
     >/dev/null
 height=$("$BITCOIN_CLI" -datadir="$WORK/node" getblockcount)
-[ "$height" = "$((ACTIVATION_HEIGHT - 1))" ] || fail "expected height $((ACTIVATION_HEIGHT - 1)), got $height"
+[ "$height" = "$ACTIVATION_HEIGHT" ] || fail "expected height $ACTIVATION_HEIGHT, got $height"
+TARGET_HEIGHT=$((ACTIVATION_HEIGHT + 1))
 
 step "starting ratum-prime on port $POOL_PORT"
 mkdir -p "$WORK/pool"
@@ -145,7 +146,6 @@ RUST_LOG="${RUST_LOG:-debug}" \
     --rpc "http://127.0.0.1:$RPC_PORT" --rpc-user ratum --rpc-pass ratumtest \
     --payout-address "$POOL_ADDRESS" \
     --min-diff 1 --min-payout 1 --poll 1 \
-    --activation-height "$ACTIVATION_HEIGHT" --headline "$HEADLINE" \
     > "$WORK/pool.log" 2>&1 &
 POOL_PID=$!
 PIDS+=($POOL_PID)
@@ -178,8 +178,7 @@ cat > "$WORK/gateway.json" <<EOF
     "pool_address": "$MINER_ADDRESS",
     "coinbase_tag_primary": "RATUM",
     "coinbase_tag_secondary": "e2e",
-    "blake2b_activation_height": $ACTIVATION_HEIGHT,
-    "blake2b_headline": "$HEADLINE"
+    "blake2b_activation_height": $ACTIVATION_HEIGHT
   },
   "api": { "admin_password": "", "listen_port": $API_PORT, "modify_conf": false },
   "logger": { "log_to_console": true, "log_to_file": false, "log_level_console": 1 },
@@ -203,7 +202,7 @@ done
 grep -q 'DATUM Server MOTD' "$WORK/gateway.log" \
     || fail "the gateway never completed the handshake; see $WORK/gateway.log"
 
-step "mining with sia-test-miner until height $ACTIVATION_HEIGHT (up to ${TIMEOUT}s)"
+step "mining with sia-test-miner until height $TARGET_HEIGHT (up to ${TIMEOUT}s)"
 "$ROOT/target/release/sia-test-miner" "127.0.0.1:$STRATUM_PORT" "$MINER_ADDRESS.rig1" \
     > "$WORK/miner.log" 2>&1 &
 PIDS+=($!)
@@ -213,37 +212,29 @@ started=$SECONDS
 last_report=$SECONDS
 while [ "$SECONDS" -lt "$deadline" ]; do
     height=$("$BITCOIN_CLI" -datadir="$WORK/node" getblockcount 2>/dev/null || echo 0)
-    [ "$height" -ge "$ACTIVATION_HEIGHT" ] && break
+    [ "$height" -ge "$TARGET_HEIGHT" ] && break
     if [ $((SECONDS - last_report)) -ge 30 ]; then
         last_report=$SECONDS
-        printf '  %4ds: height %s of %s\n' $((SECONDS - started)) "$height" "$ACTIVATION_HEIGHT"
+        printf '  %4ds: height %s of %s\n' $((SECONDS - started)) "$height" "$TARGET_HEIGHT"
     fi
     sleep 2
 done
-[ "$height" -ge "$ACTIVATION_HEIGHT" ] \
-    || fail "no block at height $ACTIVATION_HEIGHT within ${TIMEOUT}s; see $WORK/pool.log and $WORK/miner.log"
+[ "$height" -ge "$TARGET_HEIGHT" ] \
+    || fail "no block at height $TARGET_HEIGHT within ${TIMEOUT}s; see $WORK/pool.log and $WORK/miner.log"
 
-step "checking the activation block"
-HASH=$("$BITCOIN_CLI" -datadir="$WORK/node" getblockhash "$ACTIVATION_HEIGHT")
+step "checking the first pooled block"
+HASH=$("$BITCOIN_CLI" -datadir="$WORK/node" getblockhash "$TARGET_HEIGHT")
 HEADER=$("$BITCOIN_CLI" -datadir="$WORK/node" getblockheader "$HASH" false)
 [ "${#HEADER}" = 328 ] || fail "the header is ${#HEADER} hex characters, not 328 (164 bytes)"
 
-COINBASE=$("$BITCOIN_CLI" -datadir="$WORK/node" getblock "$HASH" 2 \
-    | grep -m1 '"coinbase"' | cut -d'"' -f4)
-HEADLINE_HEX=$(printf '%s' "$HEADLINE" | od -An -tx1 | tr -d ' \n')
-case "$COINBASE" in
-    *"$HEADLINE_HEX"*) ;;
-    *) fail "the activation block's coinbase does not carry the headline" ;;
-esac
-
-grep -q "BLOCK at height $ACTIVATION_HEIGHT" "$WORK/pool.log" \
-    || fail "the pool did not record a block at height $ACTIVATION_HEIGHT"
+grep -q "BLOCK at height $TARGET_HEIGHT" "$WORK/pool.log" \
+    || fail "the pool did not record a block at height $TARGET_HEIGHT"
 grep -q "$HASH" "$WORK/pool.log" \
     || fail "the block on the chain is not one the pool verified"
 grep -q '<- accepted' "$WORK/pool.log" || fail "the pool accepted no shares"
 
 ACCEPTED=$(grep -c '<- accepted' "$WORK/pool.log")
-step "passed: height $ACTIVATION_HEIGHT is $HASH: a 164-byte header, headline in its coinbase"
+step "passed: height $TARGET_HEIGHT is $HASH: a 164-byte header mined through the stack"
 printf 'shares accepted: %s\n' "$ACCEPTED"
 printf 'ledger:\n'
 # The ledger is a redb database; stop the pool to release its lock, then dump it as text.

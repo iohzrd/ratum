@@ -139,6 +139,29 @@ mod tests {
     }
 
     #[test]
+    fn mainnet_post_shift_bits_match_the_node_exactly() {
+        // Knots rc4 mainnet after the BLAKE2b shift: getblocktemplate reports bits 1a008d4f
+        // and target 000000000000008d4f0000...00 (verified against a live node 2026-08-31).
+        let t = bits_to_target(0x1a008d4f).unwrap();
+        let mut e = [0u8; 32];
+        e[7] = 0x8d;
+        e[8] = 0x4f;
+        assert_eq!(hex::encode(t), hex::encode(e));
+        let d = difficulty_from_bits(0x1a008d4f).unwrap();
+        let pdiff = 2f64.powi(40) / f64::from(0x8d4f);
+        assert!((d - pdiff).abs() < 1.0, "pdiff {d} want {pdiff}");
+        // The comparator at the boundary: equal meets, one past does not.
+        assert!(meets_target(&e, &t));
+        let mut over = e;
+        over[9] = 0x01;
+        assert!(!meets_target(&over, &t));
+        let mut under = e;
+        under[8] = 0x4e;
+        under[9] = 0xff;
+        assert!(meets_target(&under, &t));
+    }
+
+    #[test]
     fn accepts_the_high_exponents_setcompact_accepts() {
         let t = bits_to_target(0x2100ffff).expect("exponent 33, mantissa 0x00ffff");
         assert_eq!(t[0], 0xff);

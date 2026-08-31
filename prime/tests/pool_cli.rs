@@ -218,7 +218,6 @@ fn numeric_flags_refuse_values_out_of_range_or_not_numbers() {
     refuses(&["--window", "-8"], "must be a positive number");
     refuses(&["--window", "nan"], "must be a positive number");
     refuses(&["--window-floor", "-1"], "sum of share difficulty");
-    refuses(&["--activation-height", "soon"], "must be a block height");
 }
 
 #[test]
@@ -227,12 +226,6 @@ fn the_poll_interval_has_bounds() {
     refuses(&["--poll", "-1"], "up to 3600");
     refuses(&["--poll", "3601"], "up to 3600");
     refuses(&["--poll", "forever"], "up to 3600");
-}
-
-#[test]
-fn activation_height_and_headline_must_be_given_together() {
-    refuses(&["--activation-height", "840000"], "must be given together");
-    refuses(&["--headline", "a headline"], "must be given together");
 }
 
 #[test]
@@ -399,7 +392,6 @@ fn the_settings_that_are_accepted_are_reported() {
             min_payout: 25_000,
             window_multiple: 6.0,
             window_floor: 900,
-            activation: Some((840_000, "a headline".to_string())),
             ..Default::default()
         },
     );
@@ -407,9 +399,6 @@ fn the_settings_that_are_accepted_are_reported() {
     assert!(payouts.contains("window 6x network difficulty"), "{payouts}");
     assert!(payouts.contains("floor 900"), "{payouts}");
     assert!(payouts.contains("minimum 25000 sats"), "{payouts}");
-    let activation = pool.expect_line("activation:");
-    assert!(activation.contains("height 840000"), "{activation}");
-    assert!(activation.contains("a headline"), "{activation}");
 }
 
 /// A command line is readable by every other process on the machine, so a node password

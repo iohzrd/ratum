@@ -32,7 +32,7 @@ fn seed_alice_and_bob(dir: &TempDir) {
 }
 
 fn tagging() -> Tagging<'static> {
-    Tagging { tag: "RATUM", prime_id: 1, headline: None }
+    Tagging { tag: "RATUM", prime_id: 1 }
 }
 
 /// Work whose coinbase pays everything to the pool's own script: with an empty share window
@@ -387,7 +387,7 @@ fn eight_reasons_a_share_is_rejected() {
     assert_eq!(reason(&submit_and_read(&mut gateway, &unknown_job)), RejectReason::BadJobId);
 
     let other_pool = Work::build(
-        &Tagging { tag: "SOMEONE ELSE", prime_id: 1, headline: None },
+        &Tagging { tag: "SOMEONE ELSE", prime_id: 1 },
         &payout,
         &[],
         work::COINBASE_VALUE,

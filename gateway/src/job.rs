@@ -247,8 +247,6 @@ impl Builder {
         }
         let (script, pot_in_script) = coinbase::script_sig(&coinbase::Tagging {
             height: template.height,
-            activation_height: c.mining.blake2b_activation_height,
-            headline: &c.mining.blake2b_headline,
             tag_primary,
             tag_secondary: &c.mining.coinbase_tag_secondary,
             unique_id: (c.mining.coinbase_unique_id & 0xffff) as u16,
@@ -256,13 +254,6 @@ impl Builder {
             datum_active: pool.is_some(),
         })
         .map_err(BuildError::Tagging)?;
-        if template.height == c.mining.blake2b_activation_height && new_block {
-            log::info!(
-                "Height {} activates BLAKE2b: putting the headline in the coinbase instead of the tags",
-                template.height
-            );
-        }
-
         let (coinbaser_id, outputs) = filter_coinbaser(&template, coinbaser);
         let set =
             coinbase_set(&template, &script, pot_in_script, enprefix, &pool_addr_script, &outputs);

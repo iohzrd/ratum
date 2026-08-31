@@ -125,10 +125,10 @@ ratum-gateway -c gateway.json
 ```
 
 The file is the C gateway's JSON schema with the same defaults. Required: `bitcoind.rpcurl`
-with `rpcuser`/`rpcpassword` or `rpccookiefile`, `mining.pool_address`,
-`mining.blake2b_activation_height` and `mining.blake2b_headline`. Below the activation height
-no work is served; at it the headline replaces the coinbase tags. `RUST_LOG` overrides
-`logger.log_level_console`.
+with `rpcuser`/`rpcpassword` or `rpccookiefile`, `mining.pool_address` and
+`mining.blake2b_activation_height`. Below the activation height no work is served.
+`mining.blake2b_headline` is ignored: the activation block, the only one the headline is
+consensus for, has been mined. `RUST_LOG` overrides `logger.log_level_console`.
 
 ### Differences from the C gateway
 

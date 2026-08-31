@@ -23,12 +23,10 @@ pub fn out(value: u64, script: &[u8]) -> Vec<u8> {
 
 /// How the coinbase identifies the pool: the tag push the pool searches for, then the 7-byte
 /// push whose last four bytes are its prime id. The PoT (power-of-two difficulty) byte is the
-/// first byte of that 7-byte push. At the activation height the tag push carries the headline
-/// instead.
+/// first byte of that 7-byte push.
 pub struct Tagging<'a> {
     pub tag: &'a str,
     pub prime_id: u32,
-    pub headline: Option<&'a str>,
 }
 
 /// A coinbase split in two around the extranonce: it pays `outputs`, then the remainder
@@ -41,14 +39,9 @@ pub fn coinbase(
     coinbase_value: u64,
 ) -> (CoinbaseSection, usize) {
     let mut script = push(&[0x0c, 0xd2, 0x26]);
-    match tagging.headline {
-        Some(h) => script.extend_from_slice(&push(h.as_bytes())),
-        None => {
-            let mut tag = tagging.tag.as_bytes().to_vec();
-            tag.push(0x00);
-            script.extend_from_slice(&push(&tag));
-        }
-    }
+    let mut tag = tagging.tag.as_bytes().to_vec();
+    tag.push(0x00);
+    script.extend_from_slice(&push(&tag));
     // The uid push (`generate_coinbase_uid_tag`): the PoT placeholder 0xFF, the 2-byte
     // `coinbase_unique_id` little-endian (0x1234 here; the gateway default is 4242), then the
     // prime id.

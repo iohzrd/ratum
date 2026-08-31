@@ -99,7 +99,6 @@ fn rule_present(v: &serde_json::Value, rule: &str) -> bool {
 /// What the parser reports once per height so a repeated template does not repeat a message.
 #[derive(Default)]
 pub struct Announced {
-    activation: Option<u32>,
     rules: Option<u32>,
     payout: Option<u32>,
 }
@@ -116,9 +115,9 @@ pub fn parse(
     decode(v, reduced_data)
 }
 
-/// The consensus checks: the BLAKE2b headline the node will enforce at the activation block,
-/// the `!blake2b` rule against the configured activation height, and the payout script
-/// against the `reduced_data` rule. Returns whether `reduced_data` is in force.
+/// The consensus checks: the `!blake2b` rule against the configured activation height, and
+/// the payout script against the `reduced_data` rule. Returns whether `reduced_data` is in
+/// force.
 fn check_rules(
     v: &serde_json::Value,
     config: &Config,
@@ -127,45 +126,6 @@ fn check_rules(
 ) -> Result<bool, TemplateError> {
     let height = u64_field(v, "height")? as u32;
     let activation = config.mining.blake2b_activation_height;
-
-    // The headline the node will enforce at the activation block, from coinbaseaux.
-    match v["coinbaseaux"]["blake2b_headline"].as_str() {
-        None => {
-            if height == activation {
-                return Err(TemplateError::Refused(format!(
-                    "Node published no BLAKE2b headline for block {height}, which mining.blake2b_activation_height names as the activation height. Either the node is not the BLAKE2b build or the configured height is wrong. Serving no work for this block."
-                )));
-            }
-        }
-        Some(hex_headline) => {
-            if height != activation {
-                return Err(TemplateError::Refused(format!(
-                    "Node template: block {height} activates BLAKE2b, but mining.blake2b_activation_height is {activation}. Serving no work for this block."
-                )));
-            }
-            let bytes = hex::decode(hex_headline).map_err(|_| {
-                TemplateError::Refused("Node published a BLAKE2b headline that is not hex".into())
-            })?;
-            if bytes.len() >= 128 {
-                return Err(TemplateError::Refused(
-                    "Node published a BLAKE2b headline over 127 bytes".into(),
-                ));
-            }
-            if bytes != config.mining.blake2b_headline.as_bytes() {
-                return Err(TemplateError::Refused(format!(
-                    "BLAKE2b headline mismatch at the activation block: the node will enforce {:?}, mining.blake2b_headline is {:?}. Serving no work for this block.",
-                    String::from_utf8_lossy(&bytes),
-                    config.mining.blake2b_headline
-                )));
-            }
-            if announced.activation != Some(height) {
-                announced.activation = Some(height);
-                info!(
-                    "Block {height} activates BLAKE2b, and the configured headline is the one the node will enforce."
-                );
-            }
-        }
-    }
 
     let expected = height >= activation;
     let node_v2 = rule_present(v, "!blake2b");
@@ -566,7 +526,7 @@ pub(crate) mod tests {
             r#"{
               "bitcoind": {"rpcuser":"u","rpcpassword":"p","rpcurl":"http://127.0.0.1:1"},
               "mining": {"pool_address":"bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080",
-                         "blake2b_activation_height": 20, "blake2b_headline": "Catbus"},
+                         "blake2b_activation_height": 20},
               "datum": {"pool_host": "", "pooled_mining_only": false, "protocol_job_slots": 6}
             }"#,
         )
@@ -607,8 +567,8 @@ pub(crate) mod tests {
         job
     }
 
-    fn gbt(height: u64, rules: &[&str], headline: Option<&str>) -> serde_json::Value {
-        let mut v = serde_json::json!({
+    fn gbt(height: u64, rules: &[&str]) -> serde_json::Value {
+        serde_json::json!({
             "height": height,
             "coinbasevalue": 5000000000u64,
             "mintime": 1700000000u64,
@@ -623,11 +583,7 @@ pub(crate) mod tests {
             "default_witness_commitment": "6a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf9",
             "rules": rules,
             "transactions": [],
-        });
-        if let Some(h) = headline {
-            v["coinbaseaux"] = serde_json::json!({"blake2b_headline": hex::encode(h)});
-        }
-        v
+        })
     }
 
     #[test]
@@ -648,9 +604,7 @@ pub(crate) mod tests {
     #[test]
     fn parses_an_activation_template() {
         let mut a = Announced::default();
-        let t =
-            parse(&gbt(20, &["segwit", "!blake2b"], Some("Catbus")), &config(), &[0; 22], &mut a)
-                .unwrap();
+        let t = parse(&gbt(20, &["segwit", "!blake2b"]), &config(), &[0; 22], &mut a).unwrap();
         assert_eq!(t.height, 20);
         assert_eq!(t.nbits, 0x207fffff);
         assert_eq!(t.nbits_bytes, [0xff, 0xff, 0x7f, 0x20]);
@@ -660,7 +614,7 @@ pub(crate) mod tests {
 
     #[test]
     fn decodes_transactions_without_the_rule_checks() {
-        let mut v = gbt(21, &[], None);
+        let mut v = gbt(21, &[]);
         v["transactions"] = serde_json::json!([{
             "txid": "11".repeat(32), "hash": "22".repeat(32), "fee": 1000, "sigops": 4,
             "weight": 400, "data": "0100",
@@ -677,22 +631,19 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn refuses_a_wrong_headline_and_a_rule_mismatch() {
+    fn refuses_a_rule_mismatch() {
         let mut a = Announced::default();
-        let e =
-            parse(&gbt(20, &["segwit", "!blake2b"], Some("Totoro")), &config(), &[0; 22], &mut a);
+        let e = parse(&gbt(21, &["segwit"]), &config(), &[0; 22], &mut a);
         assert!(matches!(e, Err(TemplateError::Refused(_))));
-        let e = parse(&gbt(21, &["segwit"], None), &config(), &[0; 22], &mut a);
+        let e = parse(&gbt(19, &["segwit", "!blake2b"]), &config(), &[0; 22], &mut a);
         assert!(matches!(e, Err(TemplateError::Refused(_))));
-        let e = parse(&gbt(19, &["segwit", "!blake2b"], None), &config(), &[0; 22], &mut a);
-        assert!(matches!(e, Err(TemplateError::Refused(_))));
-        assert!(parse(&gbt(19, &["segwit"], None), &config(), &[0; 22], &mut a).is_ok());
+        assert!(parse(&gbt(19, &["segwit"]), &config(), &[0; 22], &mut a).is_ok());
     }
 
     #[test]
     fn reduced_data_refuses_an_oversized_payout_script() {
         let mut a = Announced::default();
-        let v = gbt(21, &["segwit", "!blake2b", "reduced_data"], None);
+        let v = gbt(21, &["segwit", "!blake2b", "reduced_data"]);
         assert!(parse(&v, &config(), &[0; 35], &mut a).is_err());
         assert!(parse(&v, &config(), &[0; 34], &mut a).is_ok());
     }

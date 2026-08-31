@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! coinb1: version, one input with the null outpoint, scriptSig length, scriptSig:
-//!           BIP34 height push, tag push (or the headline at the activation height),
+//!           BIP34 height push, tag push,
 //!           uid push (0xFF PoT placeholder, unique id, prime id), PUSH 14, enprefix (2)
 //!         [12 bytes]
 //! coinb2: sequence, output count, outputs, lock time
@@ -42,8 +42,6 @@ impl Coinbase {
 
 pub struct Tagging<'a> {
     pub height: u32,
-    pub activation_height: u32,
-    pub headline: &'a str,
     pub tag_primary: &'a str,
     pub tag_secondary: &'a str,
     pub unique_id: u16,
@@ -79,16 +77,7 @@ pub fn height_push(height: u32) -> Vec<u8> {
 /// The scriptSig without the extranonce push, and the offset of the PoT placeholder in it.
 pub fn script_sig(t: &Tagging<'_>) -> Result<(Vec<u8>, usize), String> {
     let mut script = height_push(t.height);
-    if t.activation_height > 0 && t.height == t.activation_height && !t.headline.is_empty() {
-        if t.headline.len() > crate::config::MAX_COINBASE_TAG_SPACE {
-            return Err(format!(
-                "the headline is {} bytes; at most {} fit in the coinbase",
-                t.headline.len(),
-                crate::config::MAX_COINBASE_TAG_SPACE
-            ));
-        }
-        script.extend_from_slice(&encode_push(t.headline.as_bytes()));
-    } else {
+    {
         let tag0 = t.tag_primary.as_bytes();
         let mut tag1 = t.tag_secondary.as_bytes();
         let mut k = tag0.len() + tag1.len() + 2;
@@ -262,8 +251,6 @@ mod tests {
     fn tagging(height: u32) -> Tagging<'static> {
         Tagging {
             height,
-            activation_height: 20,
-            headline: "Catbus",
             tag_primary: "RATUM",
             tag_secondary: "e2e",
             unique_id: 4242,
@@ -284,10 +271,6 @@ mod tests {
         assert_eq!(&pushes[2].1[3..], &7u32.to_le_bytes());
         assert_eq!(&pushes[2].1[1..3], &4242u16.to_le_bytes());
         assert_eq!(s[pot], 0xff);
-
-        let (s, _) = script_sig(&tagging(20)).unwrap();
-        let pushes = ratum::bitcoin::script_pushes(&s);
-        assert_eq!(pushes[1].1, b"Catbus");
 
         let mut t = tagging(21);
         t.tag_secondary = "";

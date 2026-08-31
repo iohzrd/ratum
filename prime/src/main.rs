@@ -332,14 +332,6 @@ fn main() -> io::Result<()> {
         "basis points from 0 to 100 (a fee of at most 1%)",
         |n| *n <= 100,
     );
-    let activation_height = cli::resolve_opt::<u32>(
-        c.activation_height.as_deref(),
-        f.activation_height,
-        "--activation-height",
-        "a block height",
-        |_| true,
-    );
-    let headline = cli::resolve_str(c.headline.clone(), f.headline, "");
     let rpc_url = c.rpc.clone().or(f.rpc);
     let mut rpc_user = cli::resolve_str(c.rpc_user.clone(), f.rpc_user, "");
     let mut rpc_pass = cli::resolve_str(c.rpc_pass.clone(), f.rpc_pass, "");
@@ -626,18 +618,6 @@ fn main() -> io::Result<()> {
          operator fee {fee_bps} bps"
     );
 
-    let activation = match (activation_height, headline.is_empty()) {
-        (Some(h), false) => {
-            info!("activation: height {h}, headline {headline:?}");
-            Some((h, headline.clone()))
-        }
-        (Some(_), true) | (None, false) => {
-            eprintln!("--activation-height and --headline must be given together");
-            std::process::exit(2);
-        }
-        (None, true) => None,
-    };
-
     let config = ClientConfig { payout_script, prime_id, coinbase_tag, min_difficulty };
     let config_payload = match config.encode() {
         Ok(p) => p,
@@ -646,8 +626,7 @@ fn main() -> io::Result<()> {
             std::process::exit(2);
         }
     };
-    let mut policy = PoolPolicy::from_config(&config);
-    policy.activation = activation;
+    let policy = PoolPolicy::from_config(&config);
 
     // The `ReplayGuard` is in memory only, so without this a restart loses every share it
     // has credited and would credit one of them again if a gateway resent it. The ledger

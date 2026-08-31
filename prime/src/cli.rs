@@ -65,10 +65,6 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub fee_bps: Option<String>,
     #[arg(long)]
-    pub activation_height: Option<String>,
-    #[arg(long)]
-    pub headline: Option<String>,
-    #[arg(long)]
     pub rpc: Option<String>,
     #[arg(long)]
     pub rpc_user: Option<String>,

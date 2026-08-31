@@ -35,7 +35,6 @@ pub struct PoolArgs {
     pub coinbase_tag: String,
     pub prime_id: u32,
     pub motd: String,
-    pub activation: Option<(u32, String)>,
     pub max_connections: Option<usize>,
     pub data_dir: Option<PathBuf>,
     pub extra: Vec<String>,
@@ -55,7 +54,6 @@ impl Default for PoolArgs {
             coinbase_tag: "RATUM".to_string(),
             prime_id: 1,
             motd: "RATUM Prime".to_string(),
-            activation: None,
             max_connections: None,
             data_dir: None,
             extra: Vec::new(),
@@ -113,12 +111,6 @@ impl Pool {
             argv.push("test".into());
             // No password: the fake node does not check credentials, and a password on the
             // command line would make the pool log a warning some tests assert is absent.
-        }
-        if let Some((height, headline)) = &args.activation {
-            argv.push("--activation-height".into());
-            argv.push(height.to_string());
-            argv.push("--headline".into());
-            argv.push(headline.clone());
         }
         if let Some(n) = args.max_connections {
             argv.push("--max-connections".into());

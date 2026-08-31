@@ -95,7 +95,6 @@ pub struct PoolPolicy {
     pub coinbase_tag: String,
     pub min_difficulty: u64,
     pub ntime_window_secs: u64,
-    pub activation: Option<(u32, String)>,
 }
 
 impl PoolPolicy {
@@ -106,7 +105,6 @@ impl PoolPolicy {
             coinbase_tag: c.coinbase_tag.clone(),
             min_difficulty: c.min_difficulty,
             ntime_window_secs: DEFAULT_NTIME_WINDOW_SECS,
-            activation: None,
         }
     }
 }
@@ -635,30 +633,18 @@ fn locate_pot_byte(
         .position(|(_, data)| data.len() == 7 && data[3..7] == prime)
         .ok_or(RejectReason::MissingPoolTag)?;
 
-    match &policy.activation {
-        Some((activation_height, headline)) if *activation_height == height => {
-            let wanted = headline.as_bytes();
-            let found =
-                !wanted.is_empty() && tx.script_sig.windows(wanted.len()).any(|w| w == wanted);
-            if !found {
-                return Err(RejectReason::MissingHeadline);
-            }
-        }
-        _ => {
-            if !policy.coinbase_tag.is_empty() {
-                let tag = policy.coinbase_tag.as_bytes();
-                let ok = uid_push > 0 && {
-                    let (_, data) = pushes[uid_push - 1];
-                    data.len() > tag.len()
-                        && &data[..tag.len()] == tag
-                        // What the gateway writes after the primary tag: 0x00 when it
-                        // is the only tag, 0x0F when a secondary one follows.
-                        && matches!(data[tag.len()], 0x00 | 0x0f)
-                };
-                if !ok {
-                    return Err(RejectReason::MissingPoolTag);
-                }
-            }
+    if !policy.coinbase_tag.is_empty() {
+        let tag = policy.coinbase_tag.as_bytes();
+        let ok = uid_push > 0 && {
+            let (_, data) = pushes[uid_push - 1];
+            data.len() > tag.len()
+                && &data[..tag.len()] == tag
+                // What the gateway writes after the primary tag: 0x00 when it
+                // is the only tag, 0x0F when a secondary one follows.
+                && matches!(data[tag.len()], 0x00 | 0x0f)
+        };
+        if !ok {
+            return Err(RejectReason::MissingPoolTag);
         }
     }
 
@@ -789,23 +775,13 @@ mod tests {
             coinbase_tag: "RATUM".to_string(),
             min_difficulty: 1,
             ntime_window_secs: DEFAULT_NTIME_WINDOW_SECS,
-            activation: None,
         }
     }
 
     use ratum::fixtures::{self, Tagging, p2wpkh};
 
     fn coinbase_sections(p: &PoolPolicy, outputs: &[CoinbaseOutput]) -> (CoinbaseSection, usize) {
-        let tagging = Tagging { tag: &p.coinbase_tag, prime_id: p.prime_id, headline: None };
-        fixtures::coinbase(&tagging, &p.payout_script, outputs, COINBASE_VALUE)
-    }
-
-    fn activation_coinbase(
-        p: &PoolPolicy,
-        headline: &str,
-        outputs: &[CoinbaseOutput],
-    ) -> (CoinbaseSection, usize) {
-        let tagging = Tagging { tag: "", prime_id: p.prime_id, headline: Some(headline) };
+        let tagging = Tagging { tag: &p.coinbase_tag, prime_id: p.prime_id };
         fixtures::coinbase(&tagging, &p.payout_script, outputs, COINBASE_VALUE)
     }
 
@@ -958,6 +934,21 @@ mod tests {
         let a = v.verify(&s, NOW).unwrap();
         assert!(target::meets_target(&a.work.block_hash, &target::DIFF1_TARGET));
         assert!(!a.is_block);
+    }
+
+    /// The mainnet post-shift bits (1a008d4f): a share whose hash is above that target is
+    /// not a block under it, and the same share is a block when the network target is easier
+    /// than its hash, so the flag follows `next_bits` through the mainnet value exactly.
+    #[test]
+    fn the_block_flag_follows_the_mainnet_next_bits() {
+        let (mut v, s) = setup_hard();
+        v.set_next_target(Some(0x1a008d4f));
+        let a = v.verify(&s, NOW).unwrap();
+        assert!(!a.is_block, "hash {} is above the 1a008d4f target", hex::encode(a.work.block_hash));
+        let mut v2 = setup_hard().0;
+        v2.set_next_target(Some(0x2100ffff));
+        let b = v2.verify(&s, NOW).unwrap();
+        assert!(b.is_block, "hash {} meets the easy target", hex::encode(b.work.block_hash));
     }
 
     /// Whether a share is a block comes from the node's template target, not the job's own bits.
@@ -1455,62 +1446,6 @@ mod tests {
         share.coinbase = Some(cb);
         share.job = Some(job_section(pot_index));
         assert_eq!(v.rebuild(&share, NOW), Err(RejectReason::MissingPoolTag));
-    }
-
-    const HEADLINE: &str = "RATUM 2026 the fork that let the SC-Lite mine bitcoin";
-
-    #[test]
-    fn accepts_the_activation_block_whose_coinbase_carries_the_headline() {
-        let mut p = policy();
-        p.activation = Some((840_000, HEADLINE.to_string()));
-        let (cb, pot_index) = activation_coinbase(&p, HEADLINE, &split().outputs);
-        let mut v = Verifier::new(p);
-        v.record_split(&split());
-        let (_, base) = setup();
-        let mut share = base.clone();
-        share.coinbase = Some(cb);
-        share.job = Some(job_section(pot_index));
-        let w = v.reconstruct(&share, NOW).unwrap();
-        assert_eq!(w.height, 840_000);
-        assert_eq!(w.paid_to_split, 150_000_000);
-    }
-
-    #[test]
-    fn rejects_an_activation_block_without_the_headline() {
-        let mut p = policy();
-        p.activation = Some((840_000, HEADLINE.to_string()));
-        let (cb, pot_index) = activation_coinbase(&p, "SOME OTHER HEADLINE", &split().outputs);
-        let mut v = Verifier::new(p);
-        v.record_split(&split());
-        let (_, base) = setup();
-        let mut share = base.clone();
-        share.coinbase = Some(cb);
-        share.job = Some(job_section(pot_index));
-        assert_eq!(v.rebuild(&share, NOW), Err(RejectReason::MissingHeadline));
-    }
-
-    #[test]
-    fn the_headline_rule_applies_only_at_the_activation_height() {
-        let mut p = policy();
-        p.activation = Some((840_001, HEADLINE.to_string()));
-        let (cb, pot_index) = activation_coinbase(&p, HEADLINE, &split().outputs);
-        let mut v = Verifier::new(p);
-        v.record_split(&split());
-        let (_, base) = setup();
-        let mut share = base.clone();
-        share.coinbase = Some(cb);
-        share.job = Some(job_section(pot_index));
-        assert_eq!(v.rebuild(&share, NOW), Err(RejectReason::MissingPoolTag));
-
-        let mut p = policy();
-        p.activation = Some((840_001, HEADLINE.to_string()));
-        let (cb, pot_index) = coinbase_sections(&p, &split().outputs);
-        let mut v = Verifier::new(p);
-        v.record_split(&split());
-        let mut share = base.clone();
-        share.coinbase = Some(cb);
-        share.job = Some(job_section(pot_index));
-        assert!(v.rebuild(&share, NOW).is_ok());
     }
 
     #[test]

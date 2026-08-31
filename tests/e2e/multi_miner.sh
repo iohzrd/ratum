@@ -45,7 +45,6 @@ KEEP=0
 [ "${1:-}" = "--keep" ] && KEEP=1
 
 ACTIVATION_HEIGHT=20
-HEADLINE="RATUM multi miner test"
 
 # Four distinct addresses. The three miners are paid by the pool out of the share window;
 # the gateway is configured with a fourth for the remainder, so that a miner's payout and
@@ -208,7 +207,7 @@ rpcpassword=ratumtest
 rpcbind=127.0.0.1
 rpcport=$RPC_PORT
 testactivationheight=blake2b@$ACTIVATION_HEIGHT
-blake2b_headline=$HEADLINE
+blake2b_headline=RATUM e2e headline
 EOF
 "$BITCOIND" -datadir="$WORK/node" > "$WORK/bitcoind.log" 2>&1 &
 PIDS+=($!)
@@ -225,10 +224,10 @@ for address in "$ALICE" "$BOB" "$CAROL" "$GATEWAY_ADDRESS" "$POOL_ADDRESS"; do
     [ "$valid" = "true" ] || fail "$address is not an address this node accepts"
 done
 
-step "mining $((ACTIVATION_HEIGHT - 1)) blocks before the fork, with SHA256d"
-"$BITCOIN_CLI" -datadir="$WORK/node" generatetoaddress $((ACTIVATION_HEIGHT - 1)) "$POOL_ADDRESS" >/dev/null
+step "mining $ACTIVATION_HEIGHT blocks with the node, through the activation"
+"$BITCOIN_CLI" -datadir="$WORK/node" generatetoaddress "$ACTIVATION_HEIGHT" "$POOL_ADDRESS" >/dev/null
 height=$("$BITCOIN_CLI" -datadir="$WORK/node" getblockcount)
-[ "$height" = "$((ACTIVATION_HEIGHT - 1))" ] || fail "expected height $((ACTIVATION_HEIGHT - 1)), got $height"
+[ "$height" = "$ACTIVATION_HEIGHT" ] || fail "expected height $ACTIVATION_HEIGHT, got $height"
 
 step "starting ratum-prime on port $POOL_PORT, window floor $WINDOW_FLOOR"
 mkdir -p "$WORK/pool"
@@ -241,7 +240,6 @@ RUST_LOG="${RUST_LOG:-debug}" \
     --rpc "http://127.0.0.1:$RPC_PORT" --rpc-user ratum --rpc-pass ratumtest \
     --payout-address "$POOL_ADDRESS" \
     --min-diff 1 --min-payout "$MIN_PAYOUT" --poll 1 --window-floor "$WINDOW_FLOOR" \
-    --activation-height "$ACTIVATION_HEIGHT" --headline "$HEADLINE" \
     > "$WORK/pool.log" 2>&1 &
 POOL_PID=$!
 PIDS+=($POOL_PID)
@@ -275,8 +273,7 @@ start_gateway() {
     "pool_address": "$GATEWAY_ADDRESS",
     "coinbase_tag_primary": "RATUM",
     "coinbase_tag_secondary": "$name",
-    "blake2b_activation_height": $ACTIVATION_HEIGHT,
-    "blake2b_headline": "$HEADLINE"
+    "blake2b_activation_height": $ACTIVATION_HEIGHT
   },
   "api": { "admin_password": "", "listen_port": $api_port, "modify_conf": false },
   "logger": { "log_to_console": true, "log_to_file": false, "log_level_console": 1 },

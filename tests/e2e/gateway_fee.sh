@@ -35,7 +35,6 @@ KEEP=0
 [ "${1:-}" = "--keep" ] && KEEP=1
 
 ACTIVATION_HEIGHT=20
-HEADLINE="RATUM gateway fee test"
 
 # 5000 basis points: half of each miner's work on gateway A. A rate this high is what makes
 # the check exact over the few shares a CPU miner produces; the accounting is the same at any
@@ -139,7 +138,7 @@ rpcpassword=ratumtest
 rpcbind=127.0.0.1
 rpcport=$RPC_PORT
 testactivationheight=blake2b@$ACTIVATION_HEIGHT
-blake2b_headline=$HEADLINE
+blake2b_headline=RATUM e2e headline
 EOF
 "$BITCOIND" -datadir="$WORK/node" > "$WORK/bitcoind.log" 2>&1 &
 PIDS+=($!)
@@ -151,8 +150,8 @@ done
 "$BITCOIN_CLI" -datadir="$WORK/node" getblockchaininfo >/dev/null \
     || fail "the node never responded on port $RPC_PORT"
 
-step "mining $((ACTIVATION_HEIGHT - 1)) blocks before the fork, with SHA256d"
-"$BITCOIN_CLI" -datadir="$WORK/node" generatetoaddress $((ACTIVATION_HEIGHT - 1)) "$POOL_ADDRESS" >/dev/null
+step "mining $ACTIVATION_HEIGHT blocks with the node, through the activation"
+"$BITCOIN_CLI" -datadir="$WORK/node" generatetoaddress "$ACTIVATION_HEIGHT" "$POOL_ADDRESS" >/dev/null
 
 step "starting ratum-prime on port $POOL_PORT"
 mkdir -p "$WORK/pool"
@@ -163,7 +162,6 @@ RUST_LOG="${RUST_LOG:-debug}" \
     --rpc "http://127.0.0.1:$RPC_PORT" --rpc-user ratum --rpc-pass ratumtest \
     --payout-address "$POOL_ADDRESS" \
     --min-diff 1 --min-payout "$MIN_PAYOUT" --poll 1 --window-floor "$WINDOW_FLOOR" \
-    --activation-height "$ACTIVATION_HEIGHT" --headline "$HEADLINE" \
     > "$WORK/pool.log" 2>&1 &
 POOL_PID=$!
 PIDS+=($POOL_PID)
@@ -200,8 +198,7 @@ start_gateway() {
     "pool_address": "$GATEWAY_ADDRESS",
     "coinbase_tag_primary": "RATUM",
     "coinbase_tag_secondary": "$name",
-    "blake2b_activation_height": $ACTIVATION_HEIGHT,
-    "blake2b_headline": "$HEADLINE"
+    "blake2b_activation_height": $ACTIVATION_HEIGHT
   },
   "api": { "admin_password": "", "listen_port": $api_port, "modify_conf": false },
   "logger": { "log_to_console": true, "log_to_file": false, "log_level_console": 1 },
