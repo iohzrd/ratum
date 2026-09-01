@@ -6,14 +6,66 @@
 <title>RATUM Prime</title>
 <!--shared-css-->
 <style>
+  /* Inherited by the scrollable tables; the default scrollbar is light on the dark page. */
+  html { scrollbar-color: var(--line) var(--bg); }
+
+  /* Hero tiles: the four figures that matter first, larger than the detail cards. */
+  .hero { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+          gap: .75rem; margin-bottom: .75rem; }
+  .tile { background: var(--card); border: 1px solid var(--line); border-radius: 8px;
+          padding: .8rem .9rem; }
+  .tile .big { font-size: 1.5rem; line-height: 1.25; margin-top: .2rem;
+               font-variant-numeric: tabular-nums; word-break: break-word; }
+  .tile .sub { color: var(--muted); font-size: .8rem; margin-top: .15rem; }
+  .label { color: var(--muted); font-size: .8rem; text-transform: uppercase;
+           letter-spacing: .04em; }
+
+  /* The hashrate chart: an SVG redrawn at the container's pixel size on each poll. */
+  .chart-card { background: var(--card); border: 1px solid var(--line); border-radius: 8px;
+                padding: .8rem .9rem; margin-bottom: 1.25rem; }
+  .chart-head { display: flex; justify-content: space-between; align-items: baseline;
+                gap: .5rem; flex-wrap: wrap; margin-bottom: .4rem; }
+  .chart { position: relative; height: 150px; }
+  .chart svg { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  .chart .empty { position: absolute; inset: 0; display: flex; align-items: center;
+                  justify-content: center; color: var(--muted); font-size: .85rem; }
+  .tip { position: absolute; display: none; pointer-events: none; z-index: 2;
+         background: var(--bg); border: 1px solid var(--line); border-radius: 6px;
+         padding: .25rem .5rem; font-size: .8rem; white-space: nowrap;
+         transform: translate(-50%, -100%); }
+
+  /* Horizontal meters: window fill and retarget progress. */
+  .meter { position: relative; height: .6rem; background: var(--bg);
+           border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .meter > span { position: absolute; inset: 0; width: 0; background: var(--accent);
+                  opacity: .55; border-radius: 999px; transition: width .4s; }
+  .meter-row { display: flex; justify-content: space-between; align-items: baseline;
+               gap: .5rem; flex-wrap: wrap; margin-bottom: .35rem; }
+  .meter-row .val { font-variant-numeric: tabular-nums; }
+
+  /* Fact chips: small label:value pairs under a meter. */
+  .chips { display: flex; flex-wrap: wrap; gap: .4rem .5rem; margin-top: .7rem; }
+  .chip { border: 1px solid var(--line); border-radius: 999px; padding: .15rem .6rem;
+          font-size: .8rem; color: var(--muted); }
+  .chip b { color: var(--fg); font-weight: 600; font-variant-numeric: tabular-nums; }
+
+  .panel { background: var(--card); border: 1px solid var(--line); border-radius: 8px;
+           padding: .8rem .9rem; margin-bottom: .75rem; }
+  .banner { border: 1px solid var(--warn); background: rgba(240, 160, 75, .08);
+            border-radius: 8px; padding: .6rem .8rem; margin-bottom: .75rem; }
+
   th.key { width: 11rem; }
   .bar { position: relative; }
   .bar > span { position: absolute; inset: 0; background: rgba(110,168,254,.16);
                 border-radius: 3px; }
   .bar > em { position: relative; font-style: normal; }
+  .rank { color: var(--muted); }
   .unpayable { color: var(--warn); }
   .unpayable td { opacity: .75; }
   .chain { display: none; }
+
+  .copy-wrap { position: relative; }
+  .copy-wrap button { position: absolute; top: .9rem; right: .5rem; }
 </style>
 </head>
 <body>
@@ -28,30 +80,66 @@
   </div>
 </header>
 
-<div class="grid" id="cards"></div>
+<div class="hero" id="hero"></div>
 
-<h2>Share window</h2>
-<div style="overflow-x:auto">
-  <table id="miners">
-    <thead><tr>
-      <th>Miner</th>
-      <th class="num">Hashrate</th>
-      <th class="num">Work</th>
-      <th class="num">Share</th>
-      <th class="num">Next payout</th>
-    </tr></thead>
-    <tbody></tbody>
-  </table>
+<div class="chart-card">
+  <div class="chart-head">
+    <span class="label">Pool hashrate</span>
+    <span class="motd" id="chart-note"></span>
+  </div>
+  <div class="chart" id="chart">
+    <svg id="spark" aria-label="pool hashrate history"></svg>
+    <div class="empty" id="chart-empty">collecting samples; the pool records one per minute</div>
+    <div class="tip" id="chart-tip"></div>
+  </div>
 </div>
 
+<section>
+  <h2>Payout window</h2>
+  <div class="panel">
+    <div class="meter-row">
+      <span class="label">Window fill</span>
+      <span class="val" id="window-vals"></span>
+    </div>
+    <div class="meter"><span id="window-fill"></span></div>
+    <div class="chips" id="window-chips"></div>
+  </div>
+  <div style="overflow-x:auto">
+    <table id="miners">
+      <thead><tr>
+        <th></th>
+        <th>Miner</th>
+        <th class="num">Hashrate</th>
+        <th class="num">Work</th>
+        <th class="num">Share</th>
+        <th class="num">Next payout</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</section>
+
+<section>
+  <h2>Network</h2>
+  <div class="grid" id="net-cards"></div>
+  <div class="panel">
+    <div class="meter-row">
+      <span class="label">Next retarget</span>
+      <span class="val" id="retarget-vals"></span>
+    </div>
+    <div class="meter"><span id="retarget-fill"></span></div>
+  </div>
+</section>
+
 <section id="blocks" style="display:none">
-  <h2>Recent blocks</h2>
+  <h2 id="blocks-title">Recent blocks</h2>
+  <div class="banner" id="owed-banner" style="display:none"></div>
   <div style="overflow-x:auto">
     <table id="blocks-table">
       <thead><tr>
         <th class="num">Height</th>
         <th>Hash</th>
-        <th>Found (UTC)</th>
+        <th>Found</th>
         <th>Finder</th>
         <th class="num">To miners</th>
         <th class="num">To pool</th>
@@ -77,7 +165,10 @@
     Both gateways read the same config file, so switching is a binary swap.</p>
   <p>Add this to your gateway config, alongside your own <code>mining</code>
     and <code>stratum</code> settings:</p>
-  <pre id="gateway-config"></pre>
+  <div class="copy-wrap">
+    <pre id="gateway-config"></pre>
+    <button id="copy-config" type="button">copy</button>
+  </div>
 
   <h2>Miner usernames</h2>
   <p>The pool credits work to the stratum username up to the first <code>.</code>, and that
@@ -151,8 +242,21 @@ function duration(secs) {
 }
 
 function utcTime(unix) {
-  return new Date(unix * 1000).toISOString().slice(0, 16).replace("T", " ");
+  return new Date(unix * 1000).toISOString().slice(0, 16).replace("T", " ") + " UTC";
 }
+
+// "3 h ago" with the full UTC timestamp in the title attribute.
+function ago(unix) {
+  const secs = Date.now() / 1000 - unix;
+  const text = secs < 0 ? utcTime(unix) : duration(Math.max(secs, 1)) + " ago";
+  return `<span title="${esc(utcTime(unix))}">${text}</span>`;
+}
+
+function tile(label, big, sub) {
+  return `<div class="tile"><div class="label">${label}</div><div class="big">${big}</div>`
+    + (sub ? `<div class="sub">${sub}</div>` : "") + `</div>`;
+}
+function chip(label, value) { return `<span class="chip">${label} <b>${value}</b></span>`; }
 
 // The host and port a gateway should use. `advertise` (operator-set) wins: a trailing :port in
 // it overrides the DATUM port, otherwise it is a bare host. Unset falls back to the address
@@ -168,6 +272,124 @@ function poolEndpoint(pool) {
   }
   return { host: location.hostname || "127.0.0.1", port: pool.datum_port };
 }
+
+// --- Hashrate history -------------------------------------------------------------------
+// The server records one [unix, h/s] sample per hashrate.interval_seconds (a day kept) and
+// serves them in the snapshot, so every visitor sees the same chart. Sampling begins when
+// the pool's stats interface starts; a restart shows as a gap.
+let hist = [];
+let histInterval = 60;
+
+// Pixel positions of the drawn samples, for the hover tooltip.
+let chartPts = [];
+
+function drawChart() {
+  const el = document.getElementById("chart");
+  const svg = document.getElementById("spark");
+  const empty = document.getElementById("chart-empty");
+  const note = document.getElementById("chart-note");
+  chartPts = [];
+  const pts = hist;
+  if (pts.length < 2) {
+    svg.innerHTML = "";
+    note.textContent = "";
+    empty.style.display = "flex";
+    return;
+  }
+  empty.style.display = "none";
+
+  const w = el.clientWidth, h = el.clientHeight;
+  const padT = 14, padB = 16, padL = 2, padR = 2;
+  const t0 = pts[0][0], t1 = pts[pts.length - 1][0];
+  const span = Math.max(t1 - t0, 1);
+  const max = Math.max(...pts.map(p => p[1]), 1e-9) * 1.05;
+  const x = t => padL + (t - t0) / span * (w - padL - padR);
+  const y = v => padT + (1 - v / max) * (h - padT - padB);
+
+  // Line and area paths, broken where sampling paused (the pool was restarted) so the
+  // pause is a gap, not a line drawn across it.
+  const baseline = y(0);
+  let line = "", area = "";
+  let seg = [];
+  const flush = () => {
+    if (seg.length < 2) { seg = []; return; }
+    const d = seg.map((p, i) => (i ? "L" : "M") + p[0].toFixed(1) + " " + p[1].toFixed(1)).join(" ");
+    line += d + " ";
+    area += d + ` L${seg[seg.length - 1][0].toFixed(1)} ${baseline.toFixed(1)}`
+      + ` L${seg[0][0].toFixed(1)} ${baseline.toFixed(1)} Z `;
+    seg = [];
+  };
+  for (let i = 0; i < pts.length; i++) {
+    if (i > 0 && pts[i][0] - pts[i - 1][0] > histInterval * 2.5) flush();
+    const px = x(pts[i][0]), py = y(pts[i][1]);
+    seg.push([px, py]);
+    chartPts.push([px, py, pts[i][0], pts[i][1]]);
+  }
+  flush();
+
+  // Recessive horizontal grid at 1/2 and full scale, labeled with the hashrate they mark.
+  const gridY = [max / 2, max];
+  const grid = gridY.map(v =>
+    `<line x1="0" y1="${y(v).toFixed(1)}" x2="${w}" y2="${y(v).toFixed(1)}"
+       stroke="var(--line)" stroke-width="1"/>
+     <text x="4" y="${(y(v) - 3).toFixed(1)}" fill="var(--muted)" font-size="10">${hashrate(v)}</text>`
+  ).join("");
+
+  const last = chartPts[chartPts.length - 1];
+  svg.innerHTML = grid
+    + `<path d="${area}" fill="var(--accent)" opacity=".12"/>`
+    + `<path d="${line}" fill="none" stroke="var(--accent)" stroke-width="2"
+        stroke-linejoin="round" stroke-linecap="round"/>`
+    + `<circle cx="${last[0].toFixed(1)}" cy="${last[1].toFixed(1)}" r="3" fill="var(--accent)"/>`
+    + `<text x="${padL}" y="${h - 3}" fill="var(--muted)" font-size="10">${
+        new Date(t0 * 1000).toLocaleTimeString()}</text>`
+    + `<text x="${w - padR}" y="${h - 3}" text-anchor="end" fill="var(--muted)" font-size="10">${
+        new Date(t1 * 1000).toLocaleTimeString()}</text>`
+    + `<line id="crosshair" y1="${padT}" y2="${h - padB}" stroke="var(--muted)"
+        stroke-width="1" stroke-dasharray="3 3" visibility="hidden"/>`;
+  note.textContent = `${pts.length} samples over ${duration(span)}`;
+}
+
+// Hover: the vertical crosshair snaps to the nearest sample and the tooltip shows its
+// time and rate.
+(function () {
+  const el = document.getElementById("chart");
+  const tip = document.getElementById("chart-tip");
+  el.addEventListener("mousemove", e => {
+    const cross = document.getElementById("crosshair");
+    if (!chartPts.length || !cross) return;
+    const mx = e.clientX - el.getBoundingClientRect().left;
+    let best = chartPts[0];
+    for (const p of chartPts) if (Math.abs(p[0] - mx) < Math.abs(best[0] - mx)) best = p;
+    cross.setAttribute("x1", best[0]); cross.setAttribute("x2", best[0]);
+    cross.setAttribute("visibility", "visible");
+    tip.style.display = "block";
+    tip.style.left = Math.min(Math.max(best[0], 60), el.clientWidth - 60) + "px";
+    tip.style.top = (best[1] - 8) + "px";
+    tip.textContent = `${new Date(best[2] * 1000).toLocaleTimeString()} · ~${hashrate(best[3])}`;
+  });
+  el.addEventListener("mouseleave", () => {
+    const cross = document.getElementById("crosshair");
+    if (cross) cross.setAttribute("visibility", "hidden");
+    tip.style.display = "none";
+  });
+  addEventListener("resize", drawChart);
+})();
+
+// Copy the gateway config. The clipboard API needs a secure context, which a LAN pool over
+// plain HTTP is not; the fallback selects the text for a manual copy.
+document.getElementById("copy-config").addEventListener("click", async e => {
+  const pre = document.getElementById("gateway-config");
+  const btn = e.target;
+  try {
+    await navigator.clipboard.writeText(pre.textContent);
+    btn.textContent = "copied";
+  } catch (err) {
+    getSelection().selectAllChildren(pre);
+    btn.textContent = "select + copy";
+  }
+  setTimeout(() => { btn.textContent = "copy"; }, 1500);
+});
 
 poll(() => "stats.json", s => {
   // The subtitle shows a custom message of the day; hide it when it is empty or repeats the title.
@@ -205,35 +427,43 @@ poll(() => "stats.json", s => {
   const expectedSecs = poolHs > 0 && s.network.difficulty > 0
     ? s.network.difficulty * 4294967296 / poolHs : null;
   const blk = s.blocks || { found: 0, luck_percent: null, recent: [] };
-  const rt = s.network.retarget;
+  const lastBlock = blk.recent.length ? blk.recent[0] : null;
 
-  const cards = [
-    card("Pool hashrate", s.hashrate == null ? "-"
-      : `~${hashrate(s.hashrate.pool_hs)}`),
-    card("Expected block time", expectedSecs == null ? "-" : "~" + duration(expectedSecs)),
-    card("Blocks found", num(blk.found) + (blk.luck_percent == null ? ""
-      : ` · luck ${blk.luck_percent.toFixed(0)}%`)),
-    card("Retarget", rt == null ? "-"
-      : `${num(rt.blocks_remaining)} blocks`
-        + (s.network.observed_block_seconds == null ? ""
-          : ` (~${duration(rt.blocks_remaining * s.network.observed_block_seconds)})`)
-        + (rt.estimated_factor == null ? "" : ` · est ×${rt.estimated_factor.toFixed(2)}`)),
-    card("Tip height", num(s.network.tip_height)),
-    card("Network difficulty", s.network.difficulty == null ? "-" : Number(s.network.difficulty).toLocaleString()),
-    card("Coinbase value", btc(s.network.coinbase_value)),
-    card("Operator fee", btc(s.window.operator_fee_sats)),
-    card("Min share difficulty", num(s.pool.min_difficulty)),
-    card("Min payout", num(s.pool.min_payout) + " sats"),
-    card("Gateways connected", `${s.connections.open} / ${s.connections.max}`),
-    card("Miners in window", num(s.window.miners.length)),
-    card("Shares in window", num(s.window.shares)),
-    card("Window work", num(s.window.work) + " / " + num(s.window.target_work)),
-    card("Payout window", num(s.pool.window_multiple) + "× network difficulty"),
-    card("Coinbase tag", esc(s.pool.coinbase_tag) + " / prime " + s.pool.prime_id),
-  ];
-  document.getElementById("cards").innerHTML = cards.join("");
+  document.getElementById("hero").innerHTML = [
+    tile("Pool hashrate", poolHs > 0 ? "~" + hashrate(poolHs) : "-",
+      `over the last ${duration(s.hashrate ? s.hashrate.span_seconds : null)}`),
+    tile("Expected block time", expectedSecs == null ? "-" : "~" + duration(expectedSecs),
+      "at the current pool hashrate"),
+    tile("Blocks found", num(blk.found),
+      (blk.luck_percent == null ? "" : `luck ${blk.luck_percent.toFixed(0)}% over ${num(blk.luck_blocks)} blocks`)
+      + (lastBlock ? `${blk.luck_percent == null ? "" : " · "}last ${ago(lastBlock.found_at)}` : "")),
+    tile("Miners in window", num(s.window.miners.length),
+      `${num(s.connections.open)} of ${num(s.connections.max)} gateway slots in use`),
+  ].join("");
 
-  const rows = s.window.miners.map(m => {
+  hist = (s.hashrate && s.hashrate.history) || [];
+  histInterval = (s.hashrate && s.hashrate.interval_seconds) || 60;
+  drawChart();
+
+  // The payout window: work toward the target, then the pool policy that shapes it.
+  const work = Number(s.window.work), target = Number(s.window.target_work);
+  const fillPct = target > 0 ? Math.min(work / target * 100, 100) : 0;
+  document.getElementById("window-fill").style.width = fillPct + "%";
+  // Once full the window slides; below full, the time to fill at the current rate.
+  const fillEta = work < target && poolHs > 0
+    ? ` · full in ~${duration((target - work) * 4294967296 / poolHs)}` : "";
+  document.getElementById("window-vals").textContent =
+    `${num(work)} / ${num(target)} work (${fillPct.toFixed(1)}%)${fillEta}`;
+  document.getElementById("window-chips").innerHTML = [
+    chip("shares", num(s.window.shares)),
+    chip("window", num(s.pool.window_multiple) + "× network difficulty"),
+    chip("operator fee", btc(s.window.operator_fee_sats)),
+    chip("min payout", num(s.pool.min_payout) + " sats"),
+    chip("min share difficulty", num(s.pool.min_difficulty)),
+    chip("coinbase tag", esc(s.pool.coinbase_tag) + " / prime " + s.pool.prime_id),
+  ].join("");
+
+  const rows = s.window.miners.map((m, i) => {
     const pct = m.share_percent.toFixed(2);
     // payable false: the node resolved the identity and it cannot be paid a coinbase output,
     // so the split's amount is left to the pool instead. Its shares were recorded before the
@@ -243,6 +473,7 @@ poll(() => "stats.json", s => {
     // hashrate_hs averages the last s.hashrate.span_seconds; an identity idle that long
     // shows "-" rather than a misleading zero next to its window share.
     return `<tr class="${unpayable ? "unpayable" : ""}">
+      <td class="num rank">${i + 1}</td>
       <td>${esc(m.identity)}${tag}</td>
       <td class="num">${m.hashrate_hs > 0 ? "~" + hashrate(m.hashrate_hs) : "-"}</td>
       <td class="num">${num(m.work)}</td>
@@ -251,11 +482,42 @@ poll(() => "stats.json", s => {
     </tr>`;
   }).join("");
   document.querySelector("#miners tbody").innerHTML =
-    rows || '<tr><td colspan="5" class="motd">no shares in the window yet</td></tr>';
+    rows || '<tr><td colspan="6" class="motd">no shares in the window yet</td></tr>';
+
+  const rt = s.network.retarget;
+  document.getElementById("net-cards").innerHTML = [
+    card("Tip height", num(s.network.tip_height)),
+    card("Network difficulty", s.network.difficulty == null ? "-" : Number(s.network.difficulty).toLocaleString()),
+    card("Coinbase value", btc(s.network.coinbase_value)),
+    card("Observed block spacing", s.network.observed_block_seconds == null ? "-"
+      : "~" + duration(s.network.observed_block_seconds)),
+  ].join("");
+  // Progress through the 2016-block difficulty period, with the estimated adjustment.
+  if (rt != null) {
+    const interval = 2016;
+    const into = interval - rt.blocks_remaining;
+    document.getElementById("retarget-fill").style.width = (into / interval * 100) + "%";
+    document.getElementById("retarget-vals").textContent =
+      `${num(rt.blocks_remaining)} blocks to height ${num(rt.height)}`
+      + (s.network.observed_block_seconds == null ? ""
+        : ` (~${duration(rt.blocks_remaining * s.network.observed_block_seconds)})`)
+      + (rt.estimated_factor == null ? "" : ` · estimated ×${rt.estimated_factor.toFixed(2)}`);
+  } else {
+    document.getElementById("retarget-fill").style.width = "0";
+    document.getElementById("retarget-vals").textContent = "-";
+  }
 
   // The recorded block history, newest first; hidden while there is none. A block whose
-  // coinbase paid the window nothing shows its owed status (`s.owed` in the JSON).
-  const owedByHash = new Map((s.owed ? s.owed.blocks : []).map(b => [b.block_hash, b]));
+  // coinbase paid the window nothing shows its owed status (`s.owed` in the JSON), and the
+  // banner sums what remains unsettled.
+  const owed = s.owed || { unsettled_sats: 0, blocks: [] };
+  const owedByHash = new Map(owed.blocks.map(b => [b.block_hash, b]));
+  const banner = document.getElementById("owed-banner");
+  banner.style.display = owed.unsettled_sats > 0 ? "" : "none";
+  if (owed.unsettled_sats > 0) {
+    banner.textContent = `${btc(owed.unsettled_sats)} owed by the pool: coinbases below paid `
+      + `the window nothing, so the operator settles those payouts from the pool wallet.`;
+  }
   document.getElementById("blocks").style.display = blk.recent.length ? "" : "none";
   if (blk.recent.length) {
     document.querySelector("#blocks-table tbody").innerHTML = blk.recent.map(b => {
@@ -271,7 +533,7 @@ poll(() => "stats.json", s => {
       return `<tr>
         <td class="num">${num(b.height)}</td>
         <td class="mono" title="${esc(b.block_hash)}">${esc(b.block_hash.slice(0, 16))}…</td>
-        <td>${utcTime(b.found_at)}</td>
+        <td>${ago(b.found_at)}</td>
         <td class="mono">${esc(b.finder)}</td>
         <td class="num">${btc(b.paid_to_split)}</td>
         <td class="num">${btc(b.paid_to_pool)}</td>

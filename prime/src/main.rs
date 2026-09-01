@@ -12,10 +12,9 @@ use ratum::rpc;
 use ratum_prime::ledger::{self, Ledger};
 use ratum_prime::verify::{PoolPolicy, ReplayGuard};
 use server::{
-    OpenConnectionGuard, PayoutPolicy, Resolved, Resolver, Server, SharedCoinbaseValue,
-    SharedNextBits, SharedTip, SharedTipHistory, resolve_address, watch_node,
+    NodeView, OpenConnectionGuard, PayoutPolicy, Resolved, Resolver, Server, resolve_address,
+    watch_node,
 };
-use std::collections::VecDeque;
 use std::io;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -388,9 +387,6 @@ fn main() -> io::Result<()> {
     let pool_keys = load_or_create_keys(&key_path)?;
     info!("pool_pubkey: {}", pool_keys.pubkey_hex());
 
-    let tip: SharedTip = Arc::new(Mutex::new(None));
-    let coinbase_value: SharedCoinbaseValue = Arc::new(Mutex::new(None));
-    let next_bits: SharedNextBits = Arc::new(Mutex::new(None));
     // A command line is readable by every other process on the machine, so a password
     // given there is not a secret from anyone with a local account.
     if rpc_pass_on_argv {
@@ -545,15 +541,10 @@ fn main() -> io::Result<()> {
         Some(t) => ledger::window_for_difficulty(t.difficulty, window_multiple, window_floor),
         None => window_floor,
     };
-    let tip_history: SharedTipHistory = Arc::new(Mutex::new(VecDeque::new()));
+    let node_view = Arc::new(NodeView::new());
     {
-        let (watcher, shared) = (node.clone(), Arc::clone(&tip));
-        let shared_value = Arc::clone(&coinbase_value);
-        let shared_bits = Arc::clone(&next_bits);
-        let shared_history = Arc::clone(&tip_history);
-        std::thread::spawn(move || {
-            watch_node(watcher, shared, shared_value, shared_bits, shared_history, poll, chain)
-        });
+        let (watcher, view) = (node.clone(), Arc::clone(&node_view));
+        std::thread::spawn(move || watch_node(watcher, view, poll, chain));
         info!(
             "watching the node at {url}: waiting on each new block, \
              re-reading the tip at least every {:.3}s",
@@ -655,13 +646,10 @@ fn main() -> io::Result<()> {
     }
     let server = Arc::new(Server {
         pool_keys,
-        coinbase_value: Arc::clone(&coinbase_value),
-        next_bits,
-        tip_history,
+        node_view,
         motd,
         allowed_agents,
         node,
-        tip,
         replay,
         ledger: Mutex::new(ledger),
         resolver: Mutex::new(Resolver::new()),

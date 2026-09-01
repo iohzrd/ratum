@@ -13,25 +13,40 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub(crate) type SharedTip = Arc<Mutex<Option<rpc::Tip>>>;
-pub(crate) type SharedCoinbaseValue = Arc<Mutex<Option<u64>>>;
-/// The compact target of the block the node would build on its tip, `None` until a template
-/// is read and again whenever one cannot be. A connection refuses a job claiming an easier
-/// network target than this, so an ordinary share cannot be presented as a block.
-pub(crate) type SharedNextBits = Arc<Mutex<Option<u32>>>;
-/// The tip changes the node watcher observed: `(height, unix seconds first seen)`, oldest
-/// first, capped at `TIP_HISTORY_CAP` entries. The stats interface derives the observed
-/// block spacing (and from it the retarget estimate) from the span between the first and
-/// last entries. A reorg can repeat or lower a height; the reader guards against that.
-pub(crate) type SharedTipHistory = Arc<Mutex<VecDeque<(u32, u64)>>>;
+/// What the node watcher maintains and every other thread reads, shared as one
+/// `Arc<NodeView>` between the watcher and `Server`.
+pub(crate) struct NodeView {
+    pub(crate) tip: Mutex<Option<rpc::Tip>>,
+    pub(crate) coinbase_value: Mutex<Option<u64>>,
+    /// The compact target of the block the node would build on its tip, `None` until a
+    /// template is read and again whenever one cannot be. A connection refuses a job
+    /// claiming an easier network target than this, so an ordinary share cannot be
+    /// presented as a block.
+    pub(crate) next_bits: Mutex<Option<u32>>,
+    /// The tip changes the watcher observed: `(height, unix seconds first seen)`, oldest
+    /// first, capped at `TIP_HISTORY_CAP` entries. The stats interface derives the observed
+    /// block spacing (and from it the retarget estimate) from the span between the first
+    /// and last entries. A reorg can repeat or lower a height; the reader guards against
+    /// that.
+    pub(crate) tip_history: Mutex<VecDeque<(u32, u64)>>,
+}
+
 pub(crate) const TIP_HISTORY_CAP: usize = 64;
+
+impl NodeView {
+    pub(crate) fn new() -> Self {
+        NodeView {
+            tip: Mutex::new(None),
+            coinbase_value: Mutex::new(None),
+            next_bits: Mutex::new(None),
+            tip_history: Mutex::new(VecDeque::new()),
+        }
+    }
+}
 
 pub(crate) fn watch_node(
     node: rpc::Client,
-    tip: SharedTip,
-    coinbase_value: SharedCoinbaseValue,
-    next_bits: SharedNextBits,
-    tip_history: SharedTipHistory,
+    view: Arc<NodeView>,
     interval: Duration,
     expected_chain: Option<rpc::Chain>,
 ) {
@@ -74,7 +89,7 @@ pub(crate) fn watch_node(
                     );
                     last = Some(t.hash);
                     have_template = false;
-                    let mut history = lock(&tip_history);
+                    let mut history = lock(&view.tip_history);
                     history.push_back((t.height, unix_now()));
                     while history.len() > TIP_HISTORY_CAP {
                         history.pop_front();
@@ -87,18 +102,18 @@ pub(crate) fn watch_node(
                                 "node template: the next coinbase may pay {} sats at bits {:#010x}",
                                 n.coinbase_value, n.bits
                             );
-                            *lock(&coinbase_value) = Some(n.coinbase_value);
-                            *lock(&next_bits) = Some(n.bits);
+                            *lock(&view.coinbase_value) = Some(n.coinbase_value);
+                            *lock(&view.next_bits) = Some(n.bits);
                             have_template = true;
                         }
                         Err(e) => {
                             warn!("could not read a template: {e}");
-                            *lock(&coinbase_value) = None;
-                            *lock(&next_bits) = None;
+                            *lock(&view.coinbase_value) = None;
+                            *lock(&view.next_bits) = None;
                         }
                     }
                 }
-                *lock(&tip) = Some(t);
+                *lock(&view.tip) = Some(t);
                 Some(t.height)
             }
             Err(e) => {
@@ -145,10 +160,7 @@ pub(crate) struct Server {
     /// User-agent prefixes a hello must match; empty accepts every agent (`--allow-agent`).
     pub(crate) allowed_agents: Vec<String>,
     pub(crate) node: rpc::Client,
-    pub(crate) tip: SharedTip,
-    pub(crate) coinbase_value: SharedCoinbaseValue,
-    pub(crate) next_bits: SharedNextBits,
-    pub(crate) tip_history: SharedTipHistory,
+    pub(crate) node_view: Arc<NodeView>,
     pub(crate) replay: Arc<Mutex<ReplayGuard>>,
     pub(crate) ledger: Mutex<Ledger>,
     pub(crate) resolver: Mutex<Resolver>,
@@ -456,10 +468,7 @@ mod tests {
             motd: String::new(),
             allowed_agents: Vec::new(),
             node: rpc::Client::new("http://127.0.0.1:1", "u", "p").unwrap(),
-            tip: Arc::new(Mutex::new(None)),
-            coinbase_value: Arc::new(Mutex::new(None)),
-            next_bits: Arc::new(Mutex::new(None)),
-            tip_history: Arc::new(Mutex::new(VecDeque::new())),
+            node_view: Arc::new(NodeView::new()),
             replay: Arc::new(Mutex::new(ReplayGuard::default())),
             ledger: Mutex::new(ledger),
             resolver: Mutex::new(resolver),

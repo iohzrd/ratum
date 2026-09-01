@@ -267,8 +267,8 @@ impl Connection<'_> {
 
     /// Notify the verifier and the gateway of a change of the node's tip.
     fn notify_tip_change(&mut self) -> io::Result<()> {
-        let current = lock(&self.server.tip).map(|t| t.hash);
-        let next_bits = *lock(&self.server.next_bits);
+        let current = lock(&self.server.node_view.tip).map(|t| t.hash);
+        let next_bits = *lock(&self.server.node_view.next_bits);
         if current != self.known_tip {
             self.known_tip = current;
             self.verifier.set_tip(current, unix_now());
@@ -354,7 +354,7 @@ impl Connection<'_> {
             req.value,
             &hex::encode(req.prev_hash)[..16]
         );
-        if let Some(reference) = *lock(&self.server.coinbase_value) {
+        if let Some(reference) = *lock(&self.server.node_view.coinbase_value) {
             let low = (reference as f64 / COINBASE_VALUE_TOLERANCE) as u64;
             let high = (reference as f64 * COINBASE_VALUE_TOLERANCE) as u64;
             if req.value < low || req.value > high {
@@ -542,7 +542,7 @@ impl Connection<'_> {
     /// `record_and_credit` adds the block's own share, so the difference between
     /// consecutive records is exactly the work between them.
     fn record_found_block(&self, a: &Accepted, s: &PowSubmit, now: u64) {
-        let difficulty = lock(&self.server.tip).map_or(0.0, |t| t.difficulty);
+        let difficulty = lock(&self.server.node_view.tip).map_or(0.0, |t| t.difficulty);
         let mut l = lock(&self.server.ledger);
         let block = ledger::FoundBlock {
             at: now,
@@ -638,7 +638,7 @@ impl Connection<'_> {
     fn record_and_credit(&mut self, s: &PowSubmit, a: &Accepted, now: u64) -> io::Result<()> {
         let peer = self.peer;
         let identity = ledger::identity_of(&s.username).to_string();
-        let network = lock(&self.server.tip).map(|t| t.difficulty);
+        let network = lock(&self.server.node_view.tip).map(|t| t.difficulty);
         {
             let mut l = lock(&self.server.ledger);
             if let Some(d) = network {

@@ -1,18 +1,19 @@
 //! A read-only HTTP interface: a JSON snapshot of the pool's state at `/stats.json` and a
 //! single page at `/` that fetches and renders it. It reads the same `Arc<Server>` the
-//! connection threads share, takes no action, and serves only GET, so it adds no way to
-//! change the pool. It is started only when `--stats-listen` names an address; bind it to
-//! `127.0.0.1` unless it is behind a reverse proxy, since the page is unauthenticated.
+//! connection threads share and serves only GET; its one write is the hashrate history it
+//! samples once a minute for the page's chart, so it adds no way to change the pool. It is
+//! started only when `--stats-listen` names an address; bind it to `127.0.0.1` unless it
+//! is behind a reverse proxy, since the page is unauthenticated.
 
 use crate::server::{Resolver, Server, split_after_fee, unix_now};
 use log::warn;
 use ratum::http;
 use ratum::lock;
 use ratum_prime::ledger::FoundBlock;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use tiny_http::{Method, Request, Server as HttpServer};
 
 static INDEX_HTML: LazyLock<String> =
@@ -46,6 +47,32 @@ const TARGET_BLOCK_SECS: f64 = 600.0;
 /// How many of the newest recorded blocks the snapshot lists.
 const RECENT_BLOCKS: usize = 50;
 
+/// The pool-hashrate history the snapshot serves for the page's chart: one sample per
+/// interval, kept in memory for a day. It begins when the stats interface starts, so a
+/// restart shows as a gap in the chart.
+const HISTORY_INTERVAL_SECS: u64 = 60;
+const HISTORY_CAP: usize = 24 * 60;
+
+/// Append one sample and discard the oldest beyond the cap.
+fn push_sample(history: &mut VecDeque<(u64, f64)>, at: u64, hs: f64) {
+    history.push_back((at, hs));
+    while history.len() > HISTORY_CAP {
+        history.pop_front();
+    }
+}
+
+/// The sample ring, owned by `spawn`: the sampler thread appends and the snapshot reads,
+/// and the rest of the pool has no use for it.
+type HashrateHistory = Arc<Mutex<VecDeque<(u64, f64)>>>;
+
+/// Record the hashrate estimate as of now: the same figure the snapshot computes on
+/// request, from the shares accepted in the last `HASHRATE_SPAN_SECS`.
+fn sample_hashrate(server: &Server, history: &Mutex<VecDeque<(u64, f64)>>) {
+    let now = unix_now();
+    let (work, _) = lock(&server.ledger).work_since(now.saturating_sub(HASHRATE_SPAN_SECS));
+    push_sample(&mut lock(history), now, hashes_per_second(work, HASHRATE_SPAN_SECS));
+}
+
 /// Blocks found per block expected, as a percent, over the recorded block history: for each
 /// pair of consecutive records, the work between them over the difficulty at the later one
 /// is the blocks expected in that span. The span before the first record has no start mark,
@@ -75,15 +102,30 @@ fn luck_percent(blocks: &[FoundBlock]) -> (Option<f64>, u32) {
 pub(crate) fn spawn(server: Arc<Server>, listen: &str) -> Result<SocketAddr, String> {
     let http = HttpServer::http(listen).map_err(|e| e.to_string())?;
     let addr = http.server_addr().to_ip().ok_or("no socket address")?;
+    // The chart's history: one sample now, so the snapshot never serves an empty list,
+    // then one per interval from a thread of its own.
+    let history: HashrateHistory = Arc::new(Mutex::new(VecDeque::new()));
+    sample_hashrate(&server, &history);
+    let (sampler, sampler_history) = (Arc::clone(&server), Arc::clone(&history));
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(HISTORY_INTERVAL_SECS));
+            sample_hashrate(&sampler, &sampler_history);
+        }
+    });
     http::serve("stats", http, move |request| {
-        if let Err(e) = handle(&server, request) {
+        if let Err(e) = handle(&server, &history, request) {
             warn!("stats: could not send a response: {e}");
         }
     });
     Ok(addr)
 }
 
-fn handle(server: &Server, request: Request) -> std::io::Result<()> {
+fn handle(
+    server: &Server,
+    history: &Mutex<VecDeque<(u64, f64)>>,
+    request: Request,
+) -> std::io::Result<()> {
     if *request.method() != Method::Get {
         return request.respond(http::method_not_allowed());
     }
@@ -91,7 +133,9 @@ fn handle(server: &Server, request: Request) -> std::io::Result<()> {
     let (path, _) = http::path_and_query(&request);
     match path.as_str() {
         "/" | "/index.html" => request.respond(http::html(INDEX_HTML.clone())),
-        "/stats.json" => request.respond(http::body(snapshot(server), "application/json")),
+        "/stats.json" => {
+            request.respond(http::body(snapshot(server, history), "application/json"))
+        }
         _ => request.respond(http::not_found()),
     }
 }
@@ -99,9 +143,9 @@ fn handle(server: &Server, request: Request) -> std::io::Result<()> {
 /// The JSON snapshot. Every field is read from the shared state; no secret (the node
 /// credentials, the pool signing key) is included. `work` values are `u128`, which JSON
 /// numbers cannot hold in full, so they are strings.
-fn snapshot(server: &Server) -> String {
-    let tip = *lock(&server.tip);
-    let coinbase_value = *lock(&server.coinbase_value);
+fn snapshot(server: &Server, history: &Mutex<VecDeque<(u64, f64)>>) -> String {
+    let tip = *lock(&server.node_view.tip);
+    let coinbase_value = *lock(&server.node_view.coinbase_value);
     let operator_fee = coinbase_value.map_or(0, |v| server.payout.fee_on(v));
 
     let hashrate_cutoff = unix_now().saturating_sub(HASHRATE_SPAN_SECS);
@@ -144,8 +188,8 @@ fn snapshot(server: &Server) -> String {
     // (at most `TIP_HISTORY_CAP`); `None` until it has seen two. A reorg can lower the
     // later height, which the guard discards rather than divides by.
     let observed_block_secs = {
-        let history = lock(&server.tip_history);
-        match (history.front(), history.back()) {
+        let tips = lock(&server.node_view.tip_history);
+        match (tips.front(), tips.back()) {
             (Some(&(h0, t0)), Some(&(h1, t1))) if h1 > h0 && t1 > t0 => {
                 Some((t1 - t0) as f64 / f64::from(h1 - h0))
             }
@@ -275,6 +319,13 @@ fn snapshot(server: &Server) -> String {
         "hashrate": {
             "span_seconds": HASHRATE_SPAN_SECS,
             "pool_hs": hashes_per_second(recent_work, HASHRATE_SPAN_SECS),
+            // `[unix_seconds, hashes_per_second]` pairs, oldest first, one per
+            // `interval_seconds`. Whole hashes per second: the fraction carries nothing.
+            "interval_seconds": HISTORY_INTERVAL_SECS,
+            "history": lock(history)
+                .iter()
+                .map(|&(t, hs)| serde_json::json!([t, hs as u64]))
+                .collect::<Vec<_>>(),
         },
         "window": {
             "work": total_work.to_string(),
@@ -337,5 +388,15 @@ mod tests {
         assert_eq!(luck_percent(&broken), (None, 0));
         let reset = [block(1, 500, 100.0), block(2, 100, 100.0)];
         assert_eq!(luck_percent(&reset), (None, 0));
+    }
+
+    #[test]
+    fn history_keeps_the_newest_cap_samples() {
+        let mut h = VecDeque::new();
+        for i in 0..(HISTORY_CAP as u64 + 5) {
+            push_sample(&mut h, i, 1.0);
+        }
+        assert_eq!(h.len(), HISTORY_CAP);
+        assert_eq!(h.front().copied(), Some((5, 1.0)), "the oldest five were discarded");
     }
 }

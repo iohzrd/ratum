@@ -71,6 +71,14 @@ fn the_stats_interface_serves_a_json_snapshot_and_a_page() {
     assert_eq!(s["connections"]["open"], 0);
     assert_eq!(s["window"]["shares"], 2, "two seeded shares");
 
+    // The server-side hashrate history: sampled once when the interface starts, so the
+    // snapshot carries at least one [unix_seconds, hashes_per_second] pair, and the seeded
+    // shares are within the sample's span.
+    let history = s["hashrate"]["history"].as_array().expect("a history array");
+    assert!(!history.is_empty(), "one sample at startup");
+    assert!(history[0][0].as_u64().expect("a unix time") > 0);
+    assert!(history[0][1].as_u64().expect("hashes per second") > 0, "the seeded work counts");
+
     // What a gateway needs to connect: the DATUM port (0, since the test listens on :0), the
     // pool's public key (32-byte sign key plus 32-byte box key, hex, so 128 characters), and
     // the operator-set advertise address the page shows in place of the browser's host.
