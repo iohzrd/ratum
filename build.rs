@@ -14,13 +14,40 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-env-changed=RATUM_GIT_COMMIT");
     let commit = match std::env::var("RATUM_GIT_COMMIT") {
-        Ok(given) if !given.trim().is_empty() => given.trim().to_string(),
+        Ok(given) if !given.trim().is_empty() => normalize(given.trim()),
         _ => describe(),
     };
     println!("cargo:rustc-env=RATUM_GIT_COMMIT={commit}");
     for path in rerun_paths() {
         println!("cargo:rerun-if-changed={}", path.display());
     }
+}
+
+/// A given value reduced to the commit hash: `git describe --tags` form
+/// (`v0.1.10-3-ga2487d7`, optionally `-dirty`) keeps only the hash and the dirty marker,
+/// since the tag and commit count repeat what the package version already reports, and a
+/// bare hash longer than 12 hex characters is truncated to 12, matching `describe` below.
+/// Any other value is embedded unchanged.
+fn normalize(given: &str) -> String {
+    let (body, dirty) = match given.strip_suffix("-dirty") {
+        Some(body) => (body, "-dirty"),
+        None => (given, ""),
+    };
+    let mut parts = body.rsplitn(3, '-');
+    let hash = parts
+        .next()
+        .and_then(|g| g.strip_prefix('g'))
+        .filter(|h| h.len() >= 4 && h.bytes().all(|b| b.is_ascii_hexdigit()));
+    let count = parts.next().is_some_and(|c| !c.is_empty() && c.bytes().all(|b| b.is_ascii_digit()));
+    let body = match hash {
+        Some(h) if count && parts.next().is_some() => h,
+        _ => body,
+    };
+    let body = match body.len() > 12 && body.bytes().all(|b| b.is_ascii_hexdigit()) {
+        true => &body[..12],
+        false => body,
+    };
+    format!("{body}{dirty}")
 }
 
 /// The abbreviated commit hash, with `-dirty` appended when a tracked file differs from it.

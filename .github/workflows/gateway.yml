@@ -1,12 +1,14 @@
-# Builds ratum-gateway for x86_64 and aarch64 Linux (static musl) and x86_64 Windows on
-# every push and pull request, runs its tests on x86_64 Linux, uploads each binary as a
-# workflow artifact, and on a `v*` tag attaches the archives and their SHA-256 sums to a
-# GitHub release.
+# Builds ratum-gateway for x86_64 and aarch64 Linux (static musl), x86_64 Windows, and
+# x86_64 and aarch64 macOS on every push and pull request, runs its tests on x86_64 Linux,
+# uploads each binary as a workflow artifact, and on a `v*` tag attaches the archives and
+# their SHA-256 sums to a GitHub release.
 #
-# Static musl so one binary runs beside any node without a matching glibc; the aarch64 build
-# runs natively on the arm runner rather than cross-compiling. TLS is rustls with its
-# default aws-lc-rs provider (minreq selects it), whose C build needs a compiler for the
-# target (musl-tools provides musl-gcc) and, on Windows, CMake and NASM.
+# Static musl so one binary runs beside any node without a matching glibc; the aarch64
+# builds run natively on the arm runners rather than cross-compiling. TLS is rustls with
+# its default aws-lc-rs provider (minreq selects it), whose C build needs a compiler for
+# the target (musl-tools provides musl-gcc) and, on Windows, CMake and NASM; the macOS
+# runners have clang and CMake already. The macOS binaries are not signed or notarized:
+# Gatekeeper quarantines a browser download, which `xattr -d com.apple.quarantine` lifts.
 
 name: gateway
 
@@ -25,21 +27,32 @@ env:
 
 jobs:
   build:
-    name: ${{ matrix.arch }}
+    name: ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
+        # `suffix` names the archive's platform half; Windows packages in its own step.
         include:
           - arch: x86_64
             runner: ubuntu-24.04
             target: x86_64-unknown-linux-musl
+            suffix: linux-musl
           - arch: aarch64
             runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
+            suffix: linux-musl
           - arch: x86_64
             runner: windows-2022
             target: x86_64-pc-windows-msvc
+          - arch: x86_64
+            runner: macos-26-intel
+            target: x86_64-apple-darwin
+            suffix: macos
+          - arch: aarch64
+            runner: macos-26
+            target: aarch64-apple-darwin
+            suffix: macos
     steps:
       - uses: actions/checkout@v4
 
@@ -72,19 +85,21 @@ jobs:
           CC_aarch64_unknown_linux_musl: musl-gcc
         run: cargo build --release -p ratum-gateway --target ${{ matrix.target }}
 
+      # Linux and macOS; `shasum -a 256` because macOS has no sha256sum, and the output
+      # format is the same.
       - name: Package
         id: package
-        if: runner.os == 'Linux'
+        if: runner.os != 'Windows'
         run: |
           bin=target/${{ matrix.target }}/release/ratum-gateway
           strip "$bin"
           file "$bin"
           "$bin" --version
-          name=ratum-gateway-$("$bin" --version | awk '{print $2}')-${{ matrix.arch }}-linux-musl
+          name=ratum-gateway-$("$bin" --version | awk '{print $2}')-${{ matrix.arch }}-${{ matrix.suffix }}
           mkdir "$name"
           cp "$bin" "$name/"
           tar czf "$name.tar.gz" "$name"
-          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
           echo "name=$name" >> "$GITHUB_OUTPUT"
           echo "archive=$name.tar.gz" >> "$GITHUB_OUTPUT"
 
