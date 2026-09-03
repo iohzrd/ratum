@@ -1,9 +1,11 @@
 //! The configuration file: the same JSON schema as the C gateway's `datum_gateway_config.json`,
 //! so a deployment can swap the binary without changing its file. Every key is optional
 //! except the ones the C gateway requires (`bitcoind.rpcurl`, `mining.pool_address`).
-//! Unknown keys are ignored, as the C gateway ignores them.
+//! Unknown keys are ignored, as the C gateway ignores them. The second half is the settings
+//! page's editing of the file (`apply`, `write_file`, `restart`).
 
 use serde::Deserialize;
+use serde_json::{Value, json};
 
 /// Jobs a new tip builds beyond the one the C gateway's slot check counts: the empty job and
 /// the priority job before the coinbaser job.
@@ -364,8 +366,8 @@ impl Config {
                 "api.allow_insecure_auth has no effect: the API uses HTTP Basic authentication",
             );
         }
-        if self.api.modify_conf {
-            self.warn("api.modify_conf is set but the configuration is not editable over HTTP");
+        if self.api.modify_conf && self.api.admin_password.is_empty() {
+            self.warn("api.modify_conf is set but api.admin_password is empty, so the settings page cannot save");
         }
         if self.logger.log_rotate_daily.is_some() {
             self.warn("logger.log_rotate_daily has no effect: the file is held open, so rotate it with logrotate's copytruncate");
@@ -493,6 +495,479 @@ impl Config {
     }
 }
 
+// The settings page (`/config`, `api.modify_conf`). Each form field names one key of the
+// file. `apply` puts the submitted values into the file's JSON document, parses the result
+// with the startup validation, and returns the text to write; the caller rewrites the file
+// and calls `restart`, since every thread holds the configuration it started with. The
+// field names and the `pool_host(old)` convention are the C gateway's, so a file either
+// gateway edited reads the same in both.
+
+/// One form field that sets one key.
+struct Field {
+    /// The form field's name, `section_key`.
+    name: &'static str,
+    /// What an error names.
+    label: &'static str,
+    section: &'static str,
+    key: &'static str,
+    kind: Kind,
+    /// The value the running gateway uses, which the page shows and an unchanged submission
+    /// is compared with.
+    current: fn(&Config) -> Value,
+}
+
+enum Kind {
+    Text,
+    /// A whole number in the inclusive range.
+    Int(i64, i64),
+    /// `1` or `0`.
+    Bool,
+    /// Never shown; an empty submission keeps the file's value.
+    Password,
+}
+
+const FIELDS: &[Field] = &[
+    Field {
+        name: "mining_pool_address",
+        label: "Bitcoin address",
+        section: "mining",
+        key: "pool_address",
+        kind: Kind::Text,
+        current: |c| json!(c.mining.pool_address),
+    },
+    Field {
+        name: "mining_coinbase_tag_secondary",
+        label: "Coinbase tag",
+        section: "mining",
+        key: "coinbase_tag_secondary",
+        kind: Kind::Text,
+        current: |c| json!(c.mining.coinbase_tag_secondary),
+    },
+    Field {
+        name: "mining_coinbase_unique_id",
+        label: "Unique gateway ID",
+        section: "mining",
+        key: "coinbase_unique_id",
+        kind: Kind::Int(0, 65535),
+        current: |c| json!(c.mining.coinbase_unique_id),
+    },
+    Field {
+        name: "datum_pool_port",
+        label: "Pool port",
+        section: "datum",
+        key: "pool_port",
+        kind: Kind::Int(1, 65535),
+        current: |c| json!(c.datum.pool_port),
+    },
+    Field {
+        name: "datum_pool_pubkey",
+        label: "Pool public key",
+        section: "datum",
+        key: "pool_pubkey",
+        kind: Kind::Text,
+        current: |c| json!(c.datum.pool_pubkey),
+    },
+    Field {
+        name: "datum_pool_url",
+        label: "Pool web page",
+        section: "datum",
+        key: "pool_url",
+        kind: Kind::Text,
+        current: |c| json!(c.datum.pool_url),
+    },
+    Field {
+        name: "datum_gateway_fee_bps",
+        label: "Gateway fee",
+        section: "datum",
+        key: "gateway_fee_bps",
+        kind: Kind::Int(0, 10000),
+        current: |c| json!(c.datum.gateway_fee_bps),
+    },
+    Field {
+        name: "datum_gateway_fee_address",
+        label: "Gateway fee address",
+        section: "datum",
+        key: "gateway_fee_address",
+        kind: Kind::Text,
+        current: |c| json!(c.datum.gateway_fee_address),
+    },
+    Field {
+        name: "stratum_listen_port",
+        label: "Stratum port",
+        section: "stratum",
+        key: "listen_port",
+        kind: Kind::Int(1, 65535),
+        current: |c| json!(c.stratum.listen_port),
+    },
+    Field {
+        name: "stratum_vardiff_min",
+        label: "Minimum difficulty",
+        section: "stratum",
+        key: "vardiff_min",
+        kind: Kind::Int(1, i64::MAX),
+        current: |c| json!(c.stratum.vardiff_min),
+    },
+    Field {
+        name: "stratum_fingerprint_miners",
+        label: "Fingerprint miners",
+        section: "stratum",
+        key: "fingerprint_miners",
+        kind: Kind::Bool,
+        current: |c| json!(c.stratum.fingerprint_miners),
+    },
+    Field {
+        name: "stratum_require_address_username",
+        label: "Require an address as the username",
+        section: "stratum",
+        key: "require_address_username",
+        kind: Kind::Bool,
+        current: |c| json!(c.stratum.require_address_username),
+    },
+    Field {
+        name: "bitcoind_work_update_seconds",
+        label: "Job update interval",
+        section: "bitcoind",
+        key: "work_update_seconds",
+        kind: Kind::Int(5, 120),
+        current: |c| json!(c.bitcoind.work_update_seconds),
+    },
+    Field {
+        name: "bitcoind_rpcurl",
+        label: "bitcoind RPC URL",
+        section: "bitcoind",
+        key: "rpcurl",
+        kind: Kind::Text,
+        current: |c| json!(c.bitcoind.rpcurl),
+    },
+    Field {
+        name: "bitcoind_rpcuser",
+        label: "bitcoind RPC user",
+        section: "bitcoind",
+        key: "rpcuser",
+        kind: Kind::Text,
+        current: |c| json!(c.bitcoind.rpcuser),
+    },
+    Field {
+        name: "bitcoind_rpcpassword",
+        label: "bitcoind RPC password",
+        section: "bitcoind",
+        key: "rpcpassword",
+        kind: Kind::Password,
+        current: |_| Value::Null,
+    },
+];
+
+/// The `datum.pool_host` the page shows: the running one, else the file's `pool_host(old)`
+/// (what the C gateway keeps when reward sharing is set to never), else the default.
+fn shown_pool_host(cfg: &Config, doc: &Value) -> String {
+    if !cfg.datum.pool_host.is_empty() {
+        return cfg.datum.pool_host.clone();
+    }
+    old_pool_host(doc).unwrap_or_else(|| Datum::default().pool_host)
+}
+
+fn old_pool_host(doc: &Value) -> Option<String> {
+    doc.get("datum")?.get("pool_host(old)")?.as_str().map(str::to_string)
+}
+
+/// The largest `mining.coinbase_tag_secondary` beside the running primary tag: what
+/// `validate_mining` accepts.
+fn secondary_tag_max(cfg: &Config) -> usize {
+    (88usize.saturating_sub(cfg.mining.coinbase_tag_primary.len())).min(60)
+}
+
+fn username_behaviour(cfg: &Config) -> &'static str {
+    if cfg.datum.pool_pass_full_users {
+        "full_users"
+    } else if cfg.datum.pool_pass_workers {
+        "workers"
+    } else {
+        "private"
+    }
+}
+
+fn reward_sharing(cfg: &Config) -> &'static str {
+    if cfg.datum.pool_host.is_empty() {
+        "never"
+    } else if cfg.datum.pooled_mining_only {
+        "require"
+    } else {
+        "prefer"
+    }
+}
+
+/// What the page's form shows, keyed by field name. `doc` is the file's document, or null
+/// when it could not be read.
+pub fn form_values(cfg: &Config, doc: &Value) -> Value {
+    let mut v = serde_json::Map::new();
+    for f in FIELDS {
+        if !matches!(f.kind, Kind::Password) {
+            v.insert(f.name.into(), (f.current)(cfg));
+        }
+    }
+    v.insert("username_behaviour".into(), json!(username_behaviour(cfg)));
+    v.insert("reward_sharing".into(), json!(reward_sharing(cfg)));
+    v.insert("datum_pool_host".into(), json!(shown_pool_host(cfg, doc)));
+    v.insert("mining_coinbase_tag_secondary_max".into(), json!(secondary_tag_max(cfg)));
+    Value::Object(v)
+}
+
+/// The document's `section` object, created when absent.
+fn section<'a>(
+    doc: &'a mut Value,
+    name: &str,
+) -> Result<&'a mut serde_json::Map<String, Value>, String> {
+    let root = doc.as_object_mut().ok_or("the configuration file is not a JSON object")?;
+    let entry = root.entry(name).or_insert_with(|| Value::Object(Default::default()));
+    entry.as_object_mut().ok_or_else(|| format!("the file's \"{name}\" is not a JSON object"))
+}
+
+/// The edits one submission makes to the document.
+struct Edit<'a> {
+    doc: &'a mut Value,
+    changed: bool,
+    errors: Vec<String>,
+}
+
+impl Edit<'_> {
+    fn set(&mut self, section_name: &str, key: &str, value: Value) {
+        match section(self.doc, section_name) {
+            Ok(s) => {
+                s.insert(key.into(), value);
+                self.changed = true;
+            }
+            Err(e) => self.errors.push(e),
+        }
+    }
+
+    /// `set` unless the running value is already `value`.
+    fn set_if_changed(&mut self, section_name: &str, key: &str, value: Value, current: Value) {
+        if value != current {
+            self.set(section_name, key, value);
+        }
+    }
+
+    fn remove(&mut self, section_name: &str, key: &str) {
+        if let Some(s) = self.doc.get_mut(section_name).and_then(Value::as_object_mut)
+            && s.remove(key).is_some()
+        {
+            self.changed = true;
+        }
+    }
+}
+
+fn parse_int(label: &str, text: &str, min: i64, max: i64) -> Result<i64, String> {
+    let v = text.trim().parse::<i64>().map_err(|_| format!("{label} must be a whole number"))?;
+    if v < min || v > max {
+        return Err(format!("{label} must be between {min} and {max}"));
+    }
+    Ok(v)
+}
+
+fn parse_bool(label: &str, text: &str) -> Result<bool, String> {
+    match text.trim() {
+        "1" | "true" | "on" => Ok(true),
+        "0" | "false" | "off" | "" => Ok(false),
+        _ => Err(format!("{label} must be 1 or 0")),
+    }
+}
+
+/// The document's text as the file is written: four-space indentation, as the C gateway
+/// writes it.
+fn render(doc: &Value) -> String {
+    let mut out = Vec::new();
+    let fmt = serde_json::ser::PrettyFormatter::with_indent(b"    ");
+    let mut ser = serde_json::Serializer::with_formatter(&mut out, fmt);
+    serde::Serialize::serialize(doc, &mut ser).expect("a Value serializes");
+    out.push(b'\n');
+    String::from_utf8(out).expect("JSON is UTF-8")
+}
+
+/// The file's text with `form`'s edits, validated: `Ok(None)` when no value differs from
+/// the running configuration, `Ok(Some(text))` to write, or the errors, in which case
+/// nothing is to be written.
+pub fn apply(
+    cfg: &Config,
+    file_text: &str,
+    form: &[(String, String)],
+) -> Result<Option<String>, Vec<String>> {
+    let mut doc: Value = serde_json::from_str(file_text)
+        .map_err(|e| vec![format!("the configuration file is not valid JSON: {e}")])?;
+    let mut edit = Edit { doc: &mut doc, changed: false, errors: Vec::new() };
+    let field = |name: &str| form.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str());
+
+    // The reward-sharing choice first: it decides whether the pool host field sets
+    // `pool_host` or the parked `pool_host(old)`.
+    let mut pool_host = cfg.datum.pool_host.clone();
+    let default_host = Datum::default().pool_host;
+    match field("reward_sharing") {
+        None => {}
+        Some(choice @ ("require" | "prefer")) => {
+            let only = choice == "require";
+            edit.set_if_changed(
+                "datum",
+                "pooled_mining_only",
+                json!(only),
+                json!(cfg.datum.pooled_mining_only),
+            );
+            if pool_host.is_empty() {
+                match old_pool_host(edit.doc) {
+                    Some(old) => {
+                        edit.remove("datum", "pool_host(old)");
+                        edit.set("datum", "pool_host", json!(old));
+                        pool_host = old;
+                    }
+                    None => {
+                        // Absent, the default applies; the file does not name it, as the C
+                        // gateway leaves it out.
+                        edit.remove("datum", "pool_host");
+                        edit.changed = true;
+                        pool_host = default_host.clone();
+                    }
+                }
+            }
+        }
+        Some("never") => {
+            edit.set_if_changed(
+                "datum",
+                "pooled_mining_only",
+                json!(false),
+                json!(cfg.datum.pooled_mining_only),
+            );
+            if !pool_host.is_empty() {
+                if let Some(named) = edit.doc.get("datum").and_then(|d| d.get("pool_host")).cloned()
+                {
+                    edit.set("datum", "pool_host(old)", named);
+                }
+                edit.set("datum", "pool_host", json!(""));
+                pool_host.clear();
+            }
+        }
+        Some(_) => edit.errors.push("Reward sharing must be require, prefer or never".into()),
+    }
+
+    if let Some(host) = field("datum_pool_host") {
+        let host = host.trim();
+        if !pool_host.is_empty() {
+            edit.set_if_changed("datum", "pool_host", json!(host), json!(pool_host));
+        } else if host != default_host || old_pool_host(edit.doc).is_some() {
+            // Not pooled now: the host is parked for when reward sharing is turned on. The
+            // default is not written unless something else was parked already.
+            let old = old_pool_host(edit.doc).map_or(Value::Null, |o| json!(o));
+            edit.set_if_changed("datum", "pool_host(old)", json!(host), old);
+        }
+    }
+
+    match field("username_behaviour") {
+        None => {}
+        Some("full_users") => edit.set_if_changed(
+            "datum",
+            "pool_pass_full_users",
+            json!(true),
+            json!(cfg.datum.pool_pass_full_users),
+        ),
+        Some(choice @ ("workers" | "private")) => {
+            let workers = choice == "workers";
+            edit.set_if_changed(
+                "datum",
+                "pool_pass_full_users",
+                json!(false),
+                json!(cfg.datum.pool_pass_full_users),
+            );
+            edit.set_if_changed(
+                "datum",
+                "pool_pass_workers",
+                json!(workers),
+                json!(cfg.datum.pool_pass_workers),
+            );
+        }
+        Some(_) => {
+            edit.errors.push("Miner usernames must be full_users, workers or private".into())
+        }
+    }
+
+    for f in FIELDS {
+        let Some(text) = field(f.name) else { continue };
+        let current = (f.current)(cfg);
+        match f.kind {
+            Kind::Text => edit.set_if_changed(f.section, f.key, json!(text.trim()), current),
+            Kind::Int(min, max) => match parse_int(f.label, text, min, max) {
+                Ok(v) => edit.set_if_changed(f.section, f.key, json!(v), current),
+                Err(e) => edit.errors.push(e),
+            },
+            Kind::Bool => match parse_bool(f.label, text) {
+                Ok(v) => edit.set_if_changed(f.section, f.key, json!(v), current),
+                Err(e) => edit.errors.push(e),
+            },
+            Kind::Password => {
+                if !text.is_empty() {
+                    edit.set(f.section, f.key, json!(text));
+                }
+            }
+        }
+    }
+
+    // A longer job interval raises the pool timeout with it, as the C gateway does, instead
+    // of refusing the interval for the timeout the file does not name.
+    if let Some(seconds) =
+        field("bitcoind_work_update_seconds").and_then(|t| t.trim().parse::<u64>().ok())
+        && cfg.datum.protocol_global_timeout < seconds + 5
+    {
+        edit.set("datum", "protocol_global_timeout", json!(seconds + 5));
+    }
+
+    let Edit { changed, errors, .. } = edit;
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    if !changed {
+        return Ok(None);
+    }
+    let text = render(&doc);
+    Config::parse(&text).map_err(|e| vec![e])?;
+    Ok(Some(text))
+}
+
+/// Write `text` to `path` through `path.new` and a rename, so a failure leaves the file
+/// as it was.
+pub fn write_file(path: &str, text: &str) -> std::io::Result<()> {
+    let tmp = format!("{path}.new");
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, path)
+}
+
+/// Replace the process with a new one on the same command line. The listeners close with
+/// the process (every socket and file is close-on-exec), so the new one binds them.
+pub fn restart() -> ! {
+    log::info!("Restarting to apply the new configuration");
+    log::logger().flush();
+    // The response to the request that asked for this is on its way out.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let exe = std::env::current_exe()
+        .unwrap_or_else(|_| std::env::args_os().next().map(Into::into).unwrap_or_default());
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(std::env::args_os().skip(1));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        let e = cmd.exec();
+        log::error!("Could not restart: {e}");
+        log::logger().flush();
+        std::process::exit(1);
+    }
+    #[cfg(not(unix))]
+    {
+        match cmd.spawn() {
+            Ok(_) => std::process::exit(0),
+            Err(e) => {
+                log::error!("Could not restart: {e}");
+                log::logger().flush();
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -573,5 +1048,128 @@ mod tests {
         let text = minimal().replace("\"rpcurl\"", "\"work_update_seconds\": 1, \"rpcurl\"");
         let c = Config::parse(&text).unwrap();
         assert_eq!(c.bitcoind.work_update_seconds, 5);
+    }
+
+    const FILE: &str = r#"{
+    "bitcoind": {"rpcuser": "u", "rpcpassword": "p", "rpcurl": "http://127.0.0.1:18443"},
+    "mining": {"pool_address": "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"},
+    "datum": {"pool_host": "", "pooled_mining_only": false}
+}"#;
+
+    fn form(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    fn cfg() -> Config {
+        Config::parse(FILE).unwrap()
+    }
+
+    #[test]
+    fn unchanged_values_write_nothing() {
+        let c = cfg();
+        let f = form(&[
+            ("mining_pool_address", "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"),
+            ("mining_coinbase_unique_id", "4242"),
+            ("bitcoind_rpcpassword", ""),
+            ("reward_sharing", "never"),
+            ("username_behaviour", "full_users"),
+            ("stratum_fingerprint_miners", "1"),
+        ]);
+        assert_eq!(apply(&c, FILE, &f).unwrap(), None);
+    }
+
+    #[test]
+    fn edits_are_written_with_the_file_order_kept() {
+        let c = cfg();
+        let f = form(&[("mining_coinbase_unique_id", "7"), ("stratum_vardiff_min", "1024")]);
+        let text = apply(&c, FILE, &f).unwrap().unwrap();
+        let doc: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(doc["mining"]["coinbase_unique_id"], 7);
+        assert_eq!(doc["stratum"]["vardiff_min"], 1024);
+        let keys: Vec<&str> = doc.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, ["bitcoind", "mining", "datum", "stratum"]);
+        assert!(text.starts_with("{\n    \"bitcoind\""), "{text}");
+    }
+
+    #[test]
+    fn the_startup_validation_refuses_a_bad_edit() {
+        let c = cfg();
+        let e = apply(&c, FILE, &form(&[("mining_pool_address", "nonsense")])).unwrap_err();
+        assert!(e[0].contains("mining.pool_address"), "{e:?}");
+        let e = apply(&c, FILE, &form(&[("mining_coinbase_unique_id", "70000")])).unwrap_err();
+        assert_eq!(e, ["Unique gateway ID must be between 0 and 65535"]);
+        let e = apply(&c, FILE, &form(&[("datum_pool_port", "x")])).unwrap_err();
+        assert_eq!(e, ["Pool port must be a whole number"]);
+    }
+
+    #[test]
+    fn reward_sharing_parks_and_restores_the_pool_host() {
+        let c = cfg();
+        // Never mode: a typed host is parked, not applied.
+        let text = apply(&c, FILE, &form(&[("datum_pool_host", "pool.example")])).unwrap().unwrap();
+        let doc: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(doc["datum"]["pool_host"], "");
+        assert_eq!(doc["datum"]["pool_host(old)"], "pool.example");
+        assert_eq!(form_values(&c, &doc)["datum_pool_host"], "pool.example");
+        // The default host is not parked.
+        let default = Datum::default().pool_host;
+        assert_eq!(apply(&c, FILE, &form(&[("datum_pool_host", default.as_str())])).unwrap(), None);
+
+        // Turning sharing on restores the parked host; the port and key come with the form.
+        let key = "f21f2f0ef0aa1970468f22bad9bb7f4535146f8e4a8f646bebc93da3d89b1406f40d032f09a417d94dc068055df654937922d2c89522e3e8f6f0e649de473003";
+        let f = form(&[
+            ("reward_sharing", "require"),
+            ("datum_pool_host", "pool.example"),
+            ("datum_pool_pubkey", key),
+        ]);
+        let text = apply(&c, &text, &f).unwrap().unwrap();
+        let doc: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(doc["datum"]["pool_host"], "pool.example");
+        assert_eq!(doc["datum"]["pooled_mining_only"], true);
+        assert!(doc["datum"].get("pool_host(old)").is_none());
+
+        // And off again parks it.
+        let pooled = Config::parse(&text).unwrap();
+        let text = apply(&pooled, &text, &form(&[("reward_sharing", "never")])).unwrap().unwrap();
+        let doc: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(doc["datum"]["pool_host"], "");
+        assert_eq!(doc["datum"]["pool_host(old)"], "pool.example");
+        assert_eq!(doc["datum"]["pooled_mining_only"], false);
+    }
+
+    #[test]
+    fn username_behaviour_sets_both_flags() {
+        let c = cfg();
+        let text = apply(&c, FILE, &form(&[("username_behaviour", "workers")])).unwrap().unwrap();
+        let doc: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(doc["datum"]["pool_pass_full_users"], false);
+        assert!(doc["datum"].get("pool_pass_workers").is_none(), "the default is kept");
+        let text = apply(&c, FILE, &form(&[("username_behaviour", "private")])).unwrap().unwrap();
+        let doc: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(doc["datum"]["pool_pass_full_users"], false);
+        assert_eq!(doc["datum"]["pool_pass_workers"], false);
+    }
+
+    #[test]
+    fn a_longer_job_interval_raises_the_pool_timeout() {
+        let c = cfg();
+        let text =
+            apply(&c, FILE, &form(&[("bitcoind_work_update_seconds", "100")])).unwrap().unwrap();
+        let doc: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(doc["bitcoind"]["work_update_seconds"], 100);
+        assert_eq!(doc["datum"]["protocol_global_timeout"], 105);
+    }
+
+    #[test]
+    fn the_password_is_never_shown_and_kept_when_blank() {
+        let c = cfg();
+        let shown = form_values(&c, &Value::Null);
+        assert!(shown.get("bitcoind_rpcpassword").is_none());
+        assert_eq!(shown["bitcoind_rpcuser"], "u");
+        assert_eq!(shown["reward_sharing"], "never");
+        let f = form(&[("bitcoind_rpcpassword", "new"), ("bitcoind_rpcuser", "u")]);
+        let text = apply(&c, FILE, &f).unwrap().unwrap();
+        let doc: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(doc["bitcoind"]["rpcpassword"], "new");
     }
 }

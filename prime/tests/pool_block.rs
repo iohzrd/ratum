@@ -59,7 +59,7 @@ fn work_with_transactions() -> (Work, Vec<Vec<u8>>) {
     paired[32..].copy_from_slice(&b);
 
     let mut w = Work::build(
-        &Tagging { tag: "RATUM", prime_id: 1 },
+        &Tagging { tag: "RATUM", tag_secondary: "", prime_id: 1 },
         &pool_payout_script(),
         &[],
         work::COINBASE_VALUE,

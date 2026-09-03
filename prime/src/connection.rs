@@ -551,6 +551,7 @@ impl Connection<'_> {
             paid_to_split: a.work.paid_to_split,
             paid_to_pool: a.work.paid_to_pool,
             finder: ledger::identity_of(&s.username).to_string(),
+            tag: a.work.tag_secondary.clone(),
             difficulty,
             cumulative_work: l.cumulative_work(),
         };

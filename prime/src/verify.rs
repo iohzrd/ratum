@@ -123,6 +123,10 @@ pub struct Rebuilt {
     pub txn_count: u32,
     pub paid_to_split: u64,
     pub paid_to_pool: u64,
+    /// The secondary coinbase tag the gateway wrote after the pool's tag (the gateway's
+    /// `mining.coinbase_tag_secondary`), decoded for display; empty when the coinbase
+    /// carries none.
+    pub tag_secondary: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -539,7 +543,7 @@ fn build_work(
         return Err(RejectReason::BadCoinbase);
     }
 
-    let pot_index = locate_pot_byte(&parsed, policy, job.height)?;
+    let (pot_index, tag_secondary) = locate_pot_byte(&parsed, policy, job.height)?;
     if usize::from(s.target_byte_index_of(job)) != pot_index {
         return Err(RejectReason::TargetMismatch);
     }
@@ -563,6 +567,7 @@ fn build_work(
         txn_count: job.txn_count,
         paid_to_split,
         paid_to_pool,
+        tag_secondary,
     })
 }
 
@@ -621,11 +626,13 @@ fn build_header_v2(
     Ok(h)
 }
 
+/// Locate the PoT byte and read the secondary coinbase tag out of the tag push, decoded
+/// by `decode_tag`; the tag is empty when the push carries only the pool's tag.
 fn locate_pot_byte(
     tx: &CoinbaseTx,
     policy: &PoolPolicy,
     height: u32,
-) -> Result<usize, RejectReason> {
+) -> Result<(usize, String), RejectReason> {
     let pushes = bitcoin::script_pushes(&tx.script_sig);
     let prime = policy.prime_id.to_le_bytes();
     let uid_push = pushes
@@ -633,6 +640,7 @@ fn locate_pot_byte(
         .position(|(_, data)| data.len() == 7 && data[3..7] == prime)
         .ok_or(RejectReason::MissingPoolTag)?;
 
+    let mut tag_secondary = String::new();
     if !policy.coinbase_tag.is_empty() {
         let tag = policy.coinbase_tag.as_bytes();
         let ok = uid_push > 0 && {
@@ -646,9 +654,28 @@ fn locate_pot_byte(
         if !ok {
             return Err(RejectReason::MissingPoolTag);
         }
+        let (_, data) = pushes[uid_push - 1];
+        if data[tag.len()] == 0x0f {
+            tag_secondary = decode_tag(&data[tag.len() + 1..]);
+        }
+    } else if uid_push > 0 {
+        // With no pool tag to anchor on, a push starting with the 0x0F marker is a
+        // secondary tag with an empty primary (`coinbase::script_sig` in the gateway).
+        let (_, data) = pushes[uid_push - 1];
+        if data.first() == Some(&0x0f) {
+            tag_secondary = decode_tag(&data[1..]);
+        }
     }
 
-    Ok(tx.script_sig_offset + pushes[uid_push].0)
+    Ok((tx.script_sig_offset + pushes[uid_push].0, tag_secondary))
+}
+
+/// Decode the bytes between the 0x0F marker and the end of the tag push for display: the
+/// gateway terminates the tag with 0x00, so one trailing 0x00 is removed; the bytes are
+/// client-chosen, so invalid UTF-8 is replaced and control characters are dropped.
+fn decode_tag(bytes: &[u8]) -> String {
+    let bytes = bytes.strip_suffix(&[0x00]).unwrap_or(bytes);
+    String::from_utf8_lossy(bytes).chars().filter(|c| !c.is_control()).collect()
 }
 
 fn check_outputs(
@@ -781,7 +808,7 @@ mod tests {
     use ratum::fixtures::{self, Tagging, p2wpkh};
 
     fn coinbase_sections(p: &PoolPolicy, outputs: &[CoinbaseOutput]) -> (CoinbaseSection, usize) {
-        let tagging = Tagging { tag: &p.coinbase_tag, prime_id: p.prime_id };
+        let tagging = Tagging { tag: &p.coinbase_tag, tag_secondary: "", prime_id: p.prime_id };
         fixtures::coinbase(&tagging, &p.payout_script, outputs, COINBASE_VALUE)
     }
 
@@ -1436,6 +1463,49 @@ mod tests {
         share.coinbase = Some(cb);
         share.job = Some(job_section(pot_index));
         assert_eq!(v.rebuild(&share, NOW), Err(RejectReason::MissingPoolTag));
+    }
+
+    /// Locate the PoT byte in a coinbase built with `tagging` under `p`, and read the
+    /// secondary tag; changing the coinbase changes the hash, so the extraction is tested
+    /// against `locate_pot_byte` rather than a full rebuild.
+    fn located(p: &PoolPolicy, tagging: &Tagging) -> (usize, String) {
+        let (cb, pot_index) = fixtures::coinbase(tagging, &p.payout_script, &[], COINBASE_VALUE);
+        let coinbase_tx = cb.assemble(&[0u8; share::EXTRANONCE_SIZE]);
+        let parsed = bitcoin::parse_coinbase(&coinbase_tx).expect("a parseable coinbase");
+        let (index, tag) = locate_pot_byte(&parsed, p, 840_000).expect("the pool tag is present");
+        assert_eq!(index, pot_index, "the PoT byte is where the fixture placed it");
+        (index, tag)
+    }
+
+    #[test]
+    fn reads_the_secondary_coinbase_tag_out_of_the_tag_push() {
+        let p = policy();
+        let tagging = Tagging { tag: &p.coinbase_tag, tag_secondary: "bob", prime_id: p.prime_id };
+        assert_eq!(located(&p, &tagging).1, "bob");
+    }
+
+    #[test]
+    fn reads_the_secondary_tag_when_the_pool_declares_no_tag() {
+        let mut p = policy();
+        p.coinbase_tag = String::new();
+        let tagging = Tagging { tag: "", tag_secondary: "bob", prime_id: p.prime_id };
+        assert_eq!(located(&p, &tagging).1, "bob");
+        let untagged = Tagging { tag: "", tag_secondary: "", prime_id: p.prime_id };
+        assert_eq!(located(&p, &untagged).1, "");
+    }
+
+    #[test]
+    fn a_coinbase_with_only_the_pool_tag_records_an_empty_secondary_tag() {
+        let (mut v, s) = setup();
+        assert_eq!(v.rebuild(&s, NOW).unwrap().tag_secondary, "");
+    }
+
+    #[test]
+    fn decode_tag_removes_the_terminator_and_control_characters() {
+        assert_eq!(decode_tag(b"bob\x00"), "bob");
+        assert_eq!(decode_tag(b"bob"), "bob", "a push without the terminator");
+        assert_eq!(decode_tag(b"a\x01b\x00"), "ab");
+        assert_eq!(decode_tag(&[0xff, 0x41]), "\u{fffd}A", "invalid UTF-8 is replaced");
     }
 
     #[test]

@@ -59,6 +59,7 @@ fn seed(dir: &TempDir) {
             paid_to_split,
             paid_to_pool,
             finder: MINER_A.to_string(),
+            tag: "DATUM User".to_string(),
             difficulty: 1_000_000.0,
             cumulative_work,
         }

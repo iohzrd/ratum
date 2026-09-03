@@ -56,6 +56,18 @@ pub fn param(query: &str, key: &str) -> Option<String> {
     })
 }
 
+/// Every pair of a `k=v&k=v` query or form body, decoded as `param` decodes, in order.
+pub fn pairs(query: &str) -> Vec<(String, String)> {
+    query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| {
+            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            (url_decode(k), url_decode(v))
+        })
+        .collect()
+}
+
 pub fn url_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -122,6 +134,10 @@ mod tests {
         assert_eq!(param("a=1&flag", "flag").as_deref(), Some(""));
         assert_eq!(param("a=1", "c"), None);
         assert_eq!(url_decode("%zz%4"), "%zz%4");
+        assert_eq!(
+            pairs("a=1&&b=x+y"),
+            [("a".to_string(), "1".to_string()), ("b".to_string(), "x y".to_string())]
+        );
     }
 
     #[test]

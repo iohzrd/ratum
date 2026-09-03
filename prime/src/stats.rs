@@ -180,6 +180,7 @@ fn snapshot(server: &Server, history: &Mutex<VecDeque<(u64, f64)>>) -> String {
                 "paid_to_split": b.paid_to_split,
                 "paid_to_pool": b.paid_to_pool,
                 "finder": b.finder,
+                "tag": b.tag,
             })
         })
         .collect();
@@ -364,6 +365,7 @@ mod tests {
             paid_to_split: 0,
             paid_to_pool: 0,
             finder: "a".into(),
+            tag: String::new(),
             difficulty,
             cumulative_work,
         }

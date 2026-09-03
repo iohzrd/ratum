@@ -1,14 +1,17 @@
 //! The HTTP interfaces: the admin port (`api.listen_port`) serves `status.html` at `/`,
 //! which renders `/stats.json` in the browser as the pool's stats page does, plus `/login`,
-//! `/cmd` and `/NOTIFY`; the password-less miner lookup is on `api.miner_listen_port`.
-//! `/login`, `/cmd` and the client rows of `/stats.json` require `api.admin_password` over
-//! HTTP Basic authentication when one is set; the status itself is public, as the C
-//! gateway's is. Configuration editing (`api.modify_conf`) is not served.
+//! `/cmd`, `/NOTIFY` and the settings page `/config` (`config.html`, filled from
+//! `/config.json`; a POST to `/config` saves through `config::apply`); the password-less
+//! miner lookup is on `api.miner_listen_port`. `/login`, `/cmd` and the client rows of
+//! `/stats.json` require `api.admin_password` over HTTP Basic authentication when one is
+//! set; the status itself is public, as the C gateway's is. The settings page requires a
+//! password to be set at all, and saving requires `api.modify_conf` too.
 
 use crate::stratum::{ClientStats, Server};
 use log::{info, warn};
 use ratum::http::{self, Reply};
 use serde_json::{Value, json};
+use std::collections::VecDeque;
 use std::sync::{Arc, LazyLock, Mutex};
 use tiny_http::{Header, Method, Request, Response};
 
@@ -16,6 +19,8 @@ static INDEX_HTML: LazyLock<String> =
     LazyLock::new(|| ratum::web::assemble(include_str!("status.html")));
 static MINER_HTML: LazyLock<String> =
     LazyLock::new(|| ratum::web::assemble(include_str!("miner.html")));
+static CONFIG_HTML: LazyLock<String> =
+    LazyLock::new(|| ratum::web::assemble(include_str!("config.html")));
 
 pub struct Context {
     pub server: Arc<Server>,
@@ -25,6 +30,29 @@ pub struct Context {
     /// browser replays the admin credentials on from another site does not act (the C
     /// gateway's `api_csrf_token`).
     pub csrf: String,
+    /// The configuration file the settings page edits (`-c`).
+    pub config_path: String,
+    /// The gateway-hashrate history the status page charts: one `(unix, hashes per
+    /// second)` sample per `HISTORY_INTERVAL_SECS`, a day kept, from a thread `start`
+    /// spawns. It begins with the process, so a restart shows as a gap.
+    pub history: Mutex<VecDeque<(u64, f64)>>,
+}
+
+const HISTORY_INTERVAL_SECS: u64 = 60;
+const HISTORY_CAP: usize = 24 * 60;
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// Record the hashrate the summary reports now.
+fn sample_hashrate(ctx: &Context) {
+    let hs = ctx.server.summary().hashrate_ths * 1e12;
+    let mut history = ratum::lock(&ctx.history);
+    history.push_back((unix_now(), hs));
+    while history.len() > HISTORY_CAP {
+        history.pop_front();
+    }
 }
 
 /// A random token for `Context::csrf`.
@@ -214,6 +242,16 @@ fn status_json(ctx: &Context, with_clients: bool) -> Value {
         "version": ratum::VERSION,
         "status": status,
         "uptime": duration_text(ctx.started.elapsed()),
+        "uptime_seconds": ctx.started.elapsed().as_secs(),
+        "work_update_seconds": cfg.bitcoind.work_update_seconds,
+        "stale_window_seconds": cfg.stale_window().as_secs(),
+        "hashrate": {
+            "interval_seconds": HISTORY_INTERVAL_SECS,
+            "history": ratum::lock(&ctx.history)
+                .iter()
+                .map(|(at, hs)| json!([at, hs.round()]))
+                .collect::<Vec<_>>(),
+        },
         "shares_accepted": datum_stats.accepted.json(),
         "shares_rejected": datum_stats.rejected.json(),
         "pool_host": pool_host_json(cfg),
@@ -307,9 +345,78 @@ fn miner_lookup_json(ctx: &Context, addr: Option<&str>) -> Value {
     })
 }
 
+/// The POST body, at most a megabyte.
+fn read_body(req: &mut Request) -> String {
+    let mut body = String::new();
+    let _ = req.as_reader().take(1 << 20).read_to_string(&mut body);
+    body
+}
+
+/// A JSON reply with a status code.
+fn json_status(code: u16, v: Value) -> Reply {
+    http::json(v).with_status_code(code)
+}
+
+/// The settings page and its data: refused without a password to require, as the C
+/// gateway's `/config` is, since the page shows the node credentials' user and URL.
+fn settings_access(ctx: &Context, req: &Request) -> Result<(), Reply> {
+    if ctx.server.config.api.admin_password.is_empty() {
+        Err(forbidden("The settings page requires api.admin_password to be set."))
+    } else if !authorized(ctx, req) {
+        Err(unauthorized())
+    } else {
+        Ok(())
+    }
+}
+
+/// `/config.json`: the form's values, whether saving is allowed, and the form token.
+fn settings_json(ctx: &Context) -> Value {
+    let cfg = &ctx.server.config;
+    let doc = std::fs::read_to_string(&ctx.config_path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or(Value::Null);
+    let mut v = crate::config::form_values(cfg, &doc);
+    let o = v.as_object_mut().expect("an object");
+    o.insert("editable".into(), json!(cfg.api.modify_conf));
+    o.insert("config_path".into(), json!(ctx.config_path));
+    o.insert("csrf".into(), json!(ctx.csrf));
+    v
+}
+
+/// A POST to `/config`: the reply, and whether the process restarts once it is sent.
+fn save_settings(ctx: &Context, body: &str) -> (Reply, bool) {
+    let form = http::pairs(body);
+    let errors = |code, errors: Vec<String>| {
+        (json_status(code, json!({"ok": false, "errors": errors})), false)
+    };
+    if !form.iter().any(|(k, v)| k == "csrf" && secure_eq(v, &ctx.csrf)) {
+        return errors(403, vec!["Missing or stale form token.".into()]);
+    }
+    let text = match std::fs::read_to_string(&ctx.config_path) {
+        Ok(t) => t,
+        Err(e) => return errors(500, vec![format!("could not read {}: {e}", ctx.config_path)]),
+    };
+    match crate::config::apply(&ctx.server.config, &text, &form) {
+        Err(e) => errors(400, e),
+        Ok(None) => (http::json(json!({"ok": true, "restart": false})), false),
+        Ok(Some(new_text)) => match crate::config::write_file(&ctx.config_path, &new_text) {
+            Ok(()) => {
+                info!("Wrote the new configuration to {}", ctx.config_path);
+                (http::json(json!({"ok": true, "restart": true})), true)
+            }
+            Err(e) => {
+                warn!("could not write {}: {e}", ctx.config_path);
+                errors(500, vec![format!("could not write {}: {e}", ctx.config_path)])
+            }
+        },
+    }
+}
+
 fn serve_admin(ctx: &Context, mut req: Request) {
     let (path, query) = http::path_and_query(&req);
     let method = req.method().clone();
+    let mut restart = false;
     let response = match (method, path.as_str()) {
         (Method::Get, "/") => {
             if http::param(&query, "format").as_deref() == Some("json") {
@@ -332,6 +439,29 @@ fn serve_admin(ctx: &Context, mut req: Request) {
                 unauthorized()
             }
         }
+        (Method::Get, "/config") => match settings_access(ctx, &req) {
+            Ok(()) => http::html(CONFIG_HTML.clone()),
+            Err(reply) => reply,
+        },
+        (Method::Get, "/config.json") => match settings_access(ctx, &req) {
+            Ok(()) => http::json(settings_json(ctx)),
+            Err(reply) => reply,
+        },
+        (Method::Post, "/config") => {
+            if !ctx.server.config.api.modify_conf {
+                forbidden("Saving settings requires api.modify_conf to be set.")
+            } else {
+                match settings_access(ctx, &req) {
+                    Ok(()) => {
+                        let body = read_body(&mut req);
+                        let (reply, r) = save_settings(ctx, &body);
+                        restart = r;
+                        reply
+                    }
+                    Err(reply) => reply,
+                }
+            }
+        }
         (Method::Post, "/cmd") => {
             // As in C: no admin password, no commands; and the form's token must match.
             if ctx.server.config.api.admin_password.is_empty() {
@@ -339,8 +469,7 @@ fn serve_admin(ctx: &Context, mut req: Request) {
             } else if !authorized(ctx, &req) {
                 unauthorized()
             } else {
-                let mut body = String::new();
-                let _ = req.as_reader().take(1 << 20).read_to_string(&mut body);
+                let body = read_body(&mut req);
                 if !http::param(&body, "csrf").is_some_and(|t| secure_eq(&t, &ctx.csrf)) {
                     forbidden("Missing or stale form token.")
                 } else {
@@ -361,6 +490,9 @@ fn serve_admin(ctx: &Context, mut req: Request) {
         _ => http::method_not_allowed(),
     };
     let _ = req.respond(response);
+    if restart {
+        crate::config::restart();
+    }
 }
 
 use std::io::Read as _;
@@ -397,6 +529,17 @@ pub fn start(ctx: Arc<Context>) {
         info!("No API port configured. API disabled.");
     } else if let Some(server) = bind("API", &cfg.api.listen_addr, cfg.api.listen_port) {
         info!("API listening on port {}", cfg.api.listen_port);
+        sample_hashrate(&ctx);
+        let sampler = Arc::clone(&ctx);
+        std::thread::Builder::new()
+            .name("api-sampler".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(HISTORY_INTERVAL_SECS));
+                    sample_hashrate(&sampler);
+                }
+            })
+            .expect("api sampler thread");
         let ctx = Arc::clone(&ctx);
         http::serve("api", server, move |req| serve_admin(&ctx, req));
     }

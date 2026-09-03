@@ -6,8 +6,9 @@
 <title>RATUM Gateway</title>
 <!--shared-css-->
 <style>
-  th.key { width: 14rem; }
-  .zeros { color: var(--muted); }
+  .nav a { margin-left: .75rem; }
+  #clients td.num, #clients td:last-child { white-space: nowrap; }
+  #clients td:last-child { text-align: right; }
 </style>
 </head>
 <body>
@@ -19,36 +20,57 @@
   <div class="motd right">
     <div id="updated">connecting...</div>
     <div id="version"></div>
+    <div class="nav"><a href="config">Settings</a><a href="login" id="login">Log in</a></div>
   </div>
 </header>
 
-<div class="grid" id="cards"></div>
+<div class="banner" id="banner" style="display:none"></div>
 
-<section>
-  <h2>Pool</h2>
-  <div style="overflow-x:auto"><table id="poolinfo"><tbody></tbody></table></div>
-</section>
+<div class="hero" id="hero"></div>
+
+<div class="chart-card">
+  <div class="chart-head">
+    <span class="label">Gateway hashrate</span>
+    <span class="motd" id="chart-note"></span>
+  </div>
+  <div class="chart" id="chart">
+    <svg aria-label="gateway hashrate history"></svg>
+    <div class="empty">collecting samples; the gateway records one per minute</div>
+    <div class="chart-tip"></div>
+  </div>
+</div>
 
 <section>
   <h2>Current job</h2>
-  <div style="overflow-x:auto"><table id="job"><tbody></tbody></table></div>
+  <div class="panel">
+    <div class="meter-row">
+      <span class="label">Block weight</span>
+      <span class="val" id="weight-vals"></span>
+    </div>
+    <div class="meter"><span id="weight-fill"></span></div>
+    <div class="meter-row" style="margin-top:.7rem">
+      <span class="label">Job age</span>
+      <span class="val" id="age-vals"></span>
+    </div>
+    <div class="meter"><span id="age-fill"></span></div>
+    <div class="chips" id="job-chips"></div>
+  </div>
 </section>
 
 <section>
-  <h2>Stratum clients</h2>
+  <h2>Miners</h2>
   <div style="overflow-x:auto">
     <table id="clients">
       <thead><tr>
         <th>Remote</th>
         <th>Username</th>
-        <th class="num">Subscribed</th>
-        <th class="num">Last accepted</th>
-        <th class="num">Vardiff</th>
-        <th class="num">Accepted (diff)</th>
-        <th class="num">Rejected (diff)</th>
-        <th class="num">Fee (diff)</th>
         <th class="num">Hashrate</th>
-        <th>Coinbase</th>
+        <th class="num">Difficulty</th>
+        <th class="num">Accepted</th>
+        <th class="num">Rejected</th>
+        <th class="num" id="fee-head">Fee</th>
+        <th class="num">Last share</th>
+        <th class="num">Connected</th>
         <th>User agent</th>
         <th></th>
       </tr></thead>
@@ -59,17 +81,15 @@
 
 <section>
   <h2>Coinbase outputs</h2>
-  <p>What the current job's generation transaction pays: the pool's split, then the remainder
-    to the pool's address.</p>
   <div style="overflow-x:auto">
     <table id="coinbaser">
-      <thead><tr><th class="num">Value</th><th>Address</th></tr></thead>
+      <thead><tr><th class="num">Value</th><th class="num">Share</th><th>Address</th></tr></thead>
       <tbody></tbody>
     </table>
   </div>
 </section>
 
-<footer>Read-only. Refreshes every 5 s. <span id="fee"></span>
+<footer><span id="fee"></span> Refreshes every 5 s.
   <div style="margin-top:.5rem">For the Bitcoin Knots BLAKE2b hardfork chain.
     <a href="https://github.com/iohzrd/ratum" target="_blank" rel="noopener">iohzrd/ratum</a>
   </div>
@@ -78,100 +98,119 @@
 <!--shared-js-->
 <script>
 function btc(b) { return b == null ? "-" : Number(b).toLocaleString(undefined, {minimumFractionDigits: 8, maximumFractionDigits: 8}) + " BTC"; }
-function secs(s) { return s == null || s < 0 ? "-" : Math.round(s) + "s ago"; }
-function row(k, v) { return `<tr><th class="key">${k}</th><td class="mono">${v}</td></tr>`; }
-// A hash with its leading zeros dimmed, as the C gateway's page shows the target.
-function hash(h) {
-  if (h == null) return "-";
-  const m = /^(0*)(.*)$/.exec(String(h));
-  return `<span class="zeros">${esc(m[1])}</span>${esc(m[2])}`;
+function ago(s) { return s == null || s < 0 ? "-" : duration(Math.max(s, 1)) + " ago"; }
+function pct(part, whole) { return whole > 0 ? (part / whole * 100).toFixed(1) + "%" : "-"; }
+// A count with its difficulty beside it.
+function tally(count, diff) { return `${num(count)} <span class="motd">(${num(diff)})</span>`; }
+// A cell with a bar for its share of `whole`.
+function barCell(text, part, whole) {
+  const w = whole > 0 ? Math.min(part / whole * 100, 100) : 0;
+  return `<td class="num bar"><span style="width:${w}%"></span><em>${text}</em></td>`;
 }
 
 poll(() => "stats.json", s => {
-
-  const st = document.getElementById("status");
-  st.textContent = s.status;
   // The C page's colours: green connected or non-pooled by configuration, yellow while a
   // configured pool is unreachable or before the first job, red for an error or Not Ready.
-  st.className = "chain " + (s.status.startsWith("ERROR") || s.status === "Not Ready" ? "bad"
-    : s.status === "Connected and Ready" || s.status === "Non-Pooled Mode" ? "good" : "stale");
-  document.getElementById("pool").textContent = s.pool_host
-    ? `${s.pool_host} · tag ${s.pool_tag}${s.secondary_tag ? " / " + s.secondary_tag : ""}${s.pool_motd && s.pool_motd !== "RATUM Prime" ? " · " + s.pool_motd : ""}`
-    : "non-pooled: every block pays mining.pool_address";
+  const st = document.getElementById("status");
+  const bad = s.status.startsWith("ERROR") || s.status === "Not Ready";
+  const good = s.status === "Connected and Ready" || s.status === "Non-Pooled Mode";
+  st.textContent = s.status;
+  st.className = "chain " + (bad ? "bad" : good ? "good" : "stale");
+  const tags = `${esc(s.pool_tag)}${s.secondary_tag ? " / " + esc(s.secondary_tag) : ""}`;
+  const host = s.pool_url
+    ? `<a href="${esc(s.pool_url)}" target="_blank" rel="noopener">${esc(s.pool_host)}</a>`
+    : esc(s.pool_host);
+  const motd = s.pool_motd && s.pool_motd !== "RATUM Prime" ? " · " + esc(s.pool_motd) : "";
+  document.getElementById("pool").innerHTML = s.pool_host
+    ? `${host} · tag ${tags}${motd}`
+    : `non-pooled: every block pays the gateway's address · tag ${tags}`;
   document.getElementById("version").textContent = s.version || "";
+  document.getElementById("login").style.display = s.clients == null ? "" : "none";
+
+  // One line for what needs attention: a template error, a pool that is not reached, a
+  // stratum listener that is not up.
+  const notes = [];
+  if (s.status.startsWith("ERROR")) notes.push(esc(s.status));
+  if (s.status === "Not Ready") notes.push("The pool is not connected and datum.pooled_mining_only is set: no work is served until it is reached.");
+  if (s.status.startsWith("Non-Pooled Mode (")) notes.push("The pool is unreachable; the work served pays the gateway's address alone.");
+  if (s.job && !s.stratum.listening) notes.push("The stratum listener is not up.");
+  const banner = document.getElementById("banner");
+  banner.style.display = notes.length ? "" : "none";
+  banner.innerHTML = notes.join("<br>");
 
   const fee = s.gateway_fee_bps || 0;
   document.getElementById("fee").textContent = fee
-    ? `Gateway fee ${fee} bps (${(fee / 100).toFixed(2)}%) of share work, credited to ${s.gateway_fee_address}.`
-    : "No gateway fee: every share reaches the pool under the miner's own username.";
+    ? `Gateway fee ${fee} bps (${(fee / 100).toFixed(2)}%) of share work, credited to ${s.gateway_fee_address}: ${num(s.gateway_fee_collected.count)} shares so far.`
+    : "No gateway fee.";
+  document.getElementById("fee-head").style.display = fee ? "" : "none";
 
   const j = s.job || {};
-  const cards = [
-    card("Uptime", esc(s.uptime)),
-    card("Shares accepted", `${num(s.shares_accepted.count)} <span class="motd">(${num(s.shares_accepted.diff)} diff)</span>`),
-    card("Shares rejected", `${num(s.shares_rejected.count)} <span class="motd">(${num(s.shares_rejected.diff)} diff)</span>`),
-    card("Pool min difficulty", num(s.pool_min_diff)),
-    card("Gateway fee collected", fee ? `${num(s.gateway_fee_collected.count)} shares <span class="motd">(${num(s.gateway_fee_collected.diff)} diff)</span>` : "none"),
-    card("Connections / subscribed", `${num(s.stratum.connections)} / ${num(s.stratum.subscriptions)}`),
-    card("Hashrate", ths(s.stratum.hashrate_ths)),
-    card("Block height", num(j.height)),
-    card("Block value", btc(j.value_btc)),
-    card("Transactions", j.txn_count == null ? "-" : `${num(j.txn_count)} <span class="motd">(${num(j.txn_total_weight)} weight)</span>`),
-    card("Coinbaser outputs", num(j.coinbaser_outputs)),
-    card("Stratum", s.stratum.listening ? "listening" : '<span class="stale">not listening</span>'),
-  ];
-  document.getElementById("cards").innerHTML = cards.join("");
+  const acc = s.shares_accepted, rej = s.shares_rejected;
+  const rate = s.stratum.hashrate_ths;
+  document.getElementById("hero").innerHTML = [
+    tile("Hashrate", rate > 0 ? "~" + hashrate(rate * 1e12) : "-",
+      `${num(s.stratum.subscriptions)} subscribed of ${num(s.stratum.connections)} connections`),
+    tile("Shares accepted", num(acc.count),
+      `${num(acc.diff)} difficulty · ${num(rej.count)} rejected (${pct(rej.count, acc.count + rej.count)})`),
+    tile("Block height", s.job ? num(j.height) : "-",
+      s.job ? `${btc(j.value_btc)} · ${num(j.txn_count)} transactions` : "no job yet"),
+    tile("Uptime", duration(s.uptime_seconds),
+      s.pool_host ? `pool minimum difficulty ${num(s.pool_min_diff)}` : "non-pooled mining"),
+  ].join("");
 
-  const poolRows = s.pool_host ? [
-    row("Host", s.pool_url ? `<a href="${esc(s.pool_url)}" target="_blank" rel="noopener">${esc(s.pool_host)}</a>` : esc(s.pool_host)),
-    row("Tag / secondary tag", `${esc(s.pool_tag)}${s.secondary_tag ? " / " + esc(s.secondary_tag) : ""}`),
-    row("Public key", esc(s.pool_pubkey)),
-    row("Minimum difficulty", num(s.pool_min_diff)),
-    row("MOTD", esc(s.pool_motd)),
-    row("Gateway fee", fee ? `${fee} bps (${(fee / 100).toFixed(2)}%) to ${esc(s.gateway_fee_address)}` : "none"),
-  ] : [row("Pool", "none: non-pooled mining, every block pays mining.pool_address"), row("Tag / secondary tag", `${esc(s.pool_tag)}${s.secondary_tag ? " / " + esc(s.secondary_tag) : ""}`)];
-  document.querySelector("#poolinfo tbody").innerHTML = poolRows.join("");
+  document.getElementById("chart-note").textContent = drawChart(
+    document.getElementById("chart"),
+    (s.hashrate && s.hashrate.history) || [],
+    (s.hashrate && s.hashrate.interval_seconds) || 60);
 
-  const jobRows = s.job ? [
-    row("Job", `${esc(j.job_id)} (${j.global_index}) · ${Math.round(j.created_seconds_ago)}s ago · ${j.is_datum_job ? "pooled" : "not pooled"}`),
-    row("Previous block", hash(j.previous_block)),
-    row("Target", hash(j.target)),
-    row("Difficulty", num(j.difficulty)),
-    row("Version / bits", `${esc(j.version)} / ${esc(j.bits)}`),
-    row("Time", `current ${j.curtime} · min ${j.mintime}`),
-    row("Limits", `size ${num(j.sizelimit)} · weight ${num(j.weightlimit)} · sigops ${num(j.sigoplimit)}`),
-    row("Transactions", `${num(j.txn_count)} · size ${num(j.txn_total_size)} · weight ${num(j.txn_total_weight)} · sigops ${num(j.txn_total_sigops)}`),
-    row("Witness commitment", esc(j.witness_commitment)),
-  ] : [row("Job", '<span class="stale">no job yet</span>')];
-  document.querySelector("#job tbody").innerHTML = jobRows.join("");
-
-  let clientRows;
-  if (s.clients == null) {
-    clientRows = `<tr><td colspan="12" class="motd">The client list needs the admin password: <a href="login">log in</a>.</td></tr>`;
-  } else if (s.clients.length === 0) {
-    clientRows = '<tr><td colspan="12" class="motd">no clients connected</td></tr>';
+  if (s.job) {
+    meter("weight-fill", "weight-vals", j.txn_total_weight / j.weightlimit,
+      `${num(j.txn_total_weight)} / ${num(j.weightlimit)} (${pct(j.txn_total_weight, j.weightlimit)})`);
+    meter("age-fill", "age-vals", j.created_seconds_ago / s.work_update_seconds,
+      `${duration(Math.max(j.created_seconds_ago, 1))} of ${duration(s.work_update_seconds)} between refreshes · shares stale after ${duration(s.stale_window_seconds)}`);
+    document.getElementById("job-chips").innerHTML = [
+      chip("job", esc(j.job_id)),
+      chip("payout", j.is_datum_job ? "pool split" : "gateway address"),
+      chip("difficulty", num(j.difficulty)),
+      chip("coinbase outputs", num(j.coinbaser_outputs)),
+      `<span class="chip" title="${esc(j.previous_block)}">previous block <b>…${esc(String(j.previous_block).slice(-12))}</b></span>`,
+    ].join("");
   } else {
-    clientRows = s.clients.map(c => `<tr>
+    meter("weight-fill", "weight-vals", 0, "no job yet");
+    meter("age-fill", "age-vals", 0, "-");
+    document.getElementById("job-chips").innerHTML = "";
+  }
+
+  let rows;
+  if (s.clients == null) {
+    rows = `<tr><td colspan="11" class="motd">The miner list needs the admin password: <a href="login">log in</a>.</td></tr>`;
+  } else if (s.clients.length === 0) {
+    rows = '<tr><td colspan="11" class="motd">no miners connected</td></tr>';
+  } else {
+    const maxThs = Math.max(...s.clients.map(c => c.hashrate_ths || 0));
+    rows = s.clients.map(c => `<tr>
       <td>${esc(c.remote)}</td>
-      <td class="mono">${esc(c.username)}${c.unpayable ? '<span class="tag">unpayable</span>' : ""}</td>
-      <td class="num">${secs(c.subscribed_seconds)}</td>
-      <td class="num">${secs(c.last_accepted_seconds)}</td>
+      <td class="mono">${esc(c.username)}${!c.subscribed ? '<span class="tag">not subscribed</span>' : c.unpayable ? '<span class="tag">unpayable</span>' : ""}</td>
+      ${c.hashrate_ths == null ? '<td class="num">-</td>' : barCell("~" + hashrate(c.hashrate_ths * 1e12), c.hashrate_ths, maxThs)}
       <td class="num">${num(c.vardiff)}</td>
-      <td class="num">${num(c.accepted_count)} <span class="motd">(${num(c.accepted_diff)})</span></td>
-      <td class="num">${num(c.rejected_count)} <span class="motd">(${num(c.rejected_diff)})</span></td>
-      <td class="num">${fee ? `${num(c.fee_count)} <span class="motd">(${num(c.fee_diff)})</span>` : "-"}</td>
-      <td class="num">${ths(c.hashrate_ths)}</td>
-      <td>${esc(c.coinbase)}</td>
+      <td class="num">${tally(c.accepted_count, c.accepted_diff)}</td>
+      <td class="num">${tally(c.rejected_count, c.rejected_diff)}</td>
+      <td class="num" ${fee ? "" : 'style="display:none"'}>${tally(c.fee_count, c.fee_diff)}</td>
+      <td class="num">${ago(c.last_accepted_seconds)}</td>
+      <td class="num">${c.subscribed_seconds < 0 ? "-" : duration(Math.max(c.subscribed_seconds, 1))}</td>
       <td class="mono">${esc(c.useragent)}</td>
       <td><form method="post" action="cmd"><input type="hidden" name="csrf" value="${esc(s.csrf || "")}"><input type="hidden" name="kill_client" value="${c.id}"><button>Kick</button></form></td>
     </tr>`).join("");
   }
-  document.querySelector("#clients tbody").innerHTML = clientRows;
+  document.querySelector("#clients tbody").innerHTML = rows;
 
-  const outs = (s.coinbaser || []).map(o =>
-    `<tr><td class="num">${btc(o.value_btc)}</td><td class="mono">${esc(o.address)}${o.remainder ? '<span class="tag">remainder</span>' : ""}</td></tr>`).join("");
-  document.querySelector("#coinbaser tbody").innerHTML =
-    outs || '<tr><td colspan="2" class="motd">no job yet</td></tr>';
+  const outs = s.coinbaser || [];
+  const total = outs.reduce((sum, o) => sum + o.value_btc, 0);
+  document.querySelector("#coinbaser tbody").innerHTML = outs.length ? outs.map(o => `<tr>
+    <td class="num">${btc(o.value_btc)}</td>
+    ${barCell(pct(o.value_btc, total), o.value_btc, total)}
+    <td class="mono">${esc(o.address)}${o.remainder ? '<span class="tag">remainder</span>' : ""}</td>
+  </tr>`).join("") : '<tr><td colspan="3" class="motd">no job yet</td></tr>';
 
   updated();
 });

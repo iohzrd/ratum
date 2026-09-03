@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RATUM Gateway settings</title>
+<!--shared-css-->
+<style>
+  main { max-width: 56rem; }
+  section { background: var(--card); border: 1px solid var(--line); border-radius: 8px;
+            padding: .8rem .9rem; margin: .75rem 0; }
+  .field { display: grid; grid-template-columns: 16rem 1fr; gap: .25rem .75rem;
+           align-items: center; padding: .5rem 0; border-bottom: 1px solid var(--line); }
+  .field:last-child { border-bottom: none; }
+  .field label { color: var(--muted); }
+  .field .tip { grid-column: 2; color: var(--muted); font-size: .8rem; }
+  input, select { background: var(--bg); color: var(--fg); border: 1px solid var(--line);
+                  border-radius: 4px; padding: .3rem .5rem; font: inherit; width: 100%; }
+  input[type=checkbox] { width: auto; justify-self: start; }
+  input:disabled, select:disabled { color: var(--muted); }
+  .actions { margin: 1rem 0; display: flex; gap: 1rem; align-items: center; }
+  .actions button { padding: .4rem 1rem; }
+  .errors { margin: .75rem 0; }
+  .errors div { color: var(--bad); }
+  form { display: block; }
+  @media (max-width: 40rem) {
+    .field { grid-template-columns: 1fr; }
+    .field .tip { grid-column: 1; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>RATUM Gateway settings</h1>
+    <div class="motd" id="path"></div>
+  </div>
+  <div class="motd right nav"><a href="./">Status</a></div>
+</header>
+
+<main>
+<form id="settings">
+<div class="actions">
+  <button type="submit" id="save" disabled>Save and restart</button>
+  <span class="motd" id="notice">loading...</span>
+</div>
+<div class="errors" id="errors"></div>
+
+<section>
+  <h2>Payout</h2>
+  <div class="field">
+    <label for="mining_pool_address">Bitcoin address</label>
+    <input name="mining_pool_address" id="mining_pool_address" maxlength="100">
+    <div class="tip">Where a block this gateway finds pays what the pool's split leaves; the
+      whole reward when not pooled.</div>
+  </div>
+  <div class="field">
+    <label for="username_behaviour">Miner usernames</label>
+    <select name="username_behaviour" id="username_behaviour">
+      <option value="full_users">sent to the pool as the payout address</option>
+      <option value="workers">sent to the pool as worker names under the address above</option>
+      <option value="private">kept private</option>
+    </select>
+    <div class="tip">What the pool receives as each share's username.</div>
+  </div>
+  <div class="field">
+    <label for="mining_coinbase_tag_secondary">Coinbase tag</label>
+    <input name="mining_coinbase_tag_secondary" id="mining_coinbase_tag_secondary">
+    <div class="tip">Written into the coinbase after the pool's tag; block explorers show it.</div>
+  </div>
+  <div class="field">
+    <label for="mining_coinbase_unique_id">Unique gateway ID</label>
+    <input name="mining_coinbase_unique_id" id="mining_coinbase_unique_id" maxlength="5">
+    <div class="tip">0 to 65535, different for every gateway with the same coinbase tag.</div>
+  </div>
+</section>
+
+<section>
+  <h2>Pool</h2>
+  <div class="field">
+    <label for="reward_sharing">Reward sharing</label>
+    <select name="reward_sharing" id="reward_sharing">
+      <option value="require">require (pooled mining only)</option>
+      <option value="prefer">prefer (non-pooled when the pool is unreachable)</option>
+      <option value="never">never (non-pooled only)</option>
+    </select>
+    <div class="tip">Pooled: the pool sets the payout split and every block is shared.
+      Non-pooled: only a block this gateway finds pays, to the address above.</div>
+  </div>
+  <div class="field">
+    <label for="datum_pool_host">Host</label>
+    <input name="datum_pool_host" id="datum_pool_host" maxlength="1023">
+  </div>
+  <div class="field">
+    <label for="datum_pool_port">Port</label>
+    <input name="datum_pool_port" id="datum_pool_port" maxlength="5">
+  </div>
+  <div class="field">
+    <label for="datum_pool_pubkey">Public key</label>
+    <input name="datum_pool_pubkey" id="datum_pool_pubkey" maxlength="1023">
+    <div class="tip">The pool's 128-hex-digit key; a connection to a host with another key is
+      refused.</div>
+  </div>
+  <div class="field">
+    <label for="datum_pool_url">Web page</label>
+    <input name="datum_pool_url" id="datum_pool_url" maxlength="255">
+    <div class="tip">Optional; the status and miner pages link the host to it.</div>
+  </div>
+</section>
+
+<section>
+  <h2>Gateway fee</h2>
+  <div class="field">
+    <label for="datum_gateway_fee_bps">Fee (basis points)</label>
+    <input name="datum_gateway_fee_bps" id="datum_gateway_fee_bps" maxlength="5">
+    <div class="tip">0 to 10000; one share in every 10000 / fee is credited to the fee address
+      instead of the miner. Requires usernames sent as the payout address.</div>
+  </div>
+  <div class="field">
+    <label for="datum_gateway_fee_address">Fee address</label>
+    <input name="datum_gateway_fee_address" id="datum_gateway_fee_address" maxlength="100">
+    <div class="tip">Empty: the Bitcoin address above.</div>
+  </div>
+</section>
+
+<section>
+  <h2>Stratum</h2>
+  <div class="field">
+    <label for="stratum_listen_port">Port</label>
+    <input name="stratum_listen_port" id="stratum_listen_port" maxlength="5">
+  </div>
+  <div class="field">
+    <label for="stratum_vardiff_min">Minimum difficulty</label>
+    <input name="stratum_vardiff_min" id="stratum_vardiff_min" maxlength="20">
+    <div class="tip">A power of two; the lowest difficulty vardiff assigns a miner.</div>
+  </div>
+  <div class="field">
+    <label for="stratum_fingerprint_miners">Fingerprint miners</label>
+    <input type="checkbox" name="stratum_fingerprint_miners" id="stratum_fingerprint_miners">
+    <div class="tip">Apply the known workarounds for the miner a user agent names.</div>
+  </div>
+  <div class="field">
+    <label for="stratum_require_address_username">Require an address as the username</label>
+    <input type="checkbox" name="stratum_require_address_username" id="stratum_require_address_username">
+    <div class="tip">A miner whose username is not a payable address is refused.</div>
+  </div>
+</section>
+
+<section>
+  <h2>Node</h2>
+  <div class="field">
+    <label for="bitcoind_work_update_seconds">Job update interval</label>
+    <input name="bitcoind_work_update_seconds" id="bitcoind_work_update_seconds" maxlength="3">
+    <div class="tip">5 to 120 seconds between template refreshes; 40 suggested.</div>
+  </div>
+  <div class="field">
+    <label for="bitcoind_rpcurl">RPC URL</label>
+    <input name="bitcoind_rpcurl" id="bitcoind_rpcurl" maxlength="255">
+  </div>
+  <div class="field">
+    <label for="bitcoind_rpcuser">RPC user</label>
+    <input name="bitcoind_rpcuser" id="bitcoind_rpcuser" maxlength="127">
+    <div class="tip">Empty with a cookie file (bitcoind.rpccookiefile) in the file.</div>
+  </div>
+  <div class="field">
+    <label for="bitcoind_rpcpassword">RPC password</label>
+    <input type="password" name="bitcoind_rpcpassword" id="bitcoind_rpcpassword" maxlength="127"
+      placeholder="unchanged" autocomplete="new-password">
+  </div>
+</section>
+
+<div class="actions">
+  <button type="submit" id="save2" disabled>Save and restart</button>
+</div>
+</form>
+</main>
+
+<footer>Saving writes the configuration file and restarts the gateway; connected miners
+  reconnect. Keys the page does not show keep their values.</footer>
+
+<!--shared-js-->
+<script>
+const form = document.getElementById("settings");
+const notice = document.getElementById("notice");
+const errors = document.getElementById("errors");
+const buttons = [document.getElementById("save"), document.getElementById("save2")];
+let csrf = "";
+
+function setEditable(on, why) {
+  for (const el of form.elements) el.disabled = !on;
+  poolFields();
+  notice.textContent = why;
+}
+
+// The pool fields apply only while reward sharing is on; a disabled field is not sent.
+function poolFields() {
+  const off = form.reward_sharing.value === "never" || form.reward_sharing.disabled;
+  for (const name of ["datum_pool_host", "datum_pool_port", "datum_pool_pubkey", "datum_pool_url"]) {
+    form[name].disabled = off;
+  }
+}
+form.reward_sharing.addEventListener("change", poolFields);
+
+function showErrors(list) {
+  errors.innerHTML = list.map(e => `<div>${esc(e)}</div>`).join("");
+}
+
+async function load() {
+  let s;
+  try {
+    const r = await fetch("config.json", {cache: "no-store"});
+    if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
+    s = await r.json();
+  } catch (e) {
+    setEditable(false, "could not load the settings: " + e.message);
+    return;
+  }
+  csrf = s.csrf || "";
+  document.getElementById("path").textContent = s.config_path || "";
+  for (const el of form.elements) {
+    if (!el.name || !(el.name in s)) continue;
+    if (el.type === "checkbox") el.checked = !!s[el.name]; else el.value = s[el.name];
+  }
+  form.mining_coinbase_tag_secondary.maxLength = s.mining_coinbase_tag_secondary_max || 60;
+  if (s.editable) {
+    setEditable(true, "");
+  } else {
+    setEditable(false, "Read-only: set api.modify_conf in the configuration file to save from here.");
+  }
+}
+
+// After a save the gateway restarts; the page waits for the status endpoint to answer
+// again, then reloads.
+async function awaitRestart() {
+  for (let i = 0; i < 60; i++) {
+    await new Promise(r => setTimeout(r, 2000));
+    try {
+      const r = await fetch("stats.json", {cache: "no-store"});
+      if (r.ok) { location.reload(); return; }
+    } catch (e) {}
+  }
+  notice.innerHTML = '<span class="stale">the gateway did not come back; check its log</span>';
+}
+
+form.addEventListener("submit", async ev => {
+  ev.preventDefault();
+  showErrors([]);
+  const body = new URLSearchParams();
+  body.set("csrf", csrf);
+  for (const el of form.elements) {
+    if (!el.name || el.disabled) continue;
+    body.set(el.name, el.type === "checkbox" ? (el.checked ? "1" : "0") : el.value);
+  }
+  for (const b of buttons) b.disabled = true;
+  notice.textContent = "saving...";
+  let s;
+  try {
+    const r = await fetch("config", {method: "POST", body,
+      headers: {"Content-Type": "application/x-www-form-urlencoded"}});
+    s = await r.json();
+  } catch (e) {
+    notice.textContent = "";
+    showErrors(["could not save: " + e.message]);
+    for (const b of buttons) b.disabled = false;
+    return;
+  }
+  if (!s.ok) {
+    notice.textContent = "";
+    showErrors(s.errors || ["unknown error"]);
+    for (const b of buttons) b.disabled = false;
+  } else if (!s.restart) {
+    notice.textContent = "nothing changed";
+    for (const b of buttons) b.disabled = false;
+  } else {
+    setEditable(false, "saved; the gateway is restarting...");
+    awaitRestart();
+  }
+});
+
+load();
+</script>
+</body>
+</html>

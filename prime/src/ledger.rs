@@ -169,6 +169,9 @@ pub struct FoundBlock {
     pub paid_to_pool: u64,
     /// The identity credited with the block's share.
     pub finder: String,
+    /// The secondary coinbase tag the block's coinbase carried (the gateway operator's
+    /// `mining.coinbase_tag_secondary`), empty when it carried none.
+    pub tag: String,
     /// The network difficulty when the block was accepted, 0.0 if the tip was unknown.
     pub difficulty: f64,
     /// `Ledger::cumulative_work` when the block was accepted. The work between two
@@ -178,9 +181,13 @@ pub struct FoundBlock {
 
 /// Pack a found block into the row value: at (8, LE), height (4, LE), paid_to_split (8, LE),
 /// paid_to_pool (8, LE), difficulty (8, LE, f64 bits), cumulative_work (16, LE), then the
-/// finder identity.
+/// finder identity, a 0x00 separator, and the secondary coinbase tag. The identity's bytes
+/// are printable ASCII (`verify::check_username_and_time` requires 0x21..=0x7e) and the
+/// tag's control characters are dropped at extraction (`verify::decode_tag`), so 0x00
+/// appears only as the separator. A row written before the tag field existed ends at the
+/// identity and reads back with an empty tag.
 fn pack_block(b: &FoundBlock) -> Vec<u8> {
-    let mut v = Vec::with_capacity(52 + b.finder.len());
+    let mut v = Vec::with_capacity(53 + b.finder.len() + b.tag.len());
     v.extend_from_slice(&b.at.to_le_bytes());
     v.extend_from_slice(&b.height.to_le_bytes());
     v.extend_from_slice(&b.paid_to_split.to_le_bytes());
@@ -188,6 +195,8 @@ fn pack_block(b: &FoundBlock) -> Vec<u8> {
     v.extend_from_slice(&b.difficulty.to_bits().to_le_bytes());
     v.extend_from_slice(&b.cumulative_work.to_le_bytes());
     v.extend_from_slice(b.finder.as_bytes());
+    v.push(0x00);
+    v.extend_from_slice(b.tag.as_bytes());
     v
 }
 
@@ -196,6 +205,11 @@ fn unpack_block(hash: &[u8], bytes: &[u8]) -> Option<FoundBlock> {
     if bytes.len() < 52 {
         return None;
     }
+    let rest = &bytes[52..];
+    let (finder, tag) = match rest.iter().position(|&b| b == 0x00) {
+        Some(i) => (&rest[..i], &rest[i + 1..]),
+        None => (rest, [].as_slice()),
+    };
     Some(FoundBlock {
         at: u64::from_le_bytes(bytes[0..8].try_into().ok()?),
         height: u32::from_le_bytes(bytes[8..12].try_into().ok()?),
@@ -204,7 +218,8 @@ fn unpack_block(hash: &[u8], bytes: &[u8]) -> Option<FoundBlock> {
         paid_to_pool: u64::from_le_bytes(bytes[20..28].try_into().ok()?),
         difficulty: f64::from_bits(u64::from_le_bytes(bytes[28..36].try_into().ok()?)),
         cumulative_work: u128::from_le_bytes(bytes[36..52].try_into().ok()?),
-        finder: String::from_utf8_lossy(&bytes[52..]).into_owned(),
+        finder: String::from_utf8_lossy(finder).into_owned(),
+        tag: String::from_utf8_lossy(tag).into_owned(),
     })
 }
 
@@ -1465,6 +1480,7 @@ mod tests {
             paid_to_split: n * 10,
             paid_to_pool: 5,
             finder: "alice".into(),
+            tag: "bob".into(),
             difficulty: 100.5,
             cumulative_work,
         }
@@ -1472,11 +1488,23 @@ mod tests {
 
     #[test]
     fn a_found_block_round_trips_through_pack() {
-        for b in
-            [found(1, 0), found(2, u128::MAX), FoundBlock { finder: String::new(), ..found(3, 7) }]
-        {
+        for b in [
+            found(1, 0),
+            found(2, u128::MAX),
+            FoundBlock { finder: String::new(), ..found(3, 7) },
+            FoundBlock { tag: String::new(), ..found(4, 9) },
+        ] {
             assert_eq!(unpack_block(&b.block_hash, &pack_block(&b)), Some(b));
         }
+    }
+
+    #[test]
+    fn a_block_row_without_the_tag_separator_reads_back_with_an_empty_tag() {
+        // A row written before the tag field existed: it ends at the identity.
+        let b = FoundBlock { tag: String::new(), ..found(1, 48) };
+        let mut bytes = pack_block(&b);
+        assert_eq!(bytes.pop(), Some(0x00), "the separator is the last byte when the tag is empty");
+        assert_eq!(unpack_block(&b.block_hash, &bytes), Some(b));
     }
 
     #[test]

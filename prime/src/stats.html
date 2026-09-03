@@ -6,59 +6,7 @@
 <title>RATUM Prime</title>
 <!--shared-css-->
 <style>
-  /* Inherited by the scrollable tables; the default scrollbar is light on the dark page. */
-  html { scrollbar-color: var(--line) var(--bg); }
-
-  /* Hero tiles: the four figures that matter first, larger than the detail cards. */
-  .hero { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
-          gap: .75rem; margin-bottom: .75rem; }
-  .tile { background: var(--card); border: 1px solid var(--line); border-radius: 8px;
-          padding: .8rem .9rem; }
-  .tile .big { font-size: 1.5rem; line-height: 1.25; margin-top: .2rem;
-               font-variant-numeric: tabular-nums; word-break: break-word; }
-  .tile .sub { color: var(--muted); font-size: .8rem; margin-top: .15rem; }
-  .label { color: var(--muted); font-size: .8rem; text-transform: uppercase;
-           letter-spacing: .04em; }
-
-  /* The hashrate chart: an SVG redrawn at the container's pixel size on each poll. */
-  .chart-card { background: var(--card); border: 1px solid var(--line); border-radius: 8px;
-                padding: .8rem .9rem; margin-bottom: 1.25rem; }
-  .chart-head { display: flex; justify-content: space-between; align-items: baseline;
-                gap: .5rem; flex-wrap: wrap; margin-bottom: .4rem; }
-  .chart { position: relative; height: 150px; }
-  .chart svg { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
-  .chart .empty { position: absolute; inset: 0; display: flex; align-items: center;
-                  justify-content: center; color: var(--muted); font-size: .85rem; }
-  .tip { position: absolute; display: none; pointer-events: none; z-index: 2;
-         background: var(--bg); border: 1px solid var(--line); border-radius: 6px;
-         padding: .25rem .5rem; font-size: .8rem; white-space: nowrap;
-         transform: translate(-50%, -100%); }
-
-  /* Horizontal meters: window fill and retarget progress. */
-  .meter { position: relative; height: .6rem; background: var(--bg);
-           border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
-  .meter > span { position: absolute; inset: 0; width: 0; background: var(--accent);
-                  opacity: .55; border-radius: 999px; transition: width .4s; }
-  .meter-row { display: flex; justify-content: space-between; align-items: baseline;
-               gap: .5rem; flex-wrap: wrap; margin-bottom: .35rem; }
-  .meter-row .val { font-variant-numeric: tabular-nums; }
-
-  /* Fact chips: small label:value pairs under a meter. */
-  .chips { display: flex; flex-wrap: wrap; gap: .4rem .5rem; margin-top: .7rem; }
-  .chip { border: 1px solid var(--line); border-radius: 999px; padding: .15rem .6rem;
-          font-size: .8rem; color: var(--muted); }
-  .chip b { color: var(--fg); font-weight: 600; font-variant-numeric: tabular-nums; }
-
-  .panel { background: var(--card); border: 1px solid var(--line); border-radius: 8px;
-           padding: .8rem .9rem; margin-bottom: .75rem; }
-  .banner { border: 1px solid var(--warn); background: rgba(240, 160, 75, .08);
-            border-radius: 8px; padding: .6rem .8rem; margin-bottom: .75rem; }
-
   th.key { width: 11rem; }
-  .bar { position: relative; }
-  .bar > span { position: absolute; inset: 0; background: rgba(110,168,254,.16);
-                border-radius: 3px; }
-  .bar > em { position: relative; font-style: normal; }
   .rank { color: var(--muted); }
   .unpayable { color: var(--warn); }
   .unpayable td { opacity: .75; }
@@ -90,7 +38,7 @@
   <div class="chart" id="chart">
     <svg id="spark" aria-label="pool hashrate history"></svg>
     <div class="empty" id="chart-empty">collecting samples; the pool records one per minute</div>
-    <div class="tip" id="chart-tip"></div>
+    <div class="chart-tip"></div>
   </div>
 </div>
 
@@ -141,6 +89,7 @@
         <th>Hash</th>
         <th>Found</th>
         <th>Finder</th>
+        <th>Tag</th>
         <th class="num">To miners</th>
         <th class="num">To pool</th>
         <th>Payout</th>
@@ -223,24 +172,6 @@ function btc(sats) {
   return (sats / SATS).toLocaleString(undefined, {minimumFractionDigits: 8, maximumFractionDigits: 8}) + " BTC";
 }
 
-// An approximate hashes-per-second figure with a unit chosen to keep 1 to 3 integer digits.
-function hashrate(hs) {
-  if (hs == null) return "-";
-  const units = ["H/s", "kH/s", "MH/s", "GH/s", "TH/s", "PH/s", "EH/s"];
-  let i = 0;
-  while (hs >= 1000 && i < units.length - 1) { hs /= 1000; i += 1; }
-  return hs.toLocaleString(undefined, {maximumFractionDigits: hs < 10 ? 2 : 1}) + " " + units[i];
-}
-
-// A rough duration: seconds below 90 s, minutes below 90 min, hours below 48 h, then days.
-function duration(secs) {
-  if (secs == null || !isFinite(secs) || secs <= 0) return "-";
-  if (secs < 90) return Math.round(secs) + " s";
-  if (secs < 5400) return Math.round(secs / 60) + " min";
-  if (secs < 172800) return (secs / 3600).toFixed(1) + " h";
-  return (secs / 86400).toFixed(1) + " d";
-}
-
 function utcTime(unix) {
   return new Date(unix * 1000).toISOString().slice(0, 16).replace("T", " ") + " UTC";
 }
@@ -251,12 +182,6 @@ function ago(unix) {
   const text = secs < 0 ? utcTime(unix) : duration(Math.max(secs, 1)) + " ago";
   return `<span title="${esc(utcTime(unix))}">${text}</span>`;
 }
-
-function tile(label, big, sub) {
-  return `<div class="tile"><div class="label">${label}</div><div class="big">${big}</div>`
-    + (sub ? `<div class="sub">${sub}</div>` : "") + `</div>`;
-}
-function chip(label, value) { return `<span class="chip">${label} <b>${value}</b></span>`; }
 
 // The host and port a gateway should use. `advertise` (operator-set) wins: a trailing :port in
 // it overrides the DATUM port, otherwise it is a bare host. Unset falls back to the address
@@ -273,108 +198,9 @@ function poolEndpoint(pool) {
   return { host: location.hostname || "127.0.0.1", port: pool.datum_port };
 }
 
-// --- Hashrate history -------------------------------------------------------------------
 // The server records one [unix, h/s] sample per hashrate.interval_seconds (a day kept) and
 // serves them in the snapshot, so every visitor sees the same chart. Sampling begins when
 // the pool's stats interface starts; a restart shows as a gap.
-let hist = [];
-let histInterval = 60;
-
-// Pixel positions of the drawn samples, for the hover tooltip.
-let chartPts = [];
-
-function drawChart() {
-  const el = document.getElementById("chart");
-  const svg = document.getElementById("spark");
-  const empty = document.getElementById("chart-empty");
-  const note = document.getElementById("chart-note");
-  chartPts = [];
-  const pts = hist;
-  if (pts.length < 2) {
-    svg.innerHTML = "";
-    note.textContent = "";
-    empty.style.display = "flex";
-    return;
-  }
-  empty.style.display = "none";
-
-  const w = el.clientWidth, h = el.clientHeight;
-  const padT = 14, padB = 16, padL = 2, padR = 2;
-  const t0 = pts[0][0], t1 = pts[pts.length - 1][0];
-  const span = Math.max(t1 - t0, 1);
-  const max = Math.max(...pts.map(p => p[1]), 1e-9) * 1.05;
-  const x = t => padL + (t - t0) / span * (w - padL - padR);
-  const y = v => padT + (1 - v / max) * (h - padT - padB);
-
-  // Line and area paths, broken where sampling paused (the pool was restarted) so the
-  // pause is a gap, not a line drawn across it.
-  const baseline = y(0);
-  let line = "", area = "";
-  let seg = [];
-  const flush = () => {
-    if (seg.length < 2) { seg = []; return; }
-    const d = seg.map((p, i) => (i ? "L" : "M") + p[0].toFixed(1) + " " + p[1].toFixed(1)).join(" ");
-    line += d + " ";
-    area += d + ` L${seg[seg.length - 1][0].toFixed(1)} ${baseline.toFixed(1)}`
-      + ` L${seg[0][0].toFixed(1)} ${baseline.toFixed(1)} Z `;
-    seg = [];
-  };
-  for (let i = 0; i < pts.length; i++) {
-    if (i > 0 && pts[i][0] - pts[i - 1][0] > histInterval * 2.5) flush();
-    const px = x(pts[i][0]), py = y(pts[i][1]);
-    seg.push([px, py]);
-    chartPts.push([px, py, pts[i][0], pts[i][1]]);
-  }
-  flush();
-
-  // Recessive horizontal grid at 1/2 and full scale, labeled with the hashrate they mark.
-  const gridY = [max / 2, max];
-  const grid = gridY.map(v =>
-    `<line x1="0" y1="${y(v).toFixed(1)}" x2="${w}" y2="${y(v).toFixed(1)}"
-       stroke="var(--line)" stroke-width="1"/>
-     <text x="4" y="${(y(v) - 3).toFixed(1)}" fill="var(--muted)" font-size="10">${hashrate(v)}</text>`
-  ).join("");
-
-  const last = chartPts[chartPts.length - 1];
-  svg.innerHTML = grid
-    + `<path d="${area}" fill="var(--accent)" opacity=".12"/>`
-    + `<path d="${line}" fill="none" stroke="var(--accent)" stroke-width="2"
-        stroke-linejoin="round" stroke-linecap="round"/>`
-    + `<circle cx="${last[0].toFixed(1)}" cy="${last[1].toFixed(1)}" r="3" fill="var(--accent)"/>`
-    + `<text x="${padL}" y="${h - 3}" fill="var(--muted)" font-size="10">${
-        new Date(t0 * 1000).toLocaleTimeString()}</text>`
-    + `<text x="${w - padR}" y="${h - 3}" text-anchor="end" fill="var(--muted)" font-size="10">${
-        new Date(t1 * 1000).toLocaleTimeString()}</text>`
-    + `<line id="crosshair" y1="${padT}" y2="${h - padB}" stroke="var(--muted)"
-        stroke-width="1" stroke-dasharray="3 3" visibility="hidden"/>`;
-  note.textContent = `${pts.length} samples over ${duration(span)}`;
-}
-
-// Hover: the vertical crosshair snaps to the nearest sample and the tooltip shows its
-// time and rate.
-(function () {
-  const el = document.getElementById("chart");
-  const tip = document.getElementById("chart-tip");
-  el.addEventListener("mousemove", e => {
-    const cross = document.getElementById("crosshair");
-    if (!chartPts.length || !cross) return;
-    const mx = e.clientX - el.getBoundingClientRect().left;
-    let best = chartPts[0];
-    for (const p of chartPts) if (Math.abs(p[0] - mx) < Math.abs(best[0] - mx)) best = p;
-    cross.setAttribute("x1", best[0]); cross.setAttribute("x2", best[0]);
-    cross.setAttribute("visibility", "visible");
-    tip.style.display = "block";
-    tip.style.left = Math.min(Math.max(best[0], 60), el.clientWidth - 60) + "px";
-    tip.style.top = (best[1] - 8) + "px";
-    tip.textContent = `${new Date(best[2] * 1000).toLocaleTimeString()} · ~${hashrate(best[3])}`;
-  });
-  el.addEventListener("mouseleave", () => {
-    const cross = document.getElementById("crosshair");
-    if (cross) cross.setAttribute("visibility", "hidden");
-    tip.style.display = "none";
-  });
-  addEventListener("resize", drawChart);
-})();
 
 // Copy the gateway config. The clipboard API needs a secure context, which a LAN pool over
 // plain HTTP is not; the fallback selects the text for a manual copy.
@@ -441,9 +267,10 @@ poll(() => "stats.json", s => {
       `${num(s.connections.open)} of ${num(s.connections.max)} gateway slots in use`),
   ].join("");
 
-  hist = (s.hashrate && s.hashrate.history) || [];
-  histInterval = (s.hashrate && s.hashrate.interval_seconds) || 60;
-  drawChart();
+  document.getElementById("chart-note").textContent = drawChart(
+    document.getElementById("chart"),
+    (s.hashrate && s.hashrate.history) || [],
+    (s.hashrate && s.hashrate.interval_seconds) || 60);
 
   // The payout window: work toward the target, then the pool policy that shapes it.
   const work = Number(s.window.work), target = Number(s.window.target_work);
@@ -535,6 +362,7 @@ poll(() => "stats.json", s => {
         <td class="mono" title="${esc(b.block_hash)}">${esc(b.block_hash.slice(0, 16))}…</td>
         <td>${ago(b.found_at)}</td>
         <td class="mono">${esc(b.finder)}</td>
+        <td>${esc(b.tag || "")}</td>
         <td class="num">${btc(b.paid_to_split)}</td>
         <td class="num">${btc(b.paid_to_pool)}</td>
         <td>${status}</td>

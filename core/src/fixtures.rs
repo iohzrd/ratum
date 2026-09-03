@@ -26,6 +26,9 @@ pub fn out(value: u64, script: &[u8]) -> Vec<u8> {
 /// first byte of that 7-byte push.
 pub struct Tagging<'a> {
     pub tag: &'a str,
+    /// The gateway operator's own tag, written after the pool's tag and a 0x0f marker;
+    /// empty writes no marker. The layout is `coinbase::script_sig` in the gateway crate.
+    pub tag_secondary: &'a str,
     pub prime_id: u32,
 }
 
@@ -39,8 +42,23 @@ pub fn coinbase(
     coinbase_value: u64,
 ) -> (CoinbaseSection, usize) {
     let mut script = push(&[0x0c, 0xd2, 0x26]);
-    let mut tag = tagging.tag.as_bytes().to_vec();
-    tag.push(0x00);
+    // The tag push, in the gateway's layout: the primary tag, then 0x00 when it is the only
+    // tag or 0x0f followed by the secondary tag and 0x00 when one follows.
+    let (tag0, tag1) = (tagging.tag.as_bytes(), tagging.tag_secondary.as_bytes());
+    let mut tag = Vec::with_capacity(tag0.len() + tag1.len() + 2);
+    if !tag0.is_empty() {
+        tag.extend_from_slice(tag0);
+        tag.push(if tag1.is_empty() { 0x00 } else { 0x0f });
+    } else if !tag1.is_empty() {
+        tag.push(0x0f);
+    }
+    if !tag1.is_empty() {
+        tag.extend_from_slice(tag1);
+        tag.push(0x00);
+    }
+    if tag.is_empty() {
+        tag.push(0x00);
+    }
     script.extend_from_slice(&push(&tag));
     // The uid push (`generate_coinbase_uid_tag`): the PoT placeholder 0xFF, the 2-byte
     // `coinbase_unique_id` little-endian (0x1234 here; the gateway default is 4242), then the

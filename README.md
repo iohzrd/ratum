@@ -43,6 +43,13 @@ ignored. `RUST_LOG` overrides `logger.log_level_console`.
   after which the status page renders both tables from `/stats.json`. Authentication is
   HTTP Basic, not Digest: keep the API behind TLS or on a private interface. `/cmd` takes
   form fields with the page's token and is refused without an admin password.
+- `/config` is the settings page. It requires `api.admin_password`; saving requires
+  `api.modify_conf` too. A save writes the edited keys into the configuration file (the other
+  keys and the key order are kept), validates it as at startup, and restarts the gateway on
+  the same command line to apply it: every change restarts, where the C gateway applies some
+  without one. The field names and the `pool_host(old)` convention are the C gateway's;
+  `datum.pool_url`, the gateway fee, the stratum port, `stratum.vardiff_min` and
+  `stratum.require_address_username` are editable in addition to the C page's fields.
 - A block share is charged the gateway fee like any other share when it passes the share
   checks (the C gateway exempts it); a block a check refuses is still sent under the miner's
   name.
@@ -60,7 +67,7 @@ ignored. `RUST_LOG` overrides `logger.log_level_console`.
 - Every message to the pool is padded, the block-transactions response included.
 - A refused template is logged once per reason.
 
-Not served: `api.modify_conf`, the PROXY protocol (`stratum.trust_proxy`), daily rotation
+Not served: the PROXY protocol (`stratum.trust_proxy`), daily rotation
 and SIGHUP (`logger.log_rotate_daily`; the file is held open, so rotate it with logrotate's
 `copytruncate`), the
 open-file limit warning, `datum.always_pay_self`, the per-client pacing of job updates, the
@@ -167,7 +174,9 @@ the tip, the coinbase value, the fee, the connected gateways, the build (`--vers
 same string), an approximate hashrate (accepted-share difficulty over the last 10 minutes,
 at 2^32 hashes per difficulty unit, for the pool and per miner) and each miner's share of the
 window with `payable` and `unpayable_reason`. Every accepted block is recorded in the
-ledger's `blocks` table and listed with its coinbase amounts and finder; from the record and
+ledger's `blocks` table and listed with its coinbase amounts, finder, and the secondary
+coinbase tag its coinbase carried (the gateway's `mining.coinbase_tag_secondary`); from the
+record and
 a cumulative work counter the page derives a luck figure (blocks found over blocks
 expected), and from the observed block spacing an expected time to the pool's next block and
 the next difficulty adjustment (height, countdown, estimated factor). The
