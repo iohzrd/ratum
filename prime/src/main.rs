@@ -623,7 +623,20 @@ fn main() -> io::Result<()> {
             std::process::exit(2);
         }
     };
-    let policy = PoolPolicy::from_config(&config);
+    let mut policy = PoolPolicy::from_config(&config);
+    policy.require_split = cli::resolve::<bool>(
+        c.require_split.as_deref(),
+        f.require_split,
+        true,
+        "--require-split",
+        "true or false",
+        |_| true,
+    );
+    if !policy.require_split {
+        info!(
+            "--require-split=false: a coinbase paying only the pool script is accepted from any job"
+        );
+    }
 
     // The `ReplayGuard` is in memory only, so without this a restart loses every share it
     // has credited and would credit one of them again if a gateway resent it. The ledger

@@ -125,8 +125,20 @@ min-payout = 546                # smallest output written; a miner under it leav
 
 `--allow-agent` (comma-separated prefixes, e.g. `ratum-gateway/`) refuses at hello any
 gateway whose user agent matches none of them; empty (the default) accepts every agent.
-The agent is self-reported: this fences out builds known to mishandle the coinbaser (their
+The agent is self-reported: this refuses builds known to mishandle the coinbaser (their
 blocks pay no split), it does not authenticate anyone.
+
+`--require-split` (`true`, the default, or `false`) refuses with reject code 43 (`NoSplit`)
+a share whose job names a coinbaser response this pool sent while its coinbase pays none of
+that response's outputs, once 10 seconds have passed since the response: the C gateway
+serves its outputs-free coinbase 0 to a miner it notifies while the job's coinbaser is
+awaited (a connect, a quick difficulty change, its 5 second timeout), and that miner holds
+it until its next notify. A job naming no coinbaser (id 0: the job needed none, or the
+request was refused or timed out), a response with no outputs, and subsidy-only work are
+exempt, so the check covers builds that fetch the split and then mine coinbase 0; a share
+paying any part of the split passes, and so does a block, whose value reached the pool's
+script and is recorded as owed. Like `--allow-agent`, it is a check on misbuilt gateways,
+not authentication: a build that never requests a coinbaser is not refused.
 
 ### Ledger and window
 

@@ -44,6 +44,10 @@ pub(crate) struct Cli {
     /// "ratum-gateway/"). Empty (the default) accepts every agent.
     #[arg(long)]
     pub allow_agent: Option<String>,
+    /// Refuse a share whose coinbase pays none of the outputs the coinbaser dictated for
+    /// its job ("true", the default, or "false"). See RejectReason::NoSplit.
+    #[arg(long)]
+    pub require_split: Option<String>,
     #[arg(long)]
     pub min_diff: Option<String>,
     #[arg(long)]

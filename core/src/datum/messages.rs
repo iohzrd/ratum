@@ -265,8 +265,8 @@ pub enum RejectReason {
     MissingPoolTag = 28,
     DuplicateWork = 29,
     Other = 30,
-    // 40..42 are RATUM's own codes for the header v2 checks; the gateway defines only 10..30 and
-    // logs an unknown code as an integer.
+    // 40..43 are RATUM's own codes for the header v2 checks and the split rule; the gateway
+    // defines only 10..30 and logs an unknown code as an integer.
     /// The 0x03 section is absent (the upstream SHA256d share format, which this pool does
     /// not verify), its algorithm byte is not 0x01, or its time marker is not 0x04.
     BadBlake2bSection = 40,
@@ -274,6 +274,9 @@ pub enum RejectReason {
     HeaderFieldMismatch = 41,
     /// Reserved; not returned by this version.
     HeaderMerkleMismatch = 42,
+    /// The share's coinbase paid none of the outputs the pool's coinbaser dictated for its
+    /// job, past the pool's `SPLIT_GRACE_SECS`: the gateway is not mining the split.
+    NoSplit = 43,
 }
 
 impl RejectReason {
@@ -303,6 +306,7 @@ impl RejectReason {
             40 => RejectReason::BadBlake2bSection,
             41 => RejectReason::HeaderFieldMismatch,
             42 => RejectReason::HeaderMerkleMismatch,
+            43 => RejectReason::NoSplit,
             _ => return None,
         })
     }
@@ -565,7 +569,7 @@ mod tests {
                 verdicts.push(ShareVerdict::Rejected(r));
             }
         }
-        assert_eq!(verdicts.len(), 2 + 24, "every reject reason is covered");
+        assert_eq!(verdicts.len(), 2 + 25, "every reject reason is covered");
         for verdict in verdicts {
             let r = ShareResponse { verdict, ..base };
             assert_eq!(ShareResponse::decode(&r.encode()), Some(r), "{verdict:?}");

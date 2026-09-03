@@ -375,6 +375,10 @@ impl Connection<'_> {
             req.value,
         );
         self.coinbaser_id = self.coinbaser_id.wrapping_add(1);
+        if self.coinbaser_id == 0 {
+            // Id 0 marks a job built with no coinbaser applied, so a response never uses it.
+            self.coinbaser_id = 1;
+        }
         let coinbaser_id = self.coinbaser_id;
         let mut response = CoinbaserResponse { value: req.value, coinbaser_id, outputs };
         let removed = response.retain_payable();
@@ -401,7 +405,7 @@ impl Connection<'_> {
                 }
             }
         };
-        self.verifier.record_split(&response);
+        self.verifier.record_split(&response, unix_now());
         self.send_mining(&payload, false)?;
         info!(
             "[{peer}]   <- coinbaser response ({} outputs, id {coinbaser_id})",

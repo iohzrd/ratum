@@ -57,6 +57,7 @@ settings! {
     key: String,
     motd: String,
     allow_agent: String,
+    require_split: bool,
     min_diff: u64,
     max_connections: usize,
     payout_address: String,

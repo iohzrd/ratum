@@ -82,6 +82,22 @@ pub const DEFAULT_NTIME_WINDOW_SECS: u64 = 2 * 60 * 60;
 /// tip the pool holds and the tip the gateway built on differ.
 pub const TIP_GRACE_SECS: u64 = 1;
 
+/// Seconds after a coinbaser response is sent in which a share on a job naming it may pay
+/// none of its outputs; past it, `NoSplit` when `require_split` is set. The C gateway builds
+/// coinbase 0 (the pool payout alone) at job creation and serves it by any notify sent while
+/// the job's coinbaser is awaited (`send_mining_notify` selects 0 until `full_coinbase_ready`:
+/// a connect, a quick difficulty change, and every miner once the 5 s
+/// `stratum_job_coinbaser_ready` timeout passes); the response then sets the job's
+/// `datum_coinbaser_id`, so shares on that work name it until the miner's next notify: at
+/// the response for a priority job, within the paced `work_update_seconds - 3` for a normal
+/// one, at the next job's notify once the timeout passed (the id is then set only by a
+/// response arriving before `datum_protocol_coinbaser_fetch`'s own 5 s deadline, which
+/// starts after the job's because the coinbaser thread polls for the job every 12 ms; a
+/// later response leaves id 0). 10 s covers the priority case with share transit and
+/// queueing, the first 10 s of the paced and timeout cases, and credits a build that mines
+/// coinbase 0 alone for 10 s of each job (a quarter at the default 40 s).
+pub const SPLIT_GRACE_SECS: u64 = 10;
+
 /// How many replaced tips to keep. The chain can produce several tips in quick succession
 /// when competing blocks arrive at the same height, and each one displaces the last, so
 /// holding only the most recently replaced tip would refuse work that is still credited.
@@ -95,6 +111,8 @@ pub struct PoolPolicy {
     pub coinbase_tag: String,
     pub min_difficulty: u64,
     pub ntime_window_secs: u64,
+    /// Refuse a share whose coinbase pays none of the dictated split (`--require-split`).
+    pub require_split: bool,
 }
 
 impl PoolPolicy {
@@ -105,6 +123,7 @@ impl PoolPolicy {
             coinbase_tag: c.coinbase_tag.clone(),
             min_difficulty: c.min_difficulty,
             ntime_window_secs: DEFAULT_NTIME_WINDOW_SECS,
+            require_split: true,
         }
     }
 }
@@ -121,6 +140,8 @@ pub struct Rebuilt {
     pub coinbase_tx: Vec<u8>,
     pub height: u32,
     pub txn_count: u32,
+    /// The coinbaser id the job names; 0 when no coinbaser was applied.
+    pub coinbaser_id: u8,
     pub paid_to_split: u64,
     pub paid_to_pool: u64,
     /// The secondary coinbase tag the gateway wrote after the pool's tag (the gateway's
@@ -161,11 +182,13 @@ fn coinbase_bytes(cb: &CoinbaseSection) -> usize {
 pub struct Verifier {
     policy: PoolPolicy,
     jobs: Vec<Option<JobState>>,
-    /// One split per coinbaser id, overwritten when an id repeats. No installed job still
-    /// names a repeated id: the gateway fetches at most one coinbaser per job
-    /// (`datum_coinbaser.c`, only when `need_coinbaser` is set), so the `MAX_JOBS` slots are reused
-    /// at least as fast as the `u8` id space is.
-    splits: HashMap<u8, Vec<CoinbaseOutput>>,
+    /// One split per coinbaser id, with the time its response was sent, overwritten when an
+    /// id repeats. No installed job still names a repeated id: the gateway fetches at most
+    /// one coinbaser per job (`datum_coinbaser.c`, only when `need_coinbaser` is set), so the
+    /// `MAX_JOBS` slots are reused as fast as the 255 ids (`Connection` skips 0, the id of a
+    /// job with no coinbaser applied); the one job that outlives its id by a slot is 255 jobs
+    /// old, past both gateways' stale-share window.
+    splits: HashMap<u8, (Vec<CoinbaseOutput>, u64)>,
     replay: Arc<Mutex<ReplayGuard>>,
     tip: Option<[u8; 32]>,
     /// The target of the block the node would build on its tip. A job building on the tip
@@ -216,8 +239,8 @@ impl Verifier {
         &self.policy
     }
 
-    pub fn record_split(&mut self, response: &CoinbaserResponse) {
-        self.splits.insert(response.coinbaser_id, response.outputs.clone());
+    pub fn record_split(&mut self, response: &CoinbaserResponse, now: u64) {
+        self.splits.insert(response.coinbaser_id, (response.outputs.clone(), now));
     }
 
     pub fn set_tip(&mut self, tip: Option<[u8; 32]>, now: u64) {
@@ -346,8 +369,8 @@ impl Verifier {
     }
 
     /// The checks that depend on the share or the moment rather than the job: staleness, the
-    /// username, the time. Run after the sections are installed, so that one refused share
-    /// does not leave the job without them.
+    /// split, the username, the time. Run after the sections are installed, so that one
+    /// refused share does not leave the job without them.
     fn check_share(
         &self,
         s: &PowSubmit,
@@ -368,7 +391,34 @@ impl Verifier {
         {
             return Err(RejectReason::StaleBlock);
         }
+        self.check_split(s, work, now)?;
         check_username_and_time(&self.policy, s, now)
+    }
+
+    /// The split rule (`require_split`): a share whose coinbase pays none of the outputs the
+    /// response its job names dictated, past `SPLIT_GRACE_SECS` after that response, is
+    /// work the pool dictated a split for and the gateway did not mine. Nothing is dictated
+    /// by id 0 (no coinbaser applied), an id this connection never sent (one from before a
+    /// restart), a response with no outputs, or subsidy-only work. A block passes: its value
+    /// reached the pool's script and `Connection` records it as owed, so refusing it would
+    /// only lose the record.
+    fn check_split(&self, s: &PowSubmit, work: &Rebuilt, now: u64) -> Result<(), RejectReason> {
+        if !self.policy.require_split
+            || s.subsidy_only
+            || work.paid_to_split != 0
+            || work.coinbaser_id == 0
+            || self.meets_network_target(work)
+        {
+            return Ok(());
+        }
+        match self.splits.get(&work.coinbaser_id) {
+            Some((outputs, sent_at))
+                if !outputs.is_empty() && now.saturating_sub(*sent_at) > SPLIT_GRACE_SECS =>
+            {
+                Err(RejectReason::NoSplit)
+            }
+            _ => Ok(()),
+        }
     }
 
     /// `build`, then install the sections the share carries if its hash meets its share
@@ -523,7 +573,7 @@ fn check_username_and_time(
 
 fn build_work(
     policy: &PoolPolicy,
-    splits: &HashMap<u8, Vec<CoinbaseOutput>>,
+    splits: &HashMap<u8, (Vec<CoinbaseOutput>, u64)>,
     job: &JobSection,
     cb: &CoinbaseSection,
     s: &PowSubmit,
@@ -543,7 +593,7 @@ fn build_work(
         return Err(RejectReason::BadCoinbase);
     }
 
-    let (pot_index, tag_secondary) = locate_pot_byte(&parsed, policy, job.height)?;
+    let (pot_index, tag_secondary) = locate_pot_byte(&parsed, policy)?;
     if usize::from(s.target_byte_index_of(job)) != pot_index {
         return Err(RejectReason::TargetMismatch);
     }
@@ -565,6 +615,7 @@ fn build_work(
         coinbase_tx,
         height: job.height,
         txn_count: job.txn_count,
+        coinbaser_id: job.coinbaser_id,
         paid_to_split,
         paid_to_pool,
         tag_secondary,
@@ -628,11 +679,7 @@ fn build_header_v2(
 
 /// Locate the PoT byte and read the secondary coinbase tag out of the tag push, decoded
 /// by `decode_tag`; the tag is empty when the push carries only the pool's tag.
-fn locate_pot_byte(
-    tx: &CoinbaseTx,
-    policy: &PoolPolicy,
-    height: u32,
-) -> Result<(usize, String), RejectReason> {
+fn locate_pot_byte(tx: &CoinbaseTx, policy: &PoolPolicy) -> Result<(usize, String), RejectReason> {
     let pushes = bitcoin::script_pushes(&tx.script_sig);
     let prime = policy.prime_id.to_le_bytes();
     let uid_push = pushes
@@ -680,14 +727,17 @@ fn decode_tag(bytes: &[u8]) -> String {
 
 fn check_outputs(
     policy: &PoolPolicy,
-    splits: &HashMap<u8, Vec<CoinbaseOutput>>,
+    splits: &HashMap<u8, (Vec<CoinbaseOutput>, u64)>,
     job: &JobSection,
     tx: &CoinbaseTx,
     s: &PowSubmit,
 ) -> Result<(u64, u64), RejectReason> {
     let empty: Vec<CoinbaseOutput> = Vec::new();
-    let dictated =
-        if s.subsidy_only { &empty } else { splits.get(&job.coinbaser_id).unwrap_or(&empty) };
+    let dictated = if s.subsidy_only {
+        &empty
+    } else {
+        splits.get(&job.coinbaser_id).map_or(&empty, |(outputs, _)| outputs)
+    };
 
     // `next` only increases, so the dictated outputs must appear in the order the
     // pool sent them, though outputs paying the pool may appear between them.
@@ -802,6 +852,7 @@ mod tests {
             coinbase_tag: "RATUM".to_string(),
             min_difficulty: 1,
             ntime_window_secs: DEFAULT_NTIME_WINDOW_SECS,
+            require_split: true,
         }
     }
 
@@ -874,6 +925,90 @@ mod tests {
         with_outputs(&split().outputs)
     }
 
+    /// With the node's next target at bits no share here meets, so the work is a share: a
+    /// coinbase paying only the pool on a job naming the recorded split passes inside the
+    /// grace and is `NoSplit` past it; past it, it passes when the job names id 0 or an id
+    /// never recorded, or `require_split` is off. The passes go through `reconstruct`: the
+    /// difficulty-1 nonce was found for the split-paying coinbase, so this share misses its
+    /// share target and `rebuild` would refuse every one of them as `HighHash`. The refusal
+    /// is also taken through `rebuild`, which runs `check_share` before the share target.
+    #[test]
+    fn a_coinbase_without_the_split_is_refused_after_the_grace() {
+        let build = |coinbaser_id: u8, require_split: bool| {
+            let mut p = policy();
+            p.require_split = require_split;
+            let (cb, pot_index) = coinbase_sections(&p, &[]);
+            let mut v = Verifier::new(p);
+            v.record_split(&split(), NOW);
+            v.set_next_target(Some(u32::from_le_bytes(HARD_NBITS)));
+            let mut job = job_section(pot_index);
+            job.coinbaser_id = coinbaser_id;
+            (v, share_on(job, cb))
+        };
+        let late = NOW + SPLIT_GRACE_SECS + 1;
+        let no_split = Err(RejectReason::NoSplit);
+
+        let (mut v, s) = build(1, true);
+        assert!(v.reconstruct(&s, NOW).is_ok(), "inside the grace");
+        assert_eq!(v.reconstruct(&s, late), no_split, "past the grace");
+        assert_eq!(v.rebuild(&s, late), no_split, "past the grace, through rebuild");
+
+        let (v, s) = build(0, true);
+        assert!(v.reconstruct(&s, late).is_ok(), "id 0 names no coinbaser");
+
+        let (v, s) = build(5, true);
+        assert!(v.reconstruct(&s, late).is_ok(), "id 5 was never recorded");
+
+        let (v, s) = build(1, false);
+        assert!(v.reconstruct(&s, late).is_ok(), "require_split off");
+    }
+
+    /// `check_split` alone, on the work `setup_hard` builds (a share, not a block) with its
+    /// split payment cleared: refused past the grace, passed at its boundary and by each
+    /// exemption: `require_split` off, subsidy-only work, a dictated output paid, id 0, an
+    /// id never recorded, a response with no outputs, and a block (the work `setup` builds).
+    #[test]
+    fn check_split_refuses_no_split_past_the_grace_and_passes_each_exemption() {
+        let (mut v, s) = setup_hard();
+        v.record_split(
+            &CoinbaserResponse { value: COINBASE_VALUE, coinbaser_id: 2, outputs: vec![] },
+            NOW,
+        );
+        let mut w = v.reconstruct(&s, NOW).unwrap();
+        assert!(!v.meets_network_target(&w));
+        w.paid_to_split = 0;
+        let late = NOW + SPLIT_GRACE_SECS + 1;
+        let no_split = Err(RejectReason::NoSplit);
+
+        assert_eq!(v.check_split(&s, &w, late), no_split, "past the grace");
+        assert_eq!(v.check_split(&s, &w, NOW + SPLIT_GRACE_SECS), Ok(()), "at the grace");
+        assert_eq!(v.check_split(&s, &w, NOW), Ok(()), "inside the grace");
+
+        let mut off = Verifier::new(PoolPolicy { require_split: false, ..policy() });
+        off.record_split(&split(), NOW);
+        assert_eq!(off.check_split(&s, &w, late), Ok(()), "require_split off");
+
+        let subsidy_only = PowSubmit { subsidy_only: true, ..s.clone() };
+        assert_eq!(v.check_split(&subsidy_only, &w, late), Ok(()), "subsidy-only work");
+
+        let paid = Rebuilt { paid_to_split: 1, ..w.clone() };
+        assert_eq!(v.check_split(&s, &paid, late), Ok(()), "a dictated output paid");
+
+        let id0 = Rebuilt { coinbaser_id: 0, ..w.clone() };
+        assert_eq!(v.check_split(&s, &id0, late), Ok(()), "id 0 names no coinbaser");
+
+        let id5 = Rebuilt { coinbaser_id: 5, ..w.clone() };
+        assert_eq!(v.check_split(&s, &id5, late), Ok(()), "id 5 was never recorded");
+
+        let id2 = Rebuilt { coinbaser_id: 2, ..w.clone() };
+        assert_eq!(v.check_split(&s, &id2, late), Ok(()), "id 2 dictated nothing");
+
+        let (v, s) = setup();
+        let block = Rebuilt { paid_to_split: 0, ..v.reconstruct(&s, NOW).unwrap() };
+        assert!(v.meets_network_target(&block));
+        assert_eq!(v.check_split(&s, &block, late), Ok(()), "a block");
+    }
+
     /// `setup` with the job's bits at a target no share here meets, and the node's next block
     /// at the same target, so a share meeting difficulty 1 is a share and not a block: whether
     /// a share is a block is determined by the node's template, not the job's bits.
@@ -894,7 +1029,7 @@ mod tests {
         let p = policy();
         let (cb, pot_index) = coinbase_sections(&p, outputs);
         let mut v = Verifier::new(p);
-        v.record_split(&split());
+        v.record_split(&split(), NOW);
         // The normal case: the node's next-block target equals the job's bits, so a share
         // meeting that target is a block. Tests that exercise the on-tip check override this.
         v.set_next_target(Some(u32::from_le_bytes(NBITS)));
@@ -1349,7 +1484,7 @@ mod tests {
         p.min_difficulty = 16384;
         let (_, s) = setup();
         let mut v = Verifier::new(p);
-        v.record_split(&split());
+        v.record_split(&split(), NOW);
         assert_eq!(v.reconstruct(&s, NOW), Err(RejectReason::BadTarget));
         let mut ok = s.clone();
         ok.target_byte = 14;
@@ -1363,7 +1498,7 @@ mod tests {
         redirected.outputs[1].script = p2wpkh(0x99);
         let (cb, pot_index) = coinbase_sections(&p, &redirected.outputs);
         let mut v = Verifier::new(p);
-        v.record_split(&split());
+        v.record_split(&split(), NOW);
         let (_, base) = setup();
         let mut share = base.clone();
         share.coinbase = Some(cb);
@@ -1386,7 +1521,7 @@ mod tests {
         cb.coinb2[pos..pos + 8].copy_from_slice(&(remainder - 1).to_le_bytes());
 
         let mut v = Verifier::new(p);
-        v.record_split(&sp);
+        v.record_split(&sp, NOW);
         let (_, base) = setup();
         let mut share = base.clone();
         share.coinbase = Some(cb);
@@ -1420,12 +1555,15 @@ mod tests {
         let old_split = split();
         let (cb, pot_index) = coinbase_sections(&p, &old_split.outputs);
         let mut v = Verifier::new(p.clone());
-        v.record_split(&old_split);
-        v.record_split(&CoinbaserResponse {
-            value: COINBASE_VALUE,
-            coinbaser_id: old_split.coinbaser_id + 1,
-            outputs: vec![CoinbaseOutput { value: COINBASE_VALUE, script: p2wpkh(0x77) }],
-        });
+        v.record_split(&old_split, NOW);
+        v.record_split(
+            &CoinbaserResponse {
+                value: COINBASE_VALUE,
+                coinbaser_id: old_split.coinbaser_id + 1,
+                outputs: vec![CoinbaseOutput { value: COINBASE_VALUE, script: p2wpkh(0x77) }],
+            },
+            NOW,
+        );
 
         let (_, base) = setup();
         let mut share = base.clone();
@@ -1457,7 +1595,7 @@ mod tests {
         other.coinbase_tag = "SOMEONEELSE".to_string();
         let (cb, pot_index) = coinbase_sections(&other, &split().outputs);
         let mut v = Verifier::new(policy());
-        v.record_split(&split());
+        v.record_split(&split(), NOW);
         let (_, base) = setup();
         let mut share = base.clone();
         share.coinbase = Some(cb);
@@ -1472,7 +1610,7 @@ mod tests {
         let (cb, pot_index) = fixtures::coinbase(tagging, &p.payout_script, &[], COINBASE_VALUE);
         let coinbase_tx = cb.assemble(&[0u8; share::EXTRANONCE_SIZE]);
         let parsed = bitcoin::parse_coinbase(&coinbase_tx).expect("a parseable coinbase");
-        let (index, tag) = locate_pot_byte(&parsed, p, 840_000).expect("the pool tag is present");
+        let (index, tag) = locate_pot_byte(&parsed, p).expect("the pool tag is present");
         assert_eq!(index, pot_index, "the PoT byte is where the fixture placed it");
         (index, tag)
     }
@@ -1514,7 +1652,7 @@ mod tests {
         other.prime_id = 0x1234_5678;
         let (cb, pot_index) = coinbase_sections(&other, &split().outputs);
         let mut v = Verifier::new(policy());
-        v.record_split(&split());
+        v.record_split(&split(), NOW);
         let (_, base) = setup();
         let mut share = base.clone();
         share.coinbase = Some(cb);
@@ -1548,7 +1686,7 @@ mod tests {
         let mut p = policy();
         p.ntime_window_secs = 0;
         let mut v = Verifier::new(p);
-        v.record_split(&split());
+        v.record_split(&split(), NOW);
         assert!(v.reconstruct(&old, NOW).is_ok());
     }
 
@@ -1797,13 +1935,13 @@ mod tests {
     fn a_share_is_credited_once_across_connections() {
         let (mut first, s) = setup();
         let mut second = Verifier::with_replay_guard(policy(), first.replay_guard());
-        second.record_split(&split());
+        second.record_split(&split(), NOW);
 
         assert!(first.verify(&s, NOW).is_ok());
         assert_eq!(second.verify(&s, NOW), Err(RejectReason::DuplicateWork));
 
         let mut alone = Verifier::new(policy());
-        alone.record_split(&split());
+        alone.record_split(&split(), NOW);
         assert!(alone.verify(&s, NOW).is_ok());
     }
 
