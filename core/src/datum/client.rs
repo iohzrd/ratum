@@ -1,5 +1,5 @@
 use super::framing::{self, Header, HeaderKeys, KeyRatchet, STRUCT_END, SessionNonces};
-use super::handshake::{Channel, Error, KEYS_LEN, KeyPairs, Signature};
+use super::handshake::{Channel, Error, Generation, KEYS_LEN, KeyPairs, Signature};
 use dryoc::classic::crypto_box::{
     PublicKey as BoxPublicKey, crypto_box_beforenm, crypto_box_seal, crypto_box_seal_open,
 };
@@ -59,10 +59,32 @@ impl Client {
         &self.motd
     }
 
-    /// The hello frame: four public keys, the user agent, and the header-key and nonce seed `nk`,
-    /// signed by the long-term key and sealed to the pool's box key.
+    /// The v1-generation hello frame: four public keys, the user agent, and the header-key
+    /// and nonce seed `nk`, signed by the long-term key and sealed to the pool's box key.
     pub fn hello(&mut self, pool_box_pk: &BoxPublicKey, user_agent: &str) -> Vec<u8> {
-        let mut body = Vec::with_capacity(KEYS_LEN + user_agent.len() + 32);
+        self.hello_with(pool_box_pk, user_agent, Generation::V1)
+    }
+
+    /// The version 3 hello: `hello` plus the DRS extension after `nk`, carrying the
+    /// resume token from the previous session when there is one.
+    pub fn hello_resumable(
+        &mut self,
+        pool_box_pk: &BoxPublicKey,
+        user_agent: &str,
+        token: Option<&super::messages::ResumeToken>,
+    ) -> Vec<u8> {
+        self.hello_with(pool_box_pk, user_agent, Generation::V3 { resume: token.copied() })
+    }
+
+    /// Version 1 omits the DRS extension; version 3 writes it, with the flag byte and the
+    /// token following the C gateway's layout.
+    fn hello_with(
+        &mut self,
+        pool_box_pk: &BoxPublicKey,
+        user_agent: &str,
+        generation: Generation,
+    ) -> Vec<u8> {
+        let mut body = Vec::with_capacity(KEYS_LEN + user_agent.len() + 96);
         body.extend_from_slice(&self.long_term_keys.sign_pk);
         body.extend_from_slice(&self.long_term_keys.box_pk);
         body.extend_from_slice(&self.session_keys.sign_pk);
@@ -71,10 +93,23 @@ impl Client {
         body.push(0);
         body.push(STRUCT_END);
         body.extend_from_slice(&self.nk.to_le_bytes());
-        let mut pad = [0u8; HELLO_PAD_MAX];
-        dryoc::rng::copy_randombytes(&mut pad);
-        let pad_len = 1 + usize::from(pad[0]) % HELLO_PAD_MAX;
-        body.extend_from_slice(&pad[..pad_len]);
+        if let Generation::V3 { resume } = generation {
+            body.extend_from_slice(&super::handshake::DRS_MARKER);
+            match resume {
+                Some(t) => {
+                    body.push(1);
+                    body.extend_from_slice(&t);
+                }
+                None => body.push(0),
+            }
+        }
+        // 1 to 200 repeats of one random value, as the C gateway pads
+        // (`memset(&hello_msg[i], rand(), j)`). A single repeated value is what lets a
+        // server detect the four distinct DRS marker bytes without a false positive.
+        let mut r = [0u8; 2];
+        dryoc::rng::copy_randombytes(&mut r);
+        let pad_len = 1 + usize::from(r[0]) % HELLO_PAD_MAX;
+        body.resize(body.len() + pad_len, r[1]);
 
         let mut sig: Signature = [0u8; CRYPTO_SIGN_BYTES];
         crypto_sign_detached(&mut sig, &body, &self.long_term_keys.sign_sk).expect("sign hello");

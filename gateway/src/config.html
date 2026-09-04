@@ -106,6 +106,13 @@
     <input name="datum_pool_url" id="datum_pool_url" maxlength="255">
     <div class="tip">Optional; the status and miner pages link the host to it.</div>
   </div>
+  <div class="field">
+    <label for="datum_protocol_v3">Version 3 protocol</label>
+    <input type="checkbox" name="datum_protocol_v3" id="datum_protocol_v3">
+    <div class="tip">Send the version 3 hello: the pool holds the XOR key that hides block hashes
+      and submits the blocks (anti-block-withholding). A pool that answers with a version 1
+      configuration runs the session under version 1.</div>
+  </div>
 </section>
 
 <section>

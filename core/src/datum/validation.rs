@@ -7,12 +7,15 @@ pub mod request {
     pub const TXNS: u8 = 0x11;
     /// The template's transactions without the coinbase transaction.
     pub const BLOCK_TXNS: u8 = 0x12;
+    /// version 3 protocol: upload a proposal parent the pool's node does not have.
+    pub const PARENT_FETCH: u8 = 0x14;
 }
 
 pub mod response {
     pub const SHORT_TXN_LIST: u8 = 0x90;
     pub const TXNS: u8 = 0x91;
     pub const BLOCK_TXNS: u8 = 0x92;
+    pub const PARENT_FETCH: u8 = 0x94;
 }
 
 pub use super::framing::STRUCT_END;
@@ -109,6 +112,91 @@ pub fn request_txns(job_index: u8, indices: &[u16]) -> Vec<u8> {
 
 pub fn request_block_txns(job_index: u8) -> Vec<u8> {
     vec![VALIDATION, request::BLOCK_TXNS, job_index]
+}
+
+/// version 3 protocol. The C handler requires this exact 35-byte plaintext: unlike the other
+/// validation requests it rejects any trailing padding. `parent_hash` is in internal byte
+/// order, as the job context's prev hash is sent.
+pub fn request_parent_fetch(job_index: u8, parent_hash: &[u8; 32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(35);
+    out.push(VALIDATION);
+    out.push(request::PARENT_FETCH);
+    out.push(job_index);
+    out.extend_from_slice(parent_hash);
+    out
+}
+
+/// `DATUM_PARENT_FETCH_STATUS_*`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParentStatus {
+    Success,
+    JobMismatch,
+    Busy,
+    Unavailable,
+    RpcFailed,
+    Unknown(u8),
+}
+
+impl ParentStatus {
+    pub fn from_byte(b: u8) -> Self {
+        match b {
+            0x01 => ParentStatus::Success,
+            0xF0 => ParentStatus::JobMismatch,
+            0xF6 => ParentStatus::Busy,
+            0xF7 => ParentStatus::Unavailable,
+            0xF8 => ParentStatus::RpcFailed,
+            other => ParentStatus::Unknown(other),
+        }
+    }
+
+    pub fn to_byte(self) -> u8 {
+        match self {
+            ParentStatus::Success => 0x01,
+            ParentStatus::JobMismatch => 0xF0,
+            ParentStatus::Busy => 0xF6,
+            ParentStatus::Unavailable => 0xF7,
+            ParentStatus::RpcFailed => 0xF8,
+            ParentStatus::Unknown(b) => b,
+        }
+    }
+}
+
+/// The `0x50 0x94` reply: the raw serialized parent block, or an error status with an
+/// empty block. The C gateway pads neither form.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParentFetchReply {
+    pub job_index: u8,
+    pub status: ParentStatus,
+    pub parent_hash: [u8; 32],
+    pub block: Vec<u8>,
+}
+
+impl ParentFetchReply {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(42 + self.block.len());
+        out.push(VALIDATION);
+        out.push(response::PARENT_FETCH);
+        out.push(self.job_index);
+        out.push(self.status.to_byte());
+        out.extend_from_slice(&self.parent_hash);
+        out.extend_from_slice(&(self.block.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.block);
+        out.push(STRUCT_END);
+        out
+    }
+
+    pub fn decode(data: &[u8]) -> Result<Self, Error> {
+        let mut c = body_of(data, response::PARENT_FETCH)?;
+        let job_index = c.u8("job index")?;
+        let status = ParentStatus::from_byte(c.u8("status")?);
+        let parent_hash: [u8; 32] = c.arr("parent hash")?;
+        let size = c.u32("block size")? as usize;
+        let block = c.take(size, "block").map_err(|_| Error::BadTxnSize)?.to_vec();
+        if c.u8("terminator")? != STRUCT_END {
+            return Err(Error::MissingTerminator);
+        }
+        Ok(ParentFetchReply { job_index, status, parent_hash, block })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

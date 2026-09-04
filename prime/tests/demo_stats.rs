@@ -119,8 +119,7 @@ fn serve_the_stats_page_with_demo_data() {
         },
     );
     let line = pool.expect_line("stats interface listening on http://");
-    let addr =
-        line.rsplit("http://").next().expect("an address after http://").trim().to_string();
+    let addr = line.rsplit("http://").next().expect("an address after http://").trim().to_string();
 
     // One connected gateway: its coinbaser request resolves the window's identities (which
     // is what marks the bare worker name unpayable on the page), repeated to keep the

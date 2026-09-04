@@ -17,6 +17,13 @@
 #   BITCOIN_CLI     default ~/src/bitcoin/build/bin/bitcoin-cli
 #   DATUM_GATEWAY   default the ratum-gateway crate in this workspace, built below
 #   TIMEOUT         seconds to wait for the block, default 900
+#   BLOCKS          pooled blocks to mine past the activation, default 1
+#   GATEWAY_POOL_ADDRESS
+#                   the gateway's mining.pool_address, default the miner's regtest address;
+#                   the C gateway decodes bc1/tb1 only, so give it the tb1 form of one
+#   PRIME_ARGS      extra ratum-prime flags, split on whitespace ("--abw-reveal-after 20"
+#                   reveals each retired ABW slot 20 s after the rotation, so a short run
+#                   exercises the gateway's reveal audit)
 #
 # Exits 0 only if the node accepted a block the pool verified.
 
@@ -26,6 +33,13 @@ BITCOIND=${BITCOIND:-$HOME/src/bitcoin/build/bin/bitcoind}
 BITCOIN_CLI=${BITCOIN_CLI:-$HOME/src/bitcoin/build/bin/bitcoin-cli}
 DATUM_GATEWAY=${DATUM_GATEWAY:-}
 TIMEOUT=${TIMEOUT:-900}
+# PROTOCOL_V3=true (the default, as in the gateway) runs the whole stack on the version 3
+# protocol: the gateway sends the DRS hello and version 3 config, and mines under the pool's
+# anti-block-withholding assignment, which the pool submits blocks for. PROTOCOL_V3=false
+# runs the version 1 protocol.
+PROTOCOL_V3=${PROTOCOL_V3:-true}
+BLOCKS=${BLOCKS:-1}
+PRIME_ARGS=${PRIME_ARGS:-}
 KEEP=0
 [ "${1:-}" = "--keep" ] && KEEP=1
 
@@ -35,6 +49,7 @@ KEEP=0
 ACTIVATION_HEIGHT=20
 POOL_ADDRESS=bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080
 MINER_ADDRESS=bcrt1qzyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3lgth6c
+GATEWAY_POOL_ADDRESS=${GATEWAY_POOL_ADDRESS:-$MINER_ADDRESS}
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/ratum-e2e-XXXXXX")
@@ -133,7 +148,7 @@ step "mining $ACTIVATION_HEIGHT blocks with the node, through the activation"
     >/dev/null
 height=$("$BITCOIN_CLI" -datadir="$WORK/node" getblockcount)
 [ "$height" = "$ACTIVATION_HEIGHT" ] || fail "expected height $ACTIVATION_HEIGHT, got $height"
-TARGET_HEIGHT=$((ACTIVATION_HEIGHT + 1))
+TARGET_HEIGHT=$((ACTIVATION_HEIGHT + BLOCKS))
 
 step "starting ratum-prime on port $POOL_PORT"
 mkdir -p "$WORK/pool"
@@ -146,6 +161,7 @@ RUST_LOG="${RUST_LOG:-debug}" \
     --rpc "http://127.0.0.1:$RPC_PORT" --rpc-user ratum --rpc-pass ratumtest \
     --payout-address "$POOL_ADDRESS" \
     --min-diff 1 --min-payout 1 --poll 1 \
+    $PRIME_ARGS \
     > "$WORK/pool.log" 2>&1 &
 POOL_PID=$!
 PIDS+=($POOL_PID)
@@ -175,7 +191,7 @@ cat > "$WORK/gateway.json" <<EOF
   },
   "stratum": { "listen_port": $STRATUM_PORT, "vardiff_min": 1, "vardiff_target_shares_min": 4 },
   "mining": {
-    "pool_address": "$MINER_ADDRESS",
+    "pool_address": "$GATEWAY_POOL_ADDRESS",
     "coinbase_tag_primary": "RATUM",
     "coinbase_tag_secondary": "e2e"
   },
@@ -187,7 +203,8 @@ cat > "$WORK/gateway.json" <<EOF
     "pool_pubkey": "$PUBKEY",
     "pool_pass_workers": true,
     "pool_pass_full_users": true,
-    "pooled_mining_only": true
+    "pooled_mining_only": true,
+    "protocol_v3": $PROTOCOL_V3
   }
 }
 EOF
@@ -221,7 +238,7 @@ done
 [ "$height" -ge "$TARGET_HEIGHT" ] \
     || fail "no block at height $TARGET_HEIGHT within ${TIMEOUT}s; see $WORK/pool.log and $WORK/miner.log"
 
-step "checking the first pooled block"
+step "checking the last pooled block"
 HASH=$("$BITCOIN_CLI" -datadir="$WORK/node" getblockhash "$TARGET_HEIGHT")
 HEADER=$("$BITCOIN_CLI" -datadir="$WORK/node" getblockheader "$HASH" false)
 [ "${#HEADER}" = 328 ] || fail "the header is ${#HEADER} hex characters, not 328 (164 bytes)"
@@ -233,7 +250,7 @@ grep -q "$HASH" "$WORK/pool.log" \
 grep -q '<- accepted' "$WORK/pool.log" || fail "the pool accepted no shares"
 
 ACCEPTED=$(grep -c '<- accepted' "$WORK/pool.log")
-step "passed: height $TARGET_HEIGHT is $HASH: a 164-byte header mined through the stack"
+step "passed: height $TARGET_HEIGHT is $HASH: a 164-byte header mined through the stack ($BLOCKS pooled block(s))"
 printf 'shares accepted: %s\n' "$ACCEPTED"
 printf 'ledger:\n'
 # The ledger is a redb database; stop the pool to release its lock, then dump it as text.

@@ -66,6 +66,17 @@ ignored. `RUST_LOG` overrides `logger.log_level_console`.
 - Log level 5 keeps errors; higher silences the sink. Timestamps are UTC.
 - Every message to the pool is padded, the block-transactions response included.
 - A refused template is logged once per reason.
+- Version 3 protocol (`datum.protocol_v3`, the
+  [CONVOYMining gateway](https://github.com/CONVOYMining/datum_gateway)): the gateway commits
+  its work to the pool's anti-block-withholding assignment and sends the slot with every
+  share, but retains no proofs and audits no reveal (the pool relays every block), sends no
+  bulk-framed replies (a parent fetch, 0x50 0x14, is served from its node in one frame),
+  and logs a migration request (0xA4) without following it. While the pool has announced no
+  active assignment it serves no work (the C gateway builds solo work then). On a disconnect
+  it discards its queued and unanswered shares and replays none, keeping only the resume
+  token; the shares its miners submit before the next session holds an assignment wait for
+  it, and are sent when the pool resumed the session (their assignment is announced again)
+  and discarded when it did not.
 
 Not served: the PROXY protocol (`stratum.trust_proxy`), daily rotation
 and SIGHUP (`logger.log_rotate_daily`; the file is held open, so rotate it with logrotate's
@@ -139,6 +150,33 @@ exempt, so the check covers builds that fetch the split and then mine coinbase 0
 paying any part of the split passes, and so does a block, whose value reached the pool's
 script and is recorded as owed. Like `--allow-agent`, it is a check on misbuilt gateways,
 not authentication: a build that never requests a coinbaser is not refused.
+
+`--require-v3` refuses at hello any gateway that does not use the version 3 protocol (its
+hello carries no DRS extension). Off, the default, serves version 1 and version 3 gateways;
+a version 1 client computes true block hashes and so can withhold blocks selectively. On,
+every connection is under an anti-block-withholding assignment and that is no longer
+possible; every gateway not yet on version 3 is refused. `ratum-gateway` sends a version 3
+hello by default (`datum.protocol_v3`) and, when the pool responds with a version 1
+configuration, runs that session under version 1.
+
+A version 3 session's anti-block-withholding slots rotate on a new tip (once the active
+slot is a quarter of `--abw-reveal-after` old), after 16384 shares, and after 10 minutes. A
+retired slot's key is revealed `--abw-reveal-after` seconds (1 to 600, default 300) after its
+retirement, not at the next rotation: the gateway audits every proof it retained on the slot
+the moment it processes the reveal, so the reveal must come after the last share the gateway
+can still submit on the slot's jobs (its stale-share rule allows `share_stale_seconds +
+work_update_seconds`, 160 s by default and 270 s at most; the default covers the most), and
+it is sent only once every share received before it has been answered. The gateway holds one
+proof per share until the reveal, in a cache of 65536, so the delay bounds the share rate one
+gateway can sustain: about 160 shares per second at the default, 270 at a delay of 180 (which
+covers the C default window only). A share on a revealed slot is
+refused (its key is public) but still rebuilt with that key for its exact reference and its
+receipt. When the connection closes the pool keeps the session for an hour under the
+gateway's signing key, so a gateway that reconnects with its resume token continues the same
+slots and the shares it replays verify; the reveals it may not have received are sent again
+once the delay has passed from the resume, after its replayed shares are answered. A pool
+restart declines every resume. Every share that is a block by the node's target or by its
+job's own `nbits` (the measure of the gateway's reveal audit) gets a receipt, relayed or not.
 
 ### Ledger and window
 

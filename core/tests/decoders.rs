@@ -189,6 +189,7 @@ fn random_share(rng: &mut Rng) -> PowSubmit {
             sia_nonce: rng.bytes(8).try_into().unwrap(),
             time_on_wire: rng.next() as u32,
         },
+        abw_slot: rng.bool().then(|| rng.byte() & 0x0f),
     }
 }
 
@@ -294,6 +295,7 @@ fn a_damaged_share_response_is_refused_or_reproduces_itself() {
         nonce: 0xdead_beef,
         target_byte: 14,
         job_id: 5,
+        abw_ref: None,
     };
     truncations_and_flips(&response.encode(), |bytes| {
         ShareResponse::decode(bytes).map(|r| r.encode())

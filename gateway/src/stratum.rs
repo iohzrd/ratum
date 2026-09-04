@@ -711,12 +711,15 @@ impl Connection {
             return Err(io::Error::other("job has no coinbase for the selection"));
         };
         let clean_flag = clean || quickdiff || new_block;
+        // The nbits field carries `share_nbits(pot)`, not the template's bits, as the C
+        // gateway sends for every BLAKE2b job: the compact target nearest to and not easier
+        // than the miner's share target, so the hasher is not given the network target.
         let line = format!(
-            "{{\"id\":null,\"method\":\"mining.notify\",\"params\":[\"{}\",\"{}\",\"000000{}\",\"\",[],\"\",\"{}\",\"{}\",{clean_flag}]}}",
+            "{{\"id\":null,\"method\":\"mining.notify\",\"params\":[\"{}\",\"{}\",\"000000{}\",\"\",[],\"\",\"{:08x}\",\"{}\",{clean_flag}]}}",
             r.notify_id(job),
             hex::encode(job.prevblock_hidden),
             hex::encode(commitment.h2),
-            job.template.bits,
+            target::share_nbits(pot),
             job.ntime_hex,
         );
         self.send_line(&line)
@@ -800,7 +803,10 @@ impl Connection {
         let header = job
             .header(r.coinbase, pot, req.extranonce, req.nonce, req.ntime)
             .ok_or(UNKNOWN_WORK)?;
-        let hash = header.hash_components().result;
+        // Under an ABW assignment this is the raw hash the miner computed; the gateway cannot
+        // apply the pool's mask, so it never computes the final block hash and cannot classify a
+        // block. Without an assignment it is the final hash, as before.
+        let hash = job.share_pow_hash(&header);
 
         // `miner_username` is what the miner sent; `username` is who the share is credited
         // to once a `~modifier` has been applied. stratum.require_address_username checks
@@ -813,7 +819,11 @@ impl Connection {
         )
         .unwrap_or_else(|| req.miner_username.clone());
 
-        let is_block = target::meets_target(&hash, &job.block_target);
+        // A job under an ABW assignment masks the network target with the pool's key, so
+        // the gateway cannot distinguish a block from a share and must not submit one: the pool
+        // holds the key, classifies the candidate, and submits it. Only a version 1 or solo
+        // job is classified and submitted here.
+        let is_block = job.abw.is_none() && target::meets_target(&hash, &job.block_target);
         if is_block {
             let display = hex::encode(hash);
             for _ in 0..3 {

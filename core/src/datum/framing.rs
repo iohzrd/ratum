@@ -13,6 +13,8 @@ pub mod cmd {
     pub const HELLO_OR_PING: u8 = 1;
     pub const HANDSHAKE_RESPONSE: u8 = 2;
     pub const MINING: u8 = 5;
+    /// Bulk framing (version 3 protocol): DBF fragments client to server, DBA acks back.
+    pub const BULK: u8 = 6;
     pub const INFO: u8 = 7;
 }
 

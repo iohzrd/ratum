@@ -1,20 +1,26 @@
 //! One gateway connection: the handshake, then the loop that reads its frames and
 //! responds to its coinbaser requests, shares, and block transactions.
 
-use crate::server::{Payability, Resolver, Server, coinbaser_outputs, owed_for_block, unix_now};
+use crate::abw::AbwManager;
+use crate::server::{
+    Payability, Resolver, SavedSession, Server, SessionState, coinbaser_outputs, owed_for_block,
+    unix_now,
+};
 use log::{debug, error, info, warn};
+use ratum::datum::abw::raw_hash_le;
+use ratum::datum::bulk::{self, Reassembler};
 use ratum::datum::framing::{self, Header, KeyRatchet};
-use ratum::datum::handshake::{Session, accept, open_hello};
+use ratum::datum::handshake::{Generation, Session, accept, open_hello};
 use ratum::datum::messages::{
-    CoinbaseOutput, CoinbaserRequest, CoinbaserResponse, RejectReason, ShareResponse, ShareVerdict,
-    blocknotify, client_subcmd,
+    AbwShareRef, CoinbaseOutput, CoinbaserRequest, CoinbaserResponse, RejectReason, ResumeToken,
+    ShareResponse, ShareVerdict, blocknotify, client_subcmd,
 };
 use ratum::datum::share::PowSubmit;
 use ratum::datum::validation::{self, TxnBundle};
 use ratum::io::read_exact_deadline;
 use ratum::{lock, rpc};
 use ratum_prime::ledger;
-use ratum_prime::verify::{Accepted, Verifier};
+use ratum_prime::verify::{Accepted, Rebuilt, Verifier};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
@@ -87,6 +93,7 @@ fn describe(header: Header, payload: &[u8]) -> String {
         (framing::cmd::MINING, Some(0x27)) => "share submission",
         (framing::cmd::MINING, Some(0x50)) => "job validation response",
         (framing::cmd::MINING, _) => "mining (unknown sub-command)",
+        (framing::cmd::BULK, _) => "bulk fragment",
         (framing::cmd::HELLO_OR_PING, _) => "ping",
         _ => "unknown",
     };
@@ -154,12 +161,30 @@ pub(crate) fn handle(mut stream: TcpStream, server: &Server) -> io::Result<()> {
         );
         return Ok(());
     }
+    // The hello's DRS extension is the sole generation discriminator, read before `accept`
+    // consumes the hello. A v1 gateway sends none and gets the version 1 configuration; a
+    // version 3 gateway sends one and gets version 3 plus an ABW assignment. The long-term
+    // signing key, which the hello is signed with, keys the session a later hello resumes.
+    let generation = hello.generation;
+    let client_key = hello.client_sign_pk;
+    if server.require_v3 && generation == Generation::V1 {
+        warn!(
+            "[{peer}] hello refused: agent {:?} uses the version 1 protocol (no DRS \
+             extension) and this pool requires version 3 (--require-v3)",
+            hello.user_agent
+        );
+        return Ok(());
+    }
     info!(
-        "[{peer}] hello ok: ua={:?} nk={:#010x} client={} session={}",
+        "[{peer}] hello ok: ua={:?} nk={:#010x} client={} session={} generation={}",
         hello.user_agent,
         hello.nk,
         &hex::encode(hello.client_sign_pk)[..16],
         &hex::encode(hello.session_sign_pk)[..16],
+        match generation {
+            Generation::V1 => "v1",
+            Generation::V3 { .. } => "v3",
+        },
     );
 
     let (response, session): (Vec<u8>, Session) =
@@ -177,6 +202,7 @@ pub(crate) fn handle(mut stream: TcpStream, server: &Server) -> io::Result<()> {
     let mut conn = Connection {
         server,
         peer,
+        opened: handshake_started,
         stream,
         session,
         verifier: Verifier::with_replay_guard(server.policy.clone(), Arc::clone(&server.replay)),
@@ -187,9 +213,52 @@ pub(crate) fn handle(mut stream: TcpStream, server: &Server) -> io::Result<()> {
         known_tip: None,
         known_next_bits: None,
         last_send: Instant::now(),
+        client_key,
+        v3: None,
+        bulk: Reassembler::new(),
     };
-    conn.send_mining(&server.config_payload, true)?;
-    debug!("[{peer}] sent 0x99 config ({} payload bytes, signed)", server.config_payload.len());
+
+    match generation {
+        Generation::V1 => {
+            conn.send_mining(&server.config_payload, true)?;
+            debug!("[{peer}] sent v1 0x99 config ({} bytes, signed)", server.config_payload.len());
+        }
+        Generation::V3 { resume } => {
+            // The connection holds the session before the config is sent, so a failed send
+            // still saves it for a resume.
+            let (state, resumed) =
+                server.resume_or_start(client_key, resume.as_ref(), Instant::now());
+            // The splits the resumed session dictated: the gateway's replayed shares and its
+            // shares on the jobs it still holds pay them, and its next split must not take
+            // an id one of those jobs names.
+            conn.verifier.restore_splits(state.splits);
+            conn.coinbaser_id = state.coinbaser_id;
+            let payload = server.config_payload_v3(&state.token);
+            conn.v3 = Some(V3Session { token: state.token, abw: state.abw });
+            let notices = conn.with_abw(|m| m.notices()).expect("a version 3 session");
+            conn.send_mining(&payload, true)?;
+            debug!("[{peer}] sent v3 0x99 config ({} bytes, signed)", payload.len());
+            match (resume.is_some(), resumed) {
+                (true, true) => info!(
+                    "[{peer}] resume accepted: the session's ABW assignments continue and \
+                     its replayed shares verify"
+                ),
+                (true, false) => info!(
+                    "[{peer}] resume declined: no saved session under this gateway's key \
+                     with the token it presented; new session"
+                ),
+                (false, _) => debug!("[{peer}] new version 3 session"),
+            }
+            // The gateway builds no work until it holds an active assignment. A resumed
+            // gateway cleared its active slot on reconnect and is sent every seeded slot
+            // again; the reveals it may not have received follow once its replayed shares
+            // are answered (`AbwManager::resumed`).
+            for notice in &notices {
+                conn.send_mining(notice, false)?;
+            }
+            debug!("[{peer}] sent {} ABW assignment notice(s)", notices.len());
+        }
+    }
 
     conn.stream.set_read_timeout(Some(IDLE_POLL))?;
     conn.run()
@@ -197,11 +266,26 @@ pub(crate) fn handle(mut stream: TcpStream, server: &Server) -> io::Result<()> {
 
 const MAX_CREDITED_NAMES: usize = 4096;
 
+/// A checked share's outcome: the verdict, any follow-up frame to send (a block's
+/// transaction request), and the raw PoW hash when one was computed.
+type ShareOutcome = (ShareVerdict, Option<Vec<u8>>, Option<[u8; 32]>);
+
+/// What a version 3 session holds while its connection is open: the token the gateway
+/// resumes it with and its anti-block-withholding slots. The splits the session dictated
+/// live in the verifier and the coinbaser id on the connection meanwhile; `Drop` gathers
+/// all four into the `SessionState` it saves.
+struct V3Session {
+    token: ResumeToken,
+    abw: AbwManager,
+}
+
 /// One gateway connection past its handshake: the channel, the verifier holding its jobs,
 /// and the blocks waiting on their transactions.
 struct Connection<'a> {
     server: &'a Server,
     peer: std::net::SocketAddr,
+    /// When the connection was accepted; a saved session records it as `held_since`.
+    opened: Instant,
     stream: TcpStream,
     session: Session,
     verifier: Verifier,
@@ -220,10 +304,31 @@ struct Connection<'a> {
     known_next_bits: Option<u32>,
     /// When a frame was last sent to the gateway, to pace the keepalive.
     last_send: Instant,
+    /// The gateway's long-term signing key: what a saved session is stored under.
+    client_key: [u8; 32],
+    /// The version 3 session's state that outlives the connection; `None` on a v1 session,
+    /// where headers are built with a zero key and shares carry no slot.
+    v3: Option<V3Session>,
+    /// Reassembles the bulk-framed (command 6) replies a version 3 gateway sends for large
+    /// validation responses.
+    bulk: Reassembler,
 }
 
 impl Drop for Connection<'_> {
     fn drop(&mut self) {
+        // A version 3 session is kept for `SESSION_KEEP`, so the gateway's next hello, with
+        // the token, continues its ABW slots and its replayed shares verify.
+        if let Some(v3) = self.v3.take() {
+            let state = SessionState {
+                token: v3.token,
+                abw: v3.abw,
+                splits: self.verifier.take_splits(),
+                coinbaser_id: self.coinbaser_id,
+            };
+            let session = SavedSession { state, saved_at: Instant::now(), held_since: self.opened };
+            lock(&self.server.sessions).save(self.client_key, session);
+            debug!("[{}] session saved for resume", self.peer);
+        }
         // A block whose transactions never arrived is discarded with the connection. The
         // gateway has already submitted it to its own node, but log the hash at error so the
         // operator knows the pool did not relay it.
@@ -254,6 +359,22 @@ impl Connection<'_> {
         self.send_frame(framing::cmd::MINING, payload, sign)
     }
 
+    /// The anti-block-withholding slots of a version 3 session; `None` on a v1 session.
+    fn abw(&self) -> Option<&AbwManager> {
+        self.v3.as_ref().map(|v| &v.abw)
+    }
+
+    /// Run `f` on a version 3 session's slots, then mirror their keys into the verifier: the
+    /// one path a change to the slots reaches the share checks by. `None` on a v1 session,
+    /// where `f` does not run.
+    fn with_abw<R>(&mut self, f: impl FnOnce(&mut AbwManager) -> R) -> Option<R> {
+        let manager = &mut self.v3.as_mut()?.abw;
+        let r = f(manager);
+        let keys = manager.keys();
+        self.verifier.set_abw_keys(Some(keys));
+        Some(r)
+    }
+
     /// Send a protocol ping so a connection with no shares or tip changes still produces a
     /// frame inside the gateway's `datum_protocol_global_timeout` (default 60 s). The gateway's
     /// handler for proto_cmd 1 (`datum_protocol_ping_response`) does nothing, but it sets
@@ -270,6 +391,10 @@ impl Connection<'_> {
         let current = lock(&self.server.node_view.tip).map(|t| t.hash);
         let next_bits = *lock(&self.server.node_view.next_bits);
         if current != self.known_tip {
+            // A tip change replaces a tip the connection already recorded; the first
+            // observation at startup (None to Some) establishes the baseline and must not
+            // rotate the assignment the session was seeded with.
+            let tip_replaced = self.known_tip.is_some();
             self.known_tip = current;
             self.verifier.set_tip(current, unix_now());
             // The watcher publishes the template's bits before the tip hash, so the bits read
@@ -278,6 +403,12 @@ impl Connection<'_> {
             self.verifier.set_next_target(next_bits);
             self.known_next_bits = next_bits;
             if current.is_some() {
+                // A tip change already invalidates the work on the active assignment; the
+                // rotation precedes the blocknotify so the gateway holds an active
+                // assignment before it builds work.
+                if tip_replaced {
+                    self.rotate_on_tip()?;
+                }
                 self.send_mining(&blocknotify(), false)?;
                 debug!("[{}]   <- blocknotify (new tip)", self.peer);
             }
@@ -294,10 +425,109 @@ impl Connection<'_> {
         Ok(())
     }
 
+    /// Rotate the assignment on a new tip, unless the active slot is too young
+    /// (`AbwManager::tip_rotation_allowed`). The new tip makes the gateway's jobs on the
+    /// slot stale either way, so a retired slot goes quiet at once.
+    fn rotate_on_tip(&mut self) -> io::Result<()> {
+        match self.abw() {
+            Some(m) if m.tip_rotation_allowed(Instant::now()) => self.rotate_abw("new tip"),
+            Some(_) => {
+                debug!(
+                    "[{}]   the active ABW slot is too young to rotate on the new tip",
+                    self.peer
+                );
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Seed and activate the next ABW slot and retire the active one (`AbwManager::rotate`);
+    /// `why` is logged. Nothing on a v1 session.
+    fn rotate_abw(&mut self, why: &str) -> io::Result<()> {
+        let Some((reveals, notice)) = self.with_abw(|m| m.rotate(Instant::now())) else {
+            return Ok(());
+        };
+        for r in &reveals {
+            self.send_mining(&r.payload, false)?;
+            if r.again {
+                debug!("[{}]   <- sent the reveal of ABW slot {} again", self.peer, r.slot);
+            } else {
+                warn!(
+                    "[{}]   <- revealed ABW slot {} early: the rotation reached it again \
+                     before its reveal was due",
+                    self.peer, r.slot
+                );
+            }
+        }
+        self.send_mining(&notice, false)?;
+        debug!("[{}]   <- rotated the ABW assignment ({why})", self.peer);
+        Ok(())
+    }
+
+    /// Reveal the slots retired for the session's reveal delay (`AbwManager::reveals_due`).
+    /// Nothing on a v1 session.
+    fn send_due_reveals(&mut self) -> io::Result<()> {
+        let now = Instant::now();
+        if !self.abw().is_some_and(|m| m.reveal_due(now)) {
+            return Ok(());
+        }
+        // Every share received before the reveal is answered first, and a block's receipt
+        // precedes the reveal, however long the last iteration took (a node call that
+        // retried, a large body): a due reveal waits for the socket to be drained.
+        if !self.socket_drained()? {
+            return Ok(());
+        }
+        let reveals = self.with_abw(|m| m.reveals_due(now)).unwrap_or_default();
+        if reveals.is_empty() {
+            return Ok(());
+        }
+        for r in &reveals {
+            self.send_mining(&r.payload, false)?;
+            if r.again {
+                debug!(
+                    "[{}]   <- sent the reveal of ABW slot {} again (resumed session)",
+                    self.peer, r.slot
+                );
+            } else {
+                debug!("[{}]   <- revealed the retired ABW slot {}", self.peer, r.slot);
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether nothing the gateway sent is waiting to be read: a non-blocking peek at the
+    /// socket. The read timeout (`IDLE_POLL`) is a separate socket option and stays.
+    fn socket_drained(&mut self) -> io::Result<bool> {
+        self.stream.set_nonblocking(true)?;
+        let peeked = self.stream.peek(&mut [0u8; 1]);
+        self.stream.set_nonblocking(false)?;
+        match peeked {
+            // Bytes waiting, or the peer closed (read next, as `Framing::Closed`).
+            Ok(_) => Ok(false),
+            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+                Ok(true)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The 0xA5 receipt for `work` on a version 3 session, when the share named a slot.
+    fn send_abw_receipt(&mut self, s: &PowSubmit, work: &Rebuilt) -> io::Result<()> {
+        let Some(slot) = s.abw_slot.filter(|_| self.v3.is_some()) else { return Ok(()) };
+        self.send_mining(&AbwManager::receipt(slot, work.raw_hash), false)?;
+        debug!("[{}]   <- ABW receipt for the block on slot {slot}", self.peer);
+        Ok(())
+    }
+
     fn run(&mut self) -> io::Result<()> {
         let peer = self.peer;
         loop {
             self.notify_tip_change()?;
+            if let Some(why) = self.abw().and_then(|m| m.rotation_due(Instant::now())) {
+                self.rotate_abw(why)?;
+            }
+            self.send_due_reveals()?;
 
             let mut hdr = [0u8; 4];
             match read_header(&mut self.stream, &mut hdr)? {
@@ -331,14 +561,52 @@ impl Connection<'_> {
             };
             debug!("[{peer}] {}", describe(header, &plain));
 
-            if header.proto_cmd != framing::cmd::MINING {
-                continue;
-            }
-            match plain.first().copied() {
-                Some(client_subcmd::COINBASER_REQUEST) => self.on_coinbaser_request(&plain)?,
-                Some(client_subcmd::SUBMIT_POW) => self.on_share(&plain)?,
-                Some(client_subcmd::VALIDATION) => self.on_block_txns(&plain),
+            let mining = match header.proto_cmd {
+                framing::cmd::MINING => plain,
+                framing::cmd::BULK => match self.on_bulk_fragment(&plain)? {
+                    Some(reassembled) => reassembled,
+                    None => continue,
+                },
+                _ => continue,
+            };
+            match mining.first().copied() {
+                Some(client_subcmd::COINBASER_REQUEST) => self.on_coinbaser_request(&mining)?,
+                Some(client_subcmd::SUBMIT_POW) => self.on_share(&mining)?,
+                Some(client_subcmd::VALIDATION) => self.on_block_txns(&mining),
                 _ => {}
+            }
+        }
+    }
+
+    /// One bulk fragment (command 6): acknowledge it, and on the final fragment return the
+    /// reassembled command-5 payload for the same dispatch a single frame would take.
+    fn on_bulk_fragment(&mut self, plain: &[u8]) -> io::Result<Option<Vec<u8>>> {
+        let peer = self.peer;
+        let fragment = match bulk::Fragment::decode(plain) {
+            Ok(f) => f,
+            Err(e) => {
+                warn!("[{peer}] malformed bulk fragment: {e}");
+                return Ok(None);
+            }
+        };
+        match self.bulk.accept(&fragment) {
+            Ok((ack, done)) => {
+                self.send_frame(framing::cmd::BULK, &ack.encode(), false)?;
+                Ok(done)
+            }
+            Err(e) => {
+                // The C sender advances only on an ack at the offset it advanced to and
+                // never resends, so a refused fragment is acknowledged at that offset and
+                // the transfer discarded; unacknowledged, its bulk queue would not move again
+                // for the session.
+                warn!("[{peer}] bulk fragment refused: {e}; acknowledged and discarded");
+                self.bulk.reset();
+                let ack = bulk::Ack {
+                    id: fragment.id,
+                    next_offset: fragment.offset.saturating_add(fragment.data.len() as u32),
+                };
+                self.send_frame(framing::cmd::BULK, &ack.encode(), false)?;
+                Ok(None)
             }
         }
     }
@@ -419,31 +687,62 @@ impl Connection<'_> {
         // The three fields (nonce, target byte, job id) the response echoes back with the verdict,
         // and any follow-up frame
         // the verdict calls for (a block's transaction request).
-        let (verdict, nonce, target_byte, job_id, pending) = match PowSubmit::decode(plain) {
-            Ok(s) => {
-                debug!("[{peer}]   -> share {}", describe_share(&s));
-                let (verdict, pending) = self.check_share(&s, unix_now())?;
-                (verdict, s.nonce, s.target_byte, s.job_id, pending)
-            }
-            Err(e) => {
-                warn!("[{peer}]   !! could not decode share: {e}");
-                if matches!(
-                    e,
-                    ratum::datum::share::Error::BadBlake2bSection
-                        | ratum::datum::share::Error::MissingBlake2bSection
-                        | ratum::datum::share::Error::BadExtranonceSize(_)
-                ) {
-                    warn!(
-                        "[{peer}]      a share this pool cannot read indicates a gateway \
+        let (verdict, nonce, target_byte, job_id, pending, raw_hash) =
+            match PowSubmit::decode(plain) {
+                Ok(s) => {
+                    debug!("[{peer}]   -> share {}", describe_share(&s));
+                    // The gateway retains a proof per share until the slot's reveal.
+                    self.with_abw(AbwManager::note_share);
+                    let (verdict, pending, raw_hash) = self.check_share(&s, unix_now())?;
+                    (
+                        verdict,
+                        s.nonce,
+                        s.target_byte,
+                        s.job_id,
+                        pending,
+                        raw_hash.map(|h| (s.abw_slot, h)),
+                    )
+                }
+                Err(e) => {
+                    warn!("[{peer}]   !! could not decode share: {e}");
+                    if matches!(
+                        e,
+                        ratum::datum::share::Error::BadBlake2bSection
+                            | ratum::datum::share::Error::MissingBlake2bSection
+                            | ratum::datum::share::Error::BadExtranonceSize(_)
+                    ) {
+                        warn!(
+                            "[{peer}]      a share this pool cannot read indicates a gateway \
                          built against a different revision of the protocol (an upstream \
                          DATUM gateway sends no BLAKE2b section); the pool and the gateway \
                          are released together"
-                    );
+                        );
+                    }
+                    // The fields the response echoes, from the fixed prefix when that much
+                    // decoded: the C gateway retires the share's replay entry by them, and
+                    // would replay the share on every reconnect otherwise.
+                    let (job_id, target_byte, nonce) =
+                        PowSubmit::prefix(plain).unwrap_or((0, 0xff, 0));
+                    (
+                        ShareVerdict::Rejected(Verifier::reason_for_decode_error(&e)),
+                        nonce,
+                        target_byte,
+                        job_id,
+                        None,
+                        None,
+                    )
                 }
-                (ShareVerdict::Rejected(Verifier::reason_for_decode_error(&e)), 0, 0xff, 0, None)
+            };
+        // On a version 3 session, echo the exact reference (slot + raw hash) so the gateway
+        // removes exactly the one replay entry, not the ambiguous (nonce, PoT, job) triple.
+        // Present only when the share rebuilt far enough to have a raw hash and named a slot.
+        let abw_ref = match raw_hash {
+            Some((Some(slot), hash)) if self.v3.is_some() => {
+                Some(AbwShareRef { slot, raw_pow_hash: raw_hash_le(&hash) })
             }
+            _ => None,
         };
-        let response = ShareResponse { verdict, nonce, target_byte, job_id };
+        let response = ShareResponse { verdict, nonce, target_byte, job_id, abw_ref };
         self.send_mining(&response.encode(), false)?;
         if let Some(request) = pending {
             self.send_mining(&request, false)?;
@@ -453,22 +752,37 @@ impl Connection<'_> {
     }
 
     /// Verify one decoded share and act on the verdict: credit an accepted one and relay it
-    /// if it is a block, or log a rejected one. Returns the verdict and any follow-up frame.
-    fn check_share(
-        &mut self,
-        s: &PowSubmit,
-        now: u64,
-    ) -> io::Result<(ShareVerdict, Option<Vec<u8>>)> {
+    /// if it is a block, or log a rejected one. Returns the verdict, any follow-up frame,
+    /// and the raw PoW hash when the share verified far enough to have one (for the exact
+    /// ABW reference).
+    fn check_share(&mut self, s: &PowSubmit, now: u64) -> io::Result<ShareOutcome> {
         let peer = self.peer;
         match self.verifier.verify(s, now) {
             Ok(a) => {
+                let raw_hash = Some(a.work.raw_hash);
                 let mut pending = None;
+                let candidate = self.verifier.block_candidate(&a.work);
                 if a.is_block {
                     warn!(
                         "[{peer}]   ** BLOCK at height {}: {}",
                         a.work.height,
                         hex::encode(a.work.block_hash)
                     );
+                } else if candidate {
+                    info!(
+                        "[{peer}]      share meets its job's bits {:#010x} but not the node's \
+                         next target; not relayed",
+                        a.work.job_bits
+                    );
+                }
+                // Mark a block handled to the gateway's disclosure audit: without a receipt
+                // for a block it retained, its reveal-time check sets a permanent CRITICAL
+                // failure and closes the connection. The audit classifies by the job's own
+                // bits, so the receipt also covers a share the pool does not relay.
+                if candidate {
+                    self.send_abw_receipt(s, &a.work)?;
+                }
+                if a.is_block {
                     if relay_or_request_txns(peer, &self.server.node, &a, s.subsidy_only) {
                         if let Some(prev) = self.awaiting_txns.insert(s.job_id, a.clone()) {
                             error!(
@@ -509,7 +823,11 @@ impl Connection<'_> {
                 // hash stays in the `ReplayGuard`: the verdict depends on the username, which
                 // a resend of the same share would carry again.
                 if self.is_unpayable(&s.username) {
-                    return Ok((ShareVerdict::Rejected(RejectReason::BadUsername), pending));
+                    return Ok((
+                        ShareVerdict::Rejected(RejectReason::BadUsername),
+                        pending,
+                        raw_hash,
+                    ));
                 }
                 // Credit after arranging relay, and never let a ledger write error close the
                 // connection: the block relay above and any pending transaction fetch must
@@ -523,7 +841,7 @@ impl Connection<'_> {
                          resend can be credited"
                     );
                 }
-                Ok((ShareVerdict::Accepted, pending))
+                Ok((ShareVerdict::Accepted, pending, raw_hash))
             }
             Err(reason) => {
                 debug!("[{peer}]   <- rejected: {reason:?}");
@@ -536,7 +854,24 @@ impl Connection<'_> {
                         hex::encode(&w.coinbase_tx)
                     );
                 }
-                Ok((ShareVerdict::Rejected(reason), None))
+                // A version 3 gateway retains a proof for this share too: the exact
+                // reference retires its replay entry, and a block it refused for (a
+                // duplicate, say) needs the receipt, or the reveal audit finds an unhandled
+                // block, sets the permanent CRITICAL failure and closes the connection.
+                let mut raw_hash = None;
+                if self.v3.is_some()
+                    && let Some(work) = self.verifier.rebuild_refused(s)
+                {
+                    raw_hash = Some(work.raw_hash);
+                    if self.verifier.block_candidate(&work) {
+                        warn!(
+                            "[{peer}]   ** the refused share ({reason:?}) meets a block \
+                             target: sending the ABW receipt so the gateway counts it handled"
+                        );
+                        self.send_abw_receipt(s, &work)?;
+                    }
+                }
+                Ok((ShareVerdict::Rejected(reason), None, raw_hash))
             }
         }
     }

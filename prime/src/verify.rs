@@ -107,7 +107,10 @@ const MAX_RECENT_TIPS: usize = 3;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PoolPolicy {
     pub payout_script: Vec<u8>,
-    pub prime_id: u32,
+    /// u64 because the version 3 protocol carries a 64-bit prime ID; the v1 config still limits
+    /// the configured value to 32 bits, and a v1 coinbase push carries only the low four
+    /// bytes.
+    pub prime_id: u64,
     pub coinbase_tag: String,
     pub min_difficulty: u64,
     pub ntime_window_secs: u64,
@@ -119,7 +122,7 @@ impl PoolPolicy {
     pub fn from_config(c: &ClientConfig) -> Self {
         PoolPolicy {
             payout_script: c.payout_script.clone(),
-            prime_id: c.prime_id,
+            prime_id: u64::from(c.prime_id),
             coinbase_tag: c.coinbase_tag.clone(),
             min_difficulty: c.min_difficulty,
             ntime_window_secs: DEFAULT_NTIME_WINDOW_SECS,
@@ -132,8 +135,15 @@ impl PoolPolicy {
 pub struct Rebuilt {
     pub difficulty: u64,
     /// The proof-of-work hash, in the byte order targets are compared in
-    /// (`HashComponents::result`).
+    /// (`HashComponents::result`). Under an ABW assignment this is the masked hash, the one
+    /// consensus compares; without one the mask is zero and it equals `raw_hash`.
     pub block_hash: [u8; 32],
+    /// The unmasked BLAKE2b hash (`HashComponents::hash2`), same byte order. Share targets
+    /// are checked against this: its top `32 + PoT` bits are the ones the mask leaves
+    /// clear, so the check matches what the hasher and gateway computed.
+    pub raw_hash: [u8; 32],
+    /// The job's `nbits`, the header's own difficulty field, as a compact u32.
+    pub job_bits: u32,
     /// The serialized version 2 header the share names.
     pub header: [u8; header::HEADER_V2_SIZE],
     /// The assembled coinbase transaction.
@@ -156,6 +166,16 @@ pub struct Accepted {
     pub is_block: bool,
 }
 
+/// The ABW XOR keys of a version 3 session, by wire slot. A share on a seeded slot is
+/// credited. A share on a revealed slot is refused (`BadAbwSlot`), since the key is public
+/// and a gateway could withhold blocks on it, but is still rebuilt for its exact reference
+/// and, when it is a block by the gateway's measure, its receipt.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AbwKeys {
+    pub seeded: [Option<[u8; 16]>; 16],
+    pub revealed: [Option<[u8; 16]>; 16],
+}
+
 #[derive(Clone, Debug)]
 struct JobState {
     job: JobSection,
@@ -163,8 +183,8 @@ struct JobState {
     /// The parent has been the tip or a kept replaced tip. A parent the pool has not seen
     /// (the gateway's node is ahead) is never evicted.
     parent_seen: bool,
-    /// The parent left the kept tips; the coinbases and merkle branches are released and
-    /// shares on the parent are refused.
+    /// The parent left the kept tips: shares on it are refused, and the sections stay,
+    /// counted, only for the refused shares' rebuild until a share replaces the job.
     evicted: bool,
 }
 
@@ -203,6 +223,11 @@ pub struct Verifier {
     installed_coinbase_bytes: usize,
     /// `MAX_INSTALLED_COINBASE_BYTES`; tests lower it.
     cap: usize,
+    /// The ABW XOR keys this connection has been assigned, indexed by wire slot. `None`
+    /// marks a v1 session: shares carry no slot and headers are built with a zero key.
+    /// `Some` marks a version 3 session: a share must name a seeded slot, whose key enters the
+    /// rebuilt header; a revealed slot's key rebuilds the share without crediting it.
+    abw_keys: Option<AbwKeys>,
 }
 
 impl Verifier {
@@ -221,6 +246,7 @@ impl Verifier {
             recent_tips: VecDeque::new(),
             installed_coinbase_bytes: 0,
             cap: MAX_INSTALLED_COINBASE_BYTES,
+            abw_keys: None,
         }
     }
 
@@ -229,6 +255,12 @@ impl Verifier {
     /// and the job's network target is not checked against the chain.
     pub fn set_next_target(&mut self, next_bits: Option<u32>) {
         self.tip_next_target = next_bits.and_then(target::bits_to_target);
+    }
+
+    /// Install (or update) the connection's ABW slot keys. Passing `Some` switches the
+    /// verifier to version 3 session rules: every share must name a seeded slot.
+    pub fn set_abw_keys(&mut self, keys: Option<AbwKeys>) {
+        self.abw_keys = keys;
     }
 
     pub fn replay_guard(&self) -> Arc<Mutex<ReplayGuard>> {
@@ -241,6 +273,17 @@ impl Verifier {
 
     pub fn record_split(&mut self, response: &CoinbaserResponse, now: u64) {
         self.splits.insert(response.coinbaser_id, (response.outputs.clone(), now));
+    }
+
+    /// The splits recorded on this connection, taken to save with a version 3 session: the
+    /// gateway's replayed shares, and its shares on the jobs it still holds, pay them.
+    pub fn take_splits(&mut self) -> HashMap<u8, (Vec<CoinbaseOutput>, u64)> {
+        std::mem::take(&mut self.splits)
+    }
+
+    /// Restore the splits a saved session recorded (`take_splits`).
+    pub fn restore_splits(&mut self, splits: HashMap<u8, (Vec<CoinbaseOutput>, u64)>) {
+        self.splits = splits;
     }
 
     pub fn set_tip(&mut self, tip: Option<[u8; 32]>, now: u64) {
@@ -269,9 +312,12 @@ impl Verifier {
         self.tip == Some(prev_hash) || self.recent_tips.iter().any(|(h, _)| *h == prev_hash)
     }
 
-    /// Release the jobs whose parent was a kept tip and no longer is.
+    /// Mark the jobs whose parent was a kept tip and no longer is. Their sections stay, and
+    /// stay counted, until a share brings the slot a new job: a share on the evicted job is
+    /// refused `StaleBlock` but still rebuilds (`rebuild_refused`) for its exact reference
+    /// and, when it is a block by its own bits, its receipt, which the version 3 gateway's
+    /// reveal audit requires for every proof it retained.
     fn evict_jobs_off_recent_tips(&mut self) {
-        let mut released = 0;
         for slot in self.jobs.iter_mut().flatten() {
             if slot.evicted {
                 continue;
@@ -281,13 +327,9 @@ impl Verifier {
             if kept {
                 slot.parent_seen = true;
             } else if slot.parent_seen {
-                released += slot.coinbase_bytes();
-                slot.coinbases = HashMap::new();
-                slot.job.merkle_branches = Vec::new();
                 slot.evicted = true;
             }
         }
-        self.installed_coinbase_bytes = self.installed_coinbase_bytes.saturating_sub(released);
     }
 
     /// Whether the reconstructed work meets the network target the node reports for the block
@@ -336,6 +378,26 @@ impl Verifier {
         Ok(Accepted { work, is_block })
     }
 
+    /// The work of a share `verify` refused, rebuilt without installing anything, without
+    /// the on-tip bits check, and with a revealed slot's key as readily as a seeded one's;
+    /// `None` when it does not rebuild (no job, a bad coinbase, a slot never seeded). A
+    /// version 3 session takes the 0x8F exact reference from the work and sends an 0xA5
+    /// receipt when `block_candidate` holds: the gateway retains a proof for every share it
+    /// sent, whatever the verdict.
+    pub fn rebuild_refused(&self, s: &PowSubmit) -> Option<Rebuilt> {
+        self.build_unchecked(s, true).ok().map(|(work, _, _)| work)
+    }
+
+    /// Whether the version 3 gateway's reveal audit counts `work` as a block: its masked hash
+    /// meets the node's next target or the job's own `nbits`. The C gateway
+    /// (`datum_protocol_abw_take_revealed_candidate_locked`) classifies a retained proof by
+    /// its header's `nbits` alone, so a block by that measure needs the 0xA5 receipt even when
+    /// the pool does not relay it (a job off the tip at a previous period's bits, a job
+    /// refused as `BadTarget`), or the audit sets the gateway's permanent CRITICAL failure.
+    pub fn block_candidate(&self, work: &Rebuilt) -> bool {
+        self.meets_network_target(work) || meets_own_bits(work)
+    }
+
     /// `build` and `check_share`, without installing anything.
     pub fn reconstruct(&self, s: &PowSubmit, now: u64) -> Result<Rebuilt, RejectReason> {
         let (work, prev_hash) = self.build(s)?;
@@ -348,24 +410,55 @@ impl Verifier {
     /// easier bits than the node's next block is refused as `BadTarget`. Returns the work and
     /// the job's parent.
     fn build(&self, s: &PowSubmit) -> Result<(Rebuilt, [u8; 32]), RejectReason> {
-        let (job, cb) = self.resolve(s)?;
-        let work = build_work(&self.policy, &self.splits, job, cb, s)?;
+        let (work, prev_hash, seeded) = self.build_unchecked(s, false)?;
+        // A revealed slot's key is public, so a gateway could withhold blocks on it: the
+        // share is not credited. The C gateway refuses to submit on a revealed slot; a share
+        // still arriving was sent before the gateway processed the reveal.
+        if !seeded {
+            return Err(RejectReason::BadAbwSlot);
+        }
 
         // A job building on the current tip must not claim an easier network target than the
         // node's own next block. Harder bits only lower the gateway's own share rate and are not
         // checked; only shares on the tip are checked, since a job on another tip cannot be
         // compared to this template.
-        if self.tip == Some(job.prev_hash)
+        if self.tip == Some(prev_hash)
             && let Some(node_target) = self.tip_next_target
         {
-            let job_target = target::bits_to_target(u32::from_le_bytes(job.nbits))
-                .ok_or(RejectReason::BadTarget)?;
+            let job_target =
+                target::bits_to_target(work.job_bits).ok_or(RejectReason::BadTarget)?;
             // Bigger target is easier; a job easier than the node's is refused.
             if job_target > node_target {
                 return Err(RejectReason::BadTarget);
             }
         }
-        Ok((work, job.prev_hash))
+        Ok((work, prev_hash))
+    }
+
+    /// `build` without the on-tip bits check and the seeded-slot rule, and with `allow_evicted`
+    /// also from the sections of an evicted job. The flag is whether the share's slot is
+    /// seeded rather than revealed (always so on a v1 session).
+    fn build_unchecked(
+        &self,
+        s: &PowSubmit,
+        allow_evicted: bool,
+    ) -> Result<(Rebuilt, [u8; 32], bool), RejectReason> {
+        let (job, cb) = self.resolve(s, allow_evicted)?;
+        let (abw_key, seeded) = match &self.abw_keys {
+            None => (None, true),
+            Some(keys) => {
+                let slot = usize::from(s.abw_slot.ok_or(RejectReason::BadAbwSlot)?);
+                let seeded = keys.seeded.get(slot).copied().flatten();
+                let revealed = keys.revealed.get(slot).copied().flatten();
+                match (seeded, revealed) {
+                    (Some(key), _) => (Some(key), true),
+                    (None, Some(key)) => (Some(key), false),
+                    (None, None) => return Err(RejectReason::BadAbwSlot),
+                }
+            }
+        };
+        let work = build_work(&self.policy, &self.splits, job, cb, s, abw_key)?;
+        Ok((work, job.prev_hash, seeded))
     }
 
     /// The checks that depend on the share or the moment rather than the job: staleness, the
@@ -431,7 +524,7 @@ impl Verifier {
     /// job refused as `BadJobId`.
     pub fn rebuild(&mut self, s: &PowSubmit, now: u64) -> Result<Rebuilt, RejectReason> {
         let (work, prev_hash) = self.build(s)?;
-        let meets = target::meets_target(&work.block_hash, &target::target_for_pot(s.target_byte));
+        let meets = target::meets_target(&work.raw_hash, &target::target_for_pot(s.target_byte));
         if meets || self.meets_network_target(&work) {
             self.install_sections(s)?;
         }
@@ -456,6 +549,7 @@ impl Verifier {
     fn resolve<'a>(
         &'a self,
         s: &'a PowSubmit,
+        allow_evicted: bool,
     ) -> Result<(&'a JobSection, &'a CoinbaseSection), RejectReason> {
         if s.subsidy_only {
             if s.coinbase_id != COINBASE_ID_SUBSIDY_ONLY {
@@ -467,6 +561,7 @@ impl Verifier {
         let slot = self.jobs[s.job_id as usize].as_ref();
         if let Some(st) = slot
             && st.evicted
+            && !allow_evicted
             && s.job.as_ref().is_none_or(|job| job.prev_hash == st.job.prev_hash)
         {
             return Err(RejectReason::StaleBlock);
@@ -571,12 +666,19 @@ fn check_username_and_time(
     Ok(())
 }
 
+/// Whether `work`'s masked hash meets its own header's `nbits`.
+pub fn meets_own_bits(work: &Rebuilt) -> bool {
+    target::bits_to_target(work.job_bits)
+        .is_some_and(|t| target::meets_target(&work.block_hash, &t))
+}
+
 fn build_work(
     policy: &PoolPolicy,
     splits: &HashMap<u8, (Vec<CoinbaseOutput>, u64)>,
     job: &JobSection,
     cb: &CoinbaseSection,
     s: &PowSubmit,
+    abw_key: Option<[u8; 16]>,
 ) -> Result<Rebuilt, RejectReason> {
     if s.target_byte >= 64
         || u64::from(s.target_byte) < u64::from(target::floor_pot(policy.min_difficulty))
@@ -606,11 +708,14 @@ fn build_work(
     let branches: &[[u8; 32]] = if s.subsidy_only { &[] } else { job.merkle_branches.as_slice() };
     let merkle_root = bitcoin::merkle_root(&bitcoin::sha256d(&coinbase_tx), branches);
 
-    let h = build_header_v2(job, s, &s.blake2b, &merkle_root)?;
+    let h = build_header_v2(job, s, &s.blake2b, &merkle_root, abw_key)?;
 
+    let hc = h.hash_components();
     Ok(Rebuilt {
         difficulty: s.difficulty(),
-        block_hash: h.hash_components().result,
+        block_hash: hc.result,
+        raw_hash: hc.hash2,
+        job_bits: u32::from_le_bytes(job.nbits),
         header: h.serialize(),
         coinbase_tx,
         height: job.height,
@@ -633,6 +738,7 @@ fn build_header_v2(
     s: &PowSubmit,
     b: &share::Blake2bSection,
     merkle_root: &[u8; 32],
+    abw_key: Option<[u8; 16]>,
 ) -> Result<HeaderV2, RejectReason> {
     let (nonce, nonce2) = b.nonce_fields();
     let (time_offset, nonce3) = b.time_fields();
@@ -664,10 +770,12 @@ fn build_header_v2(
         // time-offset selector is carried in the message's reserved bytes.
         flags: if s.use_time_offset { header::FLAG_USE_TIME_OFFSET } else { 0 },
         // Set by pool policy; the gateway does not supply it. A null key makes the mask zero, so
-        // the miner receives true block hashes; when an anti-withholding key is configured it is
-        // filled in here and the gateway never receives it.
-        xor_key_mask_clear_bits: 0,
-        xor_key: [0u8; 16],
+        // the miner receives true block hashes; under an ABW assignment the pool's key is
+        // filled in here with the clear bits the gateway committed to, and the gateway never
+        // receives the key until the reveal.
+        xor_key_mask_clear_bits: abw_key
+            .map_or(0, |_| ratum::datum::abw::clear_bits(s.target_byte)),
+        xor_key: abw_key.unwrap_or([0u8; 16]),
         height: job.height as i32,
         mm_rhs: [0u8; 32],
     };
@@ -682,9 +790,16 @@ fn build_header_v2(
 fn locate_pot_byte(tx: &CoinbaseTx, policy: &PoolPolicy) -> Result<(usize, String), RejectReason> {
     let pushes = bitcoin::script_pushes(&tx.script_sig);
     let prime = policy.prime_id.to_le_bytes();
+    // The push is the PoT byte, the 2-byte unique id, then the prime ID: 4 bytes in the v1
+    // gateway's 7-byte push, 8 in the version 3 protocol's 11-byte push. The 7-byte form only
+    // names a prime ID that fits in 32 bits.
     let uid_push = pushes
         .iter()
-        .position(|(_, data)| data.len() == 7 && data[3..7] == prime)
+        .position(|(_, data)| match data.len() {
+            7 => policy.prime_id <= u64::from(u32::MAX) && data[3..7] == prime[..4],
+            11 => data[3..11] == prime,
+            _ => false,
+        })
         .ok_or(RejectReason::MissingPoolTag)?;
 
     let mut tag_secondary = String::new();
@@ -827,8 +942,9 @@ mod tests {
             job: None,
             coinbase: None,
             blake2b: b,
+            abw_slot: None,
         };
-        assert_eq!(build_header_v2(&job, &s, &b, &h.merkle_root).unwrap(), h);
+        assert_eq!(build_header_v2(&job, &s, &b, &h.merkle_root, None).unwrap(), h);
     }
 
     const NOW: u64 = 1_760_000_000;
@@ -859,7 +975,8 @@ mod tests {
     use ratum::fixtures::{self, Tagging, p2wpkh};
 
     fn coinbase_sections(p: &PoolPolicy, outputs: &[CoinbaseOutput]) -> (CoinbaseSection, usize) {
-        let tagging = Tagging { tag: &p.coinbase_tag, tag_secondary: "", prime_id: p.prime_id };
+        let tagging =
+            Tagging { tag: &p.coinbase_tag, tag_secondary: "", prime_id: p.prime_id as u32 };
         fixtures::coinbase(&tagging, &p.payout_script, outputs, COINBASE_VALUE)
     }
 
@@ -918,6 +1035,7 @@ mod tests {
             job: Some(job),
             coinbase: Some(cb),
             blake2b: section(time_on_wire, DIFF1_NONCE),
+            abw_slot: None,
         }
     }
 
@@ -1247,6 +1365,7 @@ mod tests {
             job: Some(job),
             coinbase: Some(cb),
             blake2b: section(NOW as u32, 0),
+            abw_slot: None,
         };
         let w = v.reconstruct(&s, NOW).expect("the job's seven transactions are not carried");
         let h = built_header(&w);
@@ -1618,7 +1737,8 @@ mod tests {
     #[test]
     fn reads_the_secondary_coinbase_tag_out_of_the_tag_push() {
         let p = policy();
-        let tagging = Tagging { tag: &p.coinbase_tag, tag_secondary: "bob", prime_id: p.prime_id };
+        let tagging =
+            Tagging { tag: &p.coinbase_tag, tag_secondary: "bob", prime_id: p.prime_id as u32 };
         assert_eq!(located(&p, &tagging).1, "bob");
     }
 
@@ -1626,9 +1746,9 @@ mod tests {
     fn reads_the_secondary_tag_when_the_pool_declares_no_tag() {
         let mut p = policy();
         p.coinbase_tag = String::new();
-        let tagging = Tagging { tag: "", tag_secondary: "bob", prime_id: p.prime_id };
+        let tagging = Tagging { tag: "", tag_secondary: "bob", prime_id: p.prime_id as u32 };
         assert_eq!(located(&p, &tagging).1, "bob");
-        let untagged = Tagging { tag: "", tag_secondary: "", prime_id: p.prime_id };
+        let untagged = Tagging { tag: "", tag_secondary: "", prime_id: p.prime_id as u32 };
         assert_eq!(located(&p, &untagged).1, "");
     }
 
@@ -1644,6 +1764,132 @@ mod tests {
         assert_eq!(decode_tag(b"bob"), "bob", "a push without the terminator");
         assert_eq!(decode_tag(b"a\x01b\x00"), "ab");
         assert_eq!(decode_tag(&[0xff, 0x41]), "\u{fffd}A", "invalid UTF-8 is replaced");
+    }
+
+    /// The fixture's coinbase with the version 3 protocol's 11-byte prime push in place of
+    /// the 7-byte one: the same PoT byte index, the scriptSig four bytes longer.
+    fn widen_prime_push(cb: &CoinbaseSection, pot_index: usize, prime_id: u64) -> CoinbaseSection {
+        let mut coinb1 = cb.coinb1.clone();
+        assert_eq!(coinb1[pot_index - 1], 0x07, "the 7-byte push opcode precedes the PoT byte");
+        coinb1[pot_index - 1] = 0x0b;
+        assert_eq!(&coinb1[pot_index + 3..pot_index + 7], &prime_id.to_le_bytes()[..4]);
+        coinb1.splice(pot_index + 7..pot_index + 7, prime_id.to_le_bytes()[4..].iter().copied());
+        // The scriptSig length: one compact-size byte after the 4-byte version, the input
+        // count, the 32-byte previous txid and the 4-byte index.
+        coinb1[41] += 4;
+        CoinbaseSection { coinbase_id: cb.coinbase_id, coinb1, coinb2: cb.coinb2.clone() }
+    }
+
+    #[test]
+    fn accepts_the_version_3_eleven_byte_prime_push() {
+        let mut wide = policy();
+        wide.prime_id = 0x1122_3344_5566_7788;
+        let (cb, pot_index) = coinbase_sections(&wide, &split().outputs);
+        let cb = widen_prime_push(&cb, pot_index, wide.prime_id);
+        let mut v = Verifier::new(wide.clone());
+        v.record_split(&split(), NOW);
+        let mut share = share_on(job_section(pot_index), cb.clone());
+        share.target_byte = 5;
+        let w = v.reconstruct(&share, NOW).expect("the 64-bit prime id is found in the push");
+        assert_eq!(w.coinbase_tx[pot_index], 5, "the PoT byte is at the claimed index");
+
+        // A 7-byte push names only a prime id that fits in 32 bits.
+        let (narrow, _) = coinbase_sections(&wide, &split().outputs);
+        share.coinbase = Some(narrow);
+        assert_eq!(v.reconstruct(&share, NOW), Err(RejectReason::MissingPoolTag));
+        // An 11-byte push naming another prime id is refused.
+        let mut other = Verifier::new(policy());
+        other.record_split(&split(), NOW);
+        share.coinbase = Some(cb);
+        assert_eq!(other.reconstruct(&share, NOW), Err(RejectReason::MissingPoolTag));
+    }
+
+    #[test]
+    fn a_refused_share_rebuilds_for_the_exact_reference_when_its_job_resolves() {
+        let (mut v, share) = setup();
+        let mut refused = share.clone();
+        refused.username = String::new();
+        assert_eq!(v.verify(&refused, NOW), Err(RejectReason::BadUsername));
+        let work = v.rebuild_refused(&refused).expect("the job section resolves");
+        assert_eq!(work.raw_hash, v.reconstruct(&share, NOW).unwrap().raw_hash);
+        assert!(
+            v.block_candidate(&work),
+            "under the node's regtest target the refused share is a block"
+        );
+
+        let (v, share) = setup_hard();
+        let mut refused = share.clone();
+        refused.username = String::new();
+        let work = v.rebuild_refused(&refused).expect("the job section resolves");
+        assert!(!v.block_candidate(&work), "under a hard network target it is a share only");
+
+        let mut unknown = share.clone();
+        unknown.job = None;
+        unknown.job_id = 9;
+        assert!(v.rebuild_refused(&unknown).is_none(), "an unknown job has no work to rebuild");
+    }
+
+    /// A share on a revealed slot is refused (its key is public) but rebuilt with that key
+    /// for the exact reference and the receipt; a slot never seeded rebuilds nothing.
+    #[test]
+    fn a_share_on_a_revealed_slot_is_refused_but_rebuilt_for_its_reference() {
+        let (mut v, share) = setup();
+        let seeded = [0x11u8; 16];
+        let revealed = [0x22u8; 16];
+        let mut keys = AbwKeys::default();
+        keys.seeded[0] = Some(seeded);
+        keys.revealed[1] = Some(revealed);
+        v.set_abw_keys(Some(keys));
+
+        let mut on_seeded = share.clone();
+        on_seeded.abw_slot = Some(0);
+        assert_ne!(v.verify(&on_seeded, NOW), Err(RejectReason::BadAbwSlot));
+
+        let mut on_revealed = share.clone();
+        on_revealed.abw_slot = Some(1);
+        assert_eq!(v.verify(&on_revealed, NOW), Err(RejectReason::BadAbwSlot));
+        let work = v.rebuild_refused(&on_revealed).expect("rebuilt with the revealed key");
+        assert_eq!(&work.header[112..128], &revealed, "the header carries the revealed key");
+
+        let mut never_seeded = share.clone();
+        never_seeded.abw_slot = Some(2);
+        assert_eq!(v.verify(&never_seeded, NOW), Err(RejectReason::BadAbwSlot));
+        assert!(v.rebuild_refused(&never_seeded).is_none());
+
+        let mut without = share;
+        without.abw_slot = None;
+        assert_eq!(v.verify(&without, NOW), Err(RejectReason::BadAbwSlot));
+        assert!(v.rebuild_refused(&without).is_none());
+    }
+
+    /// The C gateway's reveal audit classifies a retained proof by its header's own `nbits`,
+    /// so the receipt criterion covers a share that meets its job's bits and not the node's
+    /// target: a job on the tip claiming easier bits (refused as `BadTarget`, rebuilt without
+    /// that check) and a job off the tip at easier bits (accepted as a share, not relayed).
+    #[test]
+    fn a_share_meeting_its_jobs_own_bits_is_a_block_candidate_without_being_a_block() {
+        let (mut v, s) = setup();
+        let job = s.job.clone().unwrap();
+        v.set_next_target(Some(0x1b00_ffff));
+        v.set_tip(Some(job.prev_hash), NOW);
+        assert_eq!(v.verify(&s, NOW), Err(RejectReason::BadTarget));
+        let work = v.rebuild_refused(&s).expect("rebuilt without the on-tip bits check");
+        assert_eq!(work.job_bits, u32::from_le_bytes(NBITS));
+        assert!(meets_own_bits(&work));
+        assert!(v.block_candidate(&work), "a block by the job's own bits gets the receipt");
+
+        let (mut v, s) = setup();
+        v.set_next_target(Some(0x1b00_ffff));
+        v.set_tip(Some([0x5a; 32]), NOW);
+        v.set_tip(Some([0x11; 32]), NOW);
+        let a = v.verify(&s, NOW).unwrap();
+        assert!(!a.is_block, "the node's target is not met, so it is not relayed");
+        assert!(v.block_candidate(&a.work), "the gateway's audit counts it as a block");
+
+        let (mut v, s) = setup_hard();
+        let a = v.verify(&s, NOW).unwrap();
+        assert!(!meets_own_bits(&a.work));
+        assert!(!v.block_candidate(&a.work));
     }
 
     #[test]
@@ -1802,11 +2048,13 @@ mod tests {
         for i in 0..=MAX_RECENT_TIPS as u8 {
             v.set_tip(Some([i; 32]), NOW);
         }
+        let retained = v.installed_coinbase_bytes;
+        assert!(retained > 0, "the evicted job's sections are kept for the refused rebuilds");
         let mut other = s.clone();
         other.coinbase_id = 1;
         other.coinbase.as_mut().unwrap().coinbase_id = 1;
         assert_eq!(v.rebuild(&other, NOW), Err(RejectReason::StaleBlock));
-        assert_eq!(v.installed_coinbase_bytes, 0);
+        assert_eq!(v.installed_coinbase_bytes, retained, "nothing more was installed");
     }
 
     #[test]
@@ -1818,11 +2066,18 @@ mod tests {
         for i in 0..=MAX_RECENT_TIPS as u8 {
             v.set_tip(Some([i; 32]), NOW);
         }
-        assert_eq!(v.installed_coinbase_bytes, 0, "the job's coinbases were released");
+        let retained = v.installed_coinbase_bytes;
+        assert!(retained > 0, "the sections are kept until a share replaces the job");
         let mut bare = s.clone();
         bare.job = None;
         bare.coinbase = None;
         assert_eq!(v.rebuild(&bare, NOW), Err(RejectReason::StaleBlock));
+        // The refused share still rebuilds from the kept sections, for its exact reference
+        // and, as here under the regtest target, its receipt: the version 3 gateway's reveal
+        // audit counts it a block by its own bits.
+        let work = v.rebuild_refused(&bare).expect("rebuilt from the evicted job's sections");
+        assert_eq!(work.raw_hash, v.rebuild_refused(&s).unwrap().raw_hash);
+        assert!(v.block_candidate(&work));
     }
 
     #[test]

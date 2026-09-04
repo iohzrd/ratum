@@ -186,7 +186,15 @@ impl HeaderV2 {
 
     pub fn precompute(&self) -> Precomputed {
         let xor_key_hash = tagged_sha256("Bitcoin block hash PoW XOR key", &self.xor_key);
+        self.precompute_with_key_hash(xor_key_hash)
+    }
 
+    /// `precompute` for a party that holds the XOR key's commitment but not the key: the
+    /// gateway building work under an ABW assignment. H1 commits to `xor_key_hash` directly,
+    /// so H2, hash1 and hash2 match what the pool (which derives the same hash from the key)
+    /// computes. The mask needs the key, so `Precomputed::mask` is derived from `self.xor_key`
+    /// (zero on the gateway, giving a zero mask); the gateway uses only h2 and hash1.
+    pub fn precompute_with_key_hash(&self, xor_key_hash: [u8; 32]) -> Precomputed {
         // The hardware does receive the previous block hash, but only as the tagged hash
         // `prevblock_hidden` derives, so h1 commits to it as well.
         let mut prev_display = self.prev_block;

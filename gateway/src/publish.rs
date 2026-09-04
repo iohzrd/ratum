@@ -2,11 +2,11 @@
 //! coinbaser request on its own thread, and the once-per-reason reporting of a job that
 //! could not be built.
 
-use crate::datum::{PoolConfig, Shared};
-use crate::job::{BuildError, Builder};
+use crate::datum::Shared;
+use crate::job::{BuildError, Builder, PoolConfig};
 use crate::stratum::Server;
 use crate::template::Template;
-use log::{error, info};
+use log::{debug, error, info};
 use ratum::datum::messages::CoinbaserResponse;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -46,7 +46,22 @@ impl Publisher {
         coinbaser: Option<CoinbaserResponse>,
         what: &str,
     ) {
-        let built = ratum::lock(&self.builder).build(Arc::clone(t), new_block, pool, coinbaser);
+        // Under the version 3 protocol a pooled job commits to the pool's ABW assignment; until
+        // the pool has seeded one, no job is built. The C gateway builds solo work meanwhile
+        // (`datum_protocol_is_active` is false without an assignment, so its coinbaser pays
+        // its own address); this gateway serves none, since the pool sends the assignment
+        // with its configuration.
+        // With no ABW requirement (a v1 pool, or a v3 pool that disabled it) the work commits
+        // to the null key and the gateway classifies blocks itself.
+        let abw = if self.shared.require_abw() { self.shared.abw_assignment() } else { None };
+        if pool.is_some() && self.shared.require_abw() && abw.is_none() {
+            debug!(
+                "waiting for the pool's anti-withholding assignment before building {what} work"
+            );
+            return;
+        }
+        let built =
+            ratum::lock(&self.builder).build(Arc::clone(t), new_block, pool, coinbaser, abw);
         let mut last = ratum::lock(&self.last_error);
         match built {
             Ok(job) => {

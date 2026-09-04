@@ -34,6 +34,10 @@ pub struct Work {
     /// The twelve extranonce bytes a share sends, restored into the header's 16-byte field.
     pub extranonce: [u8; share::EXTRANONCE_SIZE],
     pub payout_script: Vec<u8>,
+    /// A version 3 gateway's ABW assignment: the key hash it committed to and the slot.
+    /// `None` builds v1 work with a zero key. The gateway commits to the hash without the
+    /// key, so headers hash through `precompute_with_key_hash`.
+    pub abw: Option<([u8; 32], u8)>,
 }
 
 impl Work {
@@ -67,6 +71,21 @@ impl Work {
             pot_index,
             extranonce: [7u8; share::EXTRANONCE_SIZE],
             payout_script: payout_script.to_vec(),
+            abw: None,
+        }
+    }
+
+    /// Turn this into version 3 work under an ABW assignment: the header commits to
+    /// `key_hash` with the PoT-derived clear bits, and shares carry `slot`.
+    pub fn with_abw(mut self, key_hash: [u8; 32], slot: u8) -> Self {
+        self.abw = Some((key_hash, slot));
+        self
+    }
+
+    fn precomputed(&self, h: &HeaderV2) -> ratum::header::Precomputed {
+        match self.abw {
+            Some((key_hash, _)) => h.precompute_with_key_hash(key_hash),
+            None => h.precompute(),
         }
     }
 
@@ -99,11 +118,24 @@ impl Work {
             time_offset: 0,
             txcount: self.job.txn_count as u16 + 1,
             flags: 0,
-            xor_key_mask_clear_bits: 0,
+            // A version 3 gateway commits to the assignment's clear bits; it never holds the key,
+            // so the field stays zero and the header hashes via `precompute_with_key_hash`.
+            xor_key_mask_clear_bits: self
+                .abw
+                .map_or(0, |_| ratum::datum::abw::clear_bits(target_byte)),
             xor_key: [0u8; 16],
             height: self.job.height as i32,
             mm_rhs: [0u8; 32],
         }
+    }
+
+    /// The raw (unmasked) hash a version 3 gateway checks its share target against: `hash2`, before
+    /// the pool's key-derived mask. For v1 work this equals the block hash.
+    pub fn raw_hash(&self, ntime: u32, nonce: u32, target_byte: u8) -> [u8; 32] {
+        let h = self.header(ntime, nonce, target_byte);
+        let pre = self.precomputed(&h);
+        let asic = h.asic_input_with(&pre.hash1, &pre.h2);
+        ratum::header::blake2b_256(&asic)
     }
 
     /// The hash the pool will compute, in the order it compares against a target.
@@ -130,6 +162,7 @@ impl Work {
             coinbase: Some(self.cb.clone()),
             use_time_offset: false,
             blake2b: Self::blake2b_section_of(ntime, nonce),
+            abw_slot: self.abw.map(|(_, slot)| slot),
         }
     }
 
@@ -146,7 +179,7 @@ impl Work {
     /// layout the hardware hashes.
     pub fn find_nonce(&self, ntime: u32, target_byte: u8, target: &[u8; 32]) -> Option<u32> {
         let header = self.header(ntime, 0, target_byte);
-        let pre = header.precompute();
+        let pre = self.precomputed(&header);
         let input = header.asic_input_with(&pre.hash1, &pre.h2);
         // The proof of work is compared as it comes out of BLAKE2b, not reversed the way a
         // SHA256d block hash is.

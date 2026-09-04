@@ -38,7 +38,8 @@ fn normalize(given: &str) -> String {
         .next()
         .and_then(|g| g.strip_prefix('g'))
         .filter(|h| h.len() >= 4 && h.bytes().all(|b| b.is_ascii_hexdigit()));
-    let count = parts.next().is_some_and(|c| !c.is_empty() && c.bytes().all(|b| b.is_ascii_digit()));
+    let count =
+        parts.next().is_some_and(|c| !c.is_empty() && c.bytes().all(|b| b.is_ascii_digit()));
     let body = match hash {
         Some(h) if count && parts.next().is_some() => h,
         _ => body,

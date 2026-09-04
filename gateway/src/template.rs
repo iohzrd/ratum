@@ -542,7 +542,7 @@ pub(crate) mod tests {
     /// A non-pooled job on `template()` whose id is `job_id`.
     pub(crate) fn job_with_id(job_id: &str) -> crate::job::Job {
         let mut b = crate::job::Builder::new(Arc::new(config()));
-        let mut job = b.build(Arc::new(template()), false, None, None).unwrap();
+        let mut job = b.build(Arc::new(template()), false, None, None, None).unwrap();
         job.job_id = job_id.to_string();
         job
     }

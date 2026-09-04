@@ -5,9 +5,16 @@ pub use super::messages::client_subcmd::SUBMIT_POW;
 pub const SECTION_JOB: u8 = 0x01;
 pub const SECTION_COINBASE: u8 = 0x02;
 pub const SECTION_BLAKE2B: u8 = 0x03;
+/// version 3 protocol: the one-byte anti-block-withholding assignment slot (wire 0..15). The C
+/// gateway emits it between the BLAKE2b section and the job section and refuses to build a
+/// submit without an assignment.
+pub const SECTION_ABW_SLOT: u8 = 0x05;
 /// Sub-field markers inside the BLAKE2b section.
 pub const BLAKE2B_ALGORITHM: u8 = 0x01;
 pub const BLAKE2B_TIME: u8 = 0x04;
+/// Bit 3 of the flags byte: the C gateway sets `DATUM_POW_FLAG_BLAKE2B` on every submit.
+/// The decoder reads bits 0 to 2 only.
+pub const FLAG_BLAKE2B: u8 = 0x08;
 /// Bit 0 of the first reserved byte of the submit-POW message: set when the header's
 /// `FLAG_USE_TIME_OFFSET` (m_flags bit 2) is set; the header bit itself is not sent. The
 /// reserved bytes are where a header flag the pool needs goes; the ASIC profile is not sent
@@ -176,7 +183,9 @@ pub struct PowSubmit {
     pub subsidy_only: bool,
     pub quickdiff: bool,
     pub target_byte: u8,
-    /// The upstream format's 32-bit time field; the gateway writes `blake2b.time_on_wire`.
+    /// The upstream format's 32-bit time field; the gateway writes the low half of the
+    /// BLAKE2b section's eight-byte time field, `blake2b.time_fields().0` (the C
+    /// `(uint32_t)pow->ntime`).
     pub ntime: u32,
     /// The upstream format's nonce field; the gateway writes the header's `nNonce`, which
     /// `blake2b.sia_nonce` also carries.
@@ -191,6 +200,8 @@ pub struct PowSubmit {
     pub job: Option<JobSection>,
     pub coinbase: Option<CoinbaseSection>,
     pub blake2b: Blake2bSection,
+    /// The ABW assignment slot; mandatory on version 3 sessions, absent on v1.
+    pub abw_slot: Option<u8>,
 }
 
 impl PowSubmit {
@@ -204,6 +215,22 @@ impl PowSubmit {
         // Masked because this is also called on shares that have not been checked yet,
         // where `verify::reconstruct` rejects a target byte of 64 or more.
         1u64 << (self.target_byte & 63)
+    }
+
+    /// The job id, target byte and nonce from the message's fixed prefix, for the response
+    /// to a share that does not decode: the gateway retires the share's replay entry by
+    /// them, and would replay it on every reconnect otherwise. `None` when the message is
+    /// shorter than the prefix.
+    pub fn prefix(data: &[u8]) -> Option<(u8, u8, u32)> {
+        let mut r = Cursor::new(data);
+        r.skip_if(SUBMIT_POW);
+        let job_id = r.u8("job id").ok()?;
+        r.u8("coinbase id").ok()?;
+        r.u8("flags").ok()?;
+        let target_byte = r.u8("target byte").ok()?;
+        r.u32("ntime").ok()?;
+        let nonce = r.u32("nonce").ok()?;
+        Some((job_id, target_byte, nonce))
     }
 
     pub fn decode(data: &[u8]) -> Result<Self, Error> {
@@ -234,6 +261,7 @@ impl PowSubmit {
         let mut job = None;
         let mut coinbase = None;
         let mut blake2b = None;
+        let mut abw_slot = None;
         loop {
             match r.u8("section marker")? {
                 STRUCT_END => break,
@@ -278,6 +306,9 @@ impl PowSubmit {
                     let coinb2 = r.take(len2, "coinb2")?.to_vec();
                     coinbase = Some(CoinbaseSection { coinbase_id, coinb1, coinb2 });
                 }
+                SECTION_ABW_SLOT => {
+                    abw_slot = Some(r.u8("abw slot")?);
+                }
                 SECTION_BLAKE2B => {
                     if r.u8("algorithm")? != BLAKE2B_ALGORITHM {
                         return Err(Error::BadBlake2bSection);
@@ -311,6 +342,7 @@ impl PowSubmit {
             job,
             coinbase,
             blake2b,
+            abw_slot,
         })
     }
 
@@ -322,7 +354,8 @@ impl PowSubmit {
         out.push(
             (self.is_block as u8)
                 | ((self.subsidy_only as u8) << 1)
-                | ((self.quickdiff as u8) << 2),
+                | ((self.quickdiff as u8) << 2)
+                | FLAG_BLAKE2B,
         );
         out.push(self.target_byte);
         out.extend_from_slice(&self.ntime.to_le_bytes());
@@ -369,6 +402,10 @@ impl PowSubmit {
         out.extend_from_slice(&b.sia_nonce);
         out.push(BLAKE2B_TIME);
         out.extend_from_slice(&b.time_on_wire.to_le_bytes());
+        if let Some(slot) = self.abw_slot {
+            out.push(SECTION_ABW_SLOT);
+            out.push(slot);
+        }
         out.push(STRUCT_END);
         out
     }
@@ -399,6 +436,7 @@ mod tests {
                 sia_nonce: [0x22; 8],
                 time_on_wire: 0x6543_2100,
             },
+            abw_slot: None,
         }
     }
 
@@ -449,7 +487,7 @@ mod tests {
         assert_eq!(bytes[0], SUBMIT_POW);
         assert_eq!(bytes[1], 3);
         assert_eq!(bytes[2], 2);
-        assert_eq!(bytes[3], 0);
+        assert_eq!(bytes[3], FLAG_BLAKE2B, "the C gateway sets 0x08 on every submit");
         assert_eq!(bytes[4], 14);
         assert_eq!(&bytes[5..9], &0x6543_2100u32.to_le_bytes());
         assert_eq!(&bytes[9..13], &0xdead_beefu32.to_le_bytes());
@@ -498,6 +536,80 @@ mod tests {
         let bytes = s.encode();
         assert_eq!(bytes[at - 4] & RESERVED_USE_TIME_OFFSET, RESERVED_USE_TIME_OFFSET);
         assert_eq!(PowSubmit::decode(&bytes).unwrap(), s);
+    }
+
+    #[test]
+    fn the_prefix_of_a_share_that_does_not_decode_is_still_read() {
+        let bytes = minimal().encode();
+        // Cut inside the BLAKE2b section, past the prefix, username and reserved bytes.
+        let mut truncated = bytes.clone();
+        truncated.truncate(56);
+        assert!(matches!(PowSubmit::decode(&truncated), Err(Error::Truncated(_))));
+        assert_eq!(PowSubmit::prefix(&truncated), Some((3, 14, 0xdead_beef)));
+        assert_eq!(PowSubmit::prefix(&bytes[..12]), None, "shorter than the prefix");
+        assert_eq!(PowSubmit::prefix(&bytes[..13]), Some((3, 14, 0xdead_beef)));
+    }
+
+    /// The 142-byte message `datum_pow_recycled_protocol_job_test` (CONVOYMining
+    /// datum_gateway, `datum_protocol_tests.c`) asserts offsets in, assembled here in the C
+    /// section order 0x03 0x05 0x01 0x02 (`encode` writes 0x01 0x02 0x03 0x05; the decoder
+    /// takes either order).
+    #[test]
+    fn decodes_the_c_gateways_section_order_at_its_offsets() {
+        let mut msg = vec![SUBMIT_POW, 0, 2, FLAG_BLAKE2B, 1];
+        msg.extend_from_slice(&0x1413_1211u32.to_le_bytes());
+        msg.extend_from_slice(&0x0403_0201u32.to_le_bytes());
+        msg.extend_from_slice(&0x2000_0000u32.to_le_bytes());
+        msg.push(12);
+        msg.extend_from_slice(&[0u8; 12]);
+        msg.extend_from_slice(b"pool\0");
+        msg.extend_from_slice(&[RESERVED_USE_TIME_OFFSET, 0, 0, 0]);
+        assert_eq!(msg.len(), 39);
+        msg.extend_from_slice(&[SECTION_BLAKE2B, BLAKE2B_ALGORITHM]);
+        msg.extend_from_slice(&0x1817_1615_1413_1211u64.to_le_bytes());
+        msg.extend_from_slice(&0x0807_0605_0403_0201u64.to_le_bytes());
+        assert_eq!(msg.len(), 57);
+        msg.push(BLAKE2B_TIME);
+        msg.extend_from_slice(&0x6553_412fu32.to_le_bytes());
+        assert_eq!(msg.len(), 62);
+        msg.extend_from_slice(&[SECTION_ABW_SLOT, 0]);
+        assert_eq!(msg.len(), 64);
+        msg.push(SECTION_JOB);
+        let mut prev_hash = [0u8; 32];
+        prev_hash[0] = 0xa0;
+        msg.extend_from_slice(&prev_hash);
+        msg.extend_from_slice(&4u16.to_le_bytes());
+        msg.extend_from_slice(&[0xb0, 0, 0, 0]);
+        msg.push(0);
+        msg.extend_from_slice(&100u32.to_le_bytes());
+        msg.extend_from_slice(&5_000_000_000u64.to_le_bytes());
+        msg.extend_from_slice(&[0u8; 16]);
+        msg.push(0);
+        assert_eq!(msg.len(), 133);
+        msg.extend_from_slice(&[SECTION_COINBASE, 2, 1, 0, 1, 0, 0xc0, 0xd0, STRUCT_END]);
+        assert_eq!(msg.len(), 142);
+
+        let s = PowSubmit::decode(&msg).unwrap();
+        assert_eq!((s.job_id, s.coinbase_id, s.target_byte), (0, 2, 1));
+        assert!(!s.is_block && !s.subsidy_only && !s.quickdiff);
+        assert_eq!((s.ntime, s.nonce, s.version), (0x1413_1211, 0x0403_0201, 0x2000_0000));
+        assert_eq!(s.username, "pool");
+        assert!(s.use_time_offset);
+        assert_eq!(s.blake2b.time_fields(), (0x1413_1211, 0x1817_1615));
+        assert_eq!(s.blake2b.nonce_fields(), (0x0403_0201, 0x0807_0605));
+        assert_eq!(s.blake2b.time_on_wire, 0x6553_412f);
+        assert_eq!(s.abw_slot, Some(0));
+        let job = s.job.as_ref().unwrap();
+        assert_eq!((job.prev_hash, job.target_byte_index, job.height), (prev_hash, 4, 100));
+        assert_eq!(
+            (job.nbits, job.coinbaser_id, job.coinbase_value),
+            ([0xb0, 0, 0, 0], 0, 5_000_000_000)
+        );
+        let cb = s.coinbase.as_ref().unwrap();
+        assert_eq!((cb.coinbase_id, &cb.coinb1[..], &cb.coinb2[..]), (2, &[0xc0][..], &[0xd0][..]));
+        // The message's u32 time and nonce are the low halves of the section's u64 fields.
+        assert_eq!(s.ntime, s.blake2b.time_fields().0);
+        assert_eq!(s.nonce, s.blake2b.nonce_fields().0);
     }
 
     /// The four header fields the two eight-byte Sia fields carry, in the order profile 0 lays

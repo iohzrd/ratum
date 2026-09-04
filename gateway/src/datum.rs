@@ -6,18 +6,22 @@
 //! gateway's (`datum_protocol.c`, `datum_gateway.c`).
 
 use crate::config::Config;
-use crate::job::Job;
+use crate::job::{Abw, Job, PoolConfig};
 use crate::tally::Tally;
 use crate::template::Notify;
 use log::{debug, error, info, warn};
+use ratum::datum::abw::{self, Activation, AssignmentNotice, Candidate, Reveal};
 use ratum::datum::client::Client;
 use ratum::datum::framing::{self, Header};
 use ratum::datum::handshake::KeyPairs;
 use ratum::datum::messages::{
-    ClientConfig, CoinbaserRequest, CoinbaserResponse, ShareResponse, ShareVerdict, server_subcmd,
+    ClientConfig, ClientConfigV3, CoinbaserRequest, CoinbaserResponse, MigrationRequest,
+    ResumeToken, ShareResponse, ShareVerdict, server_subcmd,
 };
 use ratum::datum::share::{self, Blake2bSection, CoinbaseSection, JobSection, PowSubmit};
-use ratum::datum::validation::{self, ShortTxnList, Status, TxnBundle};
+use ratum::datum::validation::{
+    self, ParentFetchReply, ParentStatus, ShortTxnList, Status, TxnBundle,
+};
 use ratum::header::HeaderV2;
 use ratum::io::read_exact_deadline;
 use ratum::target;
@@ -42,31 +46,98 @@ const READ_POLL: Duration = Duration::from_millis(5);
 /// with 1 to 80 or 1 to 100), so a message's length does not identify its contents.
 const MINING_PAD_MAX: usize = 100;
 
-/// The pool's 0x99 configuration.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PoolConfig {
-    pub payout_script: Vec<u8>,
-    pub prime_id: u32,
-    pub coinbase_tag: String,
-    pub min_difficulty: u64,
+/// The version 3 protocol's assignment slots: the key commitment each holds, indexed by
+/// wire slot, and the active one. `active` is `None` until the pool seeds an assignment;
+/// under the version 3 protocol the gateway serves no pooled work until then, as the C
+/// gateway does.
+#[derive(Default)]
+struct AbwSlots {
+    keys: [Option<[u8; 32]>; abw::ASSIGNMENT_SLOTS as usize],
+    active: Option<u8>,
+}
+
+impl AbwSlots {
+    /// The active assignment, or `None` when the pool has not seeded one.
+    fn assignment(&self) -> Option<Abw> {
+        let slot = self.active?;
+        Some(Abw { slot, key_hash: self.keys[slot as usize]? })
+    }
+
+    /// Whether `a` is the assignment its slot holds: neither revealed nor replaced by a
+    /// session the pool did not resume.
+    fn holds(&self, a: Abw) -> bool {
+        self.keys[a.slot as usize] == Some(a.key_hash)
+    }
+
+    /// Install a slot's key commitment (an 0xA8 notice); `active` also makes it the current
+    /// assignment.
+    fn install(&mut self, slot: u8, key_hash: [u8; 32], active: bool) {
+        self.keys[slot as usize] = Some(key_hash);
+        if active {
+            self.active = Some(slot);
+        }
+    }
+
+    /// Make an already-seeded slot the active assignment (an 0xA6 activation). Returns false
+    /// when the slot was never seeded, which the C gateway logs as an error.
+    fn activate(&mut self, slot: u8) -> bool {
+        if self.keys[slot as usize].is_none() {
+            return false;
+        }
+        self.active = Some(slot);
+        true
+    }
+
+    /// Clear a slot on the pool's reveal (0xA9): work on it is done, and the pool has
+    /// submitted any block. If it was the active slot, the active assignment is cleared so
+    /// no new work is built until the pool activates another. Returns false, changing
+    /// nothing, when `xor_key` does not hash to the commitment the slot holds, as the C
+    /// gateway's `datum_protocol_abw_reveal` leaves the slot as it was.
+    fn reveal(&mut self, slot: u8, xor_key: &[u8; 16]) -> bool {
+        if let Some(hash) = self.keys[slot as usize]
+            && !abw::key_matches_hash(xor_key, &hash)
+        {
+            return false;
+        }
+        self.keys[slot as usize] = None;
+        if self.active == Some(slot) {
+            self.active = None;
+        }
+        true
+    }
+}
+
+fn rounded_min_difficulty(min_difficulty: u64) -> u64 {
+    // The C gateway rounds a minimum difficulty that is not a power of two up to the next one
+    // (`roundDownToPowerOfTwo_64(x) << 1`, which wraps a value above 2^63 to 0; this caps at
+    // 2^63).
+    let rounded = target::pow2_ceil(min_difficulty);
+    if rounded != min_difficulty {
+        warn!("pool minimum difficulty {min_difficulty} is not a power of two; using {rounded}");
+    }
+    rounded
 }
 
 impl PoolConfig {
     fn from_message(c: ClientConfig) -> Self {
-        // The C gateway rounds a minimum difficulty that is not a power of two up to the
-        // next one.
-        let min_difficulty = target::pow2_ceil(c.min_difficulty);
-        if min_difficulty != c.min_difficulty {
-            warn!(
-                "pool minimum difficulty {} is not a power of two; using {min_difficulty}",
-                c.min_difficulty
-            );
+        PoolConfig {
+            payout_script: c.payout_script,
+            prime_id: u64::from(c.prime_id),
+            coinbase_tag: c.coinbase_tag,
+            min_difficulty: rounded_min_difficulty(c.min_difficulty),
+            protocol_v3: false,
+            abw_disabled: false,
         }
+    }
+
+    fn from_message_v3(c: ClientConfigV3) -> Self {
         PoolConfig {
             payout_script: c.payout_script,
             prime_id: c.prime_id,
             coinbase_tag: c.coinbase_tag,
-            min_difficulty,
+            min_difficulty: rounded_min_difficulty(c.min_difficulty),
+            protocol_v3: true,
+            abw_disabled: c.abw_disabled,
         }
     }
 }
@@ -121,6 +192,14 @@ pub struct Shared {
     coinbaser: Mutex<Option<Arc<CoinbaserRequestState>>>,
     /// The jobs by DATUM slot, for validation requests. Set by the job builder.
     pub slots: Mutex<Vec<Option<Arc<Job>>>>,
+    /// The version 3 protocol's anti-block-withholding slots; see `AbwSlots`.
+    abw: Mutex<AbwSlots>,
+    /// The resume token the pool last configured, re-presented on the next hello so the
+    /// pool accepts the returning identity.
+    resume_token: Mutex<Option<ResumeToken>>,
+    /// The node a parent fetch (0x50 0x14) reads the requested block from; `None` in tests,
+    /// whose replies carry `ParentStatus::Unavailable`.
+    node: Option<ratum::rpc::Client>,
     /// The template thread's notifications: raised on the pool's blocknotify, a rebuild is
     /// requested when the pool's configuration arrives or the connection ends.
     pub notify: Arc<Notify>,
@@ -130,7 +209,12 @@ pub struct Shared {
 }
 
 impl Shared {
-    pub fn new(slots: usize, queue_capacity: usize, notify: Arc<Notify>) -> Self {
+    pub fn new(
+        slots: usize,
+        queue_capacity: usize,
+        notify: Arc<Notify>,
+        node: Option<ratum::rpc::Client>,
+    ) -> Self {
         Shared {
             config: Mutex::new(None),
             min_difficulty: AtomicU64::new(0),
@@ -139,9 +223,29 @@ impl Shared {
             queue_capacity: queue_capacity.max(64),
             coinbaser: Mutex::new(None),
             slots: Mutex::new(vec![None; slots]),
+            abw: Mutex::new(AbwSlots::default()),
+            resume_token: Mutex::new(None),
+            node,
             notify,
             failures: AtomicU32::new(0),
         }
+    }
+
+    /// Whether a pooled job needs an active ABW assignment before it is built: the pool's
+    /// configuration is version 3 and does not set the ABW-disabled flag. False before a
+    /// configuration arrives; a solo job (no pool) is unaffected.
+    pub fn require_abw(&self) -> bool {
+        ratum::lock(&self.config).as_ref().is_some_and(|c| c.protocol_v3 && !c.abw_disabled)
+    }
+
+    /// The active ABW assignment (slot and key commitment), or `None` when the pool has not
+    /// seeded one. The job builder includes it in every header.
+    pub fn abw_assignment(&self) -> Option<Abw> {
+        ratum::lock(&self.abw).assignment()
+    }
+
+    pub fn resume_token(&self) -> Option<ResumeToken> {
+        *ratum::lock(&self.resume_token)
     }
 
     /// Whether the thread holds a connection past the configuration.
@@ -177,6 +281,9 @@ impl Shared {
             state.done.notify_all();
         }
         ratum::lock(&self.queue).clear();
+        // A new session re-seeds ABW from the pool; the resume token is kept so the next
+        // hello can re-present it.
+        *ratum::lock(&self.abw) = AbwSlots::default();
         was_active
     }
 
@@ -269,6 +376,10 @@ pub struct Settings {
     pub pass_full_users: bool,
     pub pass_workers: bool,
     pub pool_address: String,
+    /// Use the version 3 protocol upstream (`datum.protocol_v3`): the DRS hello, version 3
+    /// config, and anti-block-withholding. A version 1 configuration in response is accepted
+    /// and that session runs version 1.
+    pub protocol_v3: bool,
 }
 
 impl Settings {
@@ -289,6 +400,7 @@ impl Settings {
             pass_full_users: config.datum.pool_pass_full_users,
             pass_workers: config.datum.pool_pass_workers,
             pool_address: config.mining.pool_address.clone(),
+            protocol_v3: config.datum.protocol_v3,
         }
     }
 }
@@ -423,7 +535,16 @@ impl<'a> Session<'a> {
         stream.set_read_timeout(Some(READ_POLL))?;
         stream.set_write_timeout(Some(Duration::from_secs(30)))?;
         let mut client = Client::with_key_pairs(identity.clone(), KeyPairs::generate(), rand_u32());
-        let hello = client.hello(&settings.pool_box_pk, &settings.user_agent);
+        // A version 3 hello carries the DRS extension and the resume token from the
+        // previous session; a version 3 pool responds with a version 3 config and accepts the
+        // returning identity, and a version 1 pool reads the extension as padding and
+        // responds with a version 1 config. A version 1 hello carries neither.
+        let hello = if settings.protocol_v3 {
+            let token = shared.resume_token();
+            client.hello_resumable(&settings.pool_box_pk, &settings.user_agent, token.as_ref())
+        } else {
+            client.hello(&settings.pool_box_pk, &settings.user_agent)
+        };
         stream.write_all(&hello)?;
         stream.flush()?;
 
@@ -559,11 +680,67 @@ impl<'a> Session<'a> {
                     error!("pool configuration was not signed; ignored");
                     return Ok(());
                 }
-                match ClientConfig::decode(plain) {
-                    Some(c) => self.on_config(PoolConfig::from_message(c)),
-                    None => error!("malformed pool configuration; ignored"),
+                if self.settings.protocol_v3 {
+                    // A version 3 hello was sent. A version 3 pool responds with version 3; a
+                    // version 1 pool responds with version 1 and the session runs version 1.
+                    match ClientConfigV3::decode(plain) {
+                        Some(c) => {
+                            *ratum::lock(&self.shared.resume_token) = Some(c.resume_token);
+                            self.on_config(PoolConfig::from_message_v3(c));
+                        }
+                        None => match ClientConfig::decode(plain) {
+                            Some(c) => {
+                                warn!(
+                                    "pool responded to the version 3 hello with a version 1 \
+                                     configuration; this session runs version 1 (no \
+                                     anti-block-withholding)"
+                                );
+                                self.on_config(PoolConfig::from_message(c));
+                            }
+                            None => error!("malformed pool configuration; ignored"),
+                        },
+                    }
+                } else {
+                    match ClientConfig::decode(plain) {
+                        Some(c) => self.on_config(PoolConfig::from_message(c)),
+                        None => error!("malformed pool configuration; ignored"),
+                    }
                 }
             }
+            Some(server_subcmd::MIGRATION) => {
+                // The C gateway disconnects and reconnects to the target; this gateway stays
+                // on its configured pool, so the request is logged and not followed.
+                if !header.is_signed {
+                    error!("migration request was not signed; ignored");
+                    return Ok(());
+                }
+                match MigrationRequest::decode(plain) {
+                    Some(MigrationRequest { target: Some(t) }) => warn!(
+                        "pool requested migration to {:?} port {} (pool key {}); not \
+                         supported, staying on the configured pool",
+                        t.host,
+                        t.port,
+                        &hex::encode(t.pubkey)[..16]
+                    ),
+                    Some(MigrationRequest { target: None }) => {
+                        warn!(
+                            "pool requested a return to the configured pool; this gateway is on it"
+                        )
+                    }
+                    None => error!("malformed migration request; ignored"),
+                }
+            }
+            Some(abw::subcmd::ASSIGNMENT_NOTICE) => self.on_abw_notice(plain),
+            Some(abw::subcmd::ACTIVATION) => self.on_abw_activation(plain),
+            Some(abw::subcmd::REVEAL) => self.on_abw_reveal(plain),
+            Some(abw::subcmd::CANDIDATE_RECEIPT) => {
+                // The pool confirms it handled this candidate. The gateway retains no proof
+                // to audit, so this is informational.
+                if let Ok(c) = Candidate::decode(plain, abw::subcmd::CANDIDATE_RECEIPT) {
+                    debug!("ABW candidate receipt for slot {}", c.slot);
+                }
+            }
+            Some(abw::subcmd::CANDIDATE_RELEASE) => {}
             Some(server_subcmd::COINBASER) => {
                 let Some(state) = ratum::lock(&self.shared.coinbaser).clone() else {
                     warn!("coinbaser response with no request waiting");
@@ -619,11 +796,77 @@ impl<'a> Session<'a> {
         if previous.is_none() {
             ratum::lock(&self.shared.stats).motd = self.client.motd().to_string();
         }
+        if config.protocol_v3 {
+            info!(
+                "DATUM pool anti-block-withholding: {}",
+                if config.abw_disabled { "disabled by the pool" } else { "enabled" }
+            );
+        }
+        // A pool that switches its ABW policy mid-session invalidates every assignment the
+        // gateway holds, as the C gateway resets its ABW state on the change.
+        if previous.as_ref().is_some_and(|p| p.abw_disabled != config.abw_disabled) {
+            *ratum::lock(&self.shared.abw) = AbwSlots::default();
+        }
         // The jobs being served were built without this configuration (or with an older
         // one): rebuild them now rather than at the next poll.
         if previous.as_ref() != Some(&config) {
             self.shared.notify.rebuild();
         }
+    }
+
+    /// An 0xA8 assignment notice: install the slot's key commitment, optionally activating
+    /// it. A newly active assignment triggers a rebuild, since the gateway serves no version 3 pooled
+    /// work until one is active.
+    fn on_abw_notice(&mut self, plain: &[u8]) {
+        let notice = match AssignmentNotice::decode(plain) {
+            Ok(n) => n,
+            Err(e) => {
+                error!("malformed ABW assignment notice: {e}");
+                return;
+            }
+        };
+        ratum::lock(&self.shared.abw).install(notice.slot, notice.key_hash, notice.active);
+        debug!("ABW assignment for slot {} (active {})", notice.slot, notice.active);
+        if notice.active {
+            self.shared.notify.rebuild();
+        }
+    }
+
+    /// An 0xA6 activation: make an already-seeded slot the active assignment.
+    fn on_abw_activation(&mut self, plain: &[u8]) {
+        let act = match Activation::decode(plain) {
+            Ok(a) => a,
+            Err(e) => {
+                error!("malformed ABW activation: {e}");
+                return;
+            }
+        };
+        if ratum::lock(&self.shared.abw).activate(act.slot) {
+            debug!("ABW slot {} activated", act.slot);
+            self.shared.notify.rebuild();
+        } else {
+            error!("ABW activation for slot {} that was not seeded", act.slot);
+        }
+    }
+
+    /// An 0xA9 reveal: the pool disclosed the slot's key. The gateway holds no proofs to
+    /// audit (the pool submits blocks), so it clears the slot and, if it was active, waits
+    /// for the pool to activate another before building more work. A key that does not
+    /// hash to the slot's commitment is logged and changes nothing, as the C gateway's
+    /// `datum_protocol_abw_reveal` leaves the slot as it was.
+    fn on_abw_reveal(&mut self, plain: &[u8]) {
+        let reveal = match Reveal::decode(plain) {
+            Ok(r) => r,
+            Err(e) => {
+                error!("malformed ABW reveal: {e}");
+                return;
+            }
+        };
+        if !ratum::lock(&self.shared.abw).reveal(reveal.slot, &reveal.xor_key) {
+            error!("ABW reveal for slot {} does not match its commitment; ignored", reveal.slot);
+            return;
+        }
+        debug!("ABW slot {} revealed", reveal.slot);
     }
 
     fn on_share_response(&mut self, r: ShareResponse) {
@@ -715,12 +958,58 @@ impl<'a> Session<'a> {
                 );
                 bundle.encode()
             }
+            validation::request::PARENT_FETCH => {
+                // The C handler takes exactly the job index and the parent hash after the
+                // selector, and serves the parent when it is the job's
+                // (`datum_protocol_job_validation_parent_fetch`).
+                if plain.len() != 35 {
+                    warn!("malformed parent fetch request ({} bytes)", plain.len());
+                    return Ok(());
+                }
+                let idx = plain[2];
+                let parent_hash: [u8; 32] = plain[3..35].try_into().expect("32 bytes");
+                let (status, block) = match lookup {
+                    Ok(job) if job.template.prev_hash == parent_hash => {
+                        self.fetch_parent(&job.template.prev_hash_hex)
+                    }
+                    _ => (ParentStatus::JobMismatch, Vec::new()),
+                };
+                info!(
+                    "pool requested the parent block of job {idx}: {status:?}, {} bytes",
+                    block.len()
+                );
+                ParentFetchReply { job_index: idx, status, parent_hash, block }.encode()
+            }
             other => {
                 warn!("unknown validation request {other:#04x}");
                 return Ok(());
             }
         };
         self.send_mining(&response)
+    }
+
+    /// The raw parent block from the node (`getblock <hash> 0`), read in the session thread
+    /// (the C gateway reads it on a worker thread and replies later). The statuses are the
+    /// C `parent_fetch_get`'s: no result from the node is `Unavailable`, an unusable one
+    /// `RpcFailed`; the block must fit the reply frame.
+    fn fetch_parent(&self, hash_hex: &str) -> (ParentStatus, Vec<u8>) {
+        let Some(node) = &self.shared.node else { return (ParentStatus::Unavailable, Vec::new()) };
+        match node.call("getblock", serde_json::json!([hash_hex, 0])) {
+            Ok(serde_json::Value::String(hex)) => match hex::decode(&hex) {
+                Ok(block)
+                    if !block.is_empty()
+                        && block.len() <= framing::MAX_CMD_DATA_SIZE as usize - 42 =>
+                {
+                    (ParentStatus::Success, block)
+                }
+                _ => (ParentStatus::RpcFailed, Vec::new()),
+            },
+            Ok(_) => (ParentStatus::RpcFailed, Vec::new()),
+            Err(e) => {
+                warn!("getblock for the parent fetch failed: {e}");
+                (ParentStatus::Unavailable, Vec::new())
+            }
+        }
     }
 
     fn short_txn_list(&self, job: &Job) -> ShortTxnList {
@@ -758,6 +1047,17 @@ impl<'a> Session<'a> {
             debug!("coinbaser request: {} sats", state.value);
             self.send_mining(&req.encode())?;
             self.requested = Some(state);
+        }
+        // A version 3 hello was sent: the queued shares wait for the configuration (the C
+        // gateway sends none before it) and, under anti-block-withholding, for the active
+        // assignment, so a share queued while the pool was unreachable is sent once a resumed
+        // session has announced its slots again, rather than refused against an empty slot
+        // table. A version 1 configuration in response lifts the wait with the configuration.
+        if self.settings.protocol_v3
+            && (!self.shared.is_active()
+                || (self.shared.require_abw() && self.shared.abw_assignment().is_none()))
+        {
+            return Ok(());
         }
         let batch = std::mem::take(&mut *ratum::lock(&self.shared.queue));
         for share in batch {
@@ -811,6 +1111,21 @@ impl<'a> Session<'a> {
             debug!("share for job {} whose DATUM slot was reused; not sent", job.serial);
             return Ok(());
         }
+        // The C gateway refuses to submit for a disclosed assignment
+        // (`datum_protocol_pow_submit`): the pool took the slot's key out of its verifier at
+        // the reveal and would refuse the share as BadAbwSlot. A slot holding another
+        // commitment, or none, is a session the pool did not resume: its slots were seeded
+        // anew and the share's assignment is gone.
+        if let Some(a) = job.abw
+            && !ratum::lock(&self.shared.abw).holds(a)
+        {
+            warn!(
+                "share on ABW slot {} whose commitment this session does not hold (revealed, \
+                 or seeded anew after a reconnect); not sent",
+                a.slot
+            );
+            return Ok(());
+        }
         let h = &share.header;
         let Some(extranonce) = share::share_extranonce(&h.extranonce) else {
             warn!("share header extranonce does not begin with four zero bytes; not sent");
@@ -829,7 +1144,9 @@ impl<'a> Session<'a> {
             subsidy_only: share.subsidy_only,
             quickdiff: share.quickdiff,
             target_byte: share.target_byte,
-            ntime: blake2b.time_on_wire,
+            // The u32 fields are the low halves of the section's eight-byte time and nonce,
+            // as the C gateway writes them.
+            ntime: blake2b.time_fields().0,
             nonce: h.nonce,
             version: ratum::header::V2_FLAG | h.version as u32,
             extranonce,
@@ -838,6 +1155,9 @@ impl<'a> Session<'a> {
             job: job_section,
             coinbase: coinbase_section,
             blake2b,
+            // A version 3 job commits to an ABW assignment; its share carries the slot,
+            // and the gateway never flags a block on it (the pool classifies it).
+            abw_slot: job.abw.map(|a| a.slot),
         };
         debug!(
             "DATUM share: slot {} coinbase {} diff 2^{} user {:?}{}",
@@ -924,6 +1244,7 @@ mod tests {
             pass_full_users: full,
             pass_workers: workers,
             pool_address: "bc1qpool".into(),
+            protocol_v3: false,
         }
     }
 
@@ -964,9 +1285,12 @@ mod session_tests {
     use crate::template::Wake;
     use crate::template::tests::{config, template};
     use ratum::datum::framing::cmd;
-    use ratum::datum::handshake::{Channel, Session as PoolSession, accept, open_hello};
+    use ratum::datum::handshake::{
+        Channel, Generation, Session as PoolSession, accept, open_hello,
+    };
     use ratum::datum::messages::{
-        CoinbaseOutput, CoinbaserResponse, RejectReason, ShareResponse, client_subcmd,
+        CoinbaseOutput, CoinbaserResponse, MigrationTarget, RejectReason, ShareResponse,
+        client_subcmd,
     };
     use ratum::io::read_frame;
     use std::net::TcpListener;
@@ -1014,6 +1338,7 @@ mod session_tests {
                 nonce: share.nonce,
                 target_byte: share.target_byte,
                 job_id: share.job_id,
+                abw_ref: None,
             };
             self.send(&r.encode(), false);
         }
@@ -1025,13 +1350,15 @@ mod session_tests {
             prime_id: 7,
             coinbase_tag: "RATUM".into(),
             min_difficulty: 1024,
+            protocol_v3: false,
+            abw_disabled: false,
         }
     }
 
     fn config_payload(c: &PoolConfig) -> Vec<u8> {
         ClientConfig {
             payout_script: c.payout_script.clone(),
-            prime_id: c.prime_id,
+            prime_id: c.prime_id as u32,
             coinbase_tag: c.coinbase_tag.clone(),
             min_difficulty: c.min_difficulty,
         }
@@ -1043,6 +1370,15 @@ mod session_tests {
     /// reaches it with. `serve` returns when the test is done; dropping the stream ends the
     /// gateway's session.
     fn start_pool(
+        serve: impl FnOnce(&mut Pool) + Send + 'static,
+    ) -> (Settings, std::thread::JoinHandle<()>) {
+        start_pool_for(false, serve)
+    }
+
+    /// `start_pool` for a gateway of either generation: the hello must carry the DRS extension
+    /// exactly when `protocol_v3`; `serve` sends the configuration.
+    fn start_pool_for(
+        protocol_v3: bool,
         serve: impl FnOnce(&mut Pool) + Send + 'static,
     ) -> (Settings, std::thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1060,6 +1396,7 @@ mod session_tests {
             pass_full_users: true,
             pass_workers: true,
             pool_address: "bc1qpool".into(),
+            protocol_v3,
         };
         let handle = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
@@ -1070,6 +1407,11 @@ mod session_tests {
                 read_frame(&mut stream, |b| pre.unmask_header(b), Instant::now(), TEST_DEADLINE)
                     .expect("hello");
             let hello = open_hello(header, &body, &keys).expect("hello opens");
+            assert_eq!(
+                matches!(hello.generation, Generation::V3 { .. }),
+                protocol_v3,
+                "the DRS extension is present exactly on a version 3 hello"
+            );
             let (response, session) = accept(hello, &keys, "test motd").unwrap();
             stream.write_all(&response).unwrap();
             let mut pool = Pool { stream, session };
@@ -1080,7 +1422,7 @@ mod session_tests {
 
     fn shared() -> (Arc<Shared>, Arc<Notify>) {
         let notify = Arc::new(Notify::default());
-        (Arc::new(Shared::new(4, 64, Arc::clone(&notify))), notify)
+        (Arc::new(Shared::new(4, 64, Arc::clone(&notify), None)), notify)
     }
 
     /// Run a session against the pool until it ends; the error it ended with.
@@ -1112,7 +1454,26 @@ mod session_tests {
         // The builder assigns slots in order; build until the wanted one.
         for _ in 0..=slot {
             job = Some(
-                builder.build(Arc::clone(&template), false, Some(&pool_config()), None).unwrap(),
+                builder
+                    .build(Arc::clone(&template), false, Some(&pool_config()), None, None)
+                    .unwrap(),
+            );
+        }
+        let job = Arc::new(job.unwrap());
+        assert_eq!(job.datum_slot, slot);
+        ratum::lock(&shared.slots)[slot as usize] = Some(Arc::clone(&job));
+        job
+    }
+
+    /// `job` under a version 3 pool configuration and the ABW assignment `abw`.
+    fn v3_job(shared: &Shared, slot: u8, abw: Abw) -> Arc<Job> {
+        let template = Arc::new(template());
+        let mut builder = Builder::new(Arc::new(config()));
+        let pool = PoolConfig { protocol_v3: true, prime_id: TMP_PRIME_ID, ..pool_config() };
+        let mut job = None;
+        for _ in 0..=slot {
+            job = Some(
+                builder.build(Arc::clone(&template), false, Some(&pool), None, Some(abw)).unwrap(),
             );
         }
         let job = Arc::new(job.unwrap());
@@ -1197,6 +1558,7 @@ mod session_tests {
             assert_eq!(first.username, "bc1qminer.rig");
             assert_eq!(first.nonce, 1);
             assert_eq!(first.blake2b.nonce_fields(), (1, 0));
+            assert_eq!(first.ntime, first.blake2b.time_fields().0);
             p.answer(&first, ShareVerdict::Accepted);
             let second = p.share();
             assert!(second.job.is_none(), "the pool holds the job section");
@@ -1212,6 +1574,7 @@ mod session_tests {
                 nonce: subsidy.nonce,
                 target_byte: subsidy.target_byte,
                 job_id: subsidy.job_id,
+                abw_ref: None,
             }
             .encode();
             r[2] = 0xfe;
@@ -1266,8 +1629,9 @@ mod session_tests {
         let stale = queued(&old, 0, 1, "bc1qminer");
         // A newer job took slot 0 before the share was sent.
         let mut builder = Builder::new(Arc::new(config()));
-        let mut newer =
-            builder.build(Arc::clone(&old.template), false, Some(&pool_config()), None).unwrap();
+        let mut newer = builder
+            .build(Arc::clone(&old.template), false, Some(&pool_config()), None, None)
+            .unwrap();
         newer.serial = old.serial + 4;
         let newer = Arc::new(newer);
         ratum::lock(&shared.slots)[0] = Some(Arc::clone(&newer));
@@ -1335,5 +1699,309 @@ mod session_tests {
         let session = run_session(settings, Arc::clone(&shared));
         assert!(matches!(session.join().unwrap(), SessionError::GlobalTimeout(_)));
         pool.join().unwrap();
+    }
+
+    const TMP_PRIME_ID: u64 = 0x1122_3344_5566_7788;
+    const TMP_KEY_HASH: [u8; 32] = [0xa7; 32];
+
+    fn v3_config_payload() -> Vec<u8> {
+        ClientConfigV3 {
+            payout_script: ratum::fixtures::p2wpkh(9),
+            prime_id: TMP_PRIME_ID,
+            resume_token: {
+                let mut t = [0u8; 40];
+                t[..8].copy_from_slice(&TMP_PRIME_ID.to_le_bytes());
+                t
+            },
+            coinbase_tag: "RATUM".into(),
+            min_difficulty: 1024,
+            bulk_framing: true,
+            abw_disabled: false,
+        }
+        .encode()
+        .unwrap()
+    }
+
+    /// A version 3 pool: sends the version 3 config and an active slot-0 ABW assignment, then
+    /// runs `serve`.
+    fn start_v3_pool(
+        serve: impl FnOnce(&mut Pool) + Send + 'static,
+    ) -> (Settings, std::thread::JoinHandle<()>) {
+        start_pool_for(true, move |pool| {
+            pool.send(&v3_config_payload(), true);
+            pool.send(
+                &AssignmentNotice { active: true, slot: 0, key_hash: TMP_KEY_HASH }.encode(),
+                false,
+            );
+            serve(pool);
+        })
+    }
+
+    #[test]
+    fn a_pool_that_disables_abw_lifts_the_assignment_requirement() {
+        // A version 3 configuration requires an assignment unless it sets the ABW-disabled
+        // flag; a later configuration that clears the flag restores the requirement. A version
+        // 1 configuration never requires one.
+        let (shared, _) = shared();
+        assert!(!shared.require_abw(), "no configuration, no requirement");
+        let cfg = PoolConfig {
+            payout_script: vec![0x51],
+            prime_id: 1,
+            coinbase_tag: "t".into(),
+            min_difficulty: 1,
+            protocol_v3: true,
+            abw_disabled: true,
+        };
+        shared.set_config(cfg.clone());
+        assert!(!shared.require_abw(), "the pool disabled ABW");
+        shared.set_config(PoolConfig { abw_disabled: false, ..cfg.clone() });
+        assert!(shared.require_abw());
+        shared.set_config(PoolConfig { protocol_v3: false, abw_disabled: false, ..cfg });
+        assert!(!shared.require_abw(), "a version 1 configuration");
+    }
+
+    #[test]
+    fn a_version_1_configuration_after_the_version_3_hello_runs_version_1() {
+        // A version 1 pool reads the DRS extension as padding and sends a version 1 config.
+        let (settings, pool) = start_pool_for(true, |p| {
+            p.send(&config_payload(&pool_config()), true);
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        let (shared, _) = shared();
+        let session = run_session(settings, Arc::clone(&shared));
+        wait_for("the configuration", || shared.is_active());
+        assert_eq!(shared.pool_config(), Some(pool_config()));
+        assert!(!shared.require_abw(), "no assignment is required under version 1");
+        assert!(shared.resume_token().is_none());
+        pool.join().unwrap();
+        assert!(matches!(session.join().unwrap(), SessionError::Io(_)));
+    }
+
+    #[test]
+    fn the_client_negotiates_the_version_3_protocol_and_installs_an_assignment() {
+        let (settings, pool) = start_v3_pool(|_p| {
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        let (shared, _) = shared();
+        let session = run_session(settings, Arc::clone(&shared));
+        wait_for("the configuration", || shared.is_active());
+        let config = shared.pool_config().expect("configured");
+        assert!(config.protocol_v3, "the config is version 3");
+        assert_eq!(config.prime_id, TMP_PRIME_ID, "the 64-bit prime id is kept");
+        // The resume token the pool sent is stored for the next hello.
+        assert!(shared.resume_token().is_some());
+        // The active ABW assignment installed from the 0xA8 notice.
+        wait_for("the ABW assignment", || shared.abw_assignment().is_some());
+        let abw = shared.abw_assignment().unwrap();
+        assert_eq!(abw.slot, 0);
+        assert_eq!(abw.key_hash, TMP_KEY_HASH);
+        pool.join().unwrap();
+        assert!(matches!(session.join().unwrap(), SessionError::Io(_)));
+    }
+
+    #[test]
+    fn a_reveal_clears_the_slot_only_when_its_key_matches_the_commitment() {
+        let key = [0x5au8; 16];
+        let key_hash = abw::xor_key_hash(&key);
+        let (settings, pool) = start_pool_for(true, move |p| {
+            p.send(&v3_config_payload(), true);
+            p.send(&AssignmentNotice { active: true, slot: 0, key_hash }.encode(), false);
+            p.send(&Reveal { slot: 0, xor_key: [0x11; 16] }.encode(), false);
+            std::thread::sleep(Duration::from_millis(600));
+            p.send(&Reveal { slot: 0, xor_key: key }.encode(), false);
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        let (shared, _) = shared();
+        let session = run_session(settings, Arc::clone(&shared));
+        wait_for("the ABW assignment", || shared.abw_assignment().is_some());
+        // The mismatched reveal arrived with the notice; the slot stays active.
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(shared.abw_assignment().map(|a| a.slot), Some(0));
+        // The matching reveal clears it.
+        wait_for("the reveal", || shared.abw_assignment().is_none());
+        pool.join().unwrap();
+        assert!(matches!(session.join().unwrap(), SessionError::Io(_)));
+    }
+
+    #[test]
+    fn a_parent_fetch_is_answered_with_a_status_and_a_malformed_one_is_not() {
+        let (settings, pool) = start_pool(|p| {
+            p.send(&config_payload(&pool_config()), true);
+            // The share proves the job is in slot 0. With no node in the test, the job's
+            // parent is Unavailable; another hash or an empty slot is a job mismatch; a
+            // request of the wrong length gets no reply, so the next reply is the last
+            // request's.
+            let first = p.share();
+            p.answer(&first, ShareVerdict::Accepted);
+            let parent = template().prev_hash;
+            let request = validation::request_parent_fetch(0, &parent);
+            p.send(&request, false);
+            let reply = ParentFetchReply::decode(&p.read_mining().unwrap()).unwrap();
+            assert_eq!(reply.job_index, 0);
+            assert_eq!(reply.status, ParentStatus::Unavailable);
+            assert_eq!(reply.parent_hash, parent);
+            assert!(reply.block.is_empty());
+            let mut other = request.clone();
+            other[3] ^= 1;
+            p.send(&other, false);
+            let reply = ParentFetchReply::decode(&p.read_mining().unwrap()).unwrap();
+            assert_eq!(reply.status, ParentStatus::JobMismatch);
+            p.send(&validation::request_parent_fetch(3, &parent), false);
+            let reply = ParentFetchReply::decode(&p.read_mining().unwrap()).unwrap();
+            assert_eq!((reply.job_index, reply.status), (3, ParentStatus::JobMismatch));
+            p.send(&request[..34], false);
+            p.send(&request, false);
+            let reply = ParentFetchReply::decode(&p.read_mining().unwrap()).unwrap();
+            assert_eq!(reply.status, ParentStatus::Unavailable, "the truncated one got none");
+        });
+        let (shared, _) = shared();
+        let session = run_session(settings, Arc::clone(&shared));
+        wait_for("the configuration", || shared.is_active());
+        let job = job(&shared, 0);
+        shared.submit(queued(&job, 0, 1, "bc1qminer"));
+        pool.join().unwrap();
+        assert!(matches!(session.join().unwrap(), SessionError::Io(_)));
+    }
+
+    #[test]
+    fn a_migration_request_is_logged_and_the_session_continues() {
+        let (settings, pool) = start_pool(|p| {
+            p.send(&config_payload(&pool_config()), true);
+            let target =
+                MigrationTarget { host: "other.example".into(), port: 21000, pubkey: [7u8; 64] };
+            p.send(&MigrationRequest { target: Some(target) }.encode().unwrap(), true);
+            p.send(&MigrationRequest { target: None }.encode().unwrap(), true);
+            p.send(&MigrationRequest { target: None }.encode().unwrap(), false);
+            let first = p.share();
+            p.answer(&first, ShareVerdict::Accepted);
+        });
+        let (shared, _) = shared();
+        let session = run_session(settings, Arc::clone(&shared));
+        wait_for("the configuration", || shared.is_active());
+        let job = job(&shared, 0);
+        shared.submit(queued(&job, 0, 1, "bc1qminer"));
+        pool.join().unwrap();
+        assert!(matches!(session.join().unwrap(), SessionError::Io(_)));
+    }
+
+    #[test]
+    fn a_share_on_a_slot_the_pool_revealed_is_not_sent() {
+        let key = [0x5au8; 16];
+        let key_hash = abw::xor_key_hash(&key);
+        let (settings, pool) = start_pool_for(true, move |p| {
+            p.send(&v3_config_payload(), true);
+            p.send(&AssignmentNotice { active: true, slot: 0, key_hash }.encode(), false);
+            let first = p.share();
+            assert_eq!(first.abw_slot, Some(0));
+            p.answer(&first, ShareVerdict::Accepted);
+            // Slot 0 is revealed and slot 1 activated: the next share on slot 0 is not sent,
+            // so the next share read is the one on slot 1.
+            p.send(&Reveal { slot: 0, xor_key: key }.encode(), false);
+            let notice = AssignmentNotice { active: true, slot: 1, key_hash: TMP_KEY_HASH };
+            p.send(&notice.encode(), false);
+            let next = p.share();
+            assert_eq!(next.abw_slot, Some(1), "the share on the revealed slot was not sent");
+            assert_eq!(next.nonce, 3);
+        });
+        let (shared, _) = shared();
+        let session = run_session(settings, Arc::clone(&shared));
+        wait_for("the ABW assignment", || shared.abw_assignment().is_some());
+        let job0 = v3_job(&shared, 0, Abw { slot: 0, key_hash });
+        shared.submit(queued(&job0, 0, 1, "bc1qminer"));
+        wait_for("slot 1", || shared.abw_assignment().map(|a| a.slot) == Some(1));
+        shared.submit(queued(&job0, 0, 2, "bc1qminer"));
+        let job1 = v3_job(&shared, 1, Abw { slot: 1, key_hash: TMP_KEY_HASH });
+        shared.submit(queued(&job1, 0, 3, "bc1qminer"));
+        pool.join().unwrap();
+        assert!(matches!(session.join().unwrap(), SessionError::Io(_)));
+    }
+
+    #[test]
+    fn shares_queued_before_the_assignment_wait_for_it() {
+        // Under a version 3 configuration the queue waits for the active assignment (a
+        // resumed session announces its slots after the configuration), so a share on a job
+        // whose commitment the pool then announces is sent, not refused against an empty
+        // slot table.
+        let (settings, pool) = start_pool_for(true, |p| {
+            p.send(&v3_config_payload(), true);
+            std::thread::sleep(Duration::from_millis(500));
+            let notice = AssignmentNotice { active: true, slot: 0, key_hash: TMP_KEY_HASH };
+            p.send(&notice.encode(), false);
+            let first = p.share();
+            assert_eq!(first.abw_slot, Some(0));
+            assert_eq!(first.nonce, 1);
+            p.answer(&first, ShareVerdict::Accepted);
+        });
+        let (shared, _) = shared();
+        let session = run_session(settings, Arc::clone(&shared));
+        wait_for("the configuration", || shared.is_active());
+        assert!(shared.abw_assignment().is_none(), "the assignment is not announced yet");
+        let job0 = v3_job(&shared, 0, Abw { slot: 0, key_hash: TMP_KEY_HASH });
+        shared.submit(queued(&job0, 0, 1, "bc1qminer"));
+        pool.join().unwrap();
+        assert!(matches!(session.join().unwrap(), SessionError::Io(_)));
+    }
+
+    #[test]
+    fn a_v3_job_commits_to_the_assignment_and_its_share_carries_the_slot() {
+        // The builder includes the assignment in the coinbase (the wide prime push) and the
+        // header commitment, and the queued share names the slot with no block flag.
+        let template = Arc::new(template());
+        let mut builder = Builder::new(Arc::new(config()));
+        let abw = Abw { slot: 0, key_hash: TMP_KEY_HASH };
+        let v3_pool = PoolConfig {
+            payout_script: ratum::fixtures::p2wpkh(9),
+            prime_id: TMP_PRIME_ID,
+            coinbase_tag: "RATUM".into(),
+            min_difficulty: 1024,
+            protocol_v3: true,
+            abw_disabled: false,
+        };
+        let job = Arc::new(
+            builder.build(Arc::clone(&template), false, Some(&v3_pool), None, Some(abw)).unwrap(),
+        );
+        assert_eq!(job.abw, Some(abw));
+
+        // The coinbase carries the 11-byte prime push (opcode 0x0b) with the full 64-bit id,
+        // and the PoT byte follows it.
+        let cb = &job.coinbases[0];
+        let full = cb.assemble(&[0u8; share::EXTRANONCE_SIZE]);
+        assert!(job.target_pot_index >= 1);
+        assert_eq!(full[job.target_pot_index - 1], 0x0b, "the wide prime push opcode");
+        assert_eq!(
+            &full[job.target_pot_index + 3..job.target_pot_index + 11],
+            &TMP_PRIME_ID.to_le_bytes(),
+            "the 64-bit prime id follows the PoT placeholder and unique id"
+        );
+
+        // A version 3 pool that disabled ABW: no assignment, but the same 11-byte prime push.
+        let no_abw = PoolConfig { abw_disabled: true, ..v3_pool.clone() };
+        let no_abw_job =
+            builder.build(Arc::clone(&template), false, Some(&no_abw), None, None).unwrap();
+        let full = no_abw_job.coinbases[0].assemble(&[0u8; share::EXTRANONCE_SIZE]);
+        assert_eq!(full[no_abw_job.target_pot_index - 1], 0x0b, "wide prime push without ABW");
+
+        // The header commits to the key hash: its share hash differs from a v1 job's.
+        let v1_pool = PoolConfig { protocol_v3: false, ..v3_pool.clone() };
+        let v1_job =
+            builder.build(Arc::clone(&template), false, Some(&v1_pool), None, None).unwrap();
+        let en = [3u8; 16];
+        let h_v3 = job.header(0, 10, en, [0u8; 8], [0u8; 8]).unwrap();
+        let h_v1 = v1_job.header(0, 10, en, [0u8; 8], [0u8; 8]).unwrap();
+        assert_ne!(
+            job.share_pow_hash(&h_v3),
+            v1_job.share_pow_hash(&h_v1),
+            "the ABW commitment changes the hash"
+        );
+
+        let (shared, _) = shared();
+        ratum::lock(&shared.slots)[0] = Some(Arc::clone(&job));
+        shared.submit(queued(&job, 0, 1, "bc1qminer"));
+        let mut q = ratum::lock(&shared.queue);
+        let share = q.pop_front().expect("a queued share");
+        drop(q);
+        // `stratum.rs` sets is_block false for a version 3 job; the queued fixture does too.
+        assert!(!share.is_block);
+        assert_eq!(share.job.abw.map(|a| a.slot), Some(0));
     }
 }

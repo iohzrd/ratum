@@ -227,6 +227,13 @@ pub struct Datum {
     pub always_pay_self: Option<bool>,
     pub pooled_mining_only: bool,
     pub protocol_global_timeout: u64,
+    /// Use the version 3 protocol to the pool: the DRS hello, version 3 config, and
+    /// anti-block-withholding. On by default. A version 1 pool reads the DRS extension as
+    /// hello padding and responds with a version 1 configuration, which the gateway accepts;
+    /// that session runs the version 1 protocol. Under version 3 the gateway commits its work
+    /// to the pool's ABW assignment and does not classify or submit blocks itself; the pool
+    /// holds the XOR key and submits them. Off sends a version 1 hello.
+    pub protocol_v3: bool,
 }
 
 impl Default for Datum {
@@ -244,6 +251,7 @@ impl Default for Datum {
             always_pay_self: None,
             pooled_mining_only: true,
             protocol_global_timeout: 60,
+            protocol_v3: true,
         }
     }
 }
@@ -574,6 +582,14 @@ const FIELDS: &[Field] = &[
         key: "pool_url",
         kind: Kind::Text,
         current: |c| json!(c.datum.pool_url),
+    },
+    Field {
+        name: "datum_protocol_v3",
+        label: "Version 3 protocol",
+        section: "datum",
+        key: "protocol_v3",
+        kind: Kind::Bool,
+        current: |c| json!(c.datum.protocol_v3),
     },
     Field {
         name: "datum_gateway_fee_bps",

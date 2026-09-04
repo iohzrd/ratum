@@ -79,6 +79,26 @@ impl KeyPairs {
     }
 }
 
+/// The DRS extension marker a version 3 hello carries after `nk`, then a flag byte and, when
+/// the flag is 1, the 40-byte resume token. `open_hello` removes the signature before
+/// reading past `nk`, so in a version 1 hello only the pad follows: the C gateway and
+/// `Client::hello` pad with 1 to 200 repeats of one byte, which cannot match four distinct
+/// ones. A ratum-gateway built before the version 3 protocol padded with independent random
+/// bytes, which match with probability 2^-32 per hello.
+pub const DRS_MARKER: [u8; 4] = *b"DRS\x01";
+
+/// The protocol generation a hello asks for, read from the DRS extension: absent in a
+/// version 1 hello; present in a version 3 hello, carrying the prior session's resume token
+/// when the client asks to resume it. To accept a resume the server echoes the identical
+/// 40 bytes (and the matching prime ID) in its version 3 configuration; anything else is a
+/// decline and the client discards its replay backlog. The configuration version the server
+/// must send follows from this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Generation {
+    V1,
+    V3 { resume: Option<super::messages::ResumeToken> },
+}
+
 #[derive(Clone, Debug)]
 pub struct Hello {
     pub client_sign_pk: SignPublicKey,
@@ -87,6 +107,7 @@ pub struct Hello {
     pub session_box_pk: BoxPublicKey,
     pub user_agent: String,
     pub nk: u32,
+    pub generation: Generation,
 }
 
 /// Unseal the hello, verify its long-term signature, and parse it.
@@ -129,7 +150,32 @@ pub fn open_hello(header: Header, payload: &[u8], pool: &KeyPairs) -> Result<Hel
     }
     let nk = u32::from_le_bytes(after[1..5].try_into().unwrap());
 
-    Ok(Hello { client_sign_pk, client_box_pk, session_sign_pk, session_box_pk, user_agent, nk })
+    let tail = &after[5..];
+    let generation = if tail.len() >= 5 && tail[..4] == DRS_MARKER {
+        let resume = if tail[4] != 0 {
+            let token: super::messages::ResumeToken = tail
+                .get(5..5 + super::messages::RESUME_TOKEN_LEN)
+                .ok_or(Error::Malformed("DRS flag set without a token"))?
+                .try_into()
+                .expect("length checked");
+            Some(token)
+        } else {
+            None
+        };
+        Generation::V3 { resume }
+    } else {
+        Generation::V1
+    };
+
+    Ok(Hello {
+        client_sign_pk,
+        client_box_pk,
+        session_sign_pk,
+        session_box_pk,
+        user_agent,
+        nk,
+        generation,
+    })
 }
 
 /// One end of the encrypted channel: the precomputed box key, the two nonces, and the two

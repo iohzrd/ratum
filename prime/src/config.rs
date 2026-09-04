@@ -58,6 +58,8 @@ settings! {
     motd: String,
     allow_agent: String,
     require_split: bool,
+    require_v3: bool,
+    abw_reveal_after: u64,
     min_diff: u64,
     max_connections: usize,
     payout_address: String,

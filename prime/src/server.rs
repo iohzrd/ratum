@@ -1,6 +1,7 @@
 //! The pool's shared state: what every connection reads, and the thread that reads the
 //! node's tip and block template for all of them.
 
+use crate::abw::AbwManager;
 use log::{error, info, warn};
 use ratum::bitcoin::output_script_size_is_valid;
 use ratum::datum::handshake::KeyPairs;
@@ -11,7 +12,7 @@ use ratum_prime::verify::{PoolPolicy, ReplayGuard};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// What the node watcher maintains and every other thread reads, shared as one
 /// `Arc<NodeView>` between the watcher and `Server`.
@@ -159,6 +160,15 @@ pub(crate) struct Server {
     pub(crate) motd: String,
     /// User-agent prefixes a hello must match; empty accepts every agent (`--allow-agent`).
     pub(crate) allowed_agents: Vec<String>,
+    /// Refuse a hello without the DRS extension (`--require-v3`): only version 3 gateways
+    /// connect, so every session is under an ABW assignment and no client can withhold
+    /// blocks selectively. Off serves both generations.
+    pub(crate) require_v3: bool,
+    /// Closed version 3 sessions a gateway may resume; see `SavedSession`.
+    pub(crate) sessions: Mutex<SessionStore>,
+    /// How long after a version 3 session's ABW slot is retired its key is revealed
+    /// (`--abw-reveal-after`); see `crate::abw`.
+    pub(crate) abw_reveal_after: Duration,
     pub(crate) node: rpc::Client,
     pub(crate) node_view: Arc<NodeView>,
     pub(crate) replay: Arc<Mutex<ReplayGuard>>,
@@ -180,6 +190,142 @@ pub(crate) struct Server {
     /// `None` falls back to the address the stats page was reached on. The stats interface only
     /// displays it.
     pub(crate) advertise: Option<String>,
+}
+
+/// How long a closed version 3 session can be resumed.
+pub(crate) const SESSION_KEEP: Duration = Duration::from_secs(3600);
+/// The most closed sessions kept; past it the oldest is evicted, and its resume declined.
+pub(crate) const MAX_SAVED_SESSIONS: usize = 4096;
+
+/// A closed version 3 session, kept so the gateway's next hello can resume it: the token it
+/// must present and the ABW slots it mined under. The C gateway keeps its slot table and
+/// retained proofs across a reconnect and replays its unanswered shares once the resume is
+/// accepted, so the slots' keys must be the ones those shares were mined under.
+pub(crate) struct SavedSession {
+    pub(crate) state: SessionState,
+    pub(crate) saved_at: Instant,
+    /// When the connection that held the session was accepted. A connection the pool has
+    /// not yet found dead (its peer gone without a close) can outlive the connection that
+    /// replaced it; `SessionStore::save` keeps the entry of the later connection.
+    pub(crate) held_since: Instant,
+}
+
+impl SavedSession {
+    pub(crate) fn expired(&self, now: Instant) -> bool {
+        now.duration_since(self.saved_at) > SESSION_KEEP
+    }
+}
+
+/// The saved sessions by the gateway's long-term signing key, which the hello that resumes
+/// one is signed with.
+#[derive(Default)]
+pub(crate) struct SessionStore {
+    map: HashMap<[u8; 32], SavedSession>,
+    /// Insertion order, for eviction.
+    order: VecDeque<[u8; 32]>,
+}
+
+impl SessionStore {
+    /// Save `session` under `key`, unless the entry there came from a connection accepted
+    /// later than the one that held `session`. The entries past `SESSION_KEEP` are removed
+    /// first, so an expired session holds its splits no longer than a hello could resume it.
+    pub(crate) fn save(&mut self, key: [u8; 32], session: SavedSession) {
+        self.prune_expired(session.saved_at);
+        if self.map.get(&key).is_some_and(|kept| kept.held_since > session.held_since) {
+            return;
+        }
+        if self.map.insert(key, session).is_some() {
+            self.order.retain(|k| *k != key);
+        }
+        self.order.push_back(key);
+        while self.map.len() > MAX_SAVED_SESSIONS {
+            match self.order.pop_front() {
+                Some(oldest) => {
+                    self.map.remove(&oldest);
+                }
+                None => break,
+            }
+        }
+    }
+
+    pub(crate) fn take(&mut self, key: &[u8; 32]) -> Option<SavedSession> {
+        let session = self.map.remove(key)?;
+        self.order.retain(|k| k != key);
+        Some(session)
+    }
+
+    /// Remove the entries no hello can resume any more.
+    fn prune_expired(&mut self, now: Instant) {
+        self.map.retain(|_, s| !s.expired(now));
+        let map = &self.map;
+        self.order.retain(|k| map.contains_key(k));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.map.len()
+    }
+}
+
+impl Server {
+    /// The v3 config a version 3 session is sent in place of `config_payload`: `token`
+    /// names the session, and bulk framing is advertised.
+    pub(crate) fn config_payload_v3(&self, token: &messages::ResumeToken) -> Vec<u8> {
+        messages::ClientConfigV3 {
+            payout_script: self.policy.payout_script.clone(),
+            prime_id: self.policy.prime_id,
+            resume_token: *token,
+            coinbase_tag: self.policy.coinbase_tag.clone(),
+            min_difficulty: self.policy.min_difficulty,
+            bulk_framing: true,
+            abw_disabled: false,
+        }
+        .encode()
+        .expect("the v1 config from the same policy encoded at startup")
+    }
+
+    /// Continue the saved session a version 3 hello presents the token of, or start one.
+    /// The entry saved under the gateway's key is consumed either way; it continues only
+    /// when it has not expired and its token is the one presented. Returns the session's
+    /// state (`AbwManager::resumed` when continued) and whether it was resumed.
+    pub(crate) fn resume_or_start(
+        &self,
+        client_key: [u8; 32],
+        presented: Option<&messages::ResumeToken>,
+        now: Instant,
+    ) -> (SessionState, bool) {
+        let saved = lock(&self.sessions).take(&client_key);
+        if let (Some(presented), Some(saved)) = (presented, saved)
+            && !saved.expired(now)
+            && saved.state.token == *presented
+        {
+            let mut state = saved.state;
+            state.abw.resumed(now);
+            return (state, true);
+        }
+        let state = SessionState {
+            token: messages::new_resume_token(self.policy.prime_id),
+            abw: AbwManager::start(now, self.abw_reveal_after),
+            splits: HashMap::new(),
+            coinbaser_id: 0,
+        };
+        (state, false)
+    }
+}
+
+/// The state of a version 3 session that outlives its connection: what a resumed
+/// connection continues with, and what `SavedSession` keeps meanwhile.
+pub(crate) struct SessionState {
+    /// The token the session is configured with and a hello resuming it presents.
+    pub(crate) token: messages::ResumeToken,
+    pub(crate) abw: AbwManager,
+    /// The splits the session dictated, by coinbaser id: the gateway's replayed shares and
+    /// its shares on the jobs it still holds pay them, and `check_outputs` refuses any
+    /// other output.
+    pub(crate) splits: HashMap<u8, (Vec<messages::CoinbaseOutput>, u64)>,
+    /// The last coinbaser id sent, continued so a resumed session's next split does not
+    /// take an id a held job still names.
+    pub(crate) coinbaser_id: u8,
 }
 
 /// Decrements `open_connections` when the connection's thread ends.
@@ -467,6 +613,9 @@ mod tests {
             pool_keys: KeyPairs::generate(),
             motd: String::new(),
             allowed_agents: Vec::new(),
+            require_v3: false,
+            sessions: Mutex::new(SessionStore::default()),
+            abw_reveal_after: crate::abw::DEFAULT_REVEAL_AFTER,
             node: rpc::Client::new("http://127.0.0.1:1", "u", "p").unwrap(),
             node_view: Arc::new(NodeView::new()),
             replay: Arc::new(Mutex::new(ReplayGuard::default())),
@@ -487,6 +636,153 @@ mod tests {
         let mut v = vec![0x00, 0x14];
         v.extend_from_slice(&[fill; 20]);
         v
+    }
+
+    #[test]
+    fn a_saved_session_is_resumed_once_by_its_token() {
+        let server = server_with(&[], &[], 0);
+        let key = [7u8; 32];
+        let now = Instant::now();
+        let token = messages::new_resume_token(1);
+        let abw = AbwManager::start(now, crate::abw::DEFAULT_REVEAL_AFTER);
+        let hash0 = ratum::datum::abw::xor_key_hash(&abw.keys().seeded[0].unwrap());
+        let split = vec![messages::CoinbaseOutput { value: 5, script: vec![0x51] }];
+        let mut splits = HashMap::new();
+        splits.insert(7u8, (split.clone(), 0));
+        let state = SessionState { token, abw, splits, coinbaser_id: 7 };
+        lock(&server.sessions).save(key, SavedSession { state, saved_at: now, held_since: now });
+
+        let (state, resumed) = server.resume_or_start(key, Some(&token), now);
+        assert!(resumed);
+        assert_eq!(state.token, token);
+        assert_eq!(ratum::datum::abw::xor_key_hash(&state.abw.keys().seeded[0].unwrap()), hash0);
+        assert_eq!(
+            state.splits.get(&7).map(|(o, _)| o),
+            Some(&split),
+            "the session's splits continue"
+        );
+        assert_eq!(state.coinbaser_id, 7, "the next split takes id 8");
+        assert_eq!(lock(&server.sessions).len(), 0, "the entry is consumed");
+
+        let (state, resumed) = server.resume_or_start(key, Some(&token), now);
+        assert!(!resumed, "a consumed session is not resumed again");
+        assert_ne!(state.token, token);
+        assert!(messages::token_matches_prime_id(&state.token, 1));
+        assert!(state.splits.is_empty());
+        assert_eq!(state.coinbaser_id, 0);
+    }
+
+    #[test]
+    fn a_resume_with_another_token_or_past_session_keep_starts_a_new_session() {
+        let server = server_with(&[], &[], 0);
+        let key = [8u8; 32];
+        let now = Instant::now();
+        let token = messages::new_resume_token(1);
+        let save = |server: &Server, saved_at: Instant| {
+            let abw = AbwManager::start(now, crate::abw::DEFAULT_REVEAL_AFTER);
+            lock(&server.sessions).save(key, saved(token, abw, saved_at, now));
+        };
+
+        save(&server, now);
+        let other = messages::new_resume_token(1);
+        let (state, resumed) = server.resume_or_start(key, Some(&other), now);
+        assert!(!resumed);
+        assert_ne!(state.token, token);
+        assert_eq!(lock(&server.sessions).len(), 0, "a mismatch consumes the entry too");
+
+        save(&server, now);
+        let (_, resumed) =
+            server.resume_or_start(key, Some(&token), now + SESSION_KEEP + Duration::from_secs(1));
+        assert!(!resumed, "expired");
+
+        save(&server, now);
+        let (_, resumed) = server.resume_or_start(key, None, now);
+        assert!(!resumed, "no token presented");
+        assert_eq!(lock(&server.sessions).len(), 0);
+
+        let (_, resumed) = server.resume_or_start([9u8; 32], Some(&token), now);
+        assert!(!resumed, "another gateway's key");
+    }
+
+    fn saved(
+        token: messages::ResumeToken,
+        abw: AbwManager,
+        saved_at: Instant,
+        held_since: Instant,
+    ) -> SavedSession {
+        let state = SessionState { token, abw, splits: HashMap::new(), coinbaser_id: 0 };
+        SavedSession { state, saved_at, held_since }
+    }
+
+    #[test]
+    fn the_session_store_evicts_the_oldest_past_its_capacity() {
+        let mut store = SessionStore::default();
+        let now = Instant::now();
+        let token = messages::new_resume_token(1);
+        for i in 0..=MAX_SAVED_SESSIONS {
+            let mut key = [0u8; 32];
+            key[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            let abw = AbwManager::start(now, crate::abw::DEFAULT_REVEAL_AFTER);
+            store.save(key, saved(token, abw, now, now));
+        }
+        assert_eq!(store.len(), MAX_SAVED_SESSIONS);
+        assert!(store.take(&[0u8; 32]).is_none(), "the first entry was evicted");
+        let mut last = [0u8; 32];
+        last[..8].copy_from_slice(&(MAX_SAVED_SESSIONS as u64).to_le_bytes());
+        assert!(store.take(&last).is_some());
+        assert_eq!(store.len(), MAX_SAVED_SESSIONS - 1);
+        // Saving under a key again replaces the entry and moves it to the newest position.
+        let mut second = [0u8; 32];
+        second[..8].copy_from_slice(&1u64.to_le_bytes());
+        let abw = AbwManager::start(now, crate::abw::DEFAULT_REVEAL_AFTER);
+        store.save(second, saved(token, abw, now, now));
+        assert_eq!(store.len(), MAX_SAVED_SESSIONS - 1);
+        assert_eq!(store.order.back(), Some(&second));
+    }
+
+    #[test]
+    fn a_save_removes_the_sessions_no_hello_can_resume() {
+        let mut store = SessionStore::default();
+        let t0 = Instant::now();
+        let token = messages::new_resume_token(1);
+        let abw = AbwManager::start(t0, crate::abw::DEFAULT_REVEAL_AFTER);
+        store.save([1u8; 32], saved(token, abw, t0, t0));
+        let later = t0 + SESSION_KEEP + Duration::from_secs(1);
+        let abw = AbwManager::start(later, crate::abw::DEFAULT_REVEAL_AFTER);
+        store.save([2u8; 32], saved(token, abw, later, later));
+        assert_eq!(store.len(), 1, "the expired entry is gone");
+        assert!(store.take(&[1u8; 32]).is_none());
+        assert!(store.take(&[2u8; 32]).is_some());
+        assert!(store.order.is_empty(), "the eviction order follows the map");
+    }
+
+    /// A connection whose peer vanished without a close stays open at the pool until its
+    /// writes fail, so it can end after the connection that replaced it: its save must not
+    /// overwrite the later connection's session.
+    #[test]
+    fn a_connection_accepted_earlier_does_not_overwrite_a_later_ones_saved_session() {
+        let mut store = SessionStore::default();
+        let key = [3u8; 32];
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(60);
+        let later = messages::new_resume_token(1);
+        let earlier = messages::new_resume_token(1);
+        let session = |token, held_since| {
+            let abw = AbwManager::start(t0, crate::abw::DEFAULT_REVEAL_AFTER);
+            saved(token, abw, t1 + Duration::from_secs(1), held_since)
+        };
+        store.save(key, session(later, t1));
+        store.save(key, session(earlier, t0));
+        assert_eq!(
+            store.take(&key).unwrap().state.token,
+            later,
+            "the later connection's entry stays"
+        );
+        // In the other order the later connection's save replaces the earlier one's.
+        store.save(key, session(earlier, t0));
+        store.save(key, session(later, t1));
+        assert_eq!(store.take(&key).unwrap().state.token, later);
+        assert_eq!(store.len(), 0);
     }
 
     #[test]

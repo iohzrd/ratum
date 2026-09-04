@@ -7,6 +7,9 @@ pub mod server_subcmd {
     pub const VALIDATION: u8 = 0x50;
     pub const SHARE_RESPONSE: u8 = 0x8F;
     pub const BLOCKNOTIFY: u8 = 0xF9;
+    /// version 3 protocol: server-requested migration to another pool server. Must be signed.
+    pub const MIGRATION: u8 = 0xA4;
+    // 0xA5..=0xA9 are the anti-block-withholding subcommands; see `super::abw::subcmd`.
 }
 
 /// The first payload byte of a `cmd::MINING` frame sent by the gateway: the mining sub-command.
@@ -18,12 +21,16 @@ pub mod client_subcmd {
 
 pub use super::framing::STRUCT_END;
 pub const CONFIG_VERSION: u8 = 1;
-/// The gateway's `pool_addr_script` field (`T_DATUM_STRATUM_JOB`, `src/datum_stratum.h`).
-/// A longer script has nowhere to go: the gateway copies it into every stratum job and
-/// writes it into the generation transaction verbatim, so it cannot be truncated to fit.
-pub const MAX_PAYOUT_SCRIPT: usize = 64;
-/// One less than the gateway's parser accepts (255, into a 256-byte buffer).
-pub const MAX_COINBASE_TAG: usize = 254;
+/// The pool's payout script in the configuration message. The C gateway's parser refuses a
+/// longer one (`MAX_OUTPUT_SCRIPT_LEN`, 83, the RDTS output-script ceiling); the version 1
+/// fork refuses one over 64 (its `pool_addr_script` field), and `ratum-prime` limits its
+/// own to the 34-byte coinbase output ceiling. Coinbaser outputs are bounded separately by
+/// `MAX_OUTPUT_SCRIPT`.
+pub const MAX_PAYOUT_SCRIPT: usize = 83;
+/// One less than the C gateway's `MAX_COINBASE_TAG_SPACE` (82): its configuration parser
+/// rejects a tag of 82 bytes or more as one that can never fit the coinbase, and refuses the
+/// whole configuration.
+pub const MAX_COINBASE_TAG: usize = 81;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
@@ -91,6 +98,209 @@ impl ClientConfig {
             return None;
         }
         Some(ClientConfig { payout_script, prime_id, coinbase_tag, min_difficulty })
+    }
+}
+
+/// The version 3 protocol's configuration version. A version 3 gateway rejects versions 1 and 2, and
+/// a v1 gateway rejects this, so the server picks the version from the hello's DRS
+/// extension (present only in version 3 hellos).
+pub const CONFIG_VERSION_V3: u8 = 3;
+/// `DATUM_RESUME_TOKEN_SIZE`. Bytes 0..8 must be the prime ID little-endian: the gateway
+/// treats a resume as accepted only when the configured prime ID equals that prefix and the
+/// whole token echoes what it sent.
+pub const RESUME_TOKEN_LEN: usize = 40;
+pub type ResumeToken = [u8; RESUME_TOKEN_LEN];
+/// Appended after the v3 config terminator to advertise bulk framing, and the marker of a
+/// bulk fragment.
+pub const DBF_MARKER: [u8; 4] = *b"DBF\x01";
+/// The byte before the v3 terminator is a flags byte (`0x00` in v1, where it must be zero).
+/// The only defined bit: the pool runs without anti-block-withholding, so the gateway uses the
+/// null XOR key, omits the 0x05 slot section, and classifies and submits blocks itself. Any
+/// other bit set makes the gateway reject the configuration.
+pub const CONFIG_FLAG_ABW_DISABLED: u8 = 0x01;
+
+/// Whether a resume token carries `prime_id` in its first eight bytes, the invariant the
+/// gateway checks before treating a configuration as a resume.
+pub fn token_matches_prime_id(token: &ResumeToken, prime_id: u64) -> bool {
+    u64::from_le_bytes(token[..8].try_into().expect("eight bytes")) == prime_id
+}
+
+/// A token for one new session: `prime_id` little-endian, then 32 bytes from the CSPRNG.
+/// Random, so a token names one session and a pool restart declines every resume.
+pub fn new_resume_token(prime_id: u64) -> ResumeToken {
+    let mut t = [0u8; RESUME_TOKEN_LEN];
+    t[..8].copy_from_slice(&prime_id.to_le_bytes());
+    dryoc::rng::copy_randombytes(&mut t[8..]);
+    t
+}
+
+/// The version 3 client configuration (version 3): u64 prime ID, resume token, and an
+/// optional trailing bulk-framing advertisement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClientConfigV3 {
+    pub payout_script: Vec<u8>,
+    pub prime_id: u64,
+    pub resume_token: ResumeToken,
+    pub coinbase_tag: String,
+    pub min_difficulty: u64,
+    /// Advertise bulk framing (`DBF\x01` after the terminator). Re-evaluated by the gateway
+    /// on every configuration message.
+    pub bulk_framing: bool,
+    /// `CONFIG_FLAG_ABW_DISABLED`: this pool does not run anti-block-withholding.
+    pub abw_disabled: bool,
+}
+
+impl ClientConfigV3 {
+    pub fn encode(&self) -> Result<Vec<u8>, Error> {
+        if self.payout_script.len() > MAX_PAYOUT_SCRIPT {
+            return Err(Error::TooLong { field: "payout script", len: self.payout_script.len() });
+        }
+        if self.coinbase_tag.len() > MAX_COINBASE_TAG {
+            return Err(Error::TooLong { field: "coinbase tag", len: self.coinbase_tag.len() });
+        }
+        if !self.min_difficulty.is_power_of_two() {
+            return Err(Error::MinDiffNotPowerOfTwo(self.min_difficulty));
+        }
+
+        let tag = self.coinbase_tag.as_bytes();
+        let mut out =
+            Vec::with_capacity(64 + RESUME_TOKEN_LEN + self.payout_script.len() + tag.len());
+        out.push(server_subcmd::CONFIG);
+        out.push(CONFIG_VERSION_V3);
+        out.push(self.payout_script.len() as u8);
+        out.extend_from_slice(&self.payout_script);
+        out.extend_from_slice(&self.prime_id.to_le_bytes());
+        out.extend_from_slice(&self.resume_token);
+        out.push(tag.len() as u8);
+        out.extend_from_slice(tag);
+        out.extend_from_slice(&self.min_difficulty.to_le_bytes());
+        out.push(if self.abw_disabled { CONFIG_FLAG_ABW_DISABLED } else { 0 });
+        out.push(STRUCT_END);
+        if self.bulk_framing {
+            out.extend_from_slice(&DBF_MARKER);
+        }
+        Ok(out)
+    }
+
+    pub fn decode(data: &[u8]) -> Option<Self> {
+        let mut c = Cursor::new(data);
+        c.skip_if(server_subcmd::CONFIG);
+        if c.u8("version").ok()? != CONFIG_VERSION_V3 {
+            return None;
+        }
+        let a = c.u8("script length").ok()? as usize;
+        if a > MAX_PAYOUT_SCRIPT {
+            return None;
+        }
+        let payout_script = c.take(a, "payout script").ok()?.to_vec();
+        let prime_id = c.u64("prime id").ok()?;
+        let resume_token: ResumeToken = c.arr("resume token").ok()?;
+        let b = c.u8("tag length").ok()? as usize;
+        // The C gateway refuses the configuration for a tag of `MAX_COINBASE_TAG_SPACE` (82)
+        // bytes or more.
+        if b > MAX_COINBASE_TAG {
+            return None;
+        }
+        let coinbase_tag = String::from_utf8_lossy(c.take(b, "coinbase tag").ok()?).into_owned();
+        let min_difficulty = c.u64("min difficulty").ok()?;
+        let flags = c.u8("flags").ok()?;
+        if flags & !CONFIG_FLAG_ABW_DISABLED != 0 || c.u8("terminator").ok()? != STRUCT_END {
+            return None;
+        }
+        // The gateway reads exactly four bytes after the terminator and ignores the rest.
+        let bulk_framing = c.rest().get(..4) == Some(&DBF_MARKER[..]);
+        Some(ClientConfigV3 {
+            payout_script,
+            prime_id,
+            resume_token,
+            coinbase_tag,
+            min_difficulty,
+            bulk_framing,
+            abw_disabled: flags & CONFIG_FLAG_ABW_DISABLED != 0,
+        })
+    }
+}
+
+/// A migration request (subcommand 0xA4, signed): `Some(target)` redirects the gateway,
+/// `None` returns it to its configured server.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MigrationRequest {
+    pub target: Option<MigrationTarget>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MigrationTarget {
+    pub host: String,
+    pub port: u16,
+    /// 32 bytes ed25519 signing pubkey then 32 bytes x25519 box pubkey.
+    pub pubkey: [u8; 64],
+}
+
+pub const MIGRATION_REVISION: u8 = 0;
+
+impl MigrationRequest {
+    pub fn encode(&self) -> Result<Vec<u8>, Error> {
+        let mut out = Vec::with_capacity(72 + self.target.as_ref().map_or(0, |t| t.host.len()));
+        out.push(server_subcmd::MIGRATION);
+        out.push(MIGRATION_REVISION);
+        match &self.target {
+            None => {
+                out.push(1);
+            }
+            Some(t) => {
+                let host = t.host.as_bytes();
+                if host.is_empty() || host.len() >= 1024 || host.contains(&0) {
+                    return Err(Error::OutOfRange { field: "migration host", len: host.len() });
+                }
+                if t.port == 0 {
+                    return Err(Error::OutOfRange { field: "migration port", len: 0 });
+                }
+                out.push(0);
+                out.extend_from_slice(&(host.len() as u16).to_le_bytes());
+                out.extend_from_slice(host);
+                out.extend_from_slice(&t.port.to_le_bytes());
+                out.extend_from_slice(&t.pubkey);
+            }
+        }
+        out.push(STRUCT_END);
+        Ok(out)
+    }
+
+    pub fn decode(data: &[u8]) -> Option<Self> {
+        let mut c = Cursor::new(data);
+        c.skip_if(server_subcmd::MIGRATION);
+        if c.u8("revision").ok()? != MIGRATION_REVISION {
+            return None;
+        }
+        match c.u8("action").ok()? {
+            1 => {
+                if c.u8("terminator").ok()? != STRUCT_END || !c.at_end() {
+                    return None;
+                }
+                Some(MigrationRequest { target: None })
+            }
+            0 => {
+                let host_len = c.u16("host length").ok()? as usize;
+                if host_len == 0 || host_len >= 1024 {
+                    return None;
+                }
+                let host = c.take(host_len, "host").ok()?;
+                if host.contains(&0) {
+                    return None;
+                }
+                let host = String::from_utf8_lossy(host).into_owned();
+                let port = c.u16("port").ok()?;
+                if port == 0 {
+                    return None;
+                }
+                let pubkey: [u8; 64] = c.arr("pubkey").ok()?;
+                if c.u8("terminator").ok()? != STRUCT_END || !c.at_end() {
+                    return None;
+                }
+                Some(MigrationRequest { target: Some(MigrationTarget { host, port, pubkey }) })
+            }
+            _ => None,
+        }
     }
 }
 
@@ -277,6 +487,9 @@ pub enum RejectReason {
     /// The share's coinbase paid none of the outputs the pool's coinbaser dictated for its
     /// job, past the pool's `SPLIT_GRACE_SECS`: the gateway is not mining the split.
     NoSplit = 43,
+    /// RATUM's own code: a version 3 session share names no ABW slot, an unseeded one, or one out
+    /// of range.
+    BadAbwSlot = 44,
 }
 
 impl RejectReason {
@@ -307,6 +520,7 @@ impl RejectReason {
             41 => RejectReason::HeaderFieldMismatch,
             42 => RejectReason::HeaderMerkleMismatch,
             43 => RejectReason::NoSplit,
+            44 => RejectReason::BadAbwSlot,
             _ => return None,
         })
     }
@@ -318,6 +532,18 @@ pub mod share_status {
     pub const REJECTED: u8 = 0x66;
 }
 
+/// The marker byte introducing a share response's exact ABW reference.
+pub const SHARE_RESPONSE_ABW_MARKER: u8 = 0x06;
+
+/// The version 3 protocol's exact share reference: the ABW slot (wire 0..15) and the raw
+/// (unmasked) PoW hash. A version 3 gateway removes exactly one replay entry with it; without it
+/// the gateway matches on the ambiguous (nonce, PoT, job) triple.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AbwShareRef {
+    pub slot: u8,
+    pub raw_pow_hash: [u8; 32],
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ShareResponse {
     pub verdict: ShareVerdict,
@@ -326,6 +552,8 @@ pub struct ShareResponse {
     /// from the submit; 0xFF when unknown.
     pub target_byte: u8,
     pub job_id: u8,
+    /// `None` on v1 sessions; the version 3 protocol appends the 0x06 exact reference.
+    pub abw_ref: Option<AbwShareRef>,
 }
 
 impl ShareResponse {
@@ -336,13 +564,19 @@ impl ShareResponse {
             ShareVerdict::Rejected(r) => (share_status::REJECTED, r as u16),
             ShareVerdict::RejectedUnknown(code) => (share_status::REJECTED, code),
         };
-        let mut out = Vec::with_capacity(10);
+        let mut out = Vec::with_capacity(if self.abw_ref.is_some() { 45 } else { 10 });
         out.push(server_subcmd::SHARE_RESPONSE);
         out.push(status);
         out.extend_from_slice(&reason.to_le_bytes());
         out.extend_from_slice(&self.nonce.to_le_bytes());
         out.push(self.target_byte);
         out.push(self.job_id);
+        if let Some(r) = &self.abw_ref {
+            out.push(SHARE_RESPONSE_ABW_MARKER);
+            out.push(r.slot);
+            out.extend_from_slice(&r.raw_pow_hash);
+            out.push(STRUCT_END);
+        }
         out
     }
 
@@ -360,12 +594,21 @@ impl ShareResponse {
             },
             _ => return None,
         };
-        Some(ShareResponse {
-            verdict,
-            nonce: c.u32("nonce").ok()?,
-            target_byte: c.u8("target byte").ok()?,
-            job_id: c.u8("job id").ok()?,
-        })
+        let nonce = c.u32("nonce").ok()?;
+        let target_byte = c.u8("target byte").ok()?;
+        let job_id = c.u8("job id").ok()?;
+        // The C gateway accepts the reference only at exactly this length and shape;
+        // anything else is treated as the legacy 9-byte body.
+        let abw_ref = match c.rest() {
+            [SHARE_RESPONSE_ABW_MARKER, slot, hash @ ..] if hash.len() == 33 && *slot < 16 => {
+                (hash[32] == STRUCT_END).then(|| AbwShareRef {
+                    slot: *slot,
+                    raw_pow_hash: hash[..32].try_into().expect("32 bytes"),
+                })
+            }
+            _ => None,
+        };
+        Some(ShareResponse { verdict, nonce, target_byte, job_id, abw_ref })
     }
 }
 
@@ -561,6 +804,7 @@ mod tests {
             nonce: 0x0bad_c0de,
             target_byte: 33,
             job_id: 200,
+            abw_ref: None,
         };
         let mut verdicts = vec![ShareVerdict::Accepted, ShareVerdict::AcceptedTentatively];
         for code in 0..=60u16 {
@@ -569,7 +813,7 @@ mod tests {
                 verdicts.push(ShareVerdict::Rejected(r));
             }
         }
-        assert_eq!(verdicts.len(), 2 + 25, "every reject reason is covered");
+        assert_eq!(verdicts.len(), 2 + 26, "every reject reason is covered");
         for verdict in verdicts {
             let r = ShareResponse { verdict, ..base };
             assert_eq!(ShareResponse::decode(&r.encode()), Some(r), "{verdict:?}");
@@ -592,12 +836,95 @@ mod tests {
     }
 
     #[test]
+    fn v3_config_flags_byte_carries_the_abw_policy_and_rejects_unknown_bits() {
+        let base = ClientConfigV3 {
+            payout_script: vec![0x51],
+            prime_id: 0x1122_3344_5566_7788,
+            resume_token: [7u8; RESUME_TOKEN_LEN],
+            coinbase_tag: "RATUM".into(),
+            min_difficulty: 1024,
+            bulk_framing: true,
+            abw_disabled: false,
+        };
+        let on = base.encode().unwrap();
+        // The byte before the 0xFE terminator is the flags byte: zero with ABW on.
+        let fe = on.len() - 1 - DBF_MARKER.len();
+        assert_eq!(on[fe], STRUCT_END);
+        assert_eq!(on[fe - 1], 0);
+        assert_eq!(ClientConfigV3::decode(&on).unwrap(), base);
+
+        let off = ClientConfigV3 { abw_disabled: true, ..base.clone() };
+        let bytes = off.encode().unwrap();
+        assert_eq!(bytes[fe - 1], CONFIG_FLAG_ABW_DISABLED);
+        assert_eq!(ClientConfigV3::decode(&bytes).unwrap(), off);
+
+        // The C gateway rejects any other flag bit; so does this decoder.
+        let mut bad = on.clone();
+        bad[fe - 1] = 0x80;
+        assert_eq!(ClientConfigV3::decode(&bad), None);
+        let mut bad = on;
+        bad[fe - 1] = CONFIG_FLAG_ABW_DISABLED | 0x02;
+        assert_eq!(ClientConfigV3::decode(&bad), None);
+    }
+
+    #[test]
+    fn a_new_resume_token_carries_the_prime_id_and_is_random() {
+        let a = new_resume_token(0x0102_0304_0506_0708);
+        let b = new_resume_token(0x0102_0304_0506_0708);
+        assert!(token_matches_prime_id(&a, 0x0102_0304_0506_0708));
+        assert!(!token_matches_prime_id(&a, 1));
+        assert_eq!(a[..8], b[..8]);
+        assert_ne!(a[8..], b[8..]);
+    }
+
+    #[test]
+    fn config_limits_match_what_a_convoy_gateway_accepts() {
+        // A tag of 82 bytes or more is refused by the C parser as one that can never fit.
+        let mut c = ClientConfigV3 {
+            payout_script: vec![0x51],
+            prime_id: 1,
+            resume_token: [0u8; RESUME_TOKEN_LEN],
+            coinbase_tag: "t".repeat(81),
+            min_difficulty: 1,
+            bulk_framing: false,
+            abw_disabled: false,
+        };
+        assert!(c.encode().is_ok(), "81-byte tag is the most a CONVOY gateway takes");
+        c.coinbase_tag = "t".repeat(82);
+        assert!(matches!(c.encode(), Err(Error::TooLong { field: "coinbase tag", .. })));
+        // The decoder refuses what the C parser refuses: an 82-byte tag written by hand.
+        c.coinbase_tag = "t".repeat(81);
+        let mut bytes = c.encode().unwrap();
+        let tag_len_at = 2 + 1 + 1 + 8 + RESUME_TOKEN_LEN;
+        assert_eq!(bytes[tag_len_at], 81);
+        bytes[tag_len_at] = 82;
+        bytes.insert(tag_len_at + 1, b't');
+        assert_eq!(ClientConfigV3::decode(&bytes), None);
+        // The payout script field is capped at the C gateway's MAX_OUTPUT_SCRIPT_LEN, 83.
+        c.coinbase_tag = "t".into();
+        c.payout_script = vec![0x51; 83];
+        let bytes = c.encode().expect("83-byte payout script");
+        assert_eq!(ClientConfigV3::decode(&bytes).unwrap().payout_script.len(), 83);
+        c.payout_script = vec![0x51; 84];
+        assert!(matches!(c.encode(), Err(Error::TooLong { field: "payout script", .. })));
+        // The v1 encoder shares the tag limit (the same C parser reads it).
+        let v1 = ClientConfig {
+            payout_script: vec![0x51],
+            prime_id: 1,
+            coinbase_tag: "t".repeat(82),
+            min_difficulty: 1,
+        };
+        assert!(matches!(v1.encode(), Err(Error::TooLong { field: "coinbase tag", .. })));
+    }
+
+    #[test]
     fn share_response_layout() {
         let ok = ShareResponse {
             verdict: ShareVerdict::Accepted,
             nonce: 0xdead_beef,
             target_byte: 14,
             job_id: 5,
+            abw_ref: None,
         };
         let b = ok.encode();
         assert_eq!(b.len(), 10);

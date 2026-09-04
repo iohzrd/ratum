@@ -13,6 +13,8 @@ pub struct Gateway {
     stream: TcpStream,
     client: Client,
     pool_sign_pk: [u8; 32],
+    /// The long-term keys the hello was signed with; a resume presents the same ones.
+    long_term_keys: KeyPairs,
 }
 
 impl Gateway {
@@ -27,13 +29,84 @@ impl Gateway {
         user_agent: &str,
         nk: u32,
     ) -> Self {
+        Gateway::connect_generation(
+            addr,
+            pool_sign_pk,
+            pool_box_pk,
+            user_agent,
+            nk,
+            None,
+            KeyPairs::generate(),
+        )
+    }
+
+    /// Connect as a version 3 gateway: the hello carries the DRS extension, so the pool
+    /// responds with a version 3 configuration and an ABW assignment. `token` is the resume
+    /// token to present, `None` for a new session.
+    pub fn connect_v3(
+        addr: SocketAddr,
+        pool_sign_pk: [u8; 32],
+        pool_box_pk: [u8; 32],
+        nk: u32,
+        token: Option<[u8; 40]>,
+    ) -> Self {
+        Gateway::connect_generation(
+            addr,
+            pool_sign_pk,
+            pool_box_pk,
+            "v0.4.1-beta/test",
+            nk,
+            Some(token),
+            KeyPairs::generate(),
+        )
+    }
+
+    /// `connect_v3` under given long-term keys: a resume is accepted only from the keys the
+    /// saved session was under.
+    pub fn connect_v3_as(
+        addr: SocketAddr,
+        pool_sign_pk: [u8; 32],
+        pool_box_pk: [u8; 32],
+        nk: u32,
+        token: Option<[u8; 40]>,
+        long_term_keys: KeyPairs,
+    ) -> Self {
+        Gateway::connect_generation(
+            addr,
+            pool_sign_pk,
+            pool_box_pk,
+            "v0.4.1-beta/test",
+            nk,
+            Some(token),
+            long_term_keys,
+        )
+    }
+
+    pub fn long_term_keys(&self) -> KeyPairs {
+        self.long_term_keys.clone()
+    }
+
+    /// `resume` is `None` for a v1 hello, `Some(token)` for a version 3 hello carrying `token`
+    /// (itself `None` when not resuming).
+    fn connect_generation(
+        addr: SocketAddr,
+        pool_sign_pk: [u8; 32],
+        pool_box_pk: [u8; 32],
+        user_agent: &str,
+        nk: u32,
+        resume: Option<Option<[u8; 40]>>,
+        long_term_keys: KeyPairs,
+    ) -> Self {
         let stream = TcpStream::connect(addr).expect("connect to the pool");
         stream.set_read_timeout(Some(TIMEOUT)).expect("read timeout");
         stream.set_write_timeout(Some(TIMEOUT)).expect("write timeout");
-        let client = Client::with_key_pairs(KeyPairs::generate(), KeyPairs::generate(), nk);
+        let client = Client::with_key_pairs(long_term_keys.clone(), KeyPairs::generate(), nk);
 
-        let mut gateway = Gateway { stream, client, pool_sign_pk };
-        let hello = gateway.client.hello(&pool_box_pk, user_agent);
+        let mut gateway = Gateway { stream, client, pool_sign_pk, long_term_keys };
+        let hello = match resume {
+            None => gateway.client.hello(&pool_box_pk, user_agent),
+            Some(token) => gateway.client.hello_resumable(&pool_box_pk, user_agent, token.as_ref()),
+        };
         gateway.stream.write_all(&hello).expect("send hello");
         gateway.stream.flush().expect("flush hello");
 

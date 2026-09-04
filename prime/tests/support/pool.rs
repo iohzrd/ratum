@@ -248,6 +248,21 @@ impl Pool {
         Gateway::connect(self.addr, self.sign_pk(), self.box_pk())
     }
 
+    /// Connect as a version 3 gateway (DRS hello); `token` is the resume token to
+    /// present, `None` for a new session.
+    pub fn connect_v3(&self, token: Option<[u8; 40]>) -> Gateway {
+        Gateway::connect_v3(self.addr, self.sign_pk(), self.box_pk(), 0x1234_5678, token)
+    }
+
+    /// `connect_v3` under the given long-term keys, the ones a saved session is under.
+    pub fn connect_v3_as(
+        &self,
+        token: Option<[u8; 40]>,
+        keys: ratum::datum::handshake::KeyPairs,
+    ) -> Gateway {
+        Gateway::connect_v3_as(self.addr, self.sign_pk(), self.box_pk(), 0x1234_5678, token, keys)
+    }
+
     pub fn stop(mut self) -> Vec<String> {
         let lines = self.lines();
         let _ = self.child.kill();
