@@ -108,10 +108,10 @@
   <p><strong>This pool accepts two gateways:</strong>
     <a href="https://github.com/iohzrd/ratum/releases" target="_blank"
     rel="noopener">ratum-gateway</a> (recommended; prebuilt binaries) and
-    <a href="https://github.com/iohzrd/datum_gateway" target="_blank"
-    rel="noopener">iohzrd/datum_gateway</a> built at the commit this pool allows. Every other
-    build is refused at connection: the datum_gateway builds in circulation construct their
-    coinbase without the pool's payout split, so a block they find pays the miners nothing.
+    the <a href="https://github.com/CONVOYMining/datum_gateway" target="_blank"
+    rel="noopener">CONVOY DATUM gateway</a>, both on the version 3 protocol with
+    anti-block-withholding. Other DATUM gateway builds construct their coinbase without the
+    pool's payout split, so a block they find pays the miners nothing; this pool refuses them.
     Both gateways read the same config file, so switching is a binary swap.</p>
   <p>Add this to your gateway config, alongside your own <code>mining</code>
     and <code>stratum</code> settings:</p>

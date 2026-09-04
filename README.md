@@ -6,7 +6,7 @@
 BLAKE2b hardware over the Siacoin dialect of Stratum v1, takes the coinbase payout split from
 the pool over DATUM, and submits blocks to the node.
 
-It reimplements the C gateway at https://github.com/iohzrd/datum_gateway (branch `blake2b`)
+It reimplements the C gateway at https://github.com/CONVOYMining/datum_gateway
 and reads its configuration file unchanged; the wire formats are the C gateway's byte for
 byte.
 
@@ -93,7 +93,7 @@ pool dictates where the coinbase pays, verifies the shares and relays the blocks
 
 The workspace holds the `core` library (the protocol, the version 2 header, the RPC client and
 the code the binaries share), `ratum-prime` (the pool), `ratum-gateway` (a reimplementation of
-the [DATUM Gateway fork](https://github.com/iohzrd/datum_gateway), see [Gateway](#gateway))
+the [CONVOY DATUM Gateway](https://github.com/CONVOYMining/datum_gateway), see [Gateway](#gateway))
 and `sia-test-miner` (the CPU miner the end-to-end tests drive). The header hash and share
 format are byte-coupled between the pool and the gateway, so they are one release.
 
