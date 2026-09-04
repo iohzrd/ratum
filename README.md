@@ -185,10 +185,10 @@ transaction from the operator's wallet; afterwards `ratum-prime --settle-block <
 the tip, the coinbase value, the fee, the connected gateways, the build (`--version` prints the
 same string), an approximate hashrate (accepted-share difficulty over the last 10 minutes,
 at 2^32 hashes per difficulty unit, for the pool and per miner) and each miner's share of the
-window with `payable` and `unpayable_reason`. Every accepted block is recorded in the
-ledger's `blocks` table and listed with its coinbase amounts, finder, and the secondary
-coinbase tag its coinbase carried (the gateway's `mining.coinbase_tag_secondary`); from the
-record and
+window with `payable`, `unpayable_reason` and `tag` (the secondary coinbase tag of the
+miner's newest share in the window, the gateway's `mining.coinbase_tag_secondary`). Every
+accepted block is recorded in the ledger's `blocks` table and listed with its coinbase
+amounts, finder, and the secondary coinbase tag its coinbase carried; from the record and
 a cumulative work counter the page derives a luck figure (blocks found over blocks
 expected), and from the observed block spacing an expected time to the pool's next block and
 the next difficulty adjustment (height, countdown, estimated factor). The

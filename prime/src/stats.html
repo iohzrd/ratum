@@ -57,6 +57,7 @@
       <thead><tr>
         <th></th>
         <th>Miner</th>
+        <th>Tag</th>
         <th class="num">Hashrate</th>
         <th class="num">Work</th>
         <th class="num">Share</th>
@@ -302,6 +303,7 @@ poll(() => "stats.json", s => {
     return `<tr class="${unpayable ? "unpayable" : ""}">
       <td class="num rank">${i + 1}</td>
       <td>${esc(m.identity)}${tag}</td>
+      <td>${esc(m.tag || "")}</td>
       <td class="num">${m.hashrate_hs > 0 ? "~" + hashrate(m.hashrate_hs) : "-"}</td>
       <td class="num">${num(m.work)}</td>
       <td class="num bar"><span style="width:${Math.min(m.share_percent,100)}%"></span><em>${pct}%</em></td>
@@ -309,7 +311,7 @@ poll(() => "stats.json", s => {
     </tr>`;
   }).join("");
   document.querySelector("#miners tbody").innerHTML =
-    rows || '<tr><td colspan="6" class="motd">no shares in the window yet</td></tr>';
+    rows || '<tr><td colspan="7" class="motd">no shares in the window yet</td></tr>';
 
   const rt = s.network.retarget;
   document.getElementById("net-cards").innerHTML = [

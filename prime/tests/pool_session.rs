@@ -27,8 +27,8 @@ fn now() -> u32 {
 fn seed_alice_and_bob(dir: &TempDir) {
     let (mut l, _) = Ledger::open(&dir.join("regtest.redb"), u128::MAX, None, None)
         .expect("open the seed ledger");
-    l.record(now() as u64, "alice", 3, &[0x11; 32]).unwrap();
-    l.record(now() as u64, "bob", 1, &[0x22; 32]).unwrap();
+    l.record(now() as u64, "alice", 3, &[0x11; 32], "").unwrap();
+    l.record(now() as u64, "bob", 1, &[0x22; 32], "").unwrap();
 }
 
 fn tagging() -> Tagging<'static> {

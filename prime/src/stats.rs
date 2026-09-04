@@ -133,9 +133,7 @@ fn handle(
     let (path, _) = http::path_and_query(&request);
     match path.as_str() {
         "/" | "/index.html" => request.respond(http::html(INDEX_HTML.clone())),
-        "/stats.json" => {
-            request.respond(http::body(snapshot(server, history), "application/json"))
-        }
+        "/stats.json" => request.respond(http::body(snapshot(server, history), "application/json")),
         _ => request.respond(http::not_found()),
     }
 }
@@ -149,13 +147,14 @@ fn snapshot(server: &Server, history: &Mutex<VecDeque<(u64, f64)>>) -> String {
     let operator_fee = coinbase_value.map_or(0, |v| server.payout.fee_on(v));
 
     let hashrate_cutoff = unix_now().saturating_sub(HASHRATE_SPAN_SECS);
-    let (total_work, target_work, shares, work_by_identity, split, owed, recent, blocks) = {
+    let (total_work, target_work, shares, work_by_identity, tags, split, owed, recent, blocks) = {
         let l = lock(&server.ledger);
         (
             l.total_work(),
             l.window(),
             l.len(),
             l.work_by_identity(),
+            l.tags_by_identity(),
             split_after_fee(&l, &server.payout, coinbase_value.unwrap_or(0)),
             l.owed().to_vec(),
             l.work_since(hashrate_cutoff),
@@ -261,6 +260,8 @@ fn snapshot(server: &Server, history: &Mutex<VecDeque<(u64, f64)>>) -> String {
                 "payout_sats": payout_sats.get(identity).copied().unwrap_or(0),
                 "payable": payable,
                 "unpayable_reason": unpayable_reason,
+                // The gateway tag the identity's newest share in the window came through.
+                "tag": tags.get(identity).map_or("", String::as_str),
             })
         })
         .collect();

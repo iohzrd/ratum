@@ -51,6 +51,11 @@ fn simple_tx(tag: u8) -> Vec<u8> {
 /// them: for three leaves the branch is the second transaction, then the third paired with
 /// itself.
 fn work_with_transactions() -> (Work, Vec<Vec<u8>>) {
+    tagged_work_with_transactions("")
+}
+
+/// `work_with_transactions` with the gateway's secondary coinbase tag.
+fn tagged_work_with_transactions(tag_secondary: &str) -> (Work, Vec<Vec<u8>>) {
     let txns = vec![simple_tx(0xa1), simple_tx(0xb2)];
     let a = bitcoin::txid(&txns[0]).expect("txid a");
     let b = bitcoin::txid(&txns[1]).expect("txid b");
@@ -59,7 +64,7 @@ fn work_with_transactions() -> (Work, Vec<Vec<u8>>) {
     paired[32..].copy_from_slice(&b);
 
     let mut w = Work::build(
-        &Tagging { tag: "RATUM", tag_secondary: "", prime_id: 1 },
+        &Tagging { tag: "RATUM", tag_secondary, prime_id: 1 },
         &pool_payout_script(),
         &[],
         work::COINBASE_VALUE,
@@ -106,8 +111,21 @@ fn started(dir: &str, node: &FakeNode) -> Pool {
     support::lock(&node.state).coinbase_value = Some(work::COINBASE_VALUE);
     Pool::start(
         TempDir::new(dir),
-        PoolArgs { rpc_url: Some(node.url()), min_payout: 1, ..Default::default() },
+        PoolArgs {
+            rpc_url: Some(node.url()),
+            min_payout: 1,
+            extra: vec!["--stats-listen".into(), "127.0.0.1:0".into()],
+            ..Default::default()
+        },
     )
+}
+
+/// The stats snapshot of `pool`.
+fn stats(pool: &Pool) -> serde_json::Value {
+    let line = pool.expect_line("stats interface listening on http://");
+    let addr = line.rsplit("http://").next().expect("an address after http://").trim();
+    let body = minreq::get(format!("http://{addr}/stats.json")).send().expect("stats.json");
+    serde_json::from_str(body.as_str().expect("utf-8")).expect("a JSON snapshot")
 }
 
 fn ready(pool: &Pool) -> Gateway {
@@ -130,12 +148,21 @@ fn a_solved_share_is_accepted_and_written_to_the_ledger() {
     let pool = started("accept", &node);
     let mut gateway = ready(&pool);
 
-    let (w, _) = work_with_transactions();
-    let share = solved_share(&w, false);
+    // The tag is part of the coinbase, so this work needs a nonce search of its own.
+    let (w, _) = tagged_work_with_transactions("bob");
+    let ntime = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()) as u32;
+    let (ntime, nonce) = find_nonce_with_retries(&w, ntime);
+    let share = w.submit(USERNAME, ntime, nonce, TARGET_BYTE);
     let response = submit(&mut gateway, &share);
     assert_eq!(response.verdict, ShareVerdict::Accepted, "{response:?}");
     assert_eq!(response.nonce, share.nonce);
     assert_eq!(response.target_byte, TARGET_BYTE);
+
+    // The snapshot's miner row carries the gateway tag the share came through.
+    let s = stats(&pool);
+    let miners = s["window"]["miners"].as_array().expect("a miners array");
+    let alice = miners.iter().find(|m| m["identity"] == "alice").expect("alice is listed");
+    assert_eq!(alice["tag"], "bob", "{alice}");
 
     let ledger = pool.ledger_lines();
     assert_eq!(ledger.len(), 1, "one share, one line: {ledger:?}");

@@ -36,7 +36,7 @@ fn seed(path: &std::path::Path, count: usize, difficulty: u64) {
     for i in 0..count {
         let who = if i % 4 == 0 { "alice" } else { "bob" };
         let at = now() - (count - i) as u64;
-        ledger.record(at, who, difficulty, &next_hash()).expect("seed a share");
+        ledger.record(at, who, difficulty, &next_hash(), "").expect("seed a share");
     }
 }
 
@@ -89,8 +89,8 @@ fn a_restart_credits_the_same_miners_it_did_before() {
     {
         let (mut l, _) =
             Ledger::open(&ledger_path(&dir), u128::MAX, None, None).expect("seed ledger");
-        l.record(now(), "alice", 3, &next_hash()).unwrap();
-        l.record(now(), "bob", 1, &next_hash()).unwrap();
+        l.record(now(), "alice", 3, &next_hash(), "").unwrap();
+        l.record(now(), "bob", 1, &next_hash(), "").unwrap();
     }
 
     let payouts = |pool: &Pool| {
@@ -230,7 +230,7 @@ fn dump_ledger_reads_the_one_ledger_in_a_data_dir() {
     {
         let (mut l, _) =
             Ledger::open(&ledger_path(&dir), u128::MAX, None, Some("regtest")).expect("seed");
-        l.record(now(), "alice", 7, &next_hash()).unwrap();
+        l.record(now(), "alice", 7, &next_hash(), "").unwrap();
     }
     let output = run_pool(&["--dump-ledger", "--data-dir", &data_dir]);
     assert!(output.status.success(), "{}", printed(&output));

@@ -33,18 +33,23 @@ fn seed(dir: &TempDir) {
     let (mut l, _) =
         Ledger::open(&dir.join("regtest.redb"), u128::MAX, None, None).expect("open seed ledger");
 
-    // (identity, share difficulty, share count): about 1.45M work, 72% of the 2M window.
-    let plan: [(&str, u64, u32); 4] =
-        [(MINER_A, 4096, 190), (MINER_B, 2048, 210), (MINER_C, 1024, 155), (MINER_D, 1024, 80)];
-    let count: u32 = plan.iter().map(|(_, _, n)| n).sum();
+    // (identity, share difficulty, share count, gateway tag): about 1.45M work, 72% of the
+    // 2M window.
+    let plan: [(&str, u64, u32, &str); 4] = [
+        (MINER_A, 4096, 190, "tn4"),
+        (MINER_B, 2048, 210, "garage"),
+        (MINER_C, 1024, 155, ""),
+        (MINER_D, 1024, 80, "tn4"),
+    ];
+    let count: u32 = plan.iter().map(|(_, _, n, _)| n).sum();
     let (start, span) = (now() - 540, 530u64);
     let mut i = 0u32;
-    for (identity, diff, n) in plan {
+    for (identity, diff, n, tag) in plan {
         for _ in 0..n {
             let at = start + u64::from(i) * span / u64::from(count);
             let mut hash = [0u8; 32];
             hash[..4].copy_from_slice(&i.to_le_bytes());
-            l.record(at, identity, diff, &hash).expect("record share");
+            l.record(at, identity, diff, &hash, tag).expect("record share");
             i += 1;
         }
     }

@@ -662,7 +662,13 @@ impl Connection<'_> {
                     }
                 }
             }
-            if let Err(e) = l.record(now, &identity, a.work.difficulty, &a.work.block_hash) {
+            if let Err(e) = l.record(
+                now,
+                &identity,
+                a.work.difficulty,
+                &a.work.block_hash,
+                &a.work.tag_secondary,
+            ) {
                 // verify() already recorded this hash in the shared `ReplayGuard`. The credit
                 // failed, so remove it: a resend must be creditable once the write problem
                 // clears, rather than refused as a duplicate. Drop the ledger lock first, since

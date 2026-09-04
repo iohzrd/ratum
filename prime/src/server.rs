@@ -451,7 +451,7 @@ mod tests {
         for (i, (identity, difficulty)) in shares.iter().enumerate() {
             let mut hash = [0u8; 32];
             hash[0] = i as u8;
-            ledger.record(1_000 + i as u64, identity, *difficulty, &hash).unwrap();
+            ledger.record(1_000 + i as u64, identity, *difficulty, &hash, "").unwrap();
         }
         let mut resolver = Resolver::new();
         for (address, script) in resolved {

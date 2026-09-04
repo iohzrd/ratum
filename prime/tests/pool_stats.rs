@@ -18,8 +18,8 @@ fn now() -> u64 {
 fn seed_alice_and_bob(dir: &TempDir) {
     let (mut l, _) = Ledger::open(&dir.join("regtest.redb"), u128::MAX, None, None)
         .expect("open the seed ledger");
-    l.record(now(), "alice", 3, &[0x11; 32]).unwrap();
-    l.record(now(), "bob", 1, &[0x22; 32]).unwrap();
+    l.record(now(), "alice", 3, &[0x11; 32], "").unwrap();
+    l.record(now(), "bob", 1, &[0x22; 32], "").unwrap();
 }
 
 /// The address the pool logs the interface as listening on, e.g. `127.0.0.1:41007`.

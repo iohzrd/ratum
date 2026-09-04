@@ -13,7 +13,7 @@ pub const MAX_SHARES: usize = 1 << 20;
 pub const SHARES_PER_KEEP_UNIT: u64 = MAX_SHARES as u64;
 
 /// The share rows, keyed by a monotonic sequence number so a range scan reads them in the
-/// order they were recorded. The value is a packed `(at, difficulty, hash, identity)`.
+/// order they were recorded. The value is a packed `(at, difficulty, hash, identity, tag)`.
 const SHARES: TableDefinition<u64, &[u8]> = TableDefinition::new("shares");
 
 /// A proof-of-work hash to the sequence number of the share that carries it, so a share is
@@ -54,6 +54,9 @@ pub struct Share {
     pub identity: String,
     pub difficulty: u64,
     pub hash: Option<[u8; 32]>,
+    /// The secondary coinbase tag the share's coinbase carried (the gateway operator's
+    /// `mining.coinbase_tag_secondary`), empty when it carried none.
+    pub tag: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -68,14 +71,21 @@ pub struct ReadBack {
     pub stamped: bool,
 }
 
-/// Pack a share into the row value: at (8, LE), difficulty (8, LE), hash (32), then identity.
+/// Pack a share into the row value: at (8, LE), difficulty (8, LE), the hash (32), the
+/// identity, a 0x00 separator, and the tag. The identity's bytes are printable ASCII
+/// (`verify::check_username_and_time` requires 0x21..=0x7e) and the tag's control
+/// characters are dropped at extraction (`verify::decode_tag`), so 0x00 appears only as the
+/// separator. A row written before the tag field existed ends at the identity and reads
+/// back with an empty tag.
 fn pack(share: &Share) -> Vec<u8> {
     let hash = share.hash.unwrap_or([0u8; 32]);
-    let mut v = Vec::with_capacity(48 + share.identity.len());
+    let mut v = Vec::with_capacity(49 + share.identity.len() + share.tag.len());
     v.extend_from_slice(&share.at.to_le_bytes());
     v.extend_from_slice(&share.difficulty.to_le_bytes());
     v.extend_from_slice(&hash);
     v.extend_from_slice(share.identity.as_bytes());
+    v.push(0x00);
+    v.extend_from_slice(share.tag.as_bytes());
     v
 }
 
@@ -86,8 +96,18 @@ fn unpack(bytes: &[u8]) -> Option<Share> {
     let at = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
     let difficulty = u64::from_le_bytes(bytes[8..16].try_into().ok()?);
     let hash: [u8; 32] = bytes[16..48].try_into().ok()?;
-    let identity = String::from_utf8_lossy(&bytes[48..]).into_owned();
-    Some(Share { at, identity, difficulty, hash: Some(hash) })
+    let rest = &bytes[48..];
+    let (identity, tag) = match rest.iter().position(|&b| b == 0x00) {
+        Some(i) => (&rest[..i], &rest[i + 1..]),
+        None => (rest, [].as_slice()),
+    };
+    Some(Share {
+        at,
+        identity: String::from_utf8_lossy(identity).into_owned(),
+        difficulty,
+        hash: Some(hash),
+        tag: String::from_utf8_lossy(tag).into_owned(),
+    })
 }
 
 /// What the pool owes the window for one block whose coinbase paid it nothing: the split a
@@ -527,6 +547,8 @@ pub struct Ledger {
     removed: usize,
     shares: VecDeque<Share>,
     work_per_identity: HashMap<String, u128>,
+    /// The tag of each identity's newest share in the window.
+    tag_per_identity: HashMap<String, String>,
     total_work: u128,
     window: u128,
     store: Option<Store>,
@@ -554,6 +576,7 @@ impl Ledger {
             removed: 0,
             shares: VecDeque::new(),
             work_per_identity: HashMap::new(),
+            tag_per_identity: HashMap::new(),
             total_work: 0,
             window: window.max(1),
             store: None,
@@ -629,6 +652,7 @@ impl Ledger {
         }
         self.shares.clear();
         self.work_per_identity.clear();
+        self.tag_per_identity.clear();
         self.total_work = 0;
         for share in shares {
             self.push(share);
@@ -684,8 +708,15 @@ impl Ledger {
         identity: &str,
         difficulty: u64,
         hash: &[u8; 32],
+        tag: &str,
     ) -> io::Result<()> {
-        let share = Share { at, identity: identity.to_string(), difficulty, hash: Some(*hash) };
+        let share = Share {
+            at,
+            identity: identity.to_string(),
+            difficulty,
+            hash: Some(*hash),
+            tag: tag.to_string(),
+        };
         if let Some(store) = &mut self.store {
             // The insert is durable when it returns Ok, before any in-memory state is modified,
             // so an Err allows the caller to remove the hash from the `ReplayGuard` and
@@ -823,6 +854,11 @@ impl Ledger {
         v
     }
 
+    /// The tag of each identity's newest share in the window (see `Share::tag`).
+    pub fn tags_by_identity(&self) -> HashMap<String, String> {
+        self.tag_per_identity.clone()
+    }
+
     /// Divides `value` among the identities in the window, largest first. The amounts total
     /// `value` exactly, so the gateway has no remainder to pay to the pool's script (it
     /// writes a zero-value OP_RETURN output in its place).
@@ -872,6 +908,7 @@ impl Ledger {
         self.total_work += u128::from(share.difficulty);
         *self.work_per_identity.entry(share.identity.clone()).or_insert(0) +=
             u128::from(share.difficulty);
+        self.tag_per_identity.insert(share.identity.clone(), share.tag.clone());
         self.shares.push_back(share);
     }
 
@@ -913,6 +950,7 @@ impl Ledger {
             *d -= u128::from(oldest.difficulty);
             if *d == 0 {
                 self.work_per_identity.remove(&oldest.identity);
+                self.tag_per_identity.remove(&oldest.identity);
             }
         }
     }
@@ -967,7 +1005,7 @@ mod tests {
     fn ledger_with(window: u128, shares: &[(&str, u64)]) -> Ledger {
         let mut l = Ledger::new(window);
         for (i, (identity, difficulty)) in shares.iter().enumerate() {
-            l.record(1_000 + i as u64, identity, *difficulty, &hash(i as u64)).unwrap();
+            l.record(1_000 + i as u64, identity, *difficulty, &hash(i as u64), "").unwrap();
         }
         l
     }
@@ -1075,7 +1113,7 @@ mod tests {
     fn the_window_slides_by_work() {
         let mut l = Ledger::new(100);
         for i in 0..10 {
-            l.record(i, "a", 32, &hash(i)).unwrap();
+            l.record(i, "a", 32, &hash(i), "").unwrap();
         }
         assert!(l.total_work() >= 100, "window holds {} < 100", l.total_work());
         assert!(l.total_work() < 100 + 32, "window holds {}, more than needed", l.total_work());
@@ -1086,11 +1124,11 @@ mod tests {
     fn a_miner_with_no_recent_shares_is_trimmed_from_the_window() {
         let mut l = Ledger::new(64);
         for i in 0..4 {
-            l.record(0, "leaver", 16, &hash(i)).unwrap();
+            l.record(0, "leaver", 16, &hash(i), "").unwrap();
         }
         assert_eq!(l.split(1_000, 0, 512), vec![("leaver".into(), 1_000)]);
         for i in 0..4 {
-            l.record(1, "joiner", 16, &hash(100 + i)).unwrap();
+            l.record(1, "joiner", 16, &hash(100 + i), "").unwrap();
         }
         let split = l.split(1_000, 0, 512);
         assert_eq!(split, vec![("joiner".into(), 1_000)]);
@@ -1100,8 +1138,8 @@ mod tests {
     #[test]
     fn a_window_smaller_than_one_share_still_pays_it() {
         let mut l = Ledger::new(1);
-        l.record(0, "a", 16384, &hash(0)).unwrap();
-        l.record(1, "b", 16384, &hash(1)).unwrap();
+        l.record(0, "a", 16384, &hash(0), "").unwrap();
+        l.record(1, "b", 16384, &hash(1), "").unwrap();
         assert_eq!(l.len(), 1);
         assert_eq!(l.split(1_000, 0, 512), vec![("b".into(), 1_000)]);
     }
@@ -1109,8 +1147,8 @@ mod tests {
     #[test]
     fn large_values_do_not_overflow() {
         let mut l = Ledger::new(u128::MAX);
-        l.record(0, "a", u64::MAX / 2, &hash(0)).unwrap();
-        l.record(1, "b", u64::MAX / 2, &hash(1)).unwrap();
+        l.record(0, "a", u64::MAX / 2, &hash(0), "").unwrap();
+        l.record(1, "b", u64::MAX / 2, &hash(1), "").unwrap();
         let split = l.split(2_100_000_000_000_000, 0, 512);
         assert_eq!(split.len(), 2);
         assert_eq!(split[0].1, 2_100_000_000_000_000 / 2);
@@ -1128,7 +1166,7 @@ mod tests {
     fn a_window_of_u128_max_still_caps_the_share_count() {
         let mut l = Ledger::new(u128::MAX);
         for i in 0..(MAX_SHARES + 50) {
-            l.record(i as u64, "a", 1, &hash(i as u64)).unwrap();
+            l.record(i as u64, "a", 1, &hash(i as u64), "").unwrap();
         }
         assert_eq!(l.len(), MAX_SHARES);
         assert_eq!(l.total_work(), MAX_SHARES as u128);
@@ -1186,7 +1224,7 @@ mod tests {
         // Written before stamps existed: opened without a chain, so no stamp.
         {
             let (mut l, _) = Ledger::open(&path, u128::MAX, None, None).unwrap();
-            l.record(1, "alice", 16, &hash(1)).unwrap();
+            l.record(1, "alice", 16, &hash(1), "").unwrap();
         }
         let (store, _) = Store::open(&path, None, None).unwrap();
         assert_eq!(store.chain().unwrap(), None);
@@ -1207,10 +1245,32 @@ mod tests {
             identity: "bc1qexample".into(),
             difficulty: 16384,
             hash: Some(hash(7)),
+            tag: "garage".into(),
         };
-        assert_eq!(unpack(&pack(&share)), Some(share));
+        assert_eq!(unpack(&pack(&share)), Some(share.clone()));
+        // A row written before the tag field existed ends at the identity.
+        let untagged = Share { tag: String::new(), ..share.clone() };
+        let mut bytes = pack(&untagged);
+        assert_eq!(bytes.pop(), Some(0x00), "the separator is the last byte when the tag is empty");
+        assert_eq!(unpack(&bytes), Some(untagged));
         // A row too short to hold the fixed fields is skipped, not misread.
         assert_eq!(unpack(&[0u8; 16]), None);
+    }
+
+    #[test]
+    fn the_tag_is_the_newest_share_of_each_identity_and_leaves_with_it() {
+        let mut l = Ledger::new(32);
+        l.record(1, "alice", 16, &hash(1), "old").unwrap();
+        l.record(2, "alice", 16, &hash(2), "new").unwrap();
+        l.record(3, "bob", 16, &hash(3), "").unwrap();
+        let tags = l.tags_by_identity();
+        assert_eq!(tags.get("alice").map(String::as_str), Some("new"));
+        assert_eq!(tags.get("bob").map(String::as_str), Some(""));
+        // A window of 32 holds two shares: alice's older one is trimmed by the third
+        // record, and both her shares by a fourth and fifth.
+        l.record(4, "carol", 16, &hash(4), "").unwrap();
+        l.record(5, "carol", 16, &hash(5), "").unwrap();
+        assert!(!l.tags_by_identity().contains_key("alice"));
     }
 
     #[test]
@@ -1219,8 +1279,8 @@ mod tests {
         {
             let (mut l, read_back) = open(&scratch, 1_000_000, None);
             assert_eq!(read_back.skipped, 0);
-            l.record(1, "alice", 32, &hash(1)).unwrap();
-            l.record(2, "bob", 16, &hash(2)).unwrap();
+            l.record(1, "alice", 32, &hash(1), "").unwrap();
+            l.record(2, "bob", 16, &hash(2), "").unwrap();
         }
         {
             let (reopened, read_back) = open(&scratch, 1_000_000, None);
@@ -1231,7 +1291,7 @@ mod tests {
 
         {
             let (mut l, _) = open(&scratch, 1_000_000, None);
-            l.record(3, "alice", 8, &hash(3)).unwrap();
+            l.record(3, "alice", 8, &hash(3), "").unwrap();
         }
         let (again, _) = open(&scratch, 1_000_000, None);
         assert_eq!(again.total_work(), 56);
@@ -1245,9 +1305,9 @@ mod tests {
         let scratch = Scratch::new("resend");
         {
             let (mut l, _) = open(&scratch, 1_000_000, None);
-            l.record(1, "alice", 16, &hash(1)).unwrap();
-            l.record(2, "bob", 32, &hash(2)).unwrap();
-            l.record(1, "alice", 16, &hash(1)).unwrap(); // the same hash again
+            l.record(1, "alice", 16, &hash(1), "").unwrap();
+            l.record(2, "bob", 32, &hash(2), "").unwrap();
+            l.record(1, "alice", 16, &hash(1), "").unwrap(); // the same hash again
             assert_eq!(l.total_work(), 48, "alice's share counts once, not twice");
             assert_eq!(l.len(), 2);
         }
@@ -1262,8 +1322,8 @@ mod tests {
         let scratch = Scratch::new("hashes");
         {
             let (mut l, _) = open(&scratch, 1_000_000, None);
-            l.record(1, "alice", 16, &hash(1)).unwrap();
-            l.record(2, "bob", 32, &hash(2)).unwrap();
+            l.record(1, "alice", 16, &hash(1), "").unwrap();
+            l.record(2, "bob", 32, &hash(2), "").unwrap();
         }
         let (l, _) = open(&scratch, 1_000_000, None);
         assert_eq!(l.hashes().copied().collect::<Vec<_>>(), vec![hash(1), hash(2)], "oldest first");
@@ -1272,13 +1332,13 @@ mod tests {
     #[test]
     fn hashes_returns_the_hashes_the_window_holds() {
         let mut l = ledger_with(1_000_000, &[("alice", 16), ("bob", 32)]);
-        l.record(1_100, "carol", 8, &hash(99)).unwrap();
+        l.record(1_100, "carol", 8, &hash(99), "").unwrap();
         assert_eq!(l.hashes().copied().collect::<Vec<_>>(), vec![hash(0), hash(1), hash(99)]);
 
         // Only what the window still holds: trimming drops a share's hash with it.
         let mut narrow = Ledger::new(8);
-        narrow.record(1, "alice", 8, &hash(1)).unwrap();
-        narrow.record(2, "bob", 8, &hash(2)).unwrap();
+        narrow.record(1, "alice", 8, &hash(1), "").unwrap();
+        narrow.record(2, "bob", 8, &hash(2), "").unwrap();
         assert_eq!(narrow.hashes().copied().collect::<Vec<_>>(), vec![hash(2)]);
     }
 
@@ -1288,7 +1348,7 @@ mod tests {
         {
             let (mut l, _) = open(&scratch, u128::MAX, None);
             for i in 0..1_000u64 {
-                l.record(i, "miner00", 16, &hash(i)).unwrap();
+                l.record(i, "miner00", 16, &hash(i), "").unwrap();
             }
         }
         // A ten-share window recovers about ten shares of work, not all thousand.
@@ -1305,7 +1365,7 @@ mod tests {
         {
             let (mut l, _) = open(&scratch, u128::MAX, None);
             for i in 0..5u64 {
-                l.record(i, "miner00", 16, &hash(i)).unwrap();
+                l.record(i, "miner00", 16, &hash(i), "").unwrap();
             }
         }
         let (l, read_back) = open(&scratch, 1_000_000, None);
@@ -1333,9 +1393,9 @@ mod tests {
     fn widening_the_window_re_reads_shares_from_the_store() {
         let scratch = Scratch::new("widen");
         let (mut l, _) = open(&scratch, 56, None);
-        l.record(1, "alice", 16, &hash(1)).unwrap();
-        l.record(2, "bob", 32, &hash(2)).unwrap();
-        l.record(3, "carol", 8, &hash(3)).unwrap();
+        l.record(1, "alice", 16, &hash(1), "").unwrap();
+        l.record(2, "bob", 32, &hash(2), "").unwrap();
+        l.record(3, "carol", 8, &hash(3), "").unwrap();
 
         // A difficulty drop narrows the window; the older shares are trimmed but stay stored.
         assert_eq!(l.set_window(8), 0);
@@ -1360,7 +1420,13 @@ mod tests {
         let (mut store, _) = Store::open(&scratch.join("regtest.redb"), None, None).unwrap();
         store.retain_bound = Some(5);
         for i in 0..12u64 {
-            let share = Share { at: i, identity: "m".into(), difficulty: 16, hash: Some(hash(i)) };
+            let share = Share {
+                at: i,
+                identity: "m".into(),
+                difficulty: 16,
+                hash: Some(hash(i)),
+                tag: String::new(),
+            };
             store.insert(&share).unwrap();
             store.retain().unwrap();
         }
@@ -1371,7 +1437,13 @@ mod tests {
         // A removed share's hash is gone from the dedup index, so the same hash inserts again.
         assert!(
             store
-                .insert(&Share { at: 0, identity: "m".into(), difficulty: 16, hash: Some(hash(0)) })
+                .insert(&Share {
+                    at: 0,
+                    identity: "m".into(),
+                    difficulty: 16,
+                    hash: Some(hash(0)),
+                    tag: String::new(),
+                })
                 .unwrap()
         );
     }
@@ -1380,9 +1452,9 @@ mod tests {
     fn dump_returns_every_stored_share_oldest_first() {
         let scratch = Scratch::new("dump");
         let (mut l, _) = open(&scratch, 8, None); // a window smaller than what is recorded
-        l.record(1, "alice", 16, &hash(1)).unwrap();
-        l.record(2, "bob", 16, &hash(2)).unwrap();
-        l.record(3, "carol", 16, &hash(3)).unwrap();
+        l.record(1, "alice", 16, &hash(1), "").unwrap();
+        l.record(2, "bob", 16, &hash(2), "").unwrap();
+        l.record(3, "carol", 16, &hash(3), "").unwrap();
         assert_eq!(l.len(), 1, "the window holds only the newest");
         let dumped = l.dump().unwrap();
         assert_eq!(dumped.len(), 3, "but the store holds all three");
@@ -1512,10 +1584,10 @@ mod tests {
         let scratch = Scratch::new("blocks");
         {
             let (mut l, _) = open(&scratch, u128::MAX, None);
-            l.record(1, "alice", 16, &hash(1)).unwrap();
-            l.record(2, "bob", 32, &hash(2)).unwrap();
+            l.record(1, "alice", 16, &hash(1), "").unwrap();
+            l.record(2, "bob", 32, &hash(2), "").unwrap();
             // The same hash again is not credited and not counted again.
-            l.record(3, "bob", 32, &hash(2)).unwrap();
+            l.record(3, "bob", 32, &hash(2), "").unwrap();
             assert_eq!(l.cumulative_work(), 48);
             l.record_block(found(1, 48)).unwrap();
             // The same block recorded again does not duplicate the history.
@@ -1525,15 +1597,15 @@ mod tests {
         let (mut l, _) = open(&scratch, u128::MAX, None);
         assert_eq!(l.cumulative_work(), 48, "the counter is read back from the store");
         assert_eq!(l.blocks(), &[found(1, 48)], "the first record is retained");
-        l.record(4, "carol", 16, &hash(3)).unwrap();
+        l.record(4, "carol", 16, &hash(3), "").unwrap();
         assert_eq!(l.cumulative_work(), 64, "and continues from the stored value");
     }
 
     #[test]
     fn a_file_less_ledger_counts_cumulative_work_from_its_start() {
         let mut l = Ledger::new(u128::MAX);
-        l.record(1, "alice", 16, &hash(1)).unwrap();
-        l.record(2, "alice", 32, &hash(2)).unwrap();
+        l.record(1, "alice", 16, &hash(1), "").unwrap();
+        l.record(2, "alice", 32, &hash(2), "").unwrap();
         assert_eq!(l.cumulative_work(), 48);
         l.record_block(found(1, 48)).unwrap();
         l.record_block(found(1, 48)).unwrap();
@@ -1543,9 +1615,9 @@ mod tests {
     #[test]
     fn work_since_sums_only_the_shares_at_or_after_the_cutoff() {
         let mut l = Ledger::new(u128::MAX);
-        l.record(100, "alice", 16, &hash(1)).unwrap();
-        l.record(200, "alice", 16, &hash(2)).unwrap();
-        l.record(200, "bob", 32, &hash(3)).unwrap();
+        l.record(100, "alice", 16, &hash(1), "").unwrap();
+        l.record(200, "alice", 16, &hash(2), "").unwrap();
+        l.record(200, "bob", 32, &hash(3), "").unwrap();
         let (total, by_identity) = l.work_since(150);
         assert_eq!(total, 48);
         assert_eq!(by_identity.get("alice"), Some(&16));
