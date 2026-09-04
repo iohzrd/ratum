@@ -2,8 +2,9 @@
 //! which renders `/stats.json` in the browser as the pool's stats page does, plus `/login`,
 //! `/cmd` and `/NOTIFY`; the password-less miner lookup is on `api.miner_listen_port`.
 //! `/login`, `/cmd` and the client rows of `/stats.json` require `api.admin_password` over
-//! HTTP Basic authentication when one is set; the status itself is public, as the C
-//! gateway's is. Configuration editing (`api.modify_conf`) is not served.
+//! HTTP Basic authentication, and are refused while none is configured, as the C gateway's
+//! `datum_api_check_admin_password_only` refuses them; the status itself is public, as the
+//! C gateway's is. Configuration editing (`api.modify_conf`) is not served.
 
 use crate::stratum::{ClientStats, Server};
 use log::{info, warn};
@@ -58,8 +59,10 @@ fn duration_text(d: std::time::Duration) -> String {
 
 fn authorized(ctx: &Context, req: &Request) -> bool {
     let password = &ctx.server.config.api.admin_password;
+    // As the C gateway: with no admin password configured, no request is authorized. An empty
+    // password must not mean an empty check.
     if password.is_empty() {
-        return true;
+        return false;
     }
     let Some(h) = req.headers().iter().find(|h| h.field.equiv("Authorization")) else {
         return false;

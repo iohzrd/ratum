@@ -209,7 +209,8 @@ fn a_difficulty_that_is_not_a_power_of_two_is_refused() {
 fn numeric_flags_refuse_values_out_of_range_or_not_numbers() {
     refuses(&["--max-connections", "0"], "must be a positive number");
     refuses(&["--max-connections", "lots"], "must be a positive number");
-    refuses(&["--prime-id", "-1"], "must be a number");
+    refuses(&["--prime-id", "-1"], "must be a positive number");
+    refuses(&["--prime-id", "0"], "must be a positive number");
     refuses(&["--ledger-keep", "0"], "must be at least 1");
     refuses(&["--ledger-keep", "-1"], "must be at least 1");
     refuses(&["--ledger-keep", "some"], "must be at least 1");

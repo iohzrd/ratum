@@ -45,7 +45,10 @@ pub struct Tagging<'a> {
     pub tag_primary: &'a str,
     pub tag_secondary: &'a str,
     pub unique_id: u16,
-    pub prime_id: u32,
+    pub prime_id: u64,
+    /// Write the 11-byte push carrying the full 64-bit prime id (the version 3 protocol) rather
+    /// than the 7-byte push with a 32-bit prime id (version 1).
+    pub wide_prime: bool,
     /// Whether a pool dictates the coinbase; with `prime_id` 0 and no pool the uid push is
     /// the short form.
     pub datum_active: bool,
@@ -80,6 +83,9 @@ pub fn script_sig(t: &Tagging<'_>) -> Result<(Vec<u8>, usize), String> {
     {
         let tag0 = t.tag_primary.as_bytes();
         let mut tag1 = t.tag_secondary.as_bytes();
+        // The version 3 prime push is 11 bytes rather than 7, so the tags have 4 fewer bytes
+        // of the scriptSig to fit in (the C gateway's MAX_COINBASE_TAG_SPACE went 86 to 82).
+        let tag_space = crate::config::MAX_COINBASE_TAG_SPACE - if t.wide_prime { 4 } else { 0 };
         let mut k = tag0.len() + tag1.len() + 2;
         if tag1.is_empty() {
             k -= 1;
@@ -87,16 +93,16 @@ pub fn script_sig(t: &Tagging<'_>) -> Result<(Vec<u8>, usize), String> {
                 k -= 1;
             }
         }
-        if k > crate::config::MAX_COINBASE_TAG_SPACE {
-            let excess = k - crate::config::MAX_COINBASE_TAG_SPACE;
+        if k > tag_space {
+            let excess = k - tag_space;
             if tag1.len() > excess {
                 tag1 = &tag1[..tag1.len() - excess];
-                k = crate::config::MAX_COINBASE_TAG_SPACE;
+                k = tag_space;
             } else if !tag1.is_empty() {
                 k -= tag1.len() + 1;
                 tag1 = &[];
             }
-            if k > crate::config::MAX_COINBASE_TAG_SPACE {
+            if k > tag_space {
                 return Err("the coinbase tags do not fit".into());
             }
         }
@@ -123,12 +129,20 @@ pub fn script_sig(t: &Tagging<'_>) -> Result<(Vec<u8>, usize), String> {
         pot_index = script.len();
         script.push(0xff);
         script.extend_from_slice(&t.unique_id.to_le_bytes());
-    } else {
-        script.push(0x07);
+    } else if t.wide_prime {
+        // version 3 protocol: PoT placeholder, 2-byte unique id, 8-byte prime id.
+        script.push(0x0b);
         pot_index = script.len();
         script.push(0xff);
         script.extend_from_slice(&t.unique_id.to_le_bytes());
         script.extend_from_slice(&t.prime_id.to_le_bytes());
+    } else {
+        // Version 1: the prime id is a 32-bit value in a 7-byte push.
+        script.push(0x07);
+        pot_index = script.len();
+        script.push(0xff);
+        script.extend_from_slice(&t.unique_id.to_le_bytes());
+        script.extend_from_slice(&(t.prime_id as u32).to_le_bytes());
     }
     Ok((script, pot_index))
 }
@@ -255,6 +269,7 @@ mod tests {
             tag_secondary: "e2e",
             unique_id: 4242,
             prime_id: 7,
+            wide_prime: false,
             datum_active: true,
         }
     }
@@ -348,6 +363,39 @@ mod tests {
                 if force { script.len() } else { script.len() + 15 }
             );
         }
+    }
+
+    #[test]
+    fn the_wide_prime_push_takes_four_bytes_from_the_tags_and_stays_within_100() {
+        // Short tags are not trimmed, so the version 3 script is exactly the 4 extra prime
+        // bytes longer than the version 1 one.
+        let v1 = script_sig(&tagging(21)).unwrap().0;
+        let mut t = tagging(21);
+        t.wide_prime = true;
+        let v3 = script_sig(&t).unwrap().0;
+        assert_eq!(v3.len(), v1.len() + 4);
+        assert_eq!(ratum::bitcoin::script_pushes(&v3).last().unwrap().1.len(), 11);
+
+        // Tags that fill the version 1 budget are trimmed by 4 under version 3, so the
+        // scriptSig never exceeds the consensus limit of 100 bytes.
+        let mut t = tagging(21);
+        t.tag_primary = "RATUM is a pool for the Bitcoin Knots BLAKE2b hardfork";
+        t.tag_secondary = "a secondary tag of some length";
+        let v1 = script_sig(&t).unwrap().0;
+        t.wide_prime = true;
+        let v3 = script_sig(&t).unwrap().0;
+        assert!(v1.len() <= 100);
+        assert!(
+            v3.len() <= 100,
+            "wide prime push must not push the scriptSig past 100: {}",
+            v3.len()
+        );
+        let tags = |s: &[u8]| ratum::bitcoin::script_pushes(s)[1].1.len();
+        assert_eq!(
+            tags(&v3) + 4,
+            tags(&v1),
+            "v3 tag space + 4 != v1 tag space (the u64 prime id push costs 4 bytes)"
+        );
     }
 
     #[test]

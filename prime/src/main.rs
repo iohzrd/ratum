@@ -1,3 +1,4 @@
+mod abw;
 mod cli;
 mod connection;
 mod server;
@@ -261,6 +262,25 @@ fn main() -> io::Result<()> {
         .filter(|p| !p.is_empty())
         .map(str::to_string)
         .collect();
+    let require_v3 = cli::resolve::<bool>(
+        c.require_v3.as_deref(),
+        f.require_v3,
+        false,
+        "--require-v3",
+        "true or false",
+        |_| true,
+    );
+    let abw_reveal_after = cli::resolve::<u64>(
+        c.abw_reveal_after.as_deref(),
+        f.abw_reveal_after,
+        abw::DEFAULT_REVEAL_AFTER.as_secs(),
+        "--abw-reveal-after",
+        "1 to 600 (seconds)",
+        // Bounded by the age rotation (`abw::ROTATE_AFTER`), so at most a few slots await a
+        // reveal at once and the unrevealed slots' templates stay within the gateway's cache
+        // of 256 (240 periodic fetches at the longest delay and shortest update interval).
+        |n| (1..=600).contains(n),
+    );
     let min_difficulty = cli::resolve::<u64>(
         c.min_diff.as_deref(),
         f.min_diff,
@@ -283,10 +303,17 @@ fn main() -> io::Result<()> {
     let mut payout_address = c.payout_address.clone().or(f.payout_address);
     let mut payout_script_hex = c.payout_script.clone().or(f.payout_script);
     let coinbase_tag = cli::resolve_str(c.coinbase_tag.clone(), f.coinbase_tag, "RATUM");
-    let prime_id =
-        cli::resolve::<u32>(c.prime_id.as_deref(), f.prime_id, 1, "--prime-id", "a number", |_| {
-            true
-        });
+    // Zero is refused: the C gateway keeps a resume token only under a nonzero prime id
+    // (`datum_has_resume_token = configured_prime_id != 0`), so with prime id 0 it would
+    // discard its queued and unanswered shares and its retained proofs on every reconnect.
+    let prime_id = cli::resolve::<u32>(
+        c.prime_id.as_deref(),
+        f.prime_id,
+        1,
+        "--prime-id",
+        "a positive number",
+        |n| *n > 0,
+    );
     let ledger_path = c.ledger.clone().or(f.ledger);
     // Each unit keeps SHARES_PER_KEEP_UNIT of the most recent shares; unset keeps every one.
     let ledger_keep = cli::resolve_opt::<usize>(
@@ -644,11 +671,20 @@ fn main() -> io::Result<()> {
             "gateway user agents restricted to the prefixes {allowed_agents:?}; others are refused at hello"
         );
     }
+    if require_v3 {
+        info!(
+            "version 3 protocol required: a hello without the DRS extension is refused, so \
+             every connection is under an anti-block-withholding assignment"
+        );
+    }
     let server = Arc::new(Server {
         pool_keys,
         node_view,
         motd,
         allowed_agents,
+        require_v3,
+        sessions: Mutex::new(server::SessionStore::default()),
+        abw_reveal_after: std::time::Duration::from_secs(abw_reveal_after),
         node,
         replay,
         ledger: Mutex::new(ledger),

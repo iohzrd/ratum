@@ -4,7 +4,6 @@
 
 use crate::coinbase::{self, Coinbase};
 use crate::config::Config;
-use crate::datum::PoolConfig;
 use crate::template::Template;
 use ratum::datum::messages::{CoinbaseOutput, CoinbaserResponse};
 use ratum::datum::share::EXTRANONCE_SIZE;
@@ -17,6 +16,31 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub use ratum::datum::share::{COINBASE_ID_SUBSIDY_ONLY as COINBASE_SUBSIDY_ONLY, MAX_JOBS};
 pub const JOB_INDEX_XOR: u16 = 0xC0DE;
+
+/// The pool's 0x99 configuration, as the jobs are built from it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PoolConfig {
+    pub payout_script: Vec<u8>,
+    /// u64 for the version 3 protocol; a version 1 config fills the low 32 bits.
+    pub prime_id: u64,
+    pub coinbase_tag: String,
+    pub min_difficulty: u64,
+    /// True when the config came from a version 3 message: the coinbase carries the 8-byte
+    /// prime-id push and the session runs anti-block-withholding unless `abw_disabled`.
+    pub protocol_v3: bool,
+    /// The pool sent `CONFIG_FLAG_ABW_DISABLED`: it runs without anti-block-withholding, so
+    /// pooled work is built with the null key and the gateway classifies blocks itself.
+    pub abw_disabled: bool,
+}
+
+/// The active anti-block-withholding assignment: the wire slot and the pool's key
+/// commitment. The gateway builds every header to commit to `key_hash`, without ever
+/// holding the key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Abw {
+    pub slot: u8,
+    pub key_hash: [u8; 32],
+}
 
 pub struct Job {
     /// Counts every job built; its low byte is the ring index.
@@ -38,6 +62,11 @@ pub struct Job {
     pub coinbaser_outputs: Vec<CoinbaseOutput>,
     pub pool_addr_script: Vec<u8>,
     pub is_datum_job: bool,
+    /// The anti-block-withholding assignment this job commits to (version 3 protocol). `None`
+    /// for a version 1 or solo job, whose headers use a zero XOR key. When set, the header
+    /// commitments include `key_hash` and the PoT-derived clear bits, and shares carry the
+    /// slot; the gateway cannot classify a block on such a job and never submits one.
+    pub abw: Option<Abw>,
     pub is_new_block: bool,
     pub created: Instant,
     pub stale_prevblock: AtomicBool,
@@ -82,7 +111,7 @@ impl Job {
     }
 
     /// The header fields the job fixes, before the miner's.
-    fn header_base(&self, merkle_root: [u8; 32], txcount: u16) -> HeaderV2 {
+    fn header_base(&self, merkle_root: [u8; 32], txcount: u16, pot: u8) -> HeaderV2 {
         HeaderV2 {
             version: self.template.version as i32,
             prev_block: self.template.prev_hash,
@@ -91,7 +120,35 @@ impl Job {
             bits: self.template.nbits,
             txcount,
             height: self.template.height as i32,
+            // Under an ABW assignment the header commits to the clear bits for this share's
+            // difficulty; the key itself stays zero, since the gateway never holds it.
+            xor_key_mask_clear_bits: self.abw.map_or(0, |_| ratum::datum::abw::clear_bits(pot)),
             ..Default::default()
+        }
+    }
+
+    /// H2, the commitment the miner receives, computed with the ABW key hash when this job
+    /// carries an assignment (the gateway commits to the pool's key without holding it) and
+    /// from the header's own zero key otherwise.
+    fn header_h2(&self, h: &HeaderV2) -> [u8; 32] {
+        match self.abw {
+            Some(a) => h.precompute_with_key_hash(a.key_hash).h2,
+            None => h.precompute().h2,
+        }
+    }
+
+    /// The proof-of-work hash a share is checked against. Under an ABW assignment this is the
+    /// raw (unmasked) hash the miner computed: the gateway cannot apply the pool's mask, and
+    /// the raw hash's top `32 + PoT` bits, which the share check reads, are what the mask
+    /// leaves clear. Without an assignment it is the final hash (the mask is the identity).
+    pub fn share_pow_hash(&self, h: &HeaderV2) -> [u8; 32] {
+        match self.abw {
+            Some(a) => {
+                let pre = h.precompute_with_key_hash(a.key_hash);
+                let input = h.asic_input_with(&pre.hash1, &pre.h2);
+                ratum::header::blake2b_256(&input)
+            }
+            None => h.hash_components().result,
         }
     }
 
@@ -105,7 +162,8 @@ impl Job {
         let branches: &[[u8; 32]] = if subsidy_only { &[] } else { &self.merkle_branches };
         let merkle_root = ratum::bitcoin::merkle_root(&cb_hash, branches);
         let txcount = if subsidy_only { 1 } else { self.template.txns.len() as u16 + 1 };
-        let h2 = self.header_base(merkle_root, txcount).precompute().h2;
+        let base = self.header_base(merkle_root, txcount, pot);
+        let h2 = self.header_h2(&base);
         let c = Commitment { merkle_root, h2, txcount };
         ratum::lock(&self.commitments).insert((id, pot), c.clone());
         Some(c)
@@ -121,7 +179,7 @@ impl Job {
         sia_ntime: [u8; 8],
     ) -> Option<HeaderV2> {
         let c = self.commitment(id, pot)?;
-        let mut h = self.header_base(c.merkle_root, c.txcount);
+        let mut h = self.header_base(c.merkle_root, c.txcount, pot);
         h.extranonce = extranonce;
         h.nonce = u32::from_le_bytes(sia_nonce[..4].try_into().unwrap());
         h.nonce2 = u32::from_le_bytes(sia_nonce[4..].try_into().unwrap());
@@ -227,6 +285,7 @@ impl Builder {
         new_block: bool,
         pool: Option<&PoolConfig>,
         coinbaser: Option<CoinbaserResponse>,
+        abw: Option<Abw>,
     ) -> Result<Job, BuildError> {
         let c = &self.config;
         let serial = self.serial;
@@ -251,6 +310,9 @@ impl Builder {
             tag_secondary: &c.mining.coinbase_tag_secondary,
             unique_id: (c.mining.coinbase_unique_id & 0xffff) as u16,
             prime_id,
+            // The version 3 protocol pushes the 8-byte prime id whether or not the pool runs
+            // ABW (`datum_coinbaser.c` writes all eight bytes).
+            wide_prime: pool.is_some_and(|p| p.protocol_v3),
             datum_active: pool.is_some(),
         })
         .map_err(BuildError::Tagging)?;
@@ -282,6 +344,7 @@ impl Builder {
             coinbaser_outputs: set.widest,
             pool_addr_script,
             is_datum_job: pool.is_some(),
+            abw,
             is_new_block: new_block,
             created: Instant::now(),
             stale_prevblock: AtomicBool::new(false),

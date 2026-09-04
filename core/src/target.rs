@@ -90,6 +90,36 @@ fn be_to_f64(v: &Target) -> f64 {
     out
 }
 
+/// The compact bits a version 3 gateway advertises to hashers in place of the
+/// consensus nBits (`datum_blake2b_share_nbits`): the compact encoding of the C share
+/// target `(2^224 - 1) >> exponent`, whose mantissa truncation makes the advertised value
+/// never easier than the share target. Returns 0 for an exponent of 224 or more, which the
+/// C function treats as failure.
+pub fn share_nbits(exponent: u8) -> u32 {
+    if exponent >= 224 {
+        return 0;
+    }
+    // (2^224 - 1) >> exponent, big-endian.
+    let mut t = [0u8; 32];
+    let full = (exponent / 8) as usize;
+    let rem = exponent % 8;
+    for b in t.iter_mut().skip(4 + full) {
+        *b = 0xff;
+    }
+    if rem != 0 {
+        t[4 + full] = 0xff >> rem;
+    }
+    let first = t.iter().position(|&b| b != 0).expect("nonzero below 224");
+    let size = (32 - first) as u32;
+    let at = |i: usize| t.get(i).copied().unwrap_or(0);
+    let (m0, m1, m2) = (at(first), at(first + 1), at(first + 2));
+    if m0 & 0x80 != 0 {
+        ((size + 1) << 24) | (u32::from(m0) << 8) | u32::from(m1)
+    } else {
+        (size << 24) | (u32::from(m0) << 16) | (u32::from(m1) << 8) | u32::from(m2)
+    }
+}
+
 /// `floor(log2(diff))`: the PoT (power-of-two) exponent of a difficulty.
 pub fn floor_pot(diff: u64) -> u8 {
     if diff == 0 { 0 } else { (63 - diff.leading_zeros()) as u8 }
@@ -243,6 +273,25 @@ mod tests {
         let d = difficulty_from_bits(0x207fffff).unwrap();
         assert!(d > 0.0 && d < 1e-8, "got {d}");
         assert_eq!(difficulty_from_bits(0x1d80ffff), None);
+    }
+
+    #[test]
+    fn share_nbits_matches_the_c_vectors() {
+        // Values from datum_pow_tests.c on lukejr/tmp.
+        assert_eq!(share_nbits(0), 0x1d00ffff);
+        assert_eq!(share_nbits(1), 0x1c7fffff);
+        assert_eq!(share_nbits(2), 0x1c3fffff);
+        assert_eq!(share_nbits(8), 0x1c00ffff);
+        assert_eq!(share_nbits(224), 0);
+        assert_eq!(share_nbits(255), 0);
+        // The C loop 0..224: the advertised target is never easier than the accepted one.
+        for pot in 0..224u8 {
+            let advertised = bits_to_target(share_nbits(pot)).expect("compact decodes");
+            assert!(
+                meets_target(&advertised, &target_for_pot(pot)),
+                "pot {pot}: advertised target is easier than the share target"
+            );
+        }
     }
 
     #[test]

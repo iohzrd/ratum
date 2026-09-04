@@ -133,9 +133,7 @@ fn handle(
     let (path, _) = http::path_and_query(&request);
     match path.as_str() {
         "/" | "/index.html" => request.respond(http::html(INDEX_HTML.clone())),
-        "/stats.json" => {
-            request.respond(http::body(snapshot(server, history), "application/json"))
-        }
+        "/stats.json" => request.respond(http::body(snapshot(server, history), "application/json")),
         _ => request.respond(http::not_found()),
     }
 }

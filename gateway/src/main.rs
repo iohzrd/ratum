@@ -268,6 +268,7 @@ fn main() {
         config.datum.protocol_job_slots,
         config.share_queue_capacity(),
         Arc::clone(&notify),
+        Some(node.clone()),
     ));
     #[cfg(unix)]
     signals::install(Arc::clone(&notify));

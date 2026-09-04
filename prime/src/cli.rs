@@ -44,6 +44,22 @@ pub(crate) struct Cli {
     /// "ratum-gateway/"). Empty (the default) accepts every agent.
     #[arg(long)]
     pub allow_agent: Option<String>,
+    /// Refuse at hello any gateway that does not use the version 3 protocol (its hello
+    /// carries no DRS extension). Bare `--require-v3` means true. Off (the default) serves
+    /// version 1 and version 3 gateways; on, every connection is under an
+    /// anti-block-withholding assignment, so no client can withhold blocks selectively.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    pub require_v3: Option<String>,
+    /// Seconds after an anti-block-withholding slot is retired before its key is revealed to
+    /// the gateway (1 to 600, default 300). Must exceed the time the gateway keeps
+    /// submitting shares on the slot's jobs, `share_stale_seconds + work_update_seconds` in
+    /// the C gateway (160 by default, 270 at most; the default covers the most): the
+    /// gateway audits every proof it retained on the slot when it receives the reveal. It
+    /// holds a proof per share until then, in a cache of 65536, so a longer delay lowers the
+    /// share rate one gateway can sustain (about 160 per second at the default, 270 at a
+    /// delay of 180, which covers the C default window only).
+    #[arg(long)]
+    pub abw_reveal_after: Option<String>,
     #[arg(long)]
     pub min_diff: Option<String>,
     #[arg(long)]
@@ -54,6 +70,10 @@ pub(crate) struct Cli {
     pub payout_script: Option<String>,
     #[arg(long)]
     pub coinbase_tag: Option<String>,
+    /// The pool's prime id (1 to 4294967295, default 1): the push every share's coinbase
+    /// must carry, and the first eight bytes of a version 3 resume token. Zero is refused:
+    /// the C gateway keeps no resume token under a zero prime id, so it would discard its
+    /// queued shares and retained proofs on every reconnect.
     #[arg(long)]
     pub prime_id: Option<String>,
     #[arg(long)]
