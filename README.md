@@ -85,6 +85,31 @@ open-file limit warning, `datum.always_pay_self`, the per-client pacing of job u
 testnet fast-forward, `--help`, `--example-conf`, `--test` and `/assets`. Set values among
 these are reported at startup.
 
+### Coinbase size
+
+The coinbase a pooled job commits to carries every output the pool dictated that the
+block has room for. Under the version 2 header the mining machine never receives the
+coinbase: the bytes it is sent (`CBlockHeader::GetHash`) are a fixed 35-byte `coinb1`
+(three zero bytes and H2, the commitment to the header's first stage, which carries the
+merkle root) and the 16-byte extranonce the header carries, so a coinbase of two
+outputs and one of two thousand give a miner the same job. The size classes the C gateway
+builds per miner (its Antminer-safe default holds about 17 outputs) exist because SHA256d
+miners reconstruct and hash the coinbase; this gateway builds one pooled coinbase and one
+subsidy-only coinbase per job, and serves the pooled one to every miner.
+
+What bounds it is the block: the weight limit (4,000,000; 800,000 while RDTS is active,
+every block from the fork height until the parent's median-time-past reaches
+2027-09-01), the sigop limit (80,000; a legacy P2PKH output costs four, a segwit output
+none), and, while RDTS is active, output scripts of at most 34 bytes. The gateway sizes the
+coinbase to the template's `sizelimit`, `weightlimit` and `sigoplimit` less its
+transactions, and at 33,791 bytes in all, the largest coinbase section the pool accepts
+(sized to the 512-output, 32,767-byte split a coinbaser response carries). The room a template leaves is the node's
+`-blockreservedweight` (8,000 by default, about 40 taproot outputs or 55 P2WPKH) once transactions fill it, so a
+node serving a pool with many identities is run with more: about 172 weight units per
+output (a taproot output; 124 for P2WPKH) plus about 1,400 for the rest of the coinbase. The pool dictates at most 512
+outputs (the DATUM coinbaser cap), and records what a coinbase leaves out as owed (see
+"Owed blocks" under Prime).
+
 ## Prime
 
 RATUM Prime is a DATUM pool for the [Bitcoin Knots BLAKE2b hardfork chain](https://github.com/bitcoinknots/bitcoin/pull/359),
@@ -205,17 +230,24 @@ the pool's payout script as the remainder.
 
 ### Owed blocks
 
-A gateway serves a subsidy-only job in the interval between a tip change and the next
-coinbaser split; a block found on one pays its whole value to the pool's payout script and
-the window's miners receive nothing from it. The pool records such a block in the ledger's
-`owed` table at acceptance: the split a coinbaser at that moment would have dictated, minus
-the operator fee. The amounts are logged, shown on the stats page (an "Owed by pool" card
-and table), and included in `/stats.json` under `owed`. Settlement is an ordinary
-transaction from the operator's wallet; afterwards `ratum-prime --settle-block <block-hash>`
-(with `--ledger` or `--data-dir`, pool stopped) marks the record settled, and
-`--settle-block list` prints every record. A recorded block that was rejected or orphaned
-(the pool's payout script never received its value) is removed with
-`--void-block <block-hash>`.
+Whatever a block's coinbase pays to the pool's payout script beyond the operator fee is owed
+to the window, and the pool records it in the ledger's `owed` table at acceptance. Two cases
+produce it. A coinbase that leaves dictated outputs out, paying their value to the pool's
+script as its remainder: a gateway with less room than the split (a C gateway's size class,
+this gateway before 0.1.23 with its 17-output default class, or any gateway on a block its
+transactions fill; see "Coinbase size" under Gateway). The record names exactly those
+outputs, from the split the pool dictated for the job. The other case is a coinbase that
+pays the window nothing on a job with no recorded split (a subsidy-only job, served in the
+interval between a tip change and the next coinbaser split); the record is the split a
+coinbaser at that moment would have dictated, minus the operator fee. The amounts are logged, shown in the stats page's block table ("in
+coinbase; X owed to N", or "owed by pool") and summed in its banner, and included in
+`/stats.json` under `owed`. Settlement is an ordinary transaction from the operator's
+wallet; afterwards `ratum-prime --settle-block <block-hash>` (with `--ledger` or
+`--data-dir`, pool stopped) marks the record settled, and `--settle-block list` prints every
+record. A recorded block that was rejected or orphaned (the pool's payout script never
+received its value) is removed with `--void-block <block-hash>`, and `--record-owed
+<block-hash> --owed <identity>=<sats> ...` adds a record from command-line values for a block in the
+history that has none.
 
 ### Stats interface
 

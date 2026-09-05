@@ -158,7 +158,7 @@
     raw usernames.</p>
 </section>
 
-<footer>Read-only. Refreshes every 5 s. <span id="fee"></span>
+<footer>Read-only. Refreshes every 5 s. <span id="payout-script"></span>
   <div style="margin-top:.5rem">For the Bitcoin Knots BLAKE2b hardfork chain.
     <a href="https://github.com/iohzrd/ratum" target="_blank" rel="noopener">iohzrd/ratum</a> ·
   </div>
@@ -230,9 +230,8 @@ poll(() => "stats.json", s => {
   motdEl.textContent = motd;
   motdEl.style.display = motd && motd !== "RATUM Prime" ? "" : "none";
 
-  const feePct = (s.pool.fee_bps / 100).toLocaleString(undefined, {maximumFractionDigits: 2});
-  document.getElementById("fee").textContent =
-    `Operator fee ${s.pool.fee_bps} bps (${feePct}%). Payout script ${s.pool.payout_script}.`;
+  document.getElementById("payout-script").textContent =
+    `Payout script ${s.pool.payout_script}.`;
 
   // Where a gateway reaches the pool: the operator-set advertise address if any, else the
   // address this page was reached on (correct when opened at the pool's public host).
@@ -272,7 +271,14 @@ poll(() => "stats.json", s => {
     (s.hashrate && s.hashrate.history) || [],
     (s.hashrate && s.hashrate.interval_seconds) || 60);
 
-  // The payout window: work toward the target, then the pool policy that shapes it.
+  // The payout window: work toward the target, then the pool policy that shapes it. The
+  // operator fee chip carries the rate and what it deducts from the coinbase value the node
+  // currently reports (`window.operator_fee_sats`, 0 until the node answers; the amount is
+  // omitted while `network.coinbase_value` is null).
+  const feePct = (s.pool.fee_bps / 100).toLocaleString(undefined, {maximumFractionDigits: 2});
+  const feeChip = s.pool.fee_bps === 0 ? "0%"
+    : s.network.coinbase_value == null ? `${feePct}%`
+    : `${feePct}% (${btc(s.window.operator_fee_sats)} of the coinbase)`;
   const work = Number(s.window.work), target = Number(s.window.target_work);
   const fillPct = target > 0 ? Math.min(work / target * 100, 100) : 0;
   document.getElementById("window-fill").style.width = fillPct + "%";
@@ -284,7 +290,7 @@ poll(() => "stats.json", s => {
   document.getElementById("window-chips").innerHTML = [
     chip("shares", num(s.window.shares)),
     chip("window", num(s.pool.window_multiple) + "× network difficulty"),
-    chip("operator fee", btc(s.window.operator_fee_sats)),
+    chip("operator fee", feeChip),
     chip("min payout", num(s.pool.min_payout) + " sats"),
     chip("min share difficulty", num(s.pool.min_difficulty)),
     chip("coinbase tag", esc(s.pool.coinbase_tag) + " / prime " + s.pool.prime_id),
@@ -336,27 +342,32 @@ poll(() => "stats.json", s => {
   }
 
   // The recorded block history, newest first; hidden while there is none. A block whose
-  // coinbase paid the window nothing shows its owed status (`s.owed` in the JSON), and the
-  // banner sums what remains unsettled.
+  // coinbase paid part of the window's value to the pool's script shows its owed
+  // status (`s.owed` in the JSON): dictated outputs the coinbase left out, or a coinbase
+  // that paid the window nothing. The banner sums what remains unsettled.
   const owed = s.owed || { unsettled_sats: 0, blocks: [] };
   const owedByHash = new Map(owed.blocks.map(b => [b.block_hash, b]));
   const banner = document.getElementById("owed-banner");
   banner.style.display = owed.unsettled_sats > 0 ? "" : "none";
   if (owed.unsettled_sats > 0) {
-    banner.textContent = `${btc(owed.unsettled_sats)} owed by the pool: coinbases below paid `
-      + `the window nothing, so the operator settles those payouts from the pool wallet.`;
+    banner.textContent = `${btc(owed.unsettled_sats)} owed by the pool: coinbases below left `
+      + `dictated outputs unpaid (they did not fit the miner's coinbase, or the coinbase paid `
+      + `the window nothing), so the operator settles those payouts from the pool wallet.`;
   }
   document.getElementById("blocks").style.display = blk.recent.length ? "" : "none";
   if (blk.recent.length) {
     document.querySelector("#blocks-table tbody").innerHTML = blk.recent.map(b => {
+      const o = owedByHash.get(b.block_hash);
       let status;
-      if (b.paid_to_split > 0) {
-        status = '<span class="good">split in coinbase</span>';
+      if (o == null) {
+        status = b.paid_to_split > 0 ? '<span class="good">split in coinbase</span>' : "pool";
       } else {
-        const o = owedByHash.get(b.block_hash);
-        status = o == null ? "pool"
-          : o.settled_at ? '<span class="good">owed, settled</span>'
-          : '<span class="stale">owed by pool</span>';
+        const what = b.paid_to_split > 0
+          ? `in coinbase; ${btc(o.total_sats)} owed to ${o.miners.length} miner${o.miners.length === 1 ? "" : "s"}`
+          : "owed";
+        status = o.settled_at
+          ? `<span class="good">${what}, settled</span>`
+          : `<span class="stale">${what}${b.paid_to_split > 0 ? "" : " by pool"}</span>`;
       }
       return `<tr>
         <td class="num">${num(b.height)}</td>

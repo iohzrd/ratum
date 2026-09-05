@@ -44,9 +44,9 @@ fn ledger_files_in(dir: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(found)
 }
 
-/// The ledger file a maintenance flag (`--dump-ledger`, `--settle-block`, `--void-block`)
-/// operates on, named in its refusals as `flag`. Opening it takes the exclusive lock, so
-/// the pool must not be running.
+/// The ledger file a maintenance flag (`--dump-ledger`, `--settle-block`, `--void-block`,
+/// `--record-owed`) operates on, named in its refusals as `flag`. Opening it takes the
+/// exclusive lock, so the pool must not be running.
 fn ledger_path_for(location: &LedgerLocation, flag: &str) -> io::Result<PathBuf> {
     Ok(match location {
         LedgerLocation::File(p) => p.clone(),
@@ -115,6 +115,77 @@ fn print_owed(o: &ledger::OwedBlock) {
     for (identity, sats) in &o.entries {
         println!("  {identity} {sats}");
     }
+}
+
+/// `--record-owed`: add an owed record for a block in the ledger's history from
+/// `--owed identity=sats` entries, then exit; see the flag's help. The block's height and
+/// time come from its history record; the entries may not total more than its coinbase paid
+/// to the pool's payout script.
+fn record_owed(location: &LedgerLocation, arg: &str, entries: &[String]) -> io::Result<()> {
+    let path = ledger_path_for(location, "--record-owed")?;
+    let (mut ledger, _) = Ledger::open(&path, u128::MAX, None, None)?;
+    let hash: [u8; 32] = match hex::decode(arg).ok().and_then(|v| v.try_into().ok()) {
+        Some(h) => h,
+        None => {
+            eprintln!(
+                "--record-owed takes the block hash the pool logged (64 hex digits), got {arg:?}"
+            );
+            std::process::exit(2);
+        }
+    };
+    let Some(block) = ledger.blocks().iter().find(|b| b.block_hash == hash).cloned() else {
+        eprintln!(
+            "no block under {arg} in the ledger's block history; the pool records every block \
+             it accepted there"
+        );
+        std::process::exit(2);
+    };
+    if let Some(existing) = ledger.owed().iter().find(|o| o.block_hash == hash) {
+        eprintln!("block {arg} already has an owed record; --void-block removes it first:");
+        print_owed(existing);
+        std::process::exit(2);
+    }
+    let mut parsed: Vec<(String, u64)> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let split = entry.split_once('=').map(|(id, sats)| (id.trim(), sats.trim().parse::<u64>()));
+        match split {
+            Some((id, Ok(sats))) if !id.is_empty() && sats > 0 => {
+                parsed.push((id.to_string(), sats));
+            }
+            _ => {
+                eprintln!(
+                    "--owed takes identity=sats with a positive whole number of sats, got \
+                     {entry:?}"
+                );
+                std::process::exit(2);
+            }
+        }
+    }
+    if parsed.is_empty() {
+        eprintln!("--record-owed needs at least one --owed identity=sats");
+        std::process::exit(2);
+    }
+    let total: u64 = parsed.iter().map(|(_, sats)| *sats).sum();
+    if total > block.paid_to_pool {
+        eprintln!(
+            "the entries total {total} sats, more than the {} sats the block's coinbase paid to \
+             the pool's payout script (a figure that includes the operator fee, which is not \
+             owed)",
+            block.paid_to_pool
+        );
+        std::process::exit(2);
+    }
+    let owed = ledger::OwedBlock {
+        at: block.at,
+        height: block.height,
+        block_hash: hash,
+        total,
+        settled_at: None,
+        entries: parsed,
+    };
+    ledger.record_owed(owed.clone())?;
+    print_owed(&owed);
+    Ok(())
 }
 
 /// `--settle-block`: mark an owed block settled (or list them with `list`), then exit; see
@@ -409,6 +480,9 @@ fn main() -> io::Result<()> {
     }
     if let Some(arg) = &loaded.cli.void_block {
         return void_block(&ledger_location, arg);
+    }
+    if let Some(arg) = &loaded.cli.record_owed {
+        return record_owed(&ledger_location, arg, &loaded.cli.owed);
     }
 
     let pool_keys = load_or_create_keys(&key_path)?;

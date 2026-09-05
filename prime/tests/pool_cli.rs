@@ -24,6 +24,76 @@ fn args_with(extra: &[&str]) -> Vec<String> {
     argv
 }
 
+/// `--record-owed` adds an owed record for a block in the ledger's history from `--owed`
+/// entries, with the block's height and time; it refuses entries totalling more than the
+/// block's coinbase paid to the pool's script, a block that has a record already, and a
+/// block not in the history. The record settles like any other.
+#[test]
+fn record_owed_adds_a_record_for_a_block_in_the_history() {
+    use ratum_prime::ledger::{FoundBlock, Ledger};
+    let dir = TempDir::new("record-owed");
+    let path = dir.join("regtest.redb");
+    let hash = [0x4du8; 32];
+    {
+        let (mut l, _) = Ledger::open(&path, u128::MAX, None, None).expect("open ledger");
+        l.record_block(FoundBlock {
+            at: 1_700_000_000,
+            height: 962_232,
+            block_hash: hash,
+            paid_to_split: 310_000_000,
+            paid_to_pool: 2_500_000,
+            finder: "alice".to_string(),
+            tag: String::new(),
+            difficulty: 1.0,
+            cumulative_work: 1,
+        })
+        .expect("record block");
+    }
+    let ledger = path.to_str().expect("utf-8 path");
+    let hex_hash = hex::encode(hash);
+    let run = |args: &[&str]| {
+        let mut argv = vec!["--ledger", ledger];
+        argv.extend_from_slice(args);
+        run_pool(&argv)
+    };
+
+    // A malformed entry, and entries over what the pool's script received: refused, nothing
+    // recorded.
+    let output = run(&["--record-owed", &hex_hash, "--owed", "bob=lots"]);
+    assert_eq!(output.status.code(), Some(2), "{}", printed(&output));
+    assert!(printed(&output).contains("positive whole number"), "{}", printed(&output));
+    let output = run(&["--record-owed", &hex_hash, "--owed", "bob=2500001"]);
+    assert_eq!(output.status.code(), Some(2), "{}", printed(&output));
+    assert!(printed(&output).contains("more than the 2500000 sats"), "{}", printed(&output));
+
+    // Two entries within it: recorded with the block's height and time.
+    let output =
+        run(&["--record-owed", &hex_hash, "--owed", "bob=2000000", "--owed", "carol=400000"]);
+    assert!(output.status.success(), "{}", printed(&output));
+    let text = printed(&output);
+    assert!(
+        text.contains(&format!(
+            "height 962232 block {hex_hash} found 1700000000 total 2400000 sats unsettled"
+        )),
+        "{text}"
+    );
+    assert!(text.contains("  bob 2000000") && text.contains("  carol 400000"), "{text}");
+
+    // A second record for the same block is refused, and so is a block not in the history.
+    let output = run(&["--record-owed", &hex_hash, "--owed", "bob=1"]);
+    assert_eq!(output.status.code(), Some(2), "{}", printed(&output));
+    assert!(printed(&output).contains("already has an owed record"), "{}", printed(&output));
+    let other = hex::encode([0x5eu8; 32]);
+    let output = run(&["--record-owed", &other, "--owed", "bob=1"]);
+    assert_eq!(output.status.code(), Some(2), "{}", printed(&output));
+    assert!(printed(&output).contains("no block under"), "{}", printed(&output));
+
+    // The record settles like any other.
+    let output = run(&["--settle-block", &hex_hash]);
+    assert!(output.status.success(), "{}", printed(&output));
+    assert!(printed(&output).contains("settled at"), "{}", printed(&output));
+}
+
 fn refuses(extra: &[&str], because: &str) {
     let argv = args_with(extra);
     let borrowed: Vec<&str> = argv.iter().map(String::as_str).collect();

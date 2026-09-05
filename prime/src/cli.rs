@@ -107,8 +107,9 @@ pub(crate) struct Cli {
     /// since it holds the ledger's exclusive lock.
     #[arg(long)]
     pub dump_ledger: bool,
-    /// Mark an owed block (a block whose coinbase paid the window nothing; the hash the pool
-    /// logged and the stats page shows) settled in the ledger (`--ledger` or `--data-dir`),
+    /// Mark an owed block (a block whose coinbase paid the pool's payout script value the
+    /// window is owed; the hash the pool logged and the stats page shows) settled in the
+    /// ledger (`--ledger` or `--data-dir`),
     /// print its record, and exit. Run it after paying the amounts from the pool's wallet.
     /// The pool must not be running, since it holds the ledger's exclusive lock. Without a
     /// hash, `--settle-block list` prints every owed block instead.
@@ -120,6 +121,18 @@ pub(crate) struct Cli {
     /// The pool must not be running, since it holds the ledger's exclusive lock.
     #[arg(long)]
     pub void_block: Option<String>,
+    /// Add an owed record for a block in the ledger's block history (the hash the pool
+    /// logged) from `--owed identity=sats` entries, print it, and exit. For a block the pool
+    /// accepted before it recorded the dictated outputs a coinbase leaves out, or whose
+    /// record was voided by mistake. The entries may not total more than the block's
+    /// coinbase paid to the pool's payout script; that figure includes the operator fee,
+    /// which is not owed, so the pool's records stay under it by the fee. The pool must not
+    /// be running, since it holds the ledger's exclusive lock.
+    #[arg(long)]
+    pub record_owed: Option<String>,
+    /// An `identity=sats` entry for `--record-owed`; repeat it for each identity.
+    #[arg(long, value_name = "IDENTITY=SATS")]
+    pub owed: Vec<String>,
 }
 
 /// The command line and the file it named, ready for `main` to resolve each setting from.

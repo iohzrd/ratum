@@ -1091,7 +1091,7 @@ impl<'a> Session<'a> {
             merkle_branches: job.merkle_branches.clone(),
         });
         let coinbase_section = (!sent.coinbase_known(share.coinbase_id)).then(|| {
-            let c = job.coinbase(share.coinbase_id).expect("checked by the caller");
+            let c = job.coinbase(share.coinbase_id).expect("every id names a coinbase");
             CoinbaseSection {
                 coinbase_id: share.coinbase_id,
                 coinb1: c.coinb1.clone(),
@@ -1131,10 +1131,6 @@ impl<'a> Session<'a> {
             warn!("share header extranonce does not begin with four zero bytes; not sent");
             return Ok(());
         };
-        if job.coinbase(share.coinbase_id).is_none() {
-            warn!("share names coinbase {} which the job does not have", share.coinbase_id);
-            return Ok(());
-        }
         let (job_section, coinbase_section) = self.sections_for(&share);
         let blake2b = Blake2bSection::from_header(h);
         let submit = PowSubmit {
@@ -1964,7 +1960,7 @@ mod session_tests {
 
         // The coinbase carries the 11-byte prime push (opcode 0x0b) with the full 64-bit id,
         // and the PoT byte follows it.
-        let cb = &job.coinbases[0];
+        let cb = &job.pooled;
         let full = cb.assemble(&[0u8; share::EXTRANONCE_SIZE]);
         assert!(job.target_pot_index >= 1);
         assert_eq!(full[job.target_pot_index - 1], 0x0b, "the wide prime push opcode");
@@ -1978,7 +1974,7 @@ mod session_tests {
         let no_abw = PoolConfig { abw_disabled: true, ..v3_pool.clone() };
         let no_abw_job =
             builder.build(Arc::clone(&template), false, Some(&no_abw), None, None).unwrap();
-        let full = no_abw_job.coinbases[0].assemble(&[0u8; share::EXTRANONCE_SIZE]);
+        let full = no_abw_job.pooled.assemble(&[0u8; share::EXTRANONCE_SIZE]);
         assert_eq!(full[no_abw_job.target_pot_index - 1], 0x0b, "wide prime push without ABW");
 
         // The header commits to the key hash: its share hash differs from a v1 job's.

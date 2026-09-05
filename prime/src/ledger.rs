@@ -39,13 +39,13 @@ const META_CUMULATIVE_WORK: &str = "cumulative_work";
 /// applies.
 const BLOCKS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("blocks");
 
-/// Blocks whose coinbase paid the window nothing, keyed by proof-of-work hash. A gateway
-/// serves a subsidy-only job in the interval between a tip change and the next coinbaser
-/// split, and a block found on one pays its whole value to the pool's payout script. The
-/// value the window would have received went to the pool instead, so the split that a
-/// coinbaser would have dictated is recorded here at acceptance: the pool operator owes
-/// each identity its amount, settles it with an ordinary wallet transaction, and marks the
-/// block settled with `--settle-block`. The row value is a packed `OwedBlock`.
+/// Blocks whose coinbase paid the pool's payout script value the window is owed, keyed by
+/// proof-of-work hash: the dictated outputs a coinbase left out (they did not fit the
+/// gateway's coinbase), recorded exactly, or a coinbase that paid the window nothing (a
+/// subsidy-only job, served in the interval between a tip change and the next coinbaser
+/// split), recorded as the split a coinbaser would have dictated at acceptance. The pool
+/// operator owes each identity its amount, settles it with an ordinary wallet transaction,
+/// and marks the block settled with `--settle-block`. The row value is a packed `OwedBlock`.
 const OWED: TableDefinition<&[u8], &[u8]> = TableDefinition::new("owed");
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -110,19 +110,22 @@ fn unpack(bytes: &[u8]) -> Option<Share> {
     })
 }
 
-/// What the pool owes the window for one block whose coinbase paid it nothing: the split a
-/// coinbaser would have dictated at the moment the block was accepted. `settled_at` is the
-/// unix time `--settle-block` recorded the operator's payment, `None` until then.
+/// What the pool owes the window for one block: the value its coinbase paid to the pool's
+/// payout script that is owed to the window's identities. For a coinbase that left dictated
+/// outputs out, exactly those outputs; for one that paid the window nothing on a job with no
+/// recorded split, the split a coinbaser would have dictated when the block was accepted.
+/// `settled_at` is the unix time `--settle-block` recorded the operator's payment, `None`
+/// until then.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OwedBlock {
     pub at: u64,
     pub height: u32,
     /// The proof-of-work hash, in the byte order targets are compared in (the row key).
     pub block_hash: [u8; 32],
-    /// The sats the window would have received: the coinbase value minus the operator fee.
+    /// The sats owed: the sum of `entries`.
     pub total: u64,
     pub settled_at: Option<u64>,
-    /// `(identity, sats)` largest first, summing to `total`, from `Ledger::split`.
+    /// `(identity, sats)` in the split's order, largest first, summing to `total`.
     pub entries: Vec<(String, u64)>,
 }
 
@@ -552,7 +555,7 @@ pub struct Ledger {
     total_work: u128,
     window: u128,
     store: Option<Store>,
-    /// Blocks whose coinbase paid the window nothing, oldest first: the store's `OWED`
+    /// Blocks the pool owes the window for (`OwedBlock`), oldest first: the store's `OWED`
     /// table read at open, and the read authority thereafter; every mutation writes the
     /// store first, then this list. Kept in memory so the stats interface reads it without
     /// a store transaction, and so a file-less ledger still tracks it.
@@ -773,8 +776,8 @@ impl Ledger {
         &self.blocks
     }
 
-    /// Record a block whose coinbase paid the window nothing, durably when a store backs the
-    /// ledger. A hash already recorded is left as it is, so a resent block share cannot
+    /// Record a block the pool owes the window for (`OwedBlock`), durably when a store backs
+    /// the ledger. A hash already recorded is left as it is, so a resent block share cannot
     /// double the debt. The write is durable before the in-memory list is touched, matching
     /// `record`.
     pub fn record_owed(&mut self, owed: OwedBlock) -> io::Result<()> {

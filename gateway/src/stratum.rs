@@ -2,6 +2,7 @@
 //! connection; the messages and their formats are the C gateway's (`datum_stratum.c`).
 
 use crate::address;
+use crate::coinbase::COINBASE_POOLED;
 use crate::config::Config;
 use crate::datum::{self, QueuedShare};
 use crate::dupes::Dupes;
@@ -76,7 +77,6 @@ pub struct ClientStats {
     pub rejected: Tally,
     pub fee: Tally,
     pub last_accepted: Option<Instant>,
-    pub coinbase_selection: u8,
     /// The completed window's accepted difficulty and its length, for the hashrate.
     pub window_diff: u64,
     pub window: Duration,
@@ -337,7 +337,6 @@ struct Connection {
     authorized: bool,
     username: String,
     vardiff: Vardiff,
-    coinbase_selection: u8,
     /// The difficulty each job in the ring was served at to this connection.
     job_diffs: Vec<Option<u64>>,
     sent_generation: u64,
@@ -366,7 +365,6 @@ impl Connection {
                 remote: remote.clone(),
                 unique_id,
                 current_diff: server.config.stratum.vardiff_min,
-                coinbase_selection: crate::coinbase::DEFAULT_TYPE,
                 ..Default::default()
             }),
         });
@@ -391,7 +389,6 @@ impl Connection {
                 },
                 now,
             ),
-            coinbase_selection: crate::coinbase::DEFAULT_TYPE,
             job_diffs: vec![None; MAX_JOBS],
             sent_generation: 0,
             connected: now,
@@ -565,22 +562,11 @@ impl Connection {
                     .take(127)
                     .collect()
             });
-        if s.fingerprint_miners && !useragent.is_empty() {
-            let ua = useragent.as_str();
-            if ua.starts_with("Antminer S21/") {
-                self.coinbase_selection = 5;
-            } else if ua.starts_with("PowerPlay-BM/") || ua.starts_with("xminer-1.") {
-                self.coinbase_selection = 4;
-            } else if ua.starts_with("whatsminer/v1") {
-                self.coinbase_selection = 3;
-            } else if ua.contains("bosminer-plus-tuner") {
-                self.coinbase_selection = 5;
-            } else if ua.starts_with("NiceHash/") {
-                self.vardiff.raise_floor(524_288);
-                self.coinbase_selection = 1;
-            } else if ua.starts_with("bitaxe") {
-                self.coinbase_selection = 3;
-            }
+        // Fingerprinting keeps one effect of the C gateway's: NiceHash rents hashrate at a
+        // high minimum difficulty. The coinbase size class it also assigned per miner is
+        // removed; every miner receives the one pooled coinbase (`coinbase::COINBASE_POOLED`).
+        if s.fingerprint_miners && useragent.starts_with("NiceHash/") {
+            self.vardiff.raise_floor(524_288);
         }
         let sid = format!("{:08x}", self.sid);
         self.reply_result(
@@ -596,12 +582,10 @@ impl Connection {
         )?;
         self.send_difficulty()?;
         self.subscribed = true;
-        let selection = self.coinbase_selection;
         self.with_stats(|st| {
             st.useragent = useragent;
             st.subscribed = true;
             st.subscribed_at = Some(Instant::now());
-            st.coinbase_selection = selection;
         });
         self.vardiff.reset_snapshot(Instant::now());
         let (job, _, generation) = self.server.current_for_send();
@@ -704,7 +688,7 @@ impl Connection {
             global_index: job.global_index,
             quickdiff,
             empty: new_block,
-            coinbase: if new_block { COINBASE_SUBSIDY_ONLY } else { self.coinbase_selection },
+            coinbase: if new_block { COINBASE_SUBSIDY_ONLY } else { COINBASE_POOLED },
         };
         let pot = target::floor_pot(diff.max(1));
         let Some(commitment) = job.commitment(r.coinbase, pot) else {
@@ -783,7 +767,7 @@ impl Connection {
         let mut extranonce = [0u8; 16];
         extranonce[4..8].copy_from_slice(&self.sid.to_be_bytes());
         extranonce[8..].copy_from_slice(&en2);
-        if !job_ref.empty && job_ref.coinbase as usize >= job.coinbases.len() {
+        if !job_ref.empty && job_ref.coinbase != COINBASE_POOLED {
             return Err(rejected);
         }
         let ntime =

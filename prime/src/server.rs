@@ -8,7 +8,7 @@ use ratum::datum::handshake::KeyPairs;
 use ratum::datum::messages::{self, CoinbaseOutput};
 use ratum::{lock, rpc};
 use ratum_prime::ledger::{Ledger, OwedBlock};
-use ratum_prime::verify::{PoolPolicy, ReplayGuard};
+use ratum_prime::verify::{PoolPolicy, ReplayGuard, Splits};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -322,7 +322,7 @@ pub(crate) struct SessionState {
     /// The splits the session dictated, by coinbaser id: the gateway's replayed shares and
     /// its shares on the jobs it still holds pay them, and `check_outputs` refuses any
     /// other output.
-    pub(crate) splits: HashMap<u8, (Vec<messages::CoinbaseOutput>, u64)>,
+    pub(crate) splits: Splits,
     /// The last coinbaser id sent, continued so a resumed session's next split does not
     /// take an id a held job still names.
     pub(crate) coinbaser_id: u8,
@@ -366,7 +366,7 @@ impl PayoutPolicy {
 }
 
 /// The split of a coinbase value of `value` sats after the operator fee. The one
-/// computation `coinbaser_outputs`, `owed_for_block` and the stats snapshot share, so a
+/// computation `dictated_outputs`, `owed_for_block` and the stats snapshot share, so a
 /// change to the fee or split parameters reaches all three.
 pub(crate) fn split_after_fee(l: &Ledger, payout: &PayoutPolicy, value: u64) -> Vec<(String, u64)> {
     l.split(payout.miners_share(value), payout.min_payout, messages::MAX_COINBASER_OUTPUTS)
@@ -503,7 +503,10 @@ pub(crate) fn resolve_address(node: &rpc::Client, address: &str) -> Result<Resol
     })
 }
 
-pub(crate) fn coinbaser_outputs(server: &Server, value: u64) -> (Vec<CoinbaseOutput>, usize, u128) {
+pub(crate) fn dictated_outputs(
+    server: &Server,
+    value: u64,
+) -> (Vec<(String, CoinbaseOutput)>, usize, u128) {
     let node = &server.node;
     // The pool receives the operator fee; what remains is split among the miners. The gateway
     // pays the fee to the pool's payout script as the coinbase remainder (the value minus these
@@ -520,7 +523,9 @@ pub(crate) fn coinbaser_outputs(server: &Server, value: u64) -> (Vec<CoinbaseOut
         // and is not payable) leaves its amount out of the dictated outputs, and the gateway
         // pays that amount to the pool's payout script as part of the remainder.
         match Resolver::payability(&server.resolver, node, &identity) {
-            Payability::Script(script) => outputs.push(CoinbaseOutput { value: amount, script }),
+            Payability::Script(script) => {
+                outputs.push((identity, CoinbaseOutput { value: amount, script }))
+            }
             Payability::Unpayable(why) => warn!(
                 "      {identity} cannot be paid ({why}); paying the other outputs and \
                  leaving this identity's amount to the pool"
@@ -532,6 +537,13 @@ pub(crate) fn coinbaser_outputs(server: &Server, value: u64) -> (Vec<CoinbaseOut
         }
     }
     (outputs, shares, work)
+}
+
+/// `dictated_outputs` without the identities: the outputs the coinbaser response carries.
+#[cfg(test)]
+pub(crate) fn coinbaser_outputs(server: &Server, value: u64) -> (Vec<CoinbaseOutput>, usize, u128) {
+    let (dictated, shares, work) = dictated_outputs(server, value);
+    (dictated.into_iter().map(|(_, o)| o).collect(), shares, work)
 }
 
 /// What the pool owes the window for a block whose coinbase paid it nothing: the split a
@@ -648,7 +660,14 @@ mod tests {
         let hash0 = ratum::datum::abw::xor_key_hash(&abw.keys().seeded[0].unwrap());
         let split = vec![messages::CoinbaseOutput { value: 5, script: vec![0x51] }];
         let mut splits = HashMap::new();
-        splits.insert(7u8, (split.clone(), 0));
+        splits.insert(
+            7u8,
+            ratum_prime::verify::DictatedSplit {
+                outputs: split.clone(),
+                identities: vec!["carol".to_string()],
+                sent_at: 0,
+            },
+        );
         let state = SessionState { token, abw, splits, coinbaser_id: 7 };
         lock(&server.sessions).save(key, SavedSession { state, saved_at: now, held_since: now });
 
@@ -657,7 +676,7 @@ mod tests {
         assert_eq!(state.token, token);
         assert_eq!(ratum::datum::abw::xor_key_hash(&state.abw.keys().seeded[0].unwrap()), hash0);
         assert_eq!(
-            state.splits.get(&7).map(|(o, _)| o),
+            state.splits.get(&7).map(|d| &d.outputs),
             Some(&split),
             "the session's splits continue"
         );

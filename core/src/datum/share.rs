@@ -37,6 +37,20 @@ pub const EXTRANONCE_V2_PAD: usize = EXTRANONCE_SIZE_V2 - EXTRANONCE_SIZE;
 /// `datum_stratum.h`; no named constant).
 pub const COINBASE_ID_SUBSIDY_ONLY: u8 = 0xFF;
 pub const MAX_JOBS: usize = 256;
+/// The most bytes one coinbase section (`coinb1` plus `coinb2`: the transaction less the
+/// `EXTRANONCE_SIZE` bytes the extranonce fills) may hold. The pool refuses a larger one
+/// (`CoinbaseTooLarge`) and the gateway sizes its coinbase under it. The outputs a coinbaser
+/// response dictates encode in at most `MAX_COINBASER_BLOB` bytes, each as in a transaction
+/// (value, one length byte, the script), and the rest of the transaction is at most 332
+/// bytes: 124 of framing (the version, the input count, the null outpoint, the scriptSig
+/// length, the three-byte header of the extranonce push, the twelve extranonce bytes, the
+/// sequence, a three-byte output count, the pool output's value and script length, the
+/// 47-byte witness commitment output, the lock time), a scriptSig of at most 100 bytes, a
+/// payout script of at most `MAX_PAYOUT_SCRIPT` (83), and the 25-byte OP_RETURN output the
+/// extranonce moves to when the scriptSig has no room; the section omits the twelve
+/// extranonce bytes, and 1024 rounds the rest up. The C gateway's
+/// `MAX_COINBASE_TXN_SIZE_BYTES` is 16 960; the wire allows 64 KiB per half.
+pub const MAX_COINBASE_SECTION_BYTES: usize = crate::datum::messages::MAX_COINBASER_BLOB + 1024;
 /// The gateway's `merklebranches_bin[24][32]`.
 pub const MAX_MERKLE_BRANCHES: usize = 24;
 pub const MAX_USERNAME: usize = 384;

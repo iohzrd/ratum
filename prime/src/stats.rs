@@ -197,9 +197,10 @@ fn snapshot(server: &Server, history: &Mutex<VecDeque<(u64, f64)>>) -> String {
         }
     };
 
-    // Blocks whose coinbase paid the window nothing: what the pool's payout script received
-    // that the window is owed, per block and summed per identity while unsettled. Settlement
-    // is a wallet transaction the operator records with --settle-block.
+    // What the pool's payout script received on each block that the window is owed (outputs
+    // the coinbase left out, or a coinbase that paid the window nothing), per block and
+    // summed per identity while unsettled. Settlement is a wallet transaction the operator
+    // records with --settle-block.
     let mut owed_unsettled: u64 = 0;
     let mut owed_by_identity: HashMap<String, u64> = HashMap::new();
     let owed_blocks: Vec<serde_json::Value> = owed

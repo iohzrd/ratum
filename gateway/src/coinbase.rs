@@ -18,7 +18,7 @@
 use crate::template::Template;
 use ratum::bitcoin::{encode_compact_size, encode_output, encode_push};
 use ratum::datum::messages::CoinbaseOutput;
-use ratum::datum::share::EXTRANONCE_SIZE;
+use ratum::datum::share::{EXTRANONCE_SIZE, MAX_COINBASE_SECTION_BYTES};
 
 /// The scriptSig length up to which the extranonce push fits inside it (100 - 15).
 const SCRIPT_SIG_ROOM_FOR_EXTRANONCE: usize = 85;
@@ -158,6 +158,9 @@ pub struct Params<'a> {
     pub outputs: &'a [CoinbaseOutput],
     /// The bytes available for `outputs`; each costs its script length plus nine.
     pub output_budget: usize,
+    /// The sigop cost available for `outputs` (`output_sigop_cost`): the block's limit less
+    /// its transactions and the pool script's output.
+    pub sigop_budget: u64,
     pub force_op_return_extranonce: bool,
 }
 
@@ -170,15 +173,21 @@ pub fn build(p: &Params<'_>) -> (Coinbase, usize, Vec<CoinbaseOutput>) {
     let mut included = Vec::new();
     let mut paid = 0u64;
     let mut remaining = p.output_budget;
+    let mut sigops_left = p.sigop_budget;
     for o in p.outputs {
         if remaining < 30 || paid >= p.coinbase_value {
             break;
         }
         let cost = o.script.len() + 9;
-        if paid.saturating_add(o.value) > p.coinbase_value || cost > remaining {
+        let sigops = output_sigop_cost(&o.script);
+        if paid.saturating_add(o.value) > p.coinbase_value
+            || cost > remaining
+            || sigops > sigops_left
+        {
             continue;
         }
         remaining -= cost;
+        sigops_left -= sigops;
         paid += o.value;
         included.push(o.clone());
     }
@@ -223,29 +232,89 @@ pub fn build(p: &Params<'_>) -> (Coinbase, usize, Vec<CoinbaseOutput>) {
     (Coinbase { coinb1, coinb2 }, pot_index, included)
 }
 
-/// The coinbase size classes (`MAX_COINBASE_TYPES`), by the index a stratum job id names.
-pub const TYPE_NAMES: [&str; 6] = ["Blank", "Tiny", "Default", "Respect", "Yuge", "Antmain2"];
-/// The largest transaction each class may be; 0 is the outputs-free class.
-pub const TYPE_MAX_SIZE: [usize; 6] = [0, 500, 755, 6500, 16000, 2250];
-pub const TYPE_FORCES_OP_RETURN: [bool; 6] = [false, false, true, false, false, false];
-pub const DEFAULT_TYPE: u8 = 2;
+/// The coinbase id a pooled job's stratum job ids and shares carry. There is one: under the
+/// version 2 header the mining machine receives a fixed 35-byte `coinb1` (three zero bytes
+/// and H2) and never the coinbase itself, so a job has no size class to name. The C
+/// gateway's indices 1..5 named the coinbase size classes SHA256d miners' firmware
+/// imposed, since those miners reconstruct and hash the coinbase. `COINBASE_SUBSIDY_ONLY`
+/// (0xff) names the other coinbase a job holds.
+pub const COINBASE_POOLED: u8 = 1;
 
-/// How many bytes of `max_size` the template leaves for outputs beyond `fixed_bytes`
-/// (`datum_stratum_coinbase_fit_to_template`).
-pub fn fit_to_template(max_size: usize, fixed_bytes: usize, t: &Template) -> usize {
-    let i = fixed_bytes + max_size;
-    let mut msz = max_size.saturating_sub(fixed_bytes);
-    let size_used = t.totals.size as u64 + 85 + 84 + 36;
-    if i as u64 + size_used > t.sizelimit {
-        let room = t.sizelimit.saturating_sub(size_used) as usize;
-        msz = msz.min(room.saturating_sub(fixed_bytes));
+/// The most bytes a coinbase may hold whatever room the template leaves: the pool refuses a
+/// coinbase section over `MAX_COINBASE_SECTION_BYTES`. `output_budget` takes this as the
+/// transaction's size with `fixed_bytes` counting the framing at its three-byte-output-count
+/// size (`job::coinbase_set`), and the section omits the `EXTRANONCE_SIZE` (12) bytes the
+/// transaction holds, so a section built to this is at least twelve bytes under the pool's
+/// limit.
+pub const MAX_COINBASE_BYTES: usize = MAX_COINBASE_SECTION_BYTES;
+
+/// The bytes the template leaves for a coinbase's outputs beyond `fixed_bytes`: the block's
+/// size and weight limits less its transactions (`datum_stratum_coinbase_fit_to_template`,
+/// without the size class it also took), and at most `MAX_COINBASE_BYTES` in all. A coinbase
+/// byte weighs four units, the transaction having no witness data. Under RDTS the node
+/// reports the reduced weight limit (800,000); what its transactions leave unfilled is its
+/// `-blockreservedweight` (8,000 by default), so a node serving a pool with many identities
+/// is run with a larger one.
+pub fn output_budget(fixed_bytes: usize, t: &Template) -> usize {
+    // The block around the coinbase: the header, a transaction count of at most five bytes,
+    // and the 36 bytes of witness the node adds to the coinbase (marker, flag, one 32-byte
+    // item), which weigh one unit a byte where the rest weigh four.
+    let around = (ratum::header::HEADER_V2_SIZE + 5) as u64;
+    let size_used = t.totals.size as u64 + around + 36;
+    let by_size = t.sizelimit.saturating_sub(size_used);
+    let weight_used = t.totals.weight as u64 + 4 * around + 36;
+    let by_weight = t.weightlimit.saturating_sub(weight_used) >> 2;
+    let room = by_size.min(by_weight).min(MAX_COINBASE_BYTES as u64) as usize;
+    room.saturating_sub(fixed_bytes)
+}
+
+/// The sigop cost of an output script as the block limit counts it: legacy sigops times
+/// four (`GetLegacySigOpCount` counts output scripts, and the coinbase's count is scaled by
+/// `WITNESS_SCALE_FACTOR`). OP_CHECKSIG and OP_CHECKSIGVERIFY count one, OP_CHECKMULTISIG
+/// and OP_CHECKMULTISIGVERIFY twenty (the inaccurate count the limit uses); push data is
+/// skipped. A segwit output (P2WPKH, P2WSH, P2TR) costs nothing, a P2PKH output four.
+pub fn output_sigop_cost(script: &[u8]) -> u64 {
+    let mut cost = 0u64;
+    let mut i = 0usize;
+    while i < script.len() {
+        let op = script[i];
+        i += 1;
+        let push = match op {
+            0x01..=0x4b => usize::from(op),
+            0x4c => {
+                let n = script.get(i).map_or(0, |&b| usize::from(b));
+                i += 1;
+                n
+            }
+            0x4d => {
+                let n = match script.get(i..i + 2) {
+                    Some(b) => usize::from(u16::from_le_bytes([b[0], b[1]])),
+                    None => 0,
+                };
+                i += 2;
+                n
+            }
+            0x4e => {
+                let n = match script.get(i..i + 4) {
+                    Some(b) => u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize,
+                    None => 0,
+                };
+                i += 4;
+                n
+            }
+            0xac | 0xad => {
+                cost += 4;
+                0
+            }
+            0xae | 0xaf => {
+                cost += 80;
+                0
+            }
+            _ => 0,
+        };
+        i = i.saturating_add(push);
     }
-    let weight_used = t.totals.weight as u64 + 340 + 336 + 36;
-    if 4 * i as u64 + weight_used > t.weightlimit {
-        let room = (t.weightlimit.saturating_sub(weight_used) >> 2) as usize;
-        msz = msz.min(room.saturating_sub(fixed_bytes));
-    }
-    msz
+    cost
 }
 
 #[cfg(test)]
@@ -323,8 +392,76 @@ mod tests {
             coinbase_value: 312_500_000,
             outputs,
             output_budget: 400,
+            sigop_budget: 80_000,
             force_op_return_extranonce: force,
         }
+    }
+
+    fn p2pkh(tag: u8) -> Vec<u8> {
+        let mut s = vec![0x76, 0xa9, 0x14];
+        s.extend_from_slice(&[tag; 20]);
+        s.extend_from_slice(&[0x88, 0xac]);
+        s
+    }
+
+    #[test]
+    fn output_sigop_cost_counts_legacy_outputs_times_four() {
+        assert_eq!(output_sigop_cost(&ratum::fixtures::p2wpkh(1)), 0);
+        assert_eq!(output_sigop_cost(&p2pkh(1)), 4);
+        // P2TR: OP_1 then a 32-byte push.
+        let mut p2tr = vec![0x51, 0x20];
+        p2tr.extend_from_slice(&[0x33; 32]);
+        assert_eq!(output_sigop_cost(&p2tr), 0);
+        // A bare 1-of-1 multisig: the pushed key's bytes are skipped, the CHECKMULTISIG
+        // counts twenty.
+        let mut multisig = vec![0x51, 0x21];
+        multisig.extend_from_slice(&[0xac; 33]);
+        multisig.extend_from_slice(&[0x51, 0xae]);
+        assert_eq!(output_sigop_cost(&multisig), 80);
+        // OP_RETURN data holding opcode bytes is a push, not sigops.
+        assert_eq!(output_sigop_cost(&[0x6a, 0x02, 0xac, 0xae]), 0);
+        assert_eq!(output_sigop_cost(&[]), 0);
+    }
+
+    #[test]
+    fn outputs_past_the_sigop_budget_are_left_out() {
+        let (script, pot) = script_sig(&tagging(21)).unwrap();
+        let outputs = vec![
+            CoinbaseOutput { value: 100_000_000, script: p2pkh(1) },
+            CoinbaseOutput { value: 50_000_000, script: p2pkh(2) },
+            CoinbaseOutput { value: 10_000_000, script: ratum::fixtures::p2wpkh(3) },
+        ];
+        let mut p = params(&script, pot, &outputs, None, false);
+        p.sigop_budget = 4;
+        let (_, _, included) = build(&p);
+        // One P2PKH output fits the budget; the segwit output after the second costs none.
+        assert_eq!(included.len(), 2);
+        assert_eq!(included[0].script, p2pkh(1));
+        assert_eq!(included[1].value, 10_000_000);
+        p.sigop_budget = 0;
+        let (_, _, included) = build(&p);
+        assert_eq!(included.len(), 1, "only the segwit output");
+    }
+
+    #[test]
+    fn the_output_budget_is_the_templates_room_capped_at_the_pools_section_limit() {
+        let mut t = crate::template::tests::template();
+        let size_used = t.totals.size as u64 + 85 + 84 + 36;
+        let weight_used = t.totals.weight as u64 + 340 + 336 + 36;
+        // Limits far above the transactions: the pool's section limit.
+        t.sizelimit = 4_000_000;
+        t.weightlimit = 4_000_000;
+        assert_eq!(output_budget(100, &t), MAX_COINBASE_BYTES - 100);
+        // The weight limit is the smaller: four weight units a byte.
+        t.weightlimit = weight_used + 4 * 1_000;
+        assert_eq!(output_budget(100, &t), 900);
+        // The size limit is the smaller.
+        t.weightlimit = 4_000_000;
+        t.sizelimit = size_used + 500;
+        assert_eq!(output_budget(100, &t), 400);
+        // No room at all.
+        t.sizelimit = size_used;
+        assert_eq!(output_budget(100, &t), 0);
     }
 
     #[test]

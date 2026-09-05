@@ -167,10 +167,6 @@ fn client_json(cfg: &crate::config::Config, c: &ClientStats, identity: bool) -> 
         );
         o.insert("useragent".into(), json!(c.useragent));
         o.insert("subscribed".into(), json!(c.subscribed));
-        o.insert(
-            "coinbase".into(),
-            json!(crate::coinbase::TYPE_NAMES.get(c.coinbase_selection as usize).unwrap_or(&"?")),
-        );
     }
     v
 }

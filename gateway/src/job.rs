@@ -56,7 +56,10 @@ pub struct Job {
     pub prevblock_hidden: [u8; 32],
     pub merkle_branches: Vec<[u8; 32]>,
     pub target_pot_index: usize,
-    pub coinbases: Vec<Coinbase>,
+    /// The coinbase pooled work commits to: every dictated output that fits the template's room
+    /// (`coinbase_set`), then the remainder to the pool script. Named by
+    /// `coinbase::COINBASE_POOLED`.
+    pub pooled: Coinbase,
     pub subsidy_only: Coinbase,
     pub coinbaser_id: u8,
     pub coinbaser_outputs: Vec<CoinbaseOutput>,
@@ -91,12 +94,11 @@ pub struct PayoutRow {
 }
 
 impl Job {
+    /// The coinbase an id names: the subsidy-only one for `COINBASE_SUBSIDY_ONLY`, the pooled
+    /// one for any other. The id carries no size class (see `coinbase::COINBASE_POOLED`);
+    /// the stratum layer accepts only the pooled id on a share.
     pub fn coinbase(&self, id: u8) -> Option<&Coinbase> {
-        if id == COINBASE_SUBSIDY_ONLY {
-            Some(&self.subsidy_only)
-        } else {
-            self.coinbases.get(id as usize)
-        }
+        if id == COINBASE_SUBSIDY_ONLY { Some(&self.subsidy_only) } else { Some(&self.pooled) }
     }
 
     pub fn is_stale_prevblock(&self) -> bool {
@@ -255,13 +257,13 @@ pub enum BuildError {
     BadBits,
 }
 
-/// The seven coinbases of a job and what they share.
+/// The two coinbases of a job and what they share.
 struct CoinbaseSet {
-    coinbases: Vec<Coinbase>,
+    pooled: Coinbase,
     subsidy_only: Coinbase,
     target_pot_index: usize,
-    /// The coinbaser outputs the widest size class included.
-    widest: Vec<CoinbaseOutput>,
+    /// The coinbaser outputs the pooled coinbase includes.
+    included: Vec<CoinbaseOutput>,
 }
 
 pub struct Builder {
@@ -338,10 +340,10 @@ impl Builder {
             prevblock_hidden: header::prevblock_hidden(&template.prev_hash),
             merkle_branches,
             target_pot_index: set.target_pot_index,
-            coinbases: set.coinbases,
+            pooled: set.pooled,
             subsidy_only: set.subsidy_only,
             coinbaser_id,
-            coinbaser_outputs: set.widest,
+            coinbaser_outputs: set.included,
             pool_addr_script,
             is_datum_job: pool.is_some(),
             abw,
@@ -374,8 +376,12 @@ fn filter_coinbaser(
     (r.coinbaser_id, kept)
 }
 
-/// The subsidy-only coinbase and the six size classes (`MAX_COINBASE_TYPES`), with the PoT
-/// byte at one offset in all of them.
+/// The subsidy-only coinbase and the pooled one, with the PoT byte at one offset in both.
+/// The pooled coinbase includes every dictated output the template's room allows
+/// (`coinbase::output_budget`) within the block's sigop limit: under the version 2 header
+/// the mining machine never receives the coinbase, so nothing else bounds it (the C gateway
+/// also built one per SHA256d-era size class, and served each miner the largest its
+/// firmware took).
 fn coinbase_set(
     template: &Template,
     script: &[u8],
@@ -384,7 +390,7 @@ fn coinbase_set(
     pool_script: &[u8],
     outputs: &[CoinbaseOutput],
 ) -> CoinbaseSet {
-    let params = |outs, budget, force, subsidy_only| coinbase::Params {
+    let params = |outs, budget, sigops, subsidy_only| coinbase::Params {
         script_sig: script,
         pot_index_in_script: pot_in_script,
         enprefix,
@@ -397,30 +403,28 @@ fn coinbase_set(
         },
         outputs: outs,
         output_budget: budget,
-        force_op_return_extranonce: force,
+        sigop_budget: sigops,
+        force_op_return_extranonce: false,
     };
-    let (subsidy_only, target_pot_index, _) = coinbase::build(&params(&[], 0, false, true));
-    let mut coinbases = Vec::with_capacity(coinbase::TYPE_MAX_SIZE.len());
-    let mut widest: Vec<CoinbaseOutput> = Vec::new();
-    for (ty, &max_size) in coinbase::TYPE_MAX_SIZE.iter().enumerate() {
-        let force = coinbase::TYPE_FORCES_OP_RETURN[ty];
-        let fixed = 119
-            + pool_script.len()
-            + script.len()
-            + if force || script.len() > 85 { 10 } else { 0 };
-        let budget = if ty == 0 || outputs.is_empty() {
-            0
-        } else {
-            coinbase::fit_to_template(max_size, fixed, template)
-        };
-        let (cb, pot, included) = coinbase::build(&params(outputs, budget, force, false));
-        debug_assert_eq!(pot, target_pot_index);
-        if included.len() > widest.len() {
-            widest = included;
-        }
-        coinbases.push(cb);
-    }
-    CoinbaseSet { coinbases, subsidy_only, target_pot_index, widest }
+    let (subsidy_only, target_pot_index, _) = coinbase::build(&params(&[], 0, 0, true));
+    // The transaction's bytes around the outputs: 124 of framing (the version, the input
+    // with its null outpoint, scriptSig length, 15-byte extranonce push and sequence, a
+    // three-byte output count, the pool output's value and script length, the 47-byte
+    // witness commitment output and the lock time), the scriptSig, the pool script, and the
+    // OP_RETURN output that holds the extranonce placeholder when the scriptSig has no room
+    // for it (25 bytes, less the 15 the scriptSig no longer holds). The output count is one
+    // byte up to 252 outputs; counted at three so the budget never exceeds the room. The C
+    // gateway counts 119 and never fills the room, its size classes being far smaller.
+    let fixed = 124 + pool_script.len() + script.len() + if script.len() > 85 { 10 } else { 0 };
+    let budget = if outputs.is_empty() { 0 } else { coinbase::output_budget(fixed, template) };
+    // The sigop cost the block has left after its transactions and the pool script's output.
+    let sigops = template
+        .sigoplimit
+        .saturating_sub(u64::from(template.totals.sigops))
+        .saturating_sub(coinbase::output_sigop_cost(pool_script));
+    let (pooled, pot, included) = coinbase::build(&params(outputs, budget, sigops, false));
+    debug_assert_eq!(pot, target_pot_index);
+    CoinbaseSet { pooled, subsidy_only, target_pot_index, included }
 }
 
 /// What a stratum job id names: the 14-character job id, the job's global index, and the
@@ -535,6 +539,186 @@ mod tests {
         assert_eq!(JobRef::parse("N6625a3d53cc0e202"), None, "empty work is subsidy-only");
         assert_eq!(JobRef::parse("X6625a3d53cc0e2ff"), None);
         assert_eq!(JobRef::parse("6625a3d53cc0e2"), None);
+    }
+
+    /// The pooled coinbase includes every dictated output the template has room for: the
+    /// version 2 header sends the miner none of it, so no size class bounds the count. The
+    /// room is the block's weight (four units a byte) and sigop limits less its transactions.
+    #[test]
+    fn the_pooled_coinbase_includes_every_dictated_output_the_block_has_room_for() {
+        use crate::template::tests::{config, template};
+        let pool = PoolConfig {
+            payout_script: ratum::fixtures::p2wpkh(0xee),
+            prime_id: 7,
+            coinbase_tag: "RATUM".into(),
+            min_difficulty: 1024,
+            protocol_v3: false,
+            abw_disabled: false,
+        };
+        let outputs: Vec<CoinbaseOutput> = (0..120u8)
+            .map(|i| CoinbaseOutput { value: 100_000, script: ratum::fixtures::p2wpkh(i) })
+            .collect();
+        let build = |t: Template, outs: &[CoinbaseOutput]| {
+            let split = CoinbaserResponse {
+                value: t.coinbase_value,
+                coinbaser_id: 1,
+                outputs: outs.to_vec(),
+            };
+            Builder::new(Arc::new(config()))
+                .build(Arc::new(t), false, Some(&pool), Some(split), None)
+                .unwrap()
+        };
+
+        // Room for all 120, more than the 17 the C gateway's default class holds.
+        let mut roomy = template();
+        roomy.sizelimit = 4_000_000;
+        roomy.weightlimit = 4_000_000;
+        roomy.sigoplimit = 80_000;
+        let job = build(roomy.clone(), &outputs);
+        assert_eq!(job.coinbaser_outputs.len(), 120);
+        let tx = job.pooled.assemble(&[0u8; EXTRANONCE_SIZE]);
+        let parsed = ratum::bitcoin::parse_coinbase(&tx).unwrap();
+        // The 120 dictated outputs, the remainder to the pool script, the witness commitment.
+        assert_eq!(parsed.outputs.len(), 122);
+        assert!(job.coinbase(coinbase::COINBASE_POOLED).is_some());
+
+        // A block its transactions nearly fill: the coinbase shrinks to the weight left, four
+        // units a byte, and the split's last outputs are left out.
+        let mut tight = roomy.clone();
+        let weight_used = u64::from(tight.totals.weight) + 340 + 336 + 36;
+        tight.weightlimit = weight_used + 4 * 700;
+        let job = build(tight, &outputs);
+        let included = job.coinbaser_outputs.len();
+        assert!(included > 0 && included < 120, "{included} outputs");
+        let tx = job.pooled.assemble(&[0u8; EXTRANONCE_SIZE]);
+        assert!(tx.len() <= 700 + 15, "the coinbase fits the room: {} bytes", tx.len());
+
+        // The sigop limit: a legacy output costs four, a segwit output none.
+        let mut legacy: Vec<CoinbaseOutput> = (0..30u8)
+            .map(|i| {
+                let mut s = vec![0x76, 0xa9, 0x14];
+                s.extend_from_slice(&[i; 20]);
+                s.extend_from_slice(&[0x88, 0xac]);
+                CoinbaseOutput { value: 100_000, script: s }
+            })
+            .collect();
+        legacy.push(CoinbaseOutput { value: 100_000, script: ratum::fixtures::p2wpkh(0xaa) });
+        let mut scarce = roomy;
+        scarce.sigoplimit = u64::from(scarce.totals.sigops) + 40;
+        let job = build(scarce, &legacy);
+        assert_eq!(job.coinbaser_outputs.len(), 11, "ten legacy outputs and the segwit one");
+    }
+
+    /// A split at the coinbaser response's limits (512 outputs of 64-byte scripts, more than
+    /// its blob carries) on a block with room builds a section under the pool's limit
+    /// (`MAX_COINBASE_SECTION_BYTES`, which `Verifier::resolve` refuses past), with the
+    /// longest scriptSig the tags allow; a split of 512 taproot outputs, the largest a
+    /// response carries whole, is included whole.
+    #[test]
+    fn the_pooled_coinbase_stays_under_the_pools_section_limit() {
+        use crate::template::tests::{config, template};
+        use ratum::datum::share::MAX_COINBASE_SECTION_BYTES;
+        let pool = PoolConfig {
+            payout_script: ratum::fixtures::p2wpkh(0xee),
+            prime_id: 7,
+            coinbase_tag: "a".repeat(80),
+            min_difficulty: 1024,
+            protocol_v3: true,
+            abw_disabled: false,
+        };
+        let mut roomy = template();
+        roomy.sizelimit = 4_000_000;
+        roomy.weightlimit = 4_000_000;
+        roomy.sigoplimit = 80_000;
+        let build = |outs: Vec<CoinbaseOutput>| {
+            let split =
+                CoinbaserResponse { value: roomy.coinbase_value, coinbaser_id: 1, outputs: outs };
+            Builder::new(Arc::new(config()))
+                .build(Arc::new(roomy.clone()), false, Some(&pool), Some(split), None)
+                .unwrap()
+        };
+        let section = |job: &Job| job.pooled.coinb1.len() + job.pooled.coinb2.len();
+
+        let widest: Vec<CoinbaseOutput> = (0..512u16)
+            .map(|i| {
+                let mut s = vec![0x6a, 0x3e];
+                s.extend_from_slice(&i.to_le_bytes());
+                s.resize(64, 0x33);
+                CoinbaseOutput { value: 1_000, script: s }
+            })
+            .collect();
+        let job = build(widest);
+        assert!(job.coinbaser_outputs.len() < 512, "{} outputs", job.coinbaser_outputs.len());
+        assert!(job.coinbaser_outputs.len() > 400, "{} outputs", job.coinbaser_outputs.len());
+        assert!(section(&job) <= MAX_COINBASE_SECTION_BYTES, "{} bytes", section(&job));
+        assert!(section(&job) > MAX_COINBASE_SECTION_BYTES - 128, "{} bytes", section(&job));
+
+        let taproot: Vec<CoinbaseOutput> = (0..512u16)
+            .map(|i| {
+                let mut s = vec![0x51, 0x20];
+                s.extend_from_slice(&i.to_le_bytes());
+                s.resize(34, 0x44);
+                CoinbaseOutput { value: 1_000, script: s }
+            })
+            .collect();
+        let job = build(taproot);
+        assert_eq!(job.coinbaser_outputs.len(), 512);
+        assert!(section(&job) <= MAX_COINBASE_SECTION_BYTES, "{} bytes", section(&job));
+    }
+
+    /// A coinbase built to the room a template leaves keeps the block under its weight limit:
+    /// the header (164 bytes), the transaction count (three bytes in a block of 253 or more
+    /// transactions), the coinbase with the 36-byte witness the node adds, and the
+    /// transactions. Checked for every room from one output's worth to past 252 outputs, the
+    /// point the output count takes three bytes, with taproot and P2WPKH splits.
+    #[test]
+    fn a_coinbase_built_to_the_room_keeps_the_block_under_the_weight_limit() {
+        use crate::template::tests::{config, template};
+        let pool = PoolConfig {
+            payout_script: ratum::fixtures::p2wpkh(0xee),
+            prime_id: 7,
+            coinbase_tag: "RATUM".into(),
+            min_difficulty: 1024,
+            protocol_v3: false,
+            abw_disabled: false,
+        };
+        let mut builder = Builder::new(Arc::new(config()));
+        for (script_len, op) in [(34usize, 0x51u8), (22, 0x00)] {
+            let outputs: Vec<CoinbaseOutput> = (0..512u16)
+                .map(|i| {
+                    let mut s = vec![op, (script_len - 2) as u8];
+                    s.extend_from_slice(&i.to_le_bytes());
+                    s.resize(script_len, 0x44);
+                    CoinbaseOutput { value: 1_000, script: s }
+                })
+                .collect();
+            let mut most = 0usize;
+            for room in (1_000..48_000u64).step_by(7) {
+                let mut t = template();
+                t.sizelimit = 4_000_000;
+                t.sigoplimit = 80_000;
+                t.weightlimit = u64::from(t.totals.weight) + 340 + 336 + 36 + room;
+                let split = CoinbaserResponse {
+                    value: t.coinbase_value,
+                    coinbaser_id: 1,
+                    outputs: outputs.clone(),
+                };
+                let job = builder
+                    .build(Arc::new(t.clone()), false, Some(&pool), Some(split), None)
+                    .unwrap();
+                let tx = job.pooled.assemble(&[0u8; EXTRANONCE_SIZE]);
+                let weight = 4 * (164 + 3 + tx.len() as u64) + 36 + u64::from(t.totals.weight);
+                assert!(
+                    weight <= t.weightlimit,
+                    "{} outputs of {script_len} bytes: block weight {weight} over {} by {}",
+                    job.coinbaser_outputs.len(),
+                    t.weightlimit,
+                    weight - t.weightlimit
+                );
+                most = most.max(job.coinbaser_outputs.len());
+            }
+            assert!(most > 252, "{most} outputs at most: the three-byte count was not reached");
+        }
     }
 
     #[test]

@@ -3,7 +3,7 @@
 
 use crate::abw::AbwManager;
 use crate::server::{
-    Payability, Resolver, SavedSession, Server, SessionState, coinbaser_outputs, owed_for_block,
+    Payability, Resolver, SavedSession, Server, SessionState, dictated_outputs, owed_for_block,
     unix_now,
 };
 use log::{debug, error, info, warn};
@@ -634,8 +634,9 @@ impl Connection<'_> {
                 return Ok(());
             }
         }
-        let (outputs, shares, work) = coinbaser_outputs(self.server, req.value);
-        let paid: u64 = outputs.iter().map(|o| o.value).sum();
+        let (dictated, shares, work) = dictated_outputs(self.server, req.value);
+        let paid: u64 = dictated.iter().map(|(_, o)| o.value).sum();
+        let outputs: Vec<CoinbaseOutput> = dictated.iter().map(|(_, o)| o.clone()).collect();
         info!(
             "[{peer}]      paying {} miners {} of {} sats from a window of {shares} shares ({work} work)",
             outputs.len(),
@@ -673,7 +674,23 @@ impl Connection<'_> {
                 }
             }
         };
-        self.verifier.record_split(&response, unix_now());
+        // The identity each remaining output pays, recorded with the split so an output a
+        // block's coinbase leaves out is owed to the identity the split named. The trimming
+        // above only removes outputs, so each remaining one is the next of `dictated` with
+        // its value and script; matched by position rather than by script, since two
+        // identities (a bech32 address in both cases) can name one script. An output the
+        // fallback added names none.
+        let mut rest = dictated.iter();
+        let identities: Vec<String> = response
+            .outputs
+            .iter()
+            .map(|o| {
+                rest.by_ref()
+                    .find(|(_, d)| d.value == o.value && d.script == o.script)
+                    .map_or_else(String::new, |(identity, _)| identity.clone())
+            })
+            .collect();
+        self.verifier.record_dictated(&response, identities, unix_now());
         self.send_mining(&payload, false)?;
         info!(
             "[{peer}]   <- coinbaser response ({} outputs, id {coinbaser_id})",
@@ -806,15 +823,22 @@ impl Connection<'_> {
                 if a.is_block {
                     self.record_found_block(&a, s, now);
                 }
-                // A block whose coinbase paid the window nothing (a subsidy-only job, or a
-                // coinbase built with no split): its whole value went to the pool's payout
-                // script, so record the split a coinbaser would have dictated as owed by the
-                // pool. Taken before `record_and_credit` adds the block's own share; the
-                // window is read at acceptance, so it also holds shares credited after this
-                // job was served, an approximation of the split a coinbaser serving the job
-                // would have fixed.
-                if a.is_block && a.work.paid_to_split == 0 {
-                    self.record_owed_block(&a, now);
+                // What the pool's payout script received on a block that is owed to the
+                // window is recorded as owed by the pool. A coinbase that left dictated
+                // outputs out (they did not fit the miner's coinbase) names them exactly, from
+                // the split the pool dictated for the job. A coinbase that paid the window
+                // nothing on a job with no recorded split (a subsidy-only job, or a coinbase
+                // built with no split) is recorded from the split a coinbaser would dictate
+                // now. Taken before `record_and_credit` adds the block's own share; the window
+                // is read at acceptance, so it also holds shares credited after this job was
+                // served, an approximation of the split a coinbaser serving the job would have
+                // fixed.
+                if a.is_block {
+                    if !a.work.unpaid.is_empty() {
+                        self.record_unpaid_outputs(&a, now);
+                    } else if a.work.paid_to_split == 0 {
+                        self.record_owed_block(&a, now);
+                    }
                 }
                 // A share is credited to an identity only if the coinbase can pay it. The
                 // check is here, after the relay above, so a block is still submitted, and
@@ -937,6 +961,70 @@ impl Connection<'_> {
         if let Err(e) = lock(&self.server.ledger).record_owed(owed) {
             error!(
                 "[{peer}]   !! could not record the owed split to the ledger ({e}); the \
+                 amounts above are in this log only"
+            );
+        }
+    }
+
+    /// Record what the pool owes the window for a block whose coinbase left dictated outputs
+    /// out (`Rebuilt::unpaid`): the gateway paid their value to the pool's payout script as
+    /// its remainder (an output did not fit the miner's coinbase size class), so the pool
+    /// holds it for those identities. Exact, from the split the pool dictated for the job;
+    /// `record_owed_block` approximates for a job with no recorded split. The total is capped
+    /// at what the payout script received beyond the operator fee, for a job whose coinbase
+    /// value fell short of the value the split was dictated for; the amounts are then scaled
+    /// down in proportion.
+    fn record_unpaid_outputs(&self, a: &Accepted, now: u64) {
+        let peer = self.peer;
+        let value = a.work.paid_to_split.saturating_add(a.work.paid_to_pool);
+        let fee = self.server.payout.fee_on(value);
+        let available = a.work.paid_to_pool.saturating_sub(fee);
+        let mut entries = self.verifier.unpaid_outputs(&a.work);
+        let dictated: u64 = entries.iter().map(|(_, sats)| *sats).sum();
+        if dictated > available {
+            warn!(
+                "[{peer}]   ** the coinbase left out {dictated} sats of dictated outputs but the \
+                 pool's payout script received only {available} sats beyond the fee; the owed \
+                 amounts are scaled down to what it received"
+            );
+            for (_, sats) in &mut entries {
+                *sats = (u128::from(*sats) * u128::from(available) / u128::from(dictated)) as u64;
+            }
+            entries.retain(|(_, sats)| *sats > 0);
+        }
+        let total: u64 = entries.iter().map(|(_, sats)| *sats).sum();
+        if total == 0 {
+            return;
+        }
+        warn!(
+            "[{peer}]   ** the block's coinbase left out {} of the dictated outputs; the pool's \
+             payout script received {} sats of which {total} are owed to {} identit{}:",
+            a.work.unpaid.len(),
+            a.work.paid_to_pool,
+            entries.len(),
+            if entries.len() == 1 { "y" } else { "ies" },
+        );
+        for (identity, sats) in &entries {
+            warn!("[{peer}]   **   {identity} {sats} sats");
+        }
+        warn!(
+            "[{peer}]   ** recorded as owed by block hash {}; after paying it from the pool's \
+             wallet, run: ratum-prime --settle-block {} (with --ledger or --data-dir, pool \
+             stopped)",
+            hex::encode(a.work.block_hash),
+            hex::encode(a.work.block_hash),
+        );
+        let owed = ledger::OwedBlock {
+            at: now,
+            height: a.work.height,
+            block_hash: a.work.block_hash,
+            total,
+            settled_at: None,
+            entries,
+        };
+        if let Err(e) = lock(&self.server.ledger).record_owed(owed) {
+            error!(
+                "[{peer}]   !! could not record the owed outputs to the ledger ({e}); the \
                  amounts above are in this log only"
             );
         }

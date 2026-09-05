@@ -1,7 +1,8 @@
 use ratum::bitcoin::{self, CoinbaseTx};
 use ratum::datum::messages::{ClientConfig, CoinbaseOutput, CoinbaserResponse, RejectReason};
 use ratum::datum::share::{
-    self, COINBASE_ID_SUBSIDY_ONLY, CoinbaseSection, JobSection, MAX_JOBS, MAX_USERNAME, PowSubmit,
+    self, COINBASE_ID_SUBSIDY_ONLY, CoinbaseSection, JobSection, MAX_COINBASE_SECTION_BYTES,
+    MAX_JOBS, MAX_USERNAME, PowSubmit,
 };
 use ratum::header::{self, HeaderV2};
 use ratum::target;
@@ -14,12 +15,11 @@ pub const MAX_SEEN: usize = 1 << 20;
 
 /// The most coinbase-section bytes one connection installs. A section is installed only by a
 /// share whose hash meets its share target or the network target, so each installed byte cost
-/// proof of work. The C gateway and ratum-gateway rotate through at most 256 job slots, each
-/// with up to 26 KB of sections (one per coinbase class), so 8 MiB is never reached.
-pub const MAX_INSTALLED_COINBASE_BYTES: usize = 8 << 20;
-/// The most bytes one coinbase section (`coinb1` plus `coinb2`) may hold. The C gateway's
-/// `MAX_COINBASE_TXN_SIZE_BYTES` is 16 960, the extranonce 12 of them; the wire allows 128 KiB.
-pub const MAX_COINBASE_SECTION_BYTES: usize = 17 << 10;
+/// proof of work. A gateway rotates through at most `MAX_JOBS` (256) slots; ratum-gateway
+/// installs a pooled section of at most `MAX_COINBASE_SECTION_BYTES` and a
+/// subsidy-only one per slot, the C gateway up to 26 KB of sections (one per coinbase class),
+/// so 16 MiB is never reached.
+pub const MAX_INSTALLED_COINBASE_BYTES: usize = 16 << 20;
 
 #[derive(Debug)]
 pub struct ReplayGuard {
@@ -154,6 +154,14 @@ pub struct Rebuilt {
     pub coinbaser_id: u8,
     pub paid_to_split: u64,
     pub paid_to_pool: u64,
+    /// The dictated outputs the coinbase left out, as indices into the recorded split's
+    /// outputs in the order the pool sent them (`Verifier::unpaid_outputs` names the identity
+    /// and amount of each): the gateway paid their value to the pool's payout script as its
+    /// remainder, so it is part of `paid_to_pool` and is owed to the window. Empty when every
+    /// dictated output is present, when the job names no recorded split (id 0, or an id from
+    /// before a restart), and on subsidy-only work; a dictated output paying the pool's own
+    /// payout script is never listed.
+    pub unpaid: Vec<usize>,
     /// The secondary coinbase tag the gateway wrote after the pool's tag (the gateway's
     /// `mining.coinbase_tag_secondary`), decoded for display; empty when the coinbase
     /// carries none.
@@ -175,6 +183,19 @@ pub struct AbwKeys {
     pub seeded: [Option<[u8; 16]>; 16],
     pub revealed: [Option<[u8; 16]>; 16],
 }
+
+/// A split the pool dictated on a connection: the coinbaser response's outputs, the identity
+/// each pays (parallel to `outputs`; shorter when the split was recorded without them), and
+/// when it was sent (`SPLIT_GRACE_SECS` counts from it).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DictatedSplit {
+    pub outputs: Vec<CoinbaseOutput>,
+    pub identities: Vec<String>,
+    pub sent_at: u64,
+}
+
+/// The splits a connection dictated, by coinbaser id.
+pub type Splits = HashMap<u8, DictatedSplit>;
 
 #[derive(Clone, Debug)]
 struct JobState {
@@ -208,7 +229,7 @@ pub struct Verifier {
     /// `MAX_JOBS` slots are reused as fast as the 255 ids (`Connection` skips 0, the id of a
     /// job with no coinbaser applied); the one job that outlives its id by a slot is 255 jobs
     /// old, past both gateways' stale-share window.
-    splits: HashMap<u8, (Vec<CoinbaseOutput>, u64)>,
+    splits: Splits,
     replay: Arc<Mutex<ReplayGuard>>,
     tip: Option<[u8; 32]>,
     /// The target of the block the node would build on its tip. A job building on the tip
@@ -271,19 +292,61 @@ impl Verifier {
         &self.policy
     }
 
+    /// Record the split a coinbaser response dictated, without the identities its outputs
+    /// pay: `record_dictated` with none. An output such a split leaves unpaid is reported
+    /// under its script.
     pub fn record_split(&mut self, response: &CoinbaserResponse, now: u64) {
-        self.splits.insert(response.coinbaser_id, (response.outputs.clone(), now));
+        self.record_dictated(response, Vec::new(), now);
+    }
+
+    /// Record the split a coinbaser response dictated and the identity each of its outputs
+    /// pays (`identities` parallel to `response.outputs`), so an output a coinbase leaves
+    /// out is reported under the identity the split named (`Rebuilt::unpaid`).
+    pub fn record_dictated(
+        &mut self,
+        response: &CoinbaserResponse,
+        identities: Vec<String>,
+        now: u64,
+    ) {
+        self.splits.insert(
+            response.coinbaser_id,
+            DictatedSplit { outputs: response.outputs.clone(), identities, sent_at: now },
+        );
     }
 
     /// The splits recorded on this connection, taken to save with a version 3 session: the
     /// gateway's replayed shares, and its shares on the jobs it still holds, pay them.
-    pub fn take_splits(&mut self) -> HashMap<u8, (Vec<CoinbaseOutput>, u64)> {
+    pub fn take_splits(&mut self) -> Splits {
         std::mem::take(&mut self.splits)
     }
 
     /// Restore the splits a saved session recorded (`take_splits`).
-    pub fn restore_splits(&mut self, splits: HashMap<u8, (Vec<CoinbaseOutput>, u64)>) {
+    pub fn restore_splits(&mut self, splits: Splits) {
         self.splits = splits;
+    }
+
+    /// The dictated outputs `work`'s coinbase left out (`Rebuilt::unpaid`) as `(identity,
+    /// sats)` in the pool's order, under the identity the split named for each; a split
+    /// recorded without identities names the script. Resolved on request rather than for
+    /// every share, since only a block's are recorded (the connection's
+    /// `record_unpaid_outputs`). Empty when the job's split is no longer recorded.
+    pub fn unpaid_outputs(&self, work: &Rebuilt) -> Vec<(String, u64)> {
+        let Some(split) = self.splits.get(&work.coinbaser_id) else {
+            return Vec::new();
+        };
+        work.unpaid
+            .iter()
+            .filter_map(|&i| {
+                let d = split.outputs.get(i)?;
+                let identity = split
+                    .identities
+                    .get(i)
+                    .filter(|id| !id.is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| format!("script {}", hex::encode(&d.script)));
+                Some((identity, d.value))
+            })
+            .collect()
     }
 
     pub fn set_tip(&mut self, tip: Option<[u8; 32]>, now: u64) {
@@ -505,8 +568,9 @@ impl Verifier {
             return Ok(());
         }
         match self.splits.get(&work.coinbaser_id) {
-            Some((outputs, sent_at))
-                if !outputs.is_empty() && now.saturating_sub(*sent_at) > SPLIT_GRACE_SECS =>
+            Some(split)
+                if !split.outputs.is_empty()
+                    && now.saturating_sub(split.sent_at) > SPLIT_GRACE_SECS =>
             {
                 Err(RejectReason::NoSplit)
             }
@@ -674,7 +738,7 @@ pub fn meets_own_bits(work: &Rebuilt) -> bool {
 
 fn build_work(
     policy: &PoolPolicy,
-    splits: &HashMap<u8, (Vec<CoinbaseOutput>, u64)>,
+    splits: &Splits,
     job: &JobSection,
     cb: &CoinbaseSection,
     s: &PowSubmit,
@@ -701,7 +765,8 @@ fn build_work(
     }
     coinbase_tx[pot_index] = s.target_byte;
 
-    let (paid_to_split, paid_to_pool) = check_outputs(policy, splits, job, &parsed, s)?;
+    let Payments { to_split: paid_to_split, to_pool: paid_to_pool, unpaid } =
+        check_outputs(policy, splits, job, &parsed, s)?;
 
     // A subsidy-only block holds nothing but the coinbase, so its merkle root is the
     // coinbase hash and there is no branch to hash in.
@@ -723,6 +788,7 @@ fn build_work(
         coinbaser_id: job.coinbaser_id,
         paid_to_split,
         paid_to_pool,
+        unpaid,
         tag_secondary,
     })
 }
@@ -840,23 +906,32 @@ fn decode_tag(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).chars().filter(|c| !c.is_control()).collect()
 }
 
+/// What a coinbase pays, as `check_outputs` reads it.
+struct Payments {
+    to_split: u64,
+    to_pool: u64,
+    /// The dictated outputs left out, as indices into the split; see `Rebuilt::unpaid`.
+    unpaid: Vec<usize>,
+}
+
+/// What the coinbase pays to the dictated outputs and to the pool's payout script, and the
+/// dictated outputs it leaves out, as indices into the split in the pool's order. An output
+/// paying anything else refuses the share, and the two sums must be the coinbase value.
 fn check_outputs(
     policy: &PoolPolicy,
-    splits: &HashMap<u8, (Vec<CoinbaseOutput>, u64)>,
+    splits: &Splits,
     job: &JobSection,
     tx: &CoinbaseTx,
     s: &PowSubmit,
-) -> Result<(u64, u64), RejectReason> {
+) -> Result<Payments, RejectReason> {
+    let recorded = if s.subsidy_only { None } else { splits.get(&job.coinbaser_id) };
     let empty: Vec<CoinbaseOutput> = Vec::new();
-    let dictated = if s.subsidy_only {
-        &empty
-    } else {
-        splits.get(&job.coinbaser_id).map_or(&empty, |(outputs, _)| outputs)
-    };
+    let dictated = recorded.map_or(&empty, |d| &d.outputs);
 
     // `next` only increases, so the dictated outputs must appear in the order the
     // pool sent them, though outputs paying the pool may appear between them.
     let mut next = 0usize;
+    let mut paid = vec![false; dictated.len()];
     let mut paid_to_split = 0u64;
     let mut paid_to_pool = 0u64;
     for out in &tx.outputs {
@@ -867,6 +942,7 @@ fn check_outputs(
             dictated[next..].iter().position(|d| d.value == out.value && d.script == out.script)
         {
             paid_to_split = paid_to_split.saturating_add(out.value);
+            paid[next + pos] = true;
             next += pos + 1;
             continue;
         }
@@ -881,7 +957,16 @@ fn check_outputs(
         return Err(RejectReason::BadCoinbase);
     }
 
-    Ok((paid_to_split, paid_to_pool))
+    // The outputs left out. A dictated output paying the pool's own payout script (the
+    // connection's fallback when a split cannot be encoded) is owed to no one.
+    let unpaid = dictated
+        .iter()
+        .enumerate()
+        .filter(|(i, d)| !paid[*i] && d.script != policy.payout_script)
+        .map(|(i, _)| i)
+        .collect();
+
+    Ok(Payments { to_split: paid_to_split, to_pool: paid_to_pool, unpaid })
 }
 
 #[cfg(test)]
@@ -1079,6 +1164,74 @@ mod tests {
 
         let (v, s) = build(1, false);
         assert!(v.reconstruct(&s, late).is_ok(), "require_split off");
+    }
+
+    /// The dictated outputs a coinbase leaves out are reported with the identities the split
+    /// named, in the pool's order: the gateway paid their value to the pool's script as its
+    /// remainder, and the connection records it as owed when the work is a block.
+    #[test]
+    fn the_dictated_outputs_a_coinbase_leaves_out_are_reported_with_their_identities() {
+        let names = || vec!["alice".to_string(), "bob".to_string()];
+
+        // Every dictated output paid: nothing left out.
+        let (mut v, s) = setup();
+        v.record_dictated(&split(), names(), NOW);
+        let w = v.reconstruct(&s, NOW).unwrap();
+        assert!(w.unpaid.is_empty());
+        assert_eq!((w.paid_to_split, w.paid_to_pool), (150_000_000, COINBASE_VALUE - 150_000_000));
+
+        // The second output left out: named with its amount, which the pool's script holds.
+        let (mut v, s) = with_outputs(&split().outputs[..1]);
+        v.record_dictated(&split(), names(), NOW);
+        let w = v.reconstruct(&s, NOW).unwrap();
+        assert_eq!(w.unpaid, vec![1]);
+        assert_eq!(v.unpaid_outputs(&w), vec![("bob".to_string(), 50_000_000)]);
+        assert_eq!((w.paid_to_split, w.paid_to_pool), (100_000_000, COINBASE_VALUE - 100_000_000));
+
+        // No dictated output paid: both, in the pool's order.
+        let (mut v, s) = with_outputs(&[]);
+        v.record_dictated(&split(), names(), NOW);
+        let w = v.reconstruct(&s, NOW).unwrap();
+        assert_eq!(w.unpaid, vec![0, 1]);
+        assert_eq!(
+            v.unpaid_outputs(&w),
+            vec![("alice".to_string(), 100_000_000), ("bob".to_string(), 50_000_000)]
+        );
+        assert_eq!(w.paid_to_pool, COINBASE_VALUE);
+
+        // The split no longer recorded (its id reused) names nothing.
+        v.record_dictated(&CoinbaserResponse { coinbaser_id: 3, ..split() }, names(), NOW);
+        assert_eq!(v.unpaid_outputs(&w).len(), 2, "recorded under another id still");
+        v.restore_splits(Splits::new());
+        assert!(v.unpaid_outputs(&w).is_empty());
+
+        // A split recorded without identities names the script.
+        let (mut v, s) = with_outputs(&split().outputs[..1]);
+        v.record_split(&split(), NOW);
+        let w = v.reconstruct(&s, NOW).unwrap();
+        assert_eq!(
+            v.unpaid_outputs(&w),
+            vec![(format!("script {}", hex::encode(p2wpkh(0x02))), 50_000_000)]
+        );
+
+        // A job naming no recorded split has nothing dictated to leave out.
+        let (mut v, mut s) = with_outputs(&[]);
+        v.record_dictated(&split(), names(), NOW);
+        s.job.as_mut().unwrap().coinbaser_id = 0;
+        assert!(v.reconstruct(&s, NOW).unwrap().unpaid.is_empty());
+
+        // The connection's fallback split, one output paying the pool's payout script, left
+        // out by a coinbase of another value: the pool is owed nothing by itself.
+        let (mut v, s) = with_outputs(&[]);
+        let fallback = CoinbaserResponse {
+            value: COINBASE_VALUE - 1,
+            coinbaser_id: 1,
+            outputs: vec![CoinbaseOutput { value: COINBASE_VALUE - 1, script: p2wpkh(0xee) }],
+        };
+        v.record_dictated(&fallback, vec![String::new()], NOW);
+        let w = v.reconstruct(&s, NOW).unwrap();
+        assert!(w.unpaid.is_empty(), "{:?}", w.unpaid);
+        assert_eq!((w.paid_to_split, w.paid_to_pool), (0, COINBASE_VALUE));
     }
 
     /// `check_split` alone, on the work `setup_hard` builds (a share, not a block) with its
@@ -2305,8 +2458,10 @@ mod tests {
             has_witness: false,
         };
         let (_, s) = setup();
-        let paid = check_outputs(&p, &HashMap::new(), &job_section(0), &tx, &s).unwrap();
-        assert_eq!(paid, (0, COINBASE_VALUE));
+        let Payments { to_split, to_pool, unpaid } =
+            check_outputs(&p, &HashMap::new(), &job_section(0), &tx, &s).unwrap();
+        assert_eq!((to_split, to_pool), (0, COINBASE_VALUE));
+        assert!(unpaid.is_empty(), "nothing was dictated, so nothing was left out");
     }
 
     /// Regenerates `DIFF1_NONCE` and `DIFF1_NONCE_HARD` with their ntime offsets: search
