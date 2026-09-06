@@ -14,7 +14,7 @@ use ratum::datum::share::PowSubmit;
 use ratum::target;
 use ratum_prime::ledger::Ledger;
 use ratum_prime::verify::TIP_GRACE_SECS;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use support::work::{self, Tagging, Work};
 use support::{FakeNode, Pool, PoolArgs, TempDir, script_for_address};
 
@@ -275,9 +275,18 @@ fn a_new_tip_is_announced_to_the_gateway() {
     let (payload, _) = gateway.recv_until(server_subcmd::BLOCKNOTIFY);
     assert_eq!(payload, vec![server_subcmd::BLOCKNOTIFY]);
 
+    // The watcher reads the node every 0.2 s and calls each connection's waker when the tip
+    // changes, so the announcement follows the node's new tip rather than the connection's
+    // next timed action (its keepalive, 20 s away).
     node.set_tip(&("ab".repeat(31) + "cd"), 101);
+    let changed = Instant::now();
     let (payload, _) = gateway.recv_until(server_subcmd::BLOCKNOTIFY);
     assert_eq!(payload, vec![server_subcmd::BLOCKNOTIFY]);
+    assert!(
+        changed.elapsed() < Duration::from_secs(2),
+        "the blocknotify took {:?}",
+        changed.elapsed()
+    );
 }
 
 /// The verifier's network target must be set again when the node's template arrives after the
@@ -321,8 +330,8 @@ fn the_network_target_is_set_again_when_the_template_arrives_after_its_tip() {
     // synchronizes on this poll rather than the earlier success.
     node.set_coinbase_value(Some(250_000_000));
     pool.expect_line("pay 250000000 sats");
-    // Let the session's loop cycle once (past IDLE_POLL) so it sets the target before the
-    // share arrives.
+    // The watcher calls each connection's waker on the target change as it does on a tip
+    // change; this allows for the loop to cycle and set the target before the share arrives.
     std::thread::sleep(Duration::from_millis(300));
 
     // A share whose job is on the recovered tip and claims the easy bits: rejected as BadTarget

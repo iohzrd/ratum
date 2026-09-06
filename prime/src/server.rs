@@ -2,7 +2,8 @@
 //! node's tip and block template for all of them.
 
 use crate::abw::AbwManager;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
+use mio::Waker;
 use ratum::bitcoin::output_script_size_is_valid;
 use ratum::datum::handshake::KeyPairs;
 use ratum::datum::messages::{self, CoinbaseOutput};
@@ -30,6 +31,11 @@ pub(crate) struct NodeView {
     /// and last entries. A reorg can repeat or lower a height; the reader guards against
     /// that.
     pub(crate) tip_history: Mutex<VecDeque<(u32, u64)>>,
+    /// One waker per open connection, called when the watcher observes a new tip or a new
+    /// target: each connection thread then sends its blocknotify without waiting for its
+    /// next timed check. A connection adds its waker when it starts serving and removes it
+    /// when it closes.
+    wakers: Mutex<Vec<Arc<Waker>>>,
 }
 
 pub(crate) const TIP_HISTORY_CAP: usize = 64;
@@ -41,6 +47,25 @@ impl NodeView {
             coinbase_value: Mutex::new(None),
             next_bits: Mutex::new(None),
             tip_history: Mutex::new(VecDeque::new()),
+            wakers: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub(crate) fn add_waker(&self, waker: &Arc<Waker>) {
+        lock(&self.wakers).push(Arc::clone(waker));
+    }
+
+    pub(crate) fn remove_waker(&self, waker: &Arc<Waker>) {
+        lock(&self.wakers).retain(|w| !Arc::ptr_eq(w, waker));
+    }
+
+    /// Wake every connection thread out of `Poll::poll`. A failed write to a waker only
+    /// delays that thread until its next timed check, so it is logged and not propagated.
+    fn wake_connections(&self) {
+        for w in lock(&self.wakers).iter() {
+            if let Err(e) = w.wake() {
+                debug!("could not wake a gateway connection thread: {e}");
+            }
         }
     }
 }
@@ -78,7 +103,9 @@ pub(crate) fn watch_node(
                     }
                     _ => {}
                 }
-                if last != Some(t.hash) {
+                let tip_changed = last != Some(t.hash);
+                let previous_bits = *lock(&view.next_bits);
+                if tip_changed {
                     let mut display = t.hash;
                     display.reverse();
                     info!(
@@ -115,6 +142,11 @@ pub(crate) fn watch_node(
                     }
                 }
                 *lock(&view.tip) = Some(t);
+                // What every connection's poll waits for: without this each would notice
+                // the new tip at its next timed check and serve the old one until then.
+                if tip_changed || *lock(&view.next_bits) != previous_bits {
+                    view.wake_connections();
+                }
                 Some(t.height)
             }
             Err(e) => {

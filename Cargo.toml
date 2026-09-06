@@ -3,7 +3,7 @@ resolver = "3"
 members = ["core", "prime", "gateway", "miner"]
 
 [workspace.package]
-version = "0.1.23"
+version = "0.1.24"
 edition = "2024"
 publish = false
 license = "AGPL-3.0-or-later"
@@ -23,6 +23,7 @@ hex = "0.4"
 libc = "0.2"
 log = { version = "0.4", features = ["std"] }
 minreq = { version = "3.0.0", features = ["https"] }
+mio = { version = "1", features = ["os-poll", "net"] }
 redb = "4.2.0"
 serde = { version = "1", features = ["derive"] }
 # preserve_order: the gateway rewrites its configuration file from the settings page and

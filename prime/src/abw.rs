@@ -163,6 +163,18 @@ impl AbwManager {
         Revealed { slot: r.slot, again: r.sent, payload: Reveal { slot: r.slot, xor_key }.encode() }
     }
 
+    /// When the next timed action falls due: the active slot's rotation by age and the
+    /// earliest retired slot's reveal. The connection sleeps no longer than this. The
+    /// rotation by share count is not timed; a share prompts its own check.
+    pub(crate) fn next_due(&self) -> Instant {
+        let rotation = self.activated_at + ROTATE_AFTER;
+        self.retired
+            .iter()
+            .map(|r| r.at + self.reveal_after)
+            .min()
+            .map_or(rotation, |reveal| rotation.min(reveal))
+    }
+
     /// Whether `reveals_due` would reveal a slot now.
     pub(crate) fn reveal_due(&self, now: Instant) -> bool {
         self.retired.iter().any(|r| now.duration_since(r.at) >= self.reveal_after)

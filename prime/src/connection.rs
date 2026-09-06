@@ -1,5 +1,11 @@
 //! One gateway connection: the handshake, then the loop that reads its frames and
 //! responds to its coinbaser requests, shares, and block transactions.
+//!
+//! Past the handshake the thread blocks in `mio::Poll` on the socket and on a `mio::Waker`
+//! held in `NodeView`. The node watcher calls that waker when it observes a new tip or a new
+//! network target, so the connection sends its blocknotify at once rather than at a read
+//! timeout. The remaining timeouts are the keepalive and, on a version 3 session, the ABW
+//! slot rotation and reveals.
 
 use crate::abw::AbwManager;
 use crate::server::{
@@ -7,6 +13,8 @@ use crate::server::{
     unix_now,
 };
 use log::{debug, error, info, warn};
+use mio::net::TcpStream as PolledStream;
+use mio::{Events, Interest, Poll, Token, Waker};
 use ratum::datum::abw::raw_hash_le;
 use ratum::datum::bulk::{self, Reassembler};
 use ratum::datum::framing::{self, Header, KeyRatchet};
@@ -38,54 +46,6 @@ use std::time::{Duration, Instant};
 /// narrow.
 const COINBASE_VALUE_TOLERANCE: f64 = 2.0;
 
-/// Read a frame body of `n` bytes off a connection past its handshake.
-///
-/// The socket's read timeout is `IDLE_POLL` once the handshake is complete, so a body that
-/// arrives in more than one segment (routine over anything but loopback for frames up to 4 MiB)
-/// would make a plain `read_exact` return `WouldBlock` and close the connection. This
-/// accumulates the body across those short timeouts, returning `Err(TimedOut)` only after
-/// `BODY_TIMEOUT` with no progress, the same tolerance `read_header` gives a partially received
-/// header.
-fn read_body(s: &mut TcpStream, n: usize) -> io::Result<Vec<u8>> {
-    let mut buf = vec![0u8; n];
-    let mut got = 0usize;
-    let mut idle_since = Instant::now();
-    let started = Instant::now();
-    while got < n {
-        // An absolute cap in addition to the no-progress timeout below: a gateway sending one
-        // byte per interval shorter than `BODY_TIMEOUT` resets `idle_since` on every byte and
-        // could hold the connection (and its `--max-connections` slot) indefinitely.
-        // `BODY_DEADLINE` bounds the whole frame; on a private link even a 4 MiB frame arrives
-        // well within it.
-        if started.elapsed() > BODY_DEADLINE {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "frame body exceeded its deadline",
-            ));
-        }
-        match s.read(&mut buf[got..]) {
-            Ok(0) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "connection closed mid-frame",
-                ));
-            }
-            Ok(k) => {
-                got += k;
-                idle_since = Instant::now();
-            }
-            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
-                if idle_since.elapsed() > BODY_TIMEOUT {
-                    return Err(io::Error::new(io::ErrorKind::TimedOut, "frame body stalled"));
-                }
-            }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(buf)
-}
-
 fn describe(header: Header, payload: &[u8]) -> String {
     let sub = payload.first().copied();
     let name = match (header.proto_cmd, sub) {
@@ -111,7 +71,10 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 const BODY_TIMEOUT: Duration = Duration::from_secs(30);
 const BODY_DEADLINE: Duration = Duration::from_secs(120);
-const IDLE_POLL: Duration = Duration::from_millis(100);
+/// The connection's socket in its `Poll`.
+const SOCKET: Token = Token(0);
+/// The `Waker` the node watcher calls on a new tip or target.
+const WAKE: Token = Token(1);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
 /// The largest hello frame the pool will read from an unauthenticated peer. A hello carries
 /// four 32-byte keys, a short user agent, up to 200 padding bytes, a signature and a
@@ -199,11 +162,25 @@ pub(crate) fn handle(mut stream: TcpStream, server: &Server) -> io::Result<()> {
     stream.flush()?;
     debug!("[{peer}] handshake response sent ({} bytes)", response.len());
 
+    // The handshake is done; from here the poll reports readiness, the socket itself never
+    // blocks, and both directions return `WouldBlock` instead. The watcher's waker is
+    // registered before the first send, so a tip observed during it is not missed.
+    stream.set_nonblocking(true)?;
+    let mut stream = PolledStream::from_std(stream);
+    let poll = Poll::new()?;
+    poll.registry().register(&mut stream, SOCKET, Interest::READABLE | Interest::WRITABLE)?;
+    let waker = Arc::new(Waker::new(poll.registry(), WAKE)?);
+    server.node_view.add_waker(&waker);
+
     let mut conn = Connection {
         server,
         peer,
         opened: handshake_started,
         stream,
+        poll,
+        events: Events::with_capacity(8),
+        readable: false,
+        waker,
         session,
         verifier: Verifier::with_replay_guard(server.policy.clone(), Arc::clone(&server.replay)),
         credited: HashMap::new(),
@@ -260,7 +237,6 @@ pub(crate) fn handle(mut stream: TcpStream, server: &Server) -> io::Result<()> {
         }
     }
 
-    conn.stream.set_read_timeout(Some(IDLE_POLL))?;
     conn.run()
 }
 
@@ -286,7 +262,15 @@ struct Connection<'a> {
     peer: std::net::SocketAddr,
     /// When the connection was accepted; a saved session records it as `held_since`.
     opened: Instant,
-    stream: TcpStream,
+    stream: PolledStream,
+    /// Readiness for the socket and the waker; the thread blocks here between frames.
+    poll: Poll,
+    events: Events,
+    /// Set when the poll reports the socket readable, cleared when a read returns
+    /// `WouldBlock`: the registration is edge triggered, so readiness holds until then.
+    readable: bool,
+    /// This connection's entry in `NodeView`, removed when the connection closes.
+    waker: Arc<Waker>,
     session: Session,
     verifier: Verifier,
     credited: HashMap<String, u64>,
@@ -316,6 +300,7 @@ struct Connection<'a> {
 
 impl Drop for Connection<'_> {
     fn drop(&mut self) {
+        self.server.node_view.remove_waker(&self.waker);
         // A version 3 session is kept for `SESSION_KEEP`, so the gateway's next hello, with
         // the token, continues its ABW slots and its replayed shares verify.
         if let Some(v3) = self.v3.take() {
@@ -349,10 +334,141 @@ impl Connection<'_> {
             .session
             .encrypt(cmd, payload, sign)
             .map_err(|e| io::Error::other(e.to_string()))?;
-        self.stream.write_all(&wire)?;
-        self.stream.flush()?;
+        self.write_all(&wire)?;
         self.last_send = Instant::now();
         Ok(())
+    }
+
+    /// Write every byte, waiting for write readiness while the socket buffer is full.
+    /// Fails with `TimedOut` once `WRITE_TIMEOUT` has passed, as the socket write timeout
+    /// did. Read readiness seen while waiting is kept for the next read.
+    fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
+        let deadline = Instant::now() + WRITE_TIMEOUT;
+        let mut rest = data;
+        while !rest.is_empty() {
+            match self.stream.write(rest) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(n) => rest = &rest[n..],
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Err(io::ErrorKind::TimedOut.into());
+                    }
+                    self.wait(Some(left))?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    /// Block until an event or `timeout`, recording read readiness. A waker event needs no
+    /// record: `run` reads the node view each time around the loop. `Interrupted` returns
+    /// with no event, as a timeout does.
+    fn wait(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+        match self.poll.poll(&mut self.events, timeout) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(()),
+            Err(e) => return Err(e),
+        }
+        for ev in self.events.iter() {
+            // A closed or errored socket is read so that `read` reports it.
+            if ev.token() == SOCKET && (ev.is_readable() || ev.is_read_closed() || ev.is_error()) {
+                self.readable = true;
+            }
+        }
+        Ok(())
+    }
+
+    /// How long the thread may sleep before a timed action is due: the keepalive, and a
+    /// version 3 session's slot rotation and reveals. A new tip needs no deadline; the
+    /// watcher calls this connection's waker.
+    fn until_next_action(&self) -> Duration {
+        let mut due = self.last_send + KEEPALIVE_INTERVAL;
+        if let Some(next) = self.abw().map(AbwManager::next_due) {
+            due = due.min(next);
+        }
+        due.saturating_duration_since(Instant::now())
+    }
+
+    /// Reads a frame header, distinguishing a connection that sent nothing from one that
+    /// stopped partway through a header. Only the latter is a timeout.
+    fn read_header(&mut self, hdr: &mut [u8; 4]) -> io::Result<Framing> {
+        let mut got = 0usize;
+        let mut partial_since: Option<Instant> = None;
+        while got < hdr.len() {
+            if !self.readable {
+                // Nothing has arrived at all: the caller waits on the poll. Part of a header
+                // has: wait for the rest, up to `HEADER_TIMEOUT` from the first byte.
+                let Some(since) = partial_since else { return Ok(Framing::Idle) };
+                let left = HEADER_TIMEOUT.checked_sub(since.elapsed()).filter(|d| !d.is_zero());
+                let Some(left) = left else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "frame header partially received",
+                    ));
+                };
+                self.wait(Some(left))?;
+                continue;
+            }
+            match self.stream.read(&mut hdr[got..]) {
+                Ok(0) => return Ok(Framing::Closed),
+                Ok(n) => {
+                    got += n;
+                    partial_since.get_or_insert_with(Instant::now);
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => self.readable = false,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(Framing::HeaderRead)
+    }
+
+    /// Read a frame body of `n` bytes. `BODY_TIMEOUT` bounds a stall with no byte received
+    /// and `BODY_DEADLINE` the whole body: a gateway sending one byte per interval shorter
+    /// than `BODY_TIMEOUT` resets the stall timer on every byte and could otherwise hold the
+    /// connection (and its `--max-connections` slot) indefinitely. On a private link even a
+    /// 4 MiB frame arrives well within the deadline.
+    fn read_body(&mut self, n: usize) -> io::Result<Vec<u8>> {
+        let mut buf = vec![0u8; n];
+        let mut got = 0usize;
+        let mut idle_since = Instant::now();
+        let started = Instant::now();
+        while got < n {
+            if started.elapsed() > BODY_DEADLINE {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "frame body exceeded its deadline",
+                ));
+            }
+            if !self.readable {
+                let left = BODY_TIMEOUT.checked_sub(idle_since.elapsed()).filter(|d| !d.is_zero());
+                let Some(left) = left else {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "frame body stalled"));
+                };
+                let cap = BODY_DEADLINE.saturating_sub(started.elapsed());
+                self.wait(Some(left.min(cap)))?;
+                continue;
+            }
+            match self.stream.read(&mut buf[got..]) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "connection closed mid-frame",
+                    ));
+                }
+                Ok(k) => {
+                    got += k;
+                    idle_since = Instant::now();
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => self.readable = false,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(buf)
     }
 
     fn send_mining(&mut self, payload: &[u8], sign: bool) -> io::Result<()> {
@@ -496,20 +612,13 @@ impl Connection<'_> {
         Ok(())
     }
 
-    /// Whether nothing the gateway sent is waiting to be read: a non-blocking peek at the
-    /// socket. The read timeout (`IDLE_POLL`) is a separate socket option and stays.
+    /// Whether nothing the gateway sent is waiting to be read: the poll is asked for
+    /// readiness without blocking. Read readiness that has not yet been drained counts as
+    /// bytes waiting, so a due reveal waits one more pass around the loop; a closed peer
+    /// reads as readable and is handled as `Framing::Closed`.
     fn socket_drained(&mut self) -> io::Result<bool> {
-        self.stream.set_nonblocking(true)?;
-        let peeked = self.stream.peek(&mut [0u8; 1]);
-        self.stream.set_nonblocking(false)?;
-        match peeked {
-            // Bytes waiting, or the peer closed (read next, as `Framing::Closed`).
-            Ok(_) => Ok(false),
-            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
-                Ok(true)
-            }
-            Err(e) => Err(e),
-        }
+        self.wait(Some(Duration::ZERO))?;
+        Ok(!self.readable)
     }
 
     /// The 0xA5 receipt for `work` on a version 3 session, when the share named a slot.
@@ -528,19 +637,24 @@ impl Connection<'_> {
                 self.rotate_abw(why)?;
             }
             self.send_due_reveals()?;
+            if self.last_send.elapsed() >= KEEPALIVE_INTERVAL {
+                self.send_keepalive()?;
+            }
 
+            if !self.readable {
+                // Nothing to read: block until the socket is readable, the watcher calls
+                // this connection's waker for a new tip, or a timed action is due.
+                let timeout = self.until_next_action();
+                self.wait(Some(timeout))?;
+                continue;
+            }
             let mut hdr = [0u8; 4];
-            match read_header(&mut self.stream, &mut hdr)? {
+            match self.read_header(&mut hdr)? {
                 Framing::Closed => {
                     debug!("[{peer}] disconnected");
                     return Ok(());
                 }
-                Framing::Idle => {
-                    if self.last_send.elapsed() >= KEEPALIVE_INTERVAL {
-                        self.send_keepalive()?;
-                    }
-                    continue;
-                }
+                Framing::Idle => continue,
                 Framing::HeaderRead => {}
             }
             let header = self.session.unmask_header(hdr);
@@ -551,7 +665,7 @@ impl Connection<'_> {
                 );
                 return Ok(());
             }
-            let body = read_body(&mut self.stream, header.cmd_len as usize)?;
+            let body = self.read_body(header.cmd_len as usize)?;
             let plain = match self.session.decrypt(header, &body) {
                 Ok(p) => p,
                 Err(e) => {
@@ -1182,40 +1296,6 @@ enum Framing {
     HeaderRead,
     Idle,
     Closed,
-}
-
-/// Reads a frame header, distinguishing a connection that sent nothing from one that
-/// stopped partway through a header. Only the latter is a timeout.
-fn read_header(stream: &mut TcpStream, hdr: &mut [u8; 4]) -> io::Result<Framing> {
-    let mut got = 0usize;
-    let mut partial_since: Option<Instant> = None;
-    while got < hdr.len() {
-        match stream.read(&mut hdr[got..]) {
-            Ok(0) => return Ok(Framing::Closed),
-            Ok(n) => {
-                got += n;
-                partial_since.get_or_insert_with(Instant::now);
-            }
-            Err(e)
-                if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
-                    && got == 0 =>
-            {
-                return Ok(Framing::Idle);
-            }
-            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
-                if partial_since.is_some_and(|t| t.elapsed() > HEADER_TIMEOUT) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "frame header partially received",
-                    ));
-                }
-                continue;
-            }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(Framing::HeaderRead)
 }
 
 fn block_matches_header(a: &Accepted, txns: &[Vec<u8>]) -> Result<(), String> {

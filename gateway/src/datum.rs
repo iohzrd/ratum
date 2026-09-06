@@ -4,12 +4,19 @@
 //! handshake, the configuration the pool sends, coinbaser requests for jobs that need one, the
 //! share queue, the pool's validation requests, and reconnection. The timing values are the C
 //! gateway's (`datum_protocol.c`, `datum_gateway.c`).
+//!
+//! Past the handshake the session thread blocks in `mio::Poll` on the socket and on a
+//! `mio::Waker` held in `Shared`. Queueing a share (`Shared::submit`) or staging a coinbaser
+//! request calls that waker, so the thread sends it at once rather than at a read timeout.
+//! The only remaining timeout is `Settings::global_timeout`.
 
 use crate::config::Config;
 use crate::job::{Abw, Job, PoolConfig};
 use crate::tally::Tally;
 use crate::template::Notify;
 use log::{debug, error, info, warn};
+use mio::net::TcpStream as PolledStream;
+use mio::{Events, Interest, Poll, Token, Waker};
 use ratum::datum::abw::{self, Activation, AssignmentNotice, Candidate, Reveal};
 use ratum::datum::client::Client;
 use ratum::datum::framing::{self, Header};
@@ -41,7 +48,17 @@ pub const COINBASER_MIN_VALUE: u64 = 31_250_000;
 pub const SHARE_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 /// A share sent this long after the previous one restarts the acceptance clock.
 pub const SHARE_ACK_GRACE: Duration = Duration::from_secs(25);
-const READ_POLL: Duration = Duration::from_millis(5);
+/// The read timeout the handshake runs under: `read_exact_deadline` checks its deadline
+/// between reads, so this is how closely the handshake honours `global_timeout`. Once the
+/// handshake is done the socket is non-blocking and readiness comes from the poll.
+const HANDSHAKE_READ_POLL: Duration = Duration::from_millis(5);
+/// How long a write waits for the socket to take the rest of a frame before it fails with
+/// `TimedOut`.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/// The session's socket in its `Poll`.
+const SOCKET: Token = Token(0);
+/// The `Waker` a queued share or a coinbaser request calls.
+const WAKE: Token = Token(1);
 /// Every mining message ends with this many random bytes at most (the C gateway pads each
 /// with 1 to 80 or 1 to 100), so a message's length does not identify its contents.
 const MINING_PAD_MAX: usize = 100;
@@ -206,6 +223,10 @@ pub struct Shared {
     /// Consecutive sessions that did not reach the configuration, which
     /// `pooled_mining_only` reads; a session that did resets it to one.
     pub failures: AtomicU32,
+    /// The open session's waker: called when a share is queued or a coinbaser request is
+    /// staged, so the session thread sends it without waiting for its next timed check.
+    /// `None` between sessions.
+    waker: Mutex<Option<Arc<Waker>>>,
 }
 
 impl Shared {
@@ -228,6 +249,18 @@ impl Shared {
             node,
             notify,
             failures: AtomicU32::new(0),
+            waker: Mutex::new(None),
+        }
+    }
+
+    /// Wake the session thread out of `Poll::poll`. A failed write to the waker only delays
+    /// that thread until its next timed check, so it is logged and not propagated. Nothing
+    /// to wake between sessions.
+    fn wake(&self) {
+        if let Some(w) = ratum::lock(&self.waker).as_ref()
+            && let Err(e) = w.wake()
+        {
+            debug!("could not wake the DATUM session thread: {e}");
         }
     }
 
@@ -276,6 +309,7 @@ impl Shared {
     /// The connection ended: the configuration, the coinbaser request awaiting a response
     /// and the queued shares are discarded. Whether the thread was active.
     fn disconnected(&self) -> bool {
+        *ratum::lock(&self.waker) = None;
         let was_active = ratum::lock(&self.config).take().is_some();
         if let Some(state) = ratum::lock(&self.coinbaser).take() {
             state.done.notify_all();
@@ -307,6 +341,8 @@ impl Shared {
             return;
         }
         q.push_back(share);
+        drop(q);
+        self.wake();
     }
 
     /// Ask the pool for the payout split of a job and wait up to `COINBASER_WAIT` for it.
@@ -327,6 +363,7 @@ impl Shared {
             old.superseded.store(true, Ordering::SeqCst);
             old.done.notify_all();
         }
+        self.wake();
         let guard = ratum::lock(&state.response);
         let (guard, _) = state
             .done
@@ -461,7 +498,13 @@ struct Session<'a> {
     settings: &'a Settings,
     shared: &'a Shared,
     identity: &'a KeyPairs,
-    stream: TcpStream,
+    stream: PolledStream,
+    /// Readiness for the socket and the waker; the thread blocks here between frames.
+    poll: Poll,
+    events: Events,
+    /// Set when the poll reports the socket readable, cleared when a read returns
+    /// `WouldBlock`: the registration is edge triggered, so readiness holds until then.
+    readable: bool,
     client: Client,
     last_server_msg: Instant,
     last_share_sent: Option<Instant>,
@@ -532,8 +575,8 @@ impl<'a> Session<'a> {
         identity: &'a KeyPairs,
     ) -> Result<Self, SessionError> {
         let mut stream = connect(settings)?;
-        stream.set_read_timeout(Some(READ_POLL))?;
-        stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+        stream.set_read_timeout(Some(HANDSHAKE_READ_POLL))?;
+        stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
         let mut client = Client::with_key_pairs(identity.clone(), KeyPairs::generate(), rand_u32());
         // A version 3 hello carries the DRS extension and the resume token from the
         // previous session; a version 3 pool responds with a version 3 config and accepts the
@@ -567,12 +610,23 @@ impl<'a> Session<'a> {
         client.read_handshake_response(&frame, &settings.pool_sign_pk)?;
         info!("DATUM Server MOTD: {}", client.motd());
 
+        // The handshake is done; from here the poll reports readiness, the socket itself
+        // never blocks, and both directions return `WouldBlock` instead.
+        stream.set_nonblocking(true)?;
+        let mut stream = PolledStream::from_std(stream);
+        let poll = Poll::new()?;
+        poll.registry().register(&mut stream, SOCKET, Interest::READABLE | Interest::WRITABLE)?;
+        *ratum::lock(&shared.waker) = Some(Arc::new(Waker::new(poll.registry(), WAKE)?));
+
         let slots = ratum::lock(&shared.slots).len();
         Ok(Session {
             settings,
             shared,
             identity,
             stream,
+            poll,
+            events: Events::with_capacity(8),
+            readable: false,
             client,
             last_server_msg: Instant::now(),
             last_share_sent: None,
@@ -600,19 +654,97 @@ impl<'a> Session<'a> {
             }
             Err(e) => return Err(io::Error::other(e.to_string()).into()),
         };
-        self.stream.write_all(&wire)?;
-        self.stream.flush()?;
+        self.write_all(&wire)?;
         Ok(())
     }
 
-    /// The next frame's header, accumulated across the short read timeout so the pending
-    /// sends run between polls; `None` until four bytes have arrived.
+    /// Write every byte, waiting for write readiness while the socket buffer is full.
+    /// Fails with `TimedOut` once `WRITE_TIMEOUT` has passed, as the socket write timeout
+    /// did. Read readiness seen while waiting is kept for the next read.
+    fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
+        let deadline = Instant::now() + WRITE_TIMEOUT;
+        let mut rest = data;
+        while !rest.is_empty() {
+            match self.stream.write(rest) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(n) => rest = &rest[n..],
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Err(io::ErrorKind::TimedOut.into());
+                    }
+                    self.wait(Some(left))?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    /// Block until an event or `timeout`, recording read readiness. A waker event needs no
+    /// record: `run` calls `send_pending` each time around the loop. `Interrupted` returns
+    /// with no event, as a timeout does.
+    fn wait(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+        match self.poll.poll(&mut self.events, timeout) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(()),
+            Err(e) => return Err(e),
+        }
+        for ev in self.events.iter() {
+            // A closed or errored socket is read so that `read` reports it.
+            if ev.token() == SOCKET && (ev.is_readable() || ev.is_read_closed() || ev.is_error()) {
+                self.readable = true;
+            }
+        }
+        Ok(())
+    }
+
+    /// `n` bytes, waiting for read readiness, with the deadline `read_exact_deadline`
+    /// applies: `started` plus `deadline` bounds the whole read.
+    fn read_exact(
+        &mut self,
+        n: usize,
+        started: Instant,
+        deadline: Duration,
+    ) -> io::Result<Vec<u8>> {
+        let mut buf = vec![0u8; n];
+        let mut got = 0usize;
+        while got < n {
+            let left = match deadline.checked_sub(started.elapsed()) {
+                Some(left) if !left.is_zero() => left,
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "read exceeded its deadline",
+                    ));
+                }
+            };
+            if !self.readable {
+                self.wait(Some(left))?;
+                continue;
+            }
+            match self.stream.read(&mut buf[got..]) {
+                Ok(0) => {
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed"));
+                }
+                Ok(k) => got += k,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => self.readable = false,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(buf)
+    }
+
+    /// The next frame's header, accumulated across reads so the pending sends run between
+    /// them; `None` until four bytes have arrived.
     fn poll_header(&mut self) -> Result<Option<Header>, SessionError> {
         let mut byte = [0u8; 4];
         match self.stream.read(&mut byte[..4 - self.pending_header.len()]) {
             Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into()),
             Ok(n) => self.pending_header.extend_from_slice(&byte[..n]),
-            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => self.readable = false,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(e) => return Err(e.into()),
         }
@@ -645,11 +777,18 @@ impl<'a> Session<'a> {
 
             self.send_pending()?;
 
+            if !self.readable {
+                // Nothing to read: block until the socket is readable, the waker is called
+                // for a queued share or a coinbaser request, or the global timeout is due.
+                let timeout =
+                    self.settings.global_timeout.saturating_sub(self.last_server_msg.elapsed());
+                self.wait(Some(timeout))?;
+                continue;
+            }
             let Some(header) = self.poll_header()? else { continue };
             // The global timeout covers a partly received body too, as the C main loop's
             // check does on every partial read.
-            let body = read_exact_deadline(
-                &mut self.stream,
+            let body = self.read_exact(
                 header.cmd_len as usize,
                 self.last_server_msg,
                 self.settings.global_timeout,
@@ -1660,6 +1799,32 @@ mod session_tests {
         assert_eq!(response.coinbaser_id, 3);
         assert_eq!(response.outputs.len(), 1);
         assert!(shared.fetch_coinbaser(1, [0u8; 32]).is_none(), "under the minimum value");
+        pool.join().unwrap();
+        session.join().unwrap();
+    }
+
+    /// A share queued while the session has nothing to read reaches the pool at once: the
+    /// session thread blocks in its poll with the global timeout as its only deadline, and
+    /// `Shared::submit` calls its waker.
+    #[test]
+    fn a_queued_share_wakes_the_session() {
+        let (received, when) = std::sync::mpsc::channel();
+        let (settings, pool) = start_pool(move |p| {
+            p.send(&config_payload(&pool_config()), true);
+            let share = p.share();
+            received.send(Instant::now()).expect("the test is waiting");
+            p.answer(&share, ShareVerdict::Accepted);
+            std::thread::sleep(Duration::from_millis(50));
+        });
+        let (shared, _) = shared();
+        let session = run_session(settings, Arc::clone(&shared));
+        wait_for("the configuration", || shared.is_active());
+        let j = job(&shared, 0);
+        let queued_at = Instant::now();
+        shared.submit(queued(&j, 0, 1, "bc1qminer"));
+        let at = when.recv_timeout(TEST_DEADLINE).expect("the share reached the pool");
+        let waited = at.duration_since(queued_at);
+        assert!(waited < Duration::from_millis(500), "the share waited {waited:?} to be sent");
         pool.join().unwrap();
         session.join().unwrap();
     }

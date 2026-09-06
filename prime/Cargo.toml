@@ -13,6 +13,7 @@ env_logger.workspace = true
 hex.workspace = true
 log.workspace = true
 minreq.workspace = true
+mio.workspace = true
 redb.workspace = true
 serde.workspace = true
 serde_json.workspace = true

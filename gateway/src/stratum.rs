@@ -1,5 +1,10 @@
 //! The Stratum v1 server, Siacoin dialect, serving version 2 headers. One thread per
 //! connection; the messages and their formats are the C gateway's (`datum_stratum.c`).
+//!
+//! Each connection thread blocks in `mio::Poll` on its socket and on a `mio::Waker`. The
+//! waker is called when a job is published and when a kill request is made, so the thread
+//! reads the server's generation counter and `ClientEntry::kill` at once rather than at a
+//! read timeout. The remaining timeouts are the idle checks and the hashrate window.
 
 use crate::address;
 use crate::coinbase::COINBASE_POOLED;
@@ -11,6 +16,8 @@ use crate::tally::Tally;
 use crate::username::{self, FeeMeter};
 use crate::vardiff::{self, Vardiff};
 use log::{debug, error, info, warn};
+use mio::net::TcpStream as PolledStream;
+use mio::{Events, Interest, Poll, Token, Waker};
 use ratum::target;
 use serde_json::{Value, json};
 use std::io::{self, Read, Write};
@@ -21,8 +28,14 @@ use std::time::{Duration, Instant};
 
 const CLIENT_BUFFER: usize = 16384 * 3 + 1024;
 const MAX_REQUEST_ID_CHARS: usize = 64;
-const READ_POLL: Duration = Duration::from_millis(50);
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_millis(11150);
+/// How long a write waits for the socket to take the rest of the line before it fails with
+/// `TimedOut`.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/// The connection's socket in its `Poll`.
+const SOCKET: Token = Token(0);
+/// The `Waker` a new job or a kill request calls.
+const WAKE: Token = Token(1);
 const STAT_CYCLE: Duration = Duration::from_secs(60);
 /// Difficulty to TH/s: `diff * 2^32 / 1e12` per second.
 const DIFF_TO_THS: f64 = 0.004294967296;
@@ -97,6 +110,25 @@ impl ClientStats {
 pub struct ClientEntry {
     pub kill: AtomicBool,
     pub stats: Mutex<ClientStats>,
+    /// Wakes the connection thread out of `Poll::poll`, so that it reads `kill` and the
+    /// server's generation counter without waiting for its next timed check.
+    waker: Arc<Waker>,
+}
+
+impl ClientEntry {
+    /// Wake the connection thread. A failed write to the waker only delays that thread
+    /// until its next timed check, so it is logged and not propagated.
+    fn wake(&self) {
+        if let Err(e) = self.waker.wake() {
+            debug!("could not wake a stratum connection thread: {e}");
+        }
+    }
+
+    /// Set the kill flag and wake the connection thread, which then returns `Killed`.
+    fn request_kill(&self) {
+        self.kill.store(true, Ordering::Relaxed);
+        self.wake();
+    }
 }
 
 /// What one pass over the client list yields.
@@ -186,6 +218,12 @@ impl Server {
         j.current = Some(job);
         j.empty = empty;
         self.generation.fetch_add(1, Ordering::Release);
+        drop(j);
+        // Each connection thread compares the counter after its waker returns it from
+        // `Poll::poll`, so the job reaches a subscriber as soon as it is scheduled.
+        for c in ratum::lock(&self.clients).iter() {
+            c.wake();
+        }
     }
 
     pub fn current_job(&self) -> Option<Arc<Job>> {
@@ -237,14 +275,14 @@ impl Server {
     pub fn shutdown_all(&self) {
         info!("Disconnecting all stratum clients");
         for c in ratum::lock(&self.clients).iter() {
-            c.kill.store(true, Ordering::Relaxed);
+            c.request_kill();
         }
     }
 
     pub fn kill_client(&self, unique_id: u64) -> bool {
         for c in ratum::lock(&self.clients).iter() {
             if ratum::lock(&c.stats).unique_id == unique_id {
-                c.kill.store(true, Ordering::Relaxed);
+                c.request_kill();
                 return true;
             }
         }
@@ -330,7 +368,13 @@ struct SubmitRequest {
 struct Connection {
     server: Arc<Server>,
     entry: Arc<ClientEntry>,
-    stream: TcpStream,
+    stream: PolledStream,
+    /// Readiness for the socket and the waker; the thread blocks here between reads.
+    poll: Poll,
+    events: Events,
+    /// Set when the poll reports the socket readable, cleared when a read returns
+    /// `WouldBlock`: the registration is edge triggered, so readiness holds until then.
+    readable: bool,
     remote: String,
     sid: u32,
     subscribed: bool,
@@ -353,14 +397,20 @@ impl Connection {
     fn run(server: Arc<Server>, stream: TcpStream) -> Result<(), Disconnect> {
         let remote = stream.peer_addr().map_or_else(|_| "?".to_string(), |a| a.to_string());
         stream.set_nodelay(true)?;
-        stream.set_read_timeout(Some(READ_POLL))?;
-        stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+        // The poll reports readiness; the socket itself never blocks, and both directions
+        // return `WouldBlock` instead.
+        stream.set_nonblocking(true)?;
+        let mut stream = PolledStream::from_std(stream);
+        let poll = Poll::new()?;
+        poll.registry().register(&mut stream, SOCKET, Interest::READABLE | Interest::WRITABLE)?;
+        let waker = Arc::new(Waker::new(poll.registry(), WAKE)?);
         let unique_id = server.next_unique_id.fetch_add(1, Ordering::Relaxed);
         // The C gateway packs a 22-bit client index and a thread id; here the connection
         // counter is the whole 32 bits, so two live connections never share extranonce1.
         let sid = (unique_id as u32) ^ 0xB10C_F00D;
         let entry = Arc::new(ClientEntry {
             kill: AtomicBool::new(false),
+            waker,
             stats: Mutex::new(ClientStats {
                 remote: remote.clone(),
                 unique_id,
@@ -375,6 +425,9 @@ impl Connection {
         let mut c = Connection {
             entry: Arc::clone(&entry),
             stream,
+            poll,
+            events: Events::with_capacity(8),
+            readable: false,
             remote,
             sid,
             subscribed: false,
@@ -420,6 +473,13 @@ impl Connection {
             self.idle_checks()?;
             self.roll_window();
 
+            if !self.readable {
+                // Nothing left to read: block until the socket is readable, the waker is
+                // called for a new job or a kill request, or a timed check is due.
+                let timeout = self.until_next_check();
+                self.wait(Some(timeout))?;
+                continue;
+            }
             match self.stream.read(&mut chunk) {
                 Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into()),
                 Ok(n) => {
@@ -435,12 +495,36 @@ impl Connection {
                         self.handle_line(line.trim_end_matches('\r'))?;
                     }
                 }
-                Err(e)
-                    if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => self.readable = false,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) => return Err(e.into()),
             }
         }
+    }
+
+    /// How long the thread may sleep before a timed check is due: the idle checks and the
+    /// end of the hashrate window.
+    fn until_next_check(&self) -> Duration {
+        let due = self.next_idle_check.min(self.window_started + STAT_CYCLE);
+        due.saturating_duration_since(Instant::now())
+    }
+
+    /// Block until an event or `timeout`, recording read readiness. A waker event needs no
+    /// record: `serve` reads `kill` and the generation counter each time around the loop.
+    /// `Interrupted` returns with no event, as a timeout does.
+    fn wait(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+        match self.poll.poll(&mut self.events, timeout) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(()),
+            Err(e) => return Err(e),
+        }
+        for ev in self.events.iter() {
+            // A closed or errored socket is read so that `read` reports it.
+            if ev.token() == SOCKET && (ev.is_readable() || ev.is_read_closed() || ev.is_error()) {
+                self.readable = true;
+            }
+        }
+        Ok(())
     }
 
     fn with_stats(&self, f: impl FnOnce(&mut ClientStats)) {
@@ -495,8 +579,32 @@ impl Connection {
     }
 
     fn send_line(&mut self, line: &str) -> io::Result<()> {
-        self.stream.write_all(line.as_bytes())?;
-        self.stream.write_all(b"\n")
+        self.write_all(line.as_bytes())?;
+        self.write_all(b"\n")
+    }
+
+    /// Write every byte, waiting for write readiness while the socket buffer is full.
+    /// Fails with `TimedOut` once `WRITE_TIMEOUT` has passed, as the socket write timeout
+    /// did. Read readiness seen while waiting is kept for `serve`.
+    fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
+        let deadline = Instant::now() + WRITE_TIMEOUT;
+        let mut rest = data;
+        while !rest.is_empty() {
+            match self.stream.write(rest) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(n) => rest = &rest[n..],
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Err(io::ErrorKind::TimedOut.into());
+                    }
+                    self.wait(Some(left))?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
     }
 
     /// A response to request `id`: `error` is the stratum error array or null.
@@ -916,5 +1024,214 @@ impl Connection {
             ratum::lock(&self.server.fee).add(diff);
         }
         charged
+    }
+}
+
+/// The connection thread against a client socket: the readiness path, the requests, and the
+/// events that end the connection.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::job::Builder;
+    use crate::template::tests::{config, template};
+    use std::io::{BufRead, BufReader};
+    use std::thread::JoinHandle;
+
+    /// How long a test waits for a line or a thread to end. The events under test are
+    /// signalled by the waker, so they arrive in microseconds; the first timed check of a
+    /// connection is `IDLE_CHECK_INTERVAL` away, well past this.
+    const DEADLINE: Duration = Duration::from_millis(250);
+
+    fn test_server() -> Arc<Server> {
+        let config = Arc::new(config());
+        let notify = Arc::new(crate::template::Notify::default());
+        let shared = Arc::new(datum::Shared::new(
+            config.datum.protocol_job_slots,
+            64,
+            Arc::clone(&notify),
+            None,
+        ));
+        let node = ratum::rpc::Client::new("http://127.0.0.1:1", "u", "p").unwrap();
+        Server::new(config, shared, node, notify)
+    }
+
+    /// A non-pooled job on the regtest template.
+    fn a_job(server: &Server) -> Arc<Job> {
+        let mut builder = Builder::new(Arc::clone(&server.config));
+        Arc::new(builder.build(Arc::new(template()), false, None, None, None).unwrap())
+    }
+
+    /// A connection thread serving one end of a local socket pair, and a reader and writer
+    /// for the client end.
+    struct Client {
+        server: Arc<Server>,
+        lines: BufReader<TcpStream>,
+        writer: TcpStream,
+        thread: Option<JoinHandle<Result<(), Disconnect>>>,
+    }
+
+    impl Client {
+        fn connect() -> Client {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let writer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (served, _) = listener.accept().unwrap();
+            writer.set_read_timeout(Some(DEADLINE)).unwrap();
+            let server = test_server();
+            let s = Arc::clone(&server);
+            let thread = std::thread::spawn(move || Connection::run(s, served));
+            let lines = BufReader::new(writer.try_clone().unwrap());
+            Client { server, lines, writer, thread: Some(thread) }
+        }
+
+        fn send(&mut self, line: &str) {
+            self.writer.write_all(line.as_bytes()).unwrap();
+            self.writer.write_all(b"\n").unwrap();
+        }
+
+        /// The next line the connection sent, as JSON.
+        fn line(&mut self, what: &str) -> Value {
+            let mut s = String::new();
+            let n = self.lines.read_line(&mut s).unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert!(n > 0, "{what}: the connection closed");
+            serde_json::from_str(&s).unwrap_or_else(|e| panic!("{what}: {s:?}: {e}"))
+        }
+
+        /// Subscribe and read the subscription reply and the difficulty it is followed by.
+        fn subscribe(&mut self) {
+            self.send(r#"{"id":1,"method":"mining.subscribe","params":["tester/1"]}"#);
+            assert_eq!(self.line("subscribe reply")["id"], 1);
+            assert_eq!(self.line("difficulty")["method"], "mining.set_difficulty");
+        }
+
+        fn unique_id(&self) -> u64 {
+            self.server.client_stats().first().expect("one client").unique_id
+        }
+
+        /// Wait for the connection thread to end, and return why it did.
+        fn ended(&mut self, what: &str) -> Disconnect {
+            let thread = self.thread.take().expect("the thread was already joined");
+            let started = Instant::now();
+            while !thread.is_finished() {
+                assert!(started.elapsed() < DEADLINE, "timed out waiting for {what}");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            thread.join().unwrap().expect_err("the connection ended with an error")
+        }
+    }
+
+    impl Drop for Client {
+        fn drop(&mut self) {
+            self.server.shutdown_all();
+            if let Some(t) = self.thread.take() {
+                let _ = t.join();
+            }
+        }
+    }
+
+    #[test]
+    fn a_publication_reaches_a_subscriber_at_once() {
+        let mut c = Client::connect();
+        c.subscribe();
+        let job = a_job(&c.server);
+        let published = Instant::now();
+        c.server.publish(Arc::clone(&job), false);
+        let notify = c.line("mining.notify");
+        assert!(published.elapsed() < DEADLINE, "the job waited for a timed check");
+        assert_eq!(notify["method"], "mining.notify");
+        let params = notify["params"].as_array().unwrap();
+        assert_eq!(
+            params[0].as_str().unwrap(),
+            format!("{}{COINBASE_POOLED:02x}", job.job_id),
+            "the notify names the published job and its pooled coinbase"
+        );
+    }
+
+    /// A connection that has not subscribed is sent no job, and the publication does not end
+    /// it: the waker only returns it from the poll.
+    #[test]
+    fn a_publication_sends_nothing_before_a_subscription() {
+        let mut c = Client::connect();
+        c.server.publish(a_job(&c.server), false);
+        c.subscribe();
+        // The subscription itself sends the current job, after the two subscription lines.
+        assert_eq!(c.line("mining.notify")["method"], "mining.notify");
+    }
+
+    #[test]
+    fn a_kill_request_ends_the_connection_at_once() {
+        let mut c = Client::connect();
+        c.subscribe();
+        let id = c.unique_id();
+        assert!(c.server.kill_client(id));
+        assert!(matches!(c.ended("the kill request"), Disconnect::Killed));
+        assert!(!c.server.kill_client(id), "the connection removed itself from the client list");
+    }
+
+    #[test]
+    fn shutdown_all_ends_the_connection_at_once() {
+        let mut c = Client::connect();
+        c.subscribe();
+        c.server.shutdown_all();
+        assert!(matches!(c.ended("the shutdown"), Disconnect::Killed));
+    }
+
+    /// Two requests written as one read are both answered, and a request split across two
+    /// writes is answered once its newline arrives.
+    #[test]
+    fn requests_are_parsed_by_line_across_reads() {
+        let mut c = Client::connect();
+        c.writer
+            .write_all(
+                concat!(
+                    r#"{"id":1,"method":"mining.subscribe","params":["tester/1"]}"#,
+                    "\n",
+                    r#"{"id":2,"method":"mining.authorize","params":["bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"]}"#,
+                    "\n",
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        assert_eq!(c.line("subscribe reply")["id"], 1);
+        assert_eq!(c.line("difficulty")["method"], "mining.set_difficulty");
+        let authorize = c.line("authorize reply");
+        assert_eq!(authorize["id"], 2);
+        assert_eq!(authorize["result"], Value::Bool(true));
+
+        c.writer.write_all(br#"{"id":3,"method":"mining.au"#).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        c.writer.write_all(b"thorize\",\"params\":[\"worker\"]}\n").unwrap();
+        assert_eq!(c.line("the reply to the split request")["id"], 3);
+    }
+
+    #[test]
+    fn an_unknown_method_is_answered_with_an_error() {
+        let mut c = Client::connect();
+        c.send(r#"{"id":7,"method":"mining.nothing","params":[]}"#);
+        let reply = c.line("error reply");
+        assert_eq!(reply["id"], 7);
+        assert_eq!(reply["error"][0], METHOD_NOT_FOUND.0);
+        assert_eq!(reply["error"][1], METHOD_NOT_FOUND.1);
+    }
+
+    #[test]
+    fn a_closed_socket_ends_the_connection() {
+        let mut c = Client::connect();
+        c.subscribe();
+        c.writer.shutdown(std::net::Shutdown::Both).unwrap();
+        let ended = c.ended("the closed socket");
+        assert!(matches!(ended, Disconnect::Io(_)), "{ended:?}");
+    }
+
+    #[test]
+    fn a_line_over_the_buffer_ends_the_connection() {
+        let mut c = Client::connect();
+        let long = format!("{{\"id\":1,\"method\":\"{}\"", "x".repeat(CLIENT_BUFFER));
+        // The peer may close before the whole request is written.
+        let _ = c.writer.write_all(long.as_bytes());
+        let ended = c.ended("the buffer overrun");
+        assert!(
+            matches!(&ended, Disconnect::Protocol(why) if why.contains("read buffer overrun")),
+            "{ended:?}"
+        );
     }
 }

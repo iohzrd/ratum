@@ -667,6 +667,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "mio"
+version = "1.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4b18443e9c262bfe8fa82f51666e2642c53393f7e5c27b3e1aeab922cff5b9d8"
+dependencies = [
+ "libc",
+ "log",
+ "wasi",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -741,7 +753,7 @@ checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
 name = "ratum"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "base64",
  "blake2",
@@ -760,7 +772,7 @@ dependencies = [
 
 [[package]]
 name = "ratum-gateway"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "base64",
  "bech32",
@@ -770,6 +782,7 @@ dependencies = [
  "hex",
  "libc",
  "log",
+ "mio",
  "ratum",
  "serde",
  "serde_json",
@@ -779,7 +792,7 @@ dependencies = [
 
 [[package]]
 name = "ratum-prime"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "bytes",
  "clap",
@@ -787,6 +800,7 @@ dependencies = [
  "hex",
  "log",
  "minreq",
+ "mio",
  "ratum",
  "redb",
  "serde",
@@ -1008,7 +1022,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "sia-test-miner"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "hex",
  "ratum",
