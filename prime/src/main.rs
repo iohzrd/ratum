@@ -324,6 +324,16 @@ fn main() -> io::Result<()> {
     // Unset falls back to the address the page was reached on, so set this when the public
     // address differs from that (for example the pool is behind NAT or a port-mapping proxy).
     let advertise_address = c.advertise_address.clone().or(f.advertise_address);
+    // A gateway miners may use instead of running their own, linked from the stats page. A
+    // value written without a scheme is read as an https:// URL, so "gateway.example" and
+    // "https://gateway.example" name the same page.
+    let public_gateway = c.public_gateway.clone().or(f.public_gateway).map(|u| {
+        if u.starts_with("http://") || u.starts_with("https://") {
+            u
+        } else {
+            format!("https://{u}")
+        }
+    });
     let data_dir = c.data_dir.clone().or(f.data_dir);
     let key_path = c.key.clone().or(f.key);
     let motd = cli::resolve_str(c.motd.clone(), f.motd, "RATUM Prime");
@@ -785,6 +795,7 @@ fn main() -> io::Result<()> {
         // configured listen address; the host a gateway uses is the one it reaches the pool on.
         datum_port: listen.rsplit_once(':').and_then(|(_, p)| p.parse().ok()).unwrap_or(0),
         advertise: advertise_address,
+        public_gateway,
     });
 
     if let Some(addr) = &stats_listen {

@@ -32,6 +32,10 @@ pub(crate) struct Cli {
     pub stats_listen: Option<String>,
     #[arg(long)]
     pub advertise_address: Option<String>,
+    /// URL of a gateway open to miners who do not run their own, shown on the stats page.
+    /// A value without a scheme is read as an https:// URL. Unset shows nothing.
+    #[arg(long)]
+    pub public_gateway: Option<String>,
     #[arg(long)]
     pub data_dir: Option<String>,
     #[arg(long)]

@@ -54,6 +54,8 @@ fn the_stats_interface_serves_a_json_snapshot_and_a_page() {
                 "127.0.0.1:0".into(),
                 "--advertise-address".into(),
                 "pool.example.com:29000".into(),
+                "--public-gateway".into(),
+                "gateway.example".into(),
             ],
             ..Default::default()
         },
@@ -90,6 +92,8 @@ fn the_stats_interface_serves_a_json_snapshot_and_a_page() {
     assert_eq!(s["pool"]["datum_port"], 0);
     assert_eq!(s["pool"]["pubkey"].as_str().expect("a pubkey string").len(), 128);
     assert_eq!(s["pool"]["advertise"], "pool.example.com:29000");
+    // The gateway open to miners, given without a scheme, which is read as https://.
+    assert_eq!(s["pool"]["public_gateway"], "https://gateway.example");
 
     // The seeded window is three parts alice to one part bob, read from the ledger at startup
     // regardless of the node poll.

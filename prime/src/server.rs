@@ -222,6 +222,9 @@ pub(crate) struct Server {
     /// `None` falls back to the address the stats page was reached on. The stats interface only
     /// displays it.
     pub(crate) advertise: Option<String>,
+    /// URL of a gateway open to miners who do not run their own (`--public-gateway`), with a
+    /// scheme. `None` shows nothing. The stats interface only displays it.
+    pub(crate) public_gateway: Option<String>,
 }
 
 /// How long a closed version 3 session can be resumed.
@@ -672,6 +675,7 @@ mod tests {
             max_connections: 8,
             datum_port: 28915,
             advertise: None,
+            public_gateway: None,
         }
     }
 

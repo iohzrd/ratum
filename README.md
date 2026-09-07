@@ -264,7 +264,10 @@ expected), and from the observed block spacing an expected time to the pool's ne
 the next difficulty adjustment (height, countdown, estimated factor). The
 page shows the DATUM address, the public key and a `datum_gateway` config block to point a
 gateway at the pool; `--advertise-address host[:port]` sets the address when the public one
-differs. It is unauthenticated: bind it to `127.0.0.1` unless it is behind a reverse proxy.
+differs. `--public-gateway <url>` puts a banner at the top of the page linking a gateway that
+accepts miners who do not run their own (a value without a scheme is read as `https://`);
+unset, the page shows no such banner. It is unauthenticated: bind it to `127.0.0.1` unless it
+is behind a reverse proxy.
 
 ## References
 

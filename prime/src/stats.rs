@@ -310,6 +310,8 @@ fn snapshot(server: &Server, history: &Mutex<VecDeque<(u64, f64)>>) -> String {
             "datum_port": server.datum_port,
             "pubkey": server.pool_keys.pubkey_hex(),
             "advertise": server.advertise,
+            // A gateway open to miners who do not run their own, or null.
+            "public_gateway": server.public_gateway,
         },
         "network": network,
         "connections": {

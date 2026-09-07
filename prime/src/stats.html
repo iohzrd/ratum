@@ -11,6 +11,8 @@
   .unpayable { color: var(--warn); }
   .unpayable td { opacity: .75; }
   .chain { display: none; }
+  .notice { border: 1px solid var(--accent); background: rgba(110, 168, 254, .08);
+            border-radius: 8px; padding: .6rem .8rem; margin-bottom: .75rem; }
 
   .copy-wrap { position: relative; }
   .copy-wrap button { position: absolute; top: .9rem; right: .5rem; }
@@ -27,6 +29,8 @@
     <div id="version"></div>
   </div>
 </header>
+
+<div class="notice" id="public-gateway" style="display:none"></div>
 
 <div class="banner">
   Run <a href="https://github.com/iohzrd/ratum/releases" target="_blank"
@@ -238,6 +242,16 @@ poll(() => "stats.json", s => {
   const motdEl = document.getElementById("motd");
   motdEl.textContent = motd;
   motdEl.style.display = motd && motd !== "RATUM Prime" ? "" : "none";
+
+  // A gateway the operator runs for miners who do not run their own (--public-gateway),
+  // shown only when set. The link text drops the scheme.
+  const pubGw = s.pool.public_gateway || "";
+  const pubGwEl = document.getElementById("public-gateway");
+  pubGwEl.innerHTML = pubGw
+    ? `Mine here without running a gateway:
+       <a href="${esc(pubGw)}" target="_blank" rel="noopener">${esc(pubGw.replace(/^https?:\/\//, ""))}</a>`
+    : "";
+  pubGwEl.style.display = pubGw ? "" : "none";
 
   document.getElementById("payout-script").textContent =
     `Payout script ${s.pool.payout_script}.`;

@@ -53,6 +53,7 @@ settings! {
     listen: String,
     stats_listen: String,
     advertise_address: String,
+    public_gateway: String,
     data_dir: String,
     key: String,
     motd: String,

@@ -114,7 +114,12 @@ fn serve_the_stats_page_with_demo_data() {
             min_difficulty: 1024,
             min_payout: 546,
             motd: "local demo: seeded shares, stand-in node".to_string(),
-            extra: vec!["--stats-listen".into(), "127.0.0.1:38080".into()],
+            extra: vec![
+                "--stats-listen".into(),
+                "127.0.0.1:38080".into(),
+                "--public-gateway".into(),
+                "gateway.example".into(),
+            ],
             ..Default::default()
         },
     );
