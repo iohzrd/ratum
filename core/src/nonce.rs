@@ -20,7 +20,7 @@ pub fn search(
             scope.spawn(move || {
                 let mut buf = input.to_vec();
                 let mut nonce = t;
-                while nonce <= u32::MAX as u64 {
+                while nonce <= u64::from(u32::MAX) {
                     buf[splice_at..splice_at + NONCE_SIZE]
                         .copy_from_slice(&(nonce as u32).to_le_bytes());
                     if target::meets_target(&hash(&buf), target) {

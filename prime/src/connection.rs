@@ -533,7 +533,8 @@ impl Connection<'_> {
             req.value,
             &hex::encode(req.prev_hash)[..LOG_HEX_CHARS]
         );
-        if let Some(reference) = *lock(&self.server.node_view.coinbase_value) {
+        let reference = *lock(&self.server.node_view.coinbase_value);
+        if let Some(reference) = reference {
             let low = (reference as f64 / COINBASE_VALUE_TOLERANCE) as u64;
             let high = (reference as f64 * COINBASE_VALUE_TOLERANCE) as u64;
             if req.value < low || req.value > high {
@@ -664,12 +665,12 @@ impl Connection<'_> {
 
     fn check_share(&mut self, s: &PowSubmit, now: u64) -> io::Result<ShareOutcome> {
         match self.verifier.verify(s, now) {
-            Ok(a) => self.on_accepted(s, a, now),
+            Ok(a) => self.on_accepted(s, &a, now),
             Err(reason) => self.on_refused(s, reason),
         }
     }
 
-    fn on_accepted(&mut self, s: &PowSubmit, a: Accepted, now: u64) -> io::Result<ShareOutcome> {
+    fn on_accepted(&mut self, s: &PowSubmit, a: &Accepted, now: u64) -> io::Result<ShareOutcome> {
         let peer = self.peer;
         let raw_hash = Some(a.work.raw_hash);
         let mut pending = None;
@@ -691,7 +692,7 @@ impl Connection<'_> {
             self.send_abw_receipt(s, &a.work)?;
         }
         if a.is_block {
-            if relay_or_request_txns(peer, &self.server.node, &a, s.subsidy_only) {
+            if relay_or_request_txns(peer, &self.server.node, a, s.subsidy_only) {
                 if let Some(prev) = self.awaiting_txns.insert(s.job_id, a.clone()) {
                     error!(
                         "[{peer}]   !! a block on job {} was still awaiting its \
@@ -702,11 +703,11 @@ impl Connection<'_> {
                 }
                 pending = Some(validation::request_block_txns(s.job_id));
             }
-            self.record_found_block(&a, s, now);
+            self.record_found_block(a, s, now);
             if !a.work.unpaid.is_empty() {
-                self.record_unpaid_outputs(&a, now);
+                self.record_unpaid_outputs(a, now);
             } else if a.work.paid_to_split == 0 {
-                self.record_owed_block(&a, now);
+                self.record_owed_block(a, now);
             }
         } else if s.is_block {
             warn!(
@@ -718,7 +719,7 @@ impl Connection<'_> {
             let verdict = ShareVerdict::Rejected(RejectReason::BadUsername);
             return Ok(ShareOutcome { verdict, pending, raw_hash });
         }
-        if let Err(e) = self.record_and_credit(s, &a, now) {
+        if let Err(e) = self.record_and_credit(s, a, now) {
             error!(
                 "[{peer}]   !! could not record the share to the ledger ({e}); it is \
                  not credited and its hash was removed from the ReplayGuard so a \
@@ -769,7 +770,8 @@ impl Connection<'_> {
              pool's wallet, run: ratum-prime --settle-block {hash} (with --ledger or \
              --data-dir, pool stopped)"
         );
-        if let Err(e) = lock(&self.server.ledger).record_owed(owed) {
+        let recorded = lock(&self.server.ledger).record_owed(owed);
+        if let Err(e) = recorded {
             error!(
                 "[{peer}]   !! could not record the owed amounts to the ledger ({e}); they \
                  are in this log only"

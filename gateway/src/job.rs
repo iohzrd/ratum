@@ -179,7 +179,7 @@ pub fn merkle_branches(txids: &[[u8; 32]]) -> Vec<[u8; 32]> {
     while level.len() > 1 {
         branches.push(level[1].expect("a sibling on the coinbase path is known"));
         if level.len() % 2 == 1 {
-            let last = *level.last().unwrap();
+            let last = *level.last().expect("non-empty");
             level.push(last);
         }
         let mut next = Vec::with_capacity(level.len() / 2);
@@ -376,7 +376,7 @@ const QUICKDIFF_PREFIX: char = 'Q';
 const EMPTY_PREFIX: char = 'N';
 
 impl JobRef {
-    pub fn notify_id(&self, job: &Job) -> String {
+    pub fn notify_id(self, job: &Job) -> String {
         let cb = self.coinbase;
         if self.quickdiff {
             format!("{QUICKDIFF_PREFIX}{}{cb:02x}", job.job_id)

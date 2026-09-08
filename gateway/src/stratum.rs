@@ -641,7 +641,7 @@ impl Connection {
         ))
     }
 
-    fn served_diff(&self, r: &JobRef) -> Option<u64> {
+    fn served_diff(&self, r: JobRef) -> Option<u64> {
         if r.quickdiff {
             Some(self.vardiff.quickdiff_value())
         } else {
@@ -709,7 +709,7 @@ impl Connection {
         let req = match self.parse_submit(params) {
             Ok(req) => req,
             Err((reject, diff)) => {
-                let diff = diff.unwrap_or(self.vardiff.last_sent());
+                let diff = diff.unwrap_or_else(|| self.vardiff.last_sent());
                 self.with_stats(|st| st.rejected.add(diff));
                 return self.reply_error(id, reject);
             }
@@ -749,7 +749,7 @@ impl Connection {
         if job.job_id.get(..JOB_ID_TIME_CHARS) != job_id.get(..JOB_ID_TIME_CHARS) {
             return Err(unknown);
         }
-        let job_diff = self.served_diff(&job_ref).ok_or(unknown)?;
+        let job_diff = self.served_diff(job_ref).ok_or(unknown)?;
         let rejected = (UNKNOWN_WORK, Some(job_diff));
 
         let en2 = params.get(2).and_then(Value::as_str).ok_or(rejected)?;

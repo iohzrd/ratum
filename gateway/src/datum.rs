@@ -225,7 +225,8 @@ impl Shared {
     fn disconnected(&self) -> bool {
         *ratum::lock(&self.waker) = None;
         let was_active = ratum::lock(&self.config).take().is_some();
-        if let Some(state) = ratum::lock(&self.coinbaser).take() {
+        let waiting = ratum::lock(&self.coinbaser).take();
+        if let Some(state) = waiting {
             state.done.notify_all();
         }
         ratum::lock(&self.queue).clear();
@@ -267,7 +268,8 @@ impl Shared {
             done: Condvar::new(),
             superseded: AtomicBool::new(false),
         });
-        if let Some(old) = ratum::lock(&self.coinbaser).replace(Arc::clone(&state)) {
+        let superseded = ratum::lock(&self.coinbaser).replace(Arc::clone(&state));
+        if let Some(old) = superseded {
             old.superseded.store(true, Ordering::SeqCst);
             old.done.notify_all();
         }
@@ -639,7 +641,7 @@ impl<'a> Session<'a> {
         Ok(())
     }
 
-    fn on_coinbaser_response(&mut self, plain: &[u8]) {
+    fn on_coinbaser_response(&self, plain: &[u8]) {
         let Some(state) = ratum::lock(&self.shared.coinbaser).clone() else {
             warn!("coinbaser response with no request waiting");
             return;
@@ -663,7 +665,7 @@ impl<'a> Session<'a> {
         state.done.notify_all();
     }
 
-    fn on_config_message(&mut self, plain: &[u8]) {
+    fn on_config_message(&self, plain: &[u8]) {
         if self.settings.protocol_v3
             && let Some(c) = ClientConfigV3::decode(plain)
         {
@@ -684,7 +686,7 @@ impl<'a> Session<'a> {
         self.on_config(PoolConfig::from_message(c));
     }
 
-    fn on_config(&mut self, config: PoolConfig) {
+    fn on_config(&self, config: PoolConfig) {
         info!(
             "DATUM pool configuration: prime_id {:#010x}, tag {:?}, min diff {}, payout script {}",
             config.prime_id,
@@ -710,7 +712,7 @@ impl<'a> Session<'a> {
         }
     }
 
-    fn on_abw_notice(&mut self, plain: &[u8]) {
+    fn on_abw_notice(&self, plain: &[u8]) {
         let Some(notice) = decoded("assignment notice", AssignmentNotice::decode(plain)) else {
             return;
         };
@@ -721,7 +723,7 @@ impl<'a> Session<'a> {
         }
     }
 
-    fn on_abw_activation(&mut self, plain: &[u8]) {
+    fn on_abw_activation(&self, plain: &[u8]) {
         let Some(act) = decoded("activation", Activation::decode(plain)) else { return };
         if ratum::lock(&self.shared.abw).activate(act.slot) {
             debug!("ABW slot {} activated", act.slot);
@@ -731,7 +733,7 @@ impl<'a> Session<'a> {
         }
     }
 
-    fn on_abw_reveal(&mut self, plain: &[u8]) {
+    fn on_abw_reveal(&self, plain: &[u8]) {
         let Some(reveal) = decoded("reveal", Reveal::decode(plain)) else { return };
         if !ratum::lock(&self.shared.abw).reveal(reveal.slot, &reveal.xor_key) {
             error!("ABW reveal for slot {} does not match its commitment; ignored", reveal.slot);
@@ -878,7 +880,7 @@ impl<'a> Session<'a> {
             return Ok(());
         }
         let batch = std::mem::take(&mut *ratum::lock(&self.shared.queue));
-        for share in batch {
+        for share in &batch {
             self.send_share(share)?;
         }
         Ok(())
@@ -889,8 +891,8 @@ impl<'a> Session<'a> {
         share: &QueuedShare,
     ) -> (Option<JobSection>, Option<CoinbaseSection>) {
         let job = &share.job;
-        let sent =
-            self.sent_job[job.datum_slot as usize].get_or_insert(SentSections::new(job.serial));
+        let sent = self.sent_job[job.datum_slot as usize]
+            .get_or_insert_with(|| SentSections::new(job.serial));
         if sent.serial != job.serial {
             *sent = SentSections::new(job.serial);
         }
@@ -918,7 +920,7 @@ impl<'a> Session<'a> {
         (job_section, coinbase_section)
     }
 
-    fn send_share(&mut self, share: QueuedShare) -> Result<(), SessionError> {
+    fn send_share(&mut self, share: &QueuedShare) -> Result<(), SessionError> {
         let job = &share.job;
         let current =
             ratum::lock(&self.shared.slots)[job.datum_slot as usize].as_ref().map(|j| j.serial);
@@ -941,7 +943,7 @@ impl<'a> Session<'a> {
             warn!("share header extranonce does not begin with four zero bytes; not sent");
             return Ok(());
         };
-        let (job_section, coinbase_section) = self.sections_for(&share);
+        let (job_section, coinbase_section) = self.sections_for(share);
         let blake2b = Blake2bSection::from_header(h);
         let submit = PowSubmit {
             job_id: job.datum_slot,

@@ -159,7 +159,7 @@ pub struct Api {
 
 impl Default for Api {
     fn default() -> Self {
-        Self {
+        Api {
             admin_password: String::new(),
             allow_insecure_auth: false,
             listen_addr: String::new(),

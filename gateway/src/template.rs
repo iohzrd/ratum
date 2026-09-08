@@ -186,10 +186,6 @@ fn decode(v: &serde_json::Value, reduced_data: bool) -> Result<Template, Templat
     })
 }
 
-pub fn fetch(node: &rpc::Client) -> Result<serde_json::Value, rpc::Error> {
-    node.call("getblocktemplate", serde_json::json!([{"rules": ["segwit", "blake2b"]}]))
-}
-
 #[derive(Default)]
 pub struct Notify {
     pending: Mutex<Pending>,
@@ -337,7 +333,7 @@ impl Poller {
     }
 
     fn poll(&mut self, node: &rpc::Client, payout_script: &[u8]) -> Option<Template> {
-        let raw = match fetch(node) {
+        let raw = match node.block_template() {
             Ok(v) => v,
             Err(e) => {
                 ratum::lock(&self.status).error = Some("Could not fetch new template!".into());

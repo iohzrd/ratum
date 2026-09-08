@@ -284,7 +284,7 @@ fn main() {
         template_status: Arc::clone(&template_status),
         started: Instant::now(),
         csrf: api::csrf_token(),
-        config_path: cli.config.clone(),
+        config_path: cli.config,
         history: Mutex::default(),
     }));
     start_template_thread(&rt, Arc::clone(&server), template_status);

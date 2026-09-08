@@ -223,7 +223,7 @@ fn status_json(ctx: &Context, with_clients: bool) -> Value {
         "pool_host": pool_host_json(cfg),
         "pool_url": or_null(&cfg.datum.pool_url),
         "pool_pubkey": cfg.datum.pool_pubkey,
-        "pool_tag": pool.as_ref().map_or(cfg.mining.coinbase_tag_primary.clone(), |p| p.coinbase_tag.clone()),
+        "pool_tag": pool.as_ref().map_or_else(|| cfg.mining.coinbase_tag_primary.clone(), |p| p.coinbase_tag.clone()),
         "secondary_tag": cfg.mining.coinbase_tag_secondary,
         "pool_min_diff": pool.as_ref().map(|p| p.min_difficulty),
         "pool_motd": datum_stats.motd,

@@ -4,6 +4,9 @@ use std::time::Duration;
 
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The `getblocktemplate` rules every template request in this workspace asks for.
+const TEMPLATE_RULES: [&str; 2] = ["segwit", "blake2b"];
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("cannot parse RPC url {0:?}")]
@@ -199,10 +202,10 @@ impl Client {
         if status != 200 {
             return Err(Error::Http(status, json.to_string()));
         }
-        match parsed.get("result") {
-            Some(result) => Ok(result.clone()),
-            None => Err(Error::BadResponse("response carries neither result nor error".into())),
-        }
+        parsed
+            .get("result")
+            .cloned()
+            .ok_or_else(|| Error::BadResponse("response carries neither result nor error".into()))
     }
 
     pub fn url(&self) -> &str {
@@ -240,9 +243,13 @@ impl Client {
             .ok_or_else(|| Error::BadResponse("no height in waitforblockheight".into()))
     }
 
+    /// The node's block template under the rules this workspace builds blocks for.
+    pub fn block_template(&self) -> Result<serde_json::Value, Error> {
+        self.call("getblocktemplate", serde_json::json!([{"rules": TEMPLATE_RULES}]))
+    }
+
     pub fn next_block(&self) -> Result<NextBlock, Error> {
-        let result =
-            self.call("getblocktemplate", serde_json::json!([{"rules": ["segwit", "blake2b"]}]))?;
+        let result = self.block_template()?;
         let coinbase_value = result["coinbasevalue"]
             .as_u64()
             .ok_or_else(|| Error::BadResponse("no coinbasevalue".into()))?;

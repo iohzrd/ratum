@@ -85,7 +85,7 @@ pub fn extra_client(url: &str) -> Option<rpc::Client> {
     } else {
         format!(":{HTTP_PORT}")
     };
-    let slash = if path.is_empty() && !host.contains('/') { "" } else { "/" };
+    let slash = if host.contains('/') { "/" } else { "" };
     rpc::Client::new(&format!("{scheme}://{authority}{port}{slash}{path}"), user, pass).ok()
 }
 

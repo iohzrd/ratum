@@ -352,9 +352,6 @@ impl CoinbaserResponse {
         let mut outputs = Vec::new();
         let mut total: u64 = 0;
         while !b.at_end() {
-            if b.rest().len() < COINBASER_OUTPUT_FIXED_LEN {
-                return None;
-            }
             let v = b.u64("output value").ok()?;
             if total.saturating_add(v) > value {
                 break;

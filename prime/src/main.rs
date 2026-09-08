@@ -858,7 +858,7 @@ fn main() -> io::Result<()> {
     }
 
     let listener = TcpListener::bind(&listen)?;
-    let bound = listener.local_addr().map_or(listen.clone(), |a| a.to_string());
+    let bound = listener.local_addr().map_or_else(|_| listen.clone(), |a| a.to_string());
     info!("listening on {bound} (at most {max_connections} connections)");
     accept_connections(listener, &server);
     Ok(())

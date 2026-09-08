@@ -16,8 +16,13 @@ pub fn read_exact_deadline(
         match s.read(&mut buf[got..]) {
             Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed")),
             Ok(k) => got += k,
-            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::Interrupted
+                ) => {}
             Err(e) => return Err(e),
         }
     }

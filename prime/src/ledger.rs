@@ -333,7 +333,7 @@ impl Store {
         Ok((collected, read_back))
     }
 
-    fn retain(&mut self) -> io::Result<usize> {
+    fn retain(&self) -> io::Result<usize> {
         let Some(retain) = self.retain_bound else { return Ok(0) };
         let count = {
             let r = self.db.begin_read().map_err(to_io)?;
@@ -366,7 +366,7 @@ impl Store {
         })
     }
 
-    fn insert_block(&mut self, block: &FoundBlock) -> io::Result<bool> {
+    fn insert_block(&self, block: &FoundBlock) -> io::Result<bool> {
         self.write(|w| {
             let mut table = w.open_table(BLOCKS).map_err(to_io)?;
             if table.get(block.block_hash.as_slice()).map_err(to_io)?.is_some() {
@@ -385,7 +385,7 @@ impl Store {
         Ok(out)
     }
 
-    fn write_owed(&mut self, owed: &OwedBlock) -> io::Result<()> {
+    fn write_owed(&self, owed: &OwedBlock) -> io::Result<()> {
         self.write(|w| {
             w.open_table(OWED)
                 .map_err(to_io)?
@@ -395,7 +395,7 @@ impl Store {
         })
     }
 
-    fn remove_owed(&mut self, hash: &[u8; 32]) -> io::Result<()> {
+    fn remove_owed(&self, hash: &[u8; 32]) -> io::Result<()> {
         self.write(|w| {
             w.open_table(OWED).map_err(to_io)?.remove(hash.as_slice()).map_err(to_io)?;
             Ok(())
@@ -568,7 +568,7 @@ impl Ledger {
         self.cumulative_work += u128::from(difficulty);
         self.push(share);
         self.trim();
-        if let Some(store) = &mut self.store {
+        if let Some(store) = &self.store {
             match store.retain() {
                 Ok(removed) => self.removed = removed,
                 Err(e) => log::warn!("ledger retention failed; the share is recorded ({e})"),
@@ -585,7 +585,7 @@ impl Ledger {
         if self.blocks.iter().any(|b| b.block_hash == block.block_hash) {
             return Ok(());
         }
-        if let Some(store) = &mut self.store
+        if let Some(store) = &self.store
             && !store.insert_block(&block)?
         {
             return Ok(());
@@ -602,7 +602,7 @@ impl Ledger {
         if self.owed.iter().any(|o| o.block_hash == owed.block_hash) {
             return Ok(());
         }
-        if let Some(store) = &mut self.store {
+        if let Some(store) = &self.store {
             store.write_owed(&owed)?;
         }
         self.owed.push(owed);
@@ -622,7 +622,7 @@ impl Ledger {
         }
         let mut owed = self.owed[index].clone();
         owed.settled_at = Some(at.max(1));
-        if let Some(store) = &mut self.store {
+        if let Some(store) = &self.store {
             store.write_owed(&owed)?;
         }
         self.owed[index] = owed.clone();
@@ -633,7 +633,7 @@ impl Ledger {
         let Some(index) = self.owed.iter().position(|o| o.block_hash == *hash) else {
             return Ok(None);
         };
-        if let Some(store) = &mut self.store {
+        if let Some(store) = &self.store {
             store.remove_owed(hash)?;
         }
         Ok(Some(self.owed.remove(index)))

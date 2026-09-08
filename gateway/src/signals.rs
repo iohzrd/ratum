@@ -18,7 +18,7 @@ pub fn install(notify: Arc<Notify>) {
         warn!("could not create the SIGUSR1 pipe; SIGUSR1 is not handled");
         return;
     }
-    let (read_fd, write_fd) = (fds[0], fds[1]);
+    let [read_fd, write_fd] = fds;
     PIPE_WRITE.store(write_fd, Ordering::Relaxed);
     let installed = unsafe {
         libc::signal(libc::SIGUSR1, on_usr1 as extern "C" fn(libc::c_int) as libc::sighandler_t)

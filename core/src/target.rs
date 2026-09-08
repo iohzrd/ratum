@@ -82,7 +82,7 @@ pub fn difficulty_from_bits(bits: u32) -> Option<f64> {
 }
 
 fn be_to_f64(v: &Target) -> f64 {
-    v.iter().fold(0.0f64, |out, b| out * 256.0 + f64::from(*b))
+    v.iter().fold(0.0f64, |out, b| out.mul_add(256.0, f64::from(*b)))
 }
 
 /// The largest target a share at difficulty `2^exponent` may have: difficulty-1's target
@@ -119,7 +119,7 @@ pub fn share_nbits(exponent: u8) -> u32 {
 }
 
 pub fn floor_pot(diff: u64) -> u8 {
-    if diff == 0 { 0 } else { (u64::BITS - 1 - diff.leading_zeros()) as u8 }
+    if diff == 0 { 0 } else { diff.ilog2() as u8 }
 }
 
 pub fn diff_for_pot(exponent: u8) -> u64 {
