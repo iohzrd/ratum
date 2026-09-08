@@ -49,6 +49,14 @@ pub(crate) const ROTATE_AFTER: Duration = Duration::from_secs(600);
 /// Above the C gateway's largest stale window (270 s), so a gateway at any legal
 /// `share_stale_seconds` and `work_update_seconds` has stopped submitting on the slot.
 pub(crate) const DEFAULT_REVEAL_AFTER: Duration = Duration::from_secs(300);
+/// The seconds `--abw-reveal-after` accepts. Bounded above by the age rotation
+/// (`ROTATE_AFTER`), so at most a few slots await a reveal at once and the unrevealed slots'
+/// templates stay within the gateway's cache of 256 (240 periodic fetches at the longest
+/// delay and the shortest update interval).
+pub(crate) const REVEAL_AFTER_SECS_RANGE: std::ops::RangeInclusive<u64> = 1..=600;
+/// The slots a run of tips may retire within one `reveal_after`. `tip_rotation_allowed`
+/// divides `reveal_after` by it to get the age a slot must reach before a tip rotates it.
+const MAX_TIP_ROTATIONS_PER_REVEAL: u32 = 4;
 
 /// A slot the pool retired and has not revealed since.
 #[derive(Clone, Copy, Debug)]
@@ -237,7 +245,7 @@ impl AbwManager {
     /// not reach a slot again before its reveal. A tip that does not rotate costs nothing:
     /// the gateway's jobs on the slot are stale on the new tip either way.
     pub(crate) fn tip_rotation_allowed(&self, now: Instant) -> bool {
-        now.duration_since(self.activated_at) >= self.reveal_after / 4
+        now.duration_since(self.activated_at) >= self.reveal_after / MAX_TIP_ROTATIONS_PER_REVEAL
     }
 
     /// The 0xA5 receipt for a block the pool handled, so the gateway's reveal audit counts

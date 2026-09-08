@@ -31,6 +31,20 @@ const DUST_THRESHOLD_P2PKH: u64 = 546;
 /// The largest `--fee-bps` accepted: one percent.
 const MAX_FEE_BPS: u16 = 100;
 
+/// The default `--poll`: how often the pool asks the node for its tip when it has no block
+/// notification to wait on.
+const DEFAULT_POLL_SECS: f64 = 0.5;
+
+/// The default `--min-diff`, matching the gateway's `stratum.vardiff_min` default so a
+/// gateway's own floor is not raised by connecting to this pool.
+const DEFAULT_MIN_DIFFICULTY: u64 = 16384;
+
+/// The default `--max-connections`. Each connection is a gateway served by its own thread,
+/// so this bounds threads, file descriptors and memory, and limits a connection flood. It is
+/// not a protocol limit; a larger pool raises it together with the process file-descriptor
+/// and thread limits.
+const DEFAULT_MAX_CONNECTIONS: usize = 1024;
+
 /// Where the share ledger lives, as far as the command line settles it.
 enum LedgerLocation {
     /// `--ledger <file>`: this file, whatever chain the node is on.
@@ -220,7 +234,7 @@ fn settle_block(location: &LedgerLocation, arg: &str) -> io::Result<()> {
             std::process::exit(2);
         }
     };
-    match ledger.settle_owed(&hash, server::unix_now())? {
+    match ledger.settle_owed(&hash, ratum::unix_now())? {
         Some(o) => {
             print_owed(&o);
             Ok(())
@@ -351,32 +365,28 @@ fn main() -> io::Result<()> {
         "true or false",
         |_| true,
     );
+    let reveal_range = abw::REVEAL_AFTER_SECS_RANGE;
+    let reveal_must_be = format!("{} to {} (seconds)", reveal_range.start(), reveal_range.end());
     let abw_reveal_after = cli::resolve::<u64>(
         c.abw_reveal_after.as_deref(),
         f.abw_reveal_after,
         abw::DEFAULT_REVEAL_AFTER.as_secs(),
         "--abw-reveal-after",
-        "1 to 600 (seconds)",
-        // Bounded by the age rotation (`abw::ROTATE_AFTER`), so at most a few slots await a
-        // reveal at once and the unrevealed slots' templates stay within the gateway's cache
-        // of 256 (240 periodic fetches at the longest delay and shortest update interval).
-        |n| (1..=600).contains(n),
+        &reveal_must_be,
+        |n| reveal_range.contains(n),
     );
     let min_difficulty = cli::resolve::<u64>(
         c.min_diff.as_deref(),
         f.min_diff,
-        16384,
+        DEFAULT_MIN_DIFFICULTY,
         "--min-diff",
         "a power of two",
         |n| n.is_power_of_two(),
     );
-    // Each connection is a gateway served by its own thread, so this bounds threads, file
-    // descriptors and memory, and limits a connection flood. It is not a protocol limit. A
-    // larger pool raises this together with the process file-descriptor and thread limits.
     let max_connections = cli::resolve::<usize>(
         c.max_connections.as_deref(),
         f.max_connections,
-        1024,
+        DEFAULT_MAX_CONNECTIONS,
         "--max-connections",
         "a positive number",
         |n| *n > 0,
@@ -449,13 +459,16 @@ fn main() -> io::Result<()> {
     let mut rpc_user = cli::resolve_str(c.rpc_user.clone(), f.rpc_user, "");
     let mut rpc_pass = cli::resolve_str(c.rpc_pass.clone(), f.rpc_pass, "");
     let rpc_cookie = c.rpc_cookie.clone().or(f.rpc_cookie);
+    // An hour: above the block interval, so a poll this slow already misses tips, and it
+    // bounds the value a typo can set the interval to.
+    let max_poll_secs = ratum::SECS_PER_HOUR as f64;
     let poll = Duration::from_secs_f64(cli::resolve::<f64>(
         c.poll.as_deref(),
         f.poll,
-        0.5,
+        DEFAULT_POLL_SECS,
         "--poll",
-        "a positive number of seconds up to 3600",
-        |n| n.is_finite() && *n > 0.0 && *n <= 3600.0,
+        &format!("a positive number of seconds up to {max_poll_secs:.0}"),
+        |n| n.is_finite() && *n > 0.0 && *n <= max_poll_secs,
     ));
 
     // Whether these were on the command line (as opposed to the config file), for the

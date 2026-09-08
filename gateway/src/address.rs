@@ -5,7 +5,8 @@
 
 use bech32::Hrp;
 use ratum::bitcoin::opcode::{
-    OP_0, OP_1, OP_16, OP_CHECKSIG, OP_DUP, OP_EQUAL, OP_EQUALVERIFY, OP_HASH160, OP_RETURN,
+    OP_0, OP_1, OP_16, OP_CHECKSIG, OP_DUP, OP_EQUAL, OP_EQUALVERIFY, OP_HASH160, OP_N_BASE,
+    OP_RETURN,
 };
 
 /// `base58Prefixes[PUBKEY_ADDRESS]` and `[SCRIPT_ADDRESS]` (`kernel/chainparams.cpp`):
@@ -19,16 +20,21 @@ const SCRIPT_ADDRESS_TEST: u8 = 196;
 const HASH160_SIZE: usize = 20;
 const BASE58_PAYLOAD_SIZE: usize = 1 + HASH160_SIZE;
 
-/// `OP_DUP OP_HASH160 <20> ... OP_EQUALVERIFY OP_CHECKSIG`.
+/// `OP_DUP OP_HASH160 <20> ... OP_EQUALVERIFY OP_CHECKSIG`, and where the HASH160 sits in it.
 const P2PKH_SIZE: usize = 25;
-/// `OP_HASH160 <20> ... OP_EQUAL`.
+const P2PKH_HASH_AT: std::ops::Range<usize> = 3..3 + HASH160_SIZE;
+/// `OP_HASH160 <20> ... OP_EQUAL`, and where the HASH160 sits in it.
 const P2SH_SIZE: usize = 23;
-/// The witness program lengths a witness version 0 output may carry: P2WPKH and P2WSH.
-const WITNESS_V0_PROGRAM_SIZES: [usize; 2] = [HASH160_SIZE, 32];
+const P2SH_HASH_AT: std::ops::Range<usize> = 2..2 + HASH160_SIZE;
 /// A witness version 1 output carries only the 32-byte P2TR program.
 const WITNESS_V1_PROGRAM_SIZE: usize = 32;
+/// The witness program lengths a witness version 0 output may carry: the 20-byte P2WPKH
+/// program and the 32-byte P2WSH one, which is as long as the P2TR program.
+const WITNESS_V0_PROGRAM_SIZES: [usize; 2] = [HASH160_SIZE, WITNESS_V1_PROGRAM_SIZE];
 /// The witness program lengths BIP141 allows at all.
 const WITNESS_PROGRAM_SIZES: std::ops::RangeInclusive<usize> = 2..=40;
+/// A witness output's script before its program: the version opcode and the program length.
+const WITNESS_SCRIPT_PREFIX_SIZE: usize = 2;
 
 /// The shortest string `addr_2_output_script` examines at all.
 const MIN_ADDRESS_CHARS: usize = 16;
@@ -61,7 +67,7 @@ pub fn to_output_script(addr: &str) -> Option<Vec<u8>> {
         if !ok {
             return None;
         }
-        let mut script = Vec::with_capacity(2 + program.len());
+        let mut script = Vec::with_capacity(WITNESS_SCRIPT_PREFIX_SIZE + program.len());
         script.push(witness_version_opcode(v));
         script.push(program.len() as u8);
         script.extend_from_slice(&program);
@@ -92,7 +98,7 @@ pub fn to_output_script(addr: &str) -> Option<Vec<u8>> {
 /// The opcode a witness program's version is written as: `OP_0` for version 0, `OP_1`
 /// through `OP_16` above it (`CScript() << CScript::EncodeOP_N(version)`).
 fn witness_version_opcode(version: u8) -> u8 {
-    if version == 0 { OP_0 } else { OP_1 - 1 + version }
+    if version == 0 { OP_0 } else { OP_N_BASE + version }
 }
 
 pub fn is_valid(addr: &str) -> bool {
@@ -122,22 +128,25 @@ pub fn output_script_to_display(script: &[u8]) -> String {
         && script[1] == HASH160_SIZE as u8
         && script[P2SH_SIZE - 1] == OP_EQUAL
     {
-        return base58check(SCRIPT_ADDRESS_MAIN, &script[2..2 + HASH160_SIZE]);
+        return base58check(SCRIPT_ADDRESS_MAIN, &script[P2SH_HASH_AT]);
     }
     if script.len() == P2PKH_SIZE
         && script[0] == OP_DUP
         && script[1] == OP_HASH160
         && script[2] == HASH160_SIZE as u8
     {
-        return base58check(PUBKEY_ADDRESS_MAIN, &script[3..3 + HASH160_SIZE]);
+        return base58check(PUBKEY_ADDRESS_MAIN, &script[P2PKH_HASH_AT]);
     }
-    if script.len() >= 4 && (script[0] == OP_0 || (OP_1..=OP_16).contains(&script[0])) {
-        let version = if script[0] == OP_0 { 0 } else { script[0] - (OP_1 - 1) };
+    let shortest_witness = WITNESS_SCRIPT_PREFIX_SIZE + WITNESS_PROGRAM_SIZES.start();
+    if script.len() >= shortest_witness
+        && (script[0] == OP_0 || (OP_1..=OP_16).contains(&script[0]))
+    {
+        let version = if script[0] == OP_0 { 0 } else { script[0] - OP_N_BASE };
         let len = script[1] as usize;
         if WITNESS_PROGRAM_SIZES.contains(&len)
-            && script.len() == 2 + len
+            && script.len() == WITNESS_SCRIPT_PREFIX_SIZE + len
             && let (Ok(hrp), Ok(v)) = (Hrp::parse("bc"), bech32::Fe32::try_from(version))
-            && let Ok(s) = bech32::segwit::encode(hrp, v, &script[2..])
+            && let Ok(s) = bech32::segwit::encode(hrp, v, &script[WITNESS_SCRIPT_PREFIX_SIZE..])
         {
             return s;
         }

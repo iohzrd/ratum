@@ -10,7 +10,6 @@
 use crate::abw::AbwManager;
 use crate::server::{
     Payability, Resolver, SavedSession, Server, SessionState, dictated_outputs, owed_for_block,
-    unix_now,
 };
 use log::{debug, error, info, warn};
 use mio::net::TcpStream as PolledStream;
@@ -46,18 +45,24 @@ use std::time::{Duration, Instant};
 /// narrow.
 const COINBASE_VALUE_TOLERANCE: f64 = 2.0;
 
+/// How many leading payload bytes a debug line shows, and how many hex characters of a
+/// public key or a block hash it shows: enough to tell one from another in a log.
+const LOG_PAYLOAD_BYTES: usize = 16;
+const LOG_HEX_CHARS: usize = 16;
+
 fn describe(header: Header, payload: &[u8]) -> String {
     let sub = payload.first().copied();
     let name = match (header.proto_cmd, sub) {
-        (framing::cmd::MINING, Some(0x10)) => "coinbaser request",
-        (framing::cmd::MINING, Some(0x27)) => "share submission",
-        (framing::cmd::MINING, Some(0x50)) => "job validation response",
+        (framing::cmd::MINING, Some(client_subcmd::COINBASER_REQUEST)) => "coinbaser request",
+        (framing::cmd::MINING, Some(client_subcmd::SUBMIT_POW)) => "share submission",
+        (framing::cmd::MINING, Some(client_subcmd::VALIDATION)) => "job validation response",
         (framing::cmd::MINING, _) => "mining (unknown sub-command)",
         (framing::cmd::BULK, _) => "bulk fragment",
         (framing::cmd::HELLO_OR_PING, _) => "ping",
         _ => "unknown",
     };
-    let head: Vec<String> = payload.iter().take(16).map(|b| format!("{b:02x}")).collect();
+    let head: Vec<String> =
+        payload.iter().take(LOG_PAYLOAD_BYTES).map(|b| format!("{b:02x}")).collect();
     format!("{name}: {} bytes [{}...]", payload.len(), head.join(""))
 }
 
@@ -147,8 +152,8 @@ pub(crate) fn handle(mut stream: TcpStream, server: &Server) -> io::Result<()> {
         "[{peer}] hello ok: ua={:?} nk={:#010x} client={} session={} generation={}",
         hello.user_agent,
         hello.nk,
-        &hex::encode(hello.client_sign_pk)[..16],
-        &hex::encode(hello.session_sign_pk)[..16],
+        &hex::encode(hello.client_sign_pk)[..LOG_HEX_CHARS],
+        &hex::encode(hello.session_sign_pk)[..LOG_HEX_CHARS],
         match generation {
             Generation::V1 => "v1",
             Generation::V3 { .. } => "v3",
@@ -517,7 +522,7 @@ impl Connection<'_> {
             // rotate the assignment the session was seeded with.
             let tip_replaced = self.known_tip.is_some();
             self.known_tip = current;
-            self.verifier.set_tip(current, unix_now());
+            self.verifier.set_tip(current, ratum::unix_now());
             // The watcher publishes the template's bits before the tip hash, so the bits read
             // here belong to this tip. The verifier refuses a job on the tip that claims an
             // easier target than the node's own next block.
@@ -739,7 +744,7 @@ impl Connection<'_> {
         info!(
             "[{peer}]   -> coinbaser request: {} sats, prev {}",
             req.value,
-            &hex::encode(req.prev_hash)[..16]
+            &hex::encode(req.prev_hash)[..LOG_HEX_CHARS]
         );
         if let Some(reference) = *lock(&self.server.node_view.coinbase_value) {
             let low = (reference as f64 / COINBASE_VALUE_TOLERANCE) as u64;
@@ -809,7 +814,7 @@ impl Connection<'_> {
                     .map_or_else(String::new, |(identity, _)| identity.clone())
             })
             .collect();
-        self.verifier.record_dictated(&response, identities, unix_now());
+        self.verifier.record_dictated(&response, identities, ratum::unix_now());
         self.send_mining(&payload, false)?;
         info!(
             "[{peer}]   <- coinbaser response ({} outputs, id {coinbaser_id})",
@@ -829,7 +834,7 @@ impl Connection<'_> {
                     debug!("[{peer}]   -> share {}", describe_share(&s));
                     // The gateway retains a proof per share until the slot's reveal.
                     self.with_abw(AbwManager::note_share);
-                    let (verdict, pending, raw_hash) = self.check_share(&s, unix_now())?;
+                    let (verdict, pending, raw_hash) = self.check_share(&s, ratum::unix_now())?;
                     (
                         verdict,
                         s.nonce,
@@ -857,8 +862,11 @@ impl Connection<'_> {
                     // The fields the response echoes, from the fixed prefix when that much
                     // decoded: the C gateway retires the share's replay entry by them, and
                     // would replay the share on every reconnect otherwise.
-                    let (job_id, target_byte, nonce) =
-                        PowSubmit::prefix(plain).unwrap_or((0, 0xff, 0));
+                    let (job_id, target_byte, nonce) = PowSubmit::prefix(plain).unwrap_or((
+                        0,
+                        ratum::datum::coinbase::POT_TARGET_PLACEHOLDER,
+                        0,
+                    ));
                     (
                         ShareVerdict::Rejected(Verifier::reason_for_decode_error(&e)),
                         nonce,
@@ -1252,7 +1260,7 @@ impl Connection<'_> {
 
     fn on_block_txns(&mut self, plain: &[u8]) {
         let peer = self.peer;
-        match plain.get(1).copied() {
+        match plain.get(validation::SELECTOR_AT).copied() {
             Some(validation::response::BLOCK_TXNS) => {
                 match TxnBundle::decode(plain, validation::response::BLOCK_TXNS) {
                     Ok(bundle) => {

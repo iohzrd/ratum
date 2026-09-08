@@ -8,6 +8,15 @@ use log::info;
 use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
+/// The entries the table holds at the least, whatever capacity the caller asks for.
+const MIN_CAPACITY: usize = 1024;
+/// The percent of the table a prune must free for the table to keep its size; freeing less
+/// grows it instead, as the C gateway's `i < ((dupes->max_items * 95)/100)` check does.
+const MIN_FREED_PERCENT: usize = 5;
+/// The percent the table grows by when a prune frees less than that, the C gateway's
+/// `new_max = ((dupes->max_items * 125)/100)`.
+const GROWTH_PERCENT: usize = 25;
+
 pub struct Dupes {
     seen: HashSet<[u8; 32]>,
     /// Every remembered hash with the creation time of its job, in insertion order.
@@ -20,7 +29,12 @@ pub struct Dupes {
 
 impl Dupes {
     pub fn new(capacity: usize, window: Duration) -> Self {
-        Dupes { seen: HashSet::new(), order: VecDeque::new(), capacity: capacity.max(1024), window }
+        Dupes {
+            seen: HashSet::new(),
+            order: VecDeque::new(),
+            capacity: capacity.max(MIN_CAPACITY),
+            window,
+        }
     }
 
     #[cfg(test)]
@@ -40,8 +54,8 @@ impl Dupes {
         }
         if self.order.len() >= self.capacity {
             let freed = self.prune();
-            if freed < self.capacity / 20 {
-                self.capacity += self.capacity / 4;
+            if freed < self.capacity * MIN_FREED_PERCENT / 100 {
+                self.capacity += self.capacity * GROWTH_PERCENT / 100;
                 info!(
                     "duplicate-share table grown to {} entries: {freed} of {} were stale",
                     self.capacity,

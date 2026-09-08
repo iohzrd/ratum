@@ -32,3 +32,13 @@ pub const UID_PUSH_SIZE_V1: usize = UID_PUSH_PREFIX_SIZE + size_of::<u32>();
 /// The uid push carrying the full 64-bit prime id (the version 3 protocol; the C gateway's
 /// 0x0B push).
 pub const UID_PUSH_SIZE_V3: usize = UID_PUSH_PREFIX_SIZE + size_of::<u64>();
+
+/// The extranonce prefix the gateway writes ahead of the twelve extranonce bytes, so that
+/// two jobs built from the same template still differ (`s->enprefix` in `datum_stratum.c`).
+pub const ENPREFIX_SIZE: usize = 2;
+/// The extranonce push the assembler writes: a one-byte push opcode covering the enprefix
+/// and the extranonce.
+pub const EXTRANONCE_PUSH_SIZE: usize = 1 + ENPREFIX_SIZE + super::share::EXTRANONCE_SIZE;
+/// The marker bytes a tag push carries besides the tags: `TAG_SEPARATOR` between them and
+/// `TAG_END` after the last.
+pub const TAG_MARKER_BYTES: usize = 2;

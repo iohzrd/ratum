@@ -34,7 +34,10 @@ const H2_MM_RHS_OFFSET: usize = 64;
 /// hasher prepends itself.
 pub const WORK_ROOT_LEAF_SIZE: usize = 52;
 /// The offset of H2 in the leaf, after the leading zero word.
-const WORK_ROOT_H2_OFFSET: usize = 4;
+pub const WORK_ROOT_H2_OFFSET: usize = 4;
+/// The zero bytes stratum's `coinb1` carries ahead of H2: the leaf's leading zero word less
+/// its first byte, which the Siacoin hasher prepends itself.
+pub const COINB1_LEADING_ZEROS: usize = WORK_ROOT_H2_OFFSET - 1;
 /// The offset of the extranonce in the leaf, after H2.
 const WORK_ROOT_EXTRANONCE_OFFSET: usize = 36;
 
@@ -325,12 +328,13 @@ pub fn xor_mask(xor_key: &U128, clear_bits: u8) -> [u8; 32] {
         return [0u8; 32];
     }
     let mut m = tagged_sha256("Bitcoin block hash PoW XOR mask", xor_key);
-    let clear_bytes = usize::from(clear_bits / 8);
+    let bits_per_byte = u8::BITS as u8;
+    let clear_bytes = usize::from(clear_bits / bits_per_byte);
     for b in m.iter_mut().take(clear_bytes) {
         *b = 0;
     }
     if let Some(b) = m.get_mut(clear_bytes) {
-        *b &= 0xffu8 >> (clear_bits % 8);
+        *b &= u8::MAX >> (clear_bits % bits_per_byte);
     }
     m
 }

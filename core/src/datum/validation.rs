@@ -94,12 +94,14 @@ impl From<Truncated> for Error {
     }
 }
 
-/// Every validation request starts with the mining sub-command, the request selector and the
-/// job index; the rest is the request's own payload.
-pub const REQUEST_HEADER_LEN: usize = 3;
+/// Every validation message, in either direction, starts with the mining sub-command, the
+/// selector naming the request or reply, and the job index; the rest is its own payload.
+pub const SELECTOR_AT: usize = 1;
+pub const JOB_INDEX_AT: usize = 2;
+pub const REQUEST_HEADER_LEN: usize = JOB_INDEX_AT + 1;
 /// The exact plaintext length the C handler requires of a parent fetch: the header and the
 /// 32-byte parent hash, with no trailing padding.
-pub const PARENT_FETCH_REQUEST_LEN: usize = REQUEST_HEADER_LEN + 32;
+pub const PARENT_FETCH_REQUEST_LEN: usize = REQUEST_HEADER_LEN + crate::bitcoin::HASH_SIZE;
 
 pub fn request_short_txn_list(job_index: u8) -> Vec<u8> {
     vec![VALIDATION, request::SHORT_TXN_LIST, job_index]
@@ -181,7 +183,8 @@ pub struct ParentFetchReply {
 /// What a parent fetch reply holds besides the block: the mining sub-command, the reply
 /// selector, the job index, the status, the parent hash, the block's length and the
 /// terminator. `datum_protocol_parent_fetch_reply` writes `41 + block_size` bytes.
-pub const PARENT_FETCH_REPLY_OVERHEAD: usize = 4 + 32 + size_of::<u32>() + 1;
+pub const PARENT_FETCH_REPLY_OVERHEAD: usize =
+    (REQUEST_HEADER_LEN + 1) + crate::bitcoin::HASH_SIZE + size_of::<u32>() + 1;
 
 /// The largest block a parent fetch reply carries, the C gateway's
 /// `DATUM_PARENT_FETCH_MAX_BLOCK_BYTES`: one byte under what the overhead alone leaves,

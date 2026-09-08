@@ -12,8 +12,13 @@ pub const SECTION_ABW_SLOT: u8 = 0x05;
 /// Sub-field markers inside the BLAKE2b section.
 pub const BLAKE2B_ALGORITHM: u8 = 0x01;
 pub const BLAKE2B_TIME: u8 = 0x04;
-/// Bit 3 of the flags byte: the C gateway sets `DATUM_POW_FLAG_BLAKE2B` on every submit.
-/// The decoder reads bits 0 to 2 only.
+/// The flags byte of the submit-POW message. The C gateway writes bits 0 to 2 as
+/// `(is_block ? 1 : 0) | (subsidy_only ? 2 : 0) | (quickdiff ? 4 : 0)` (`datum_protocol.c`,
+/// which has no named constants for them) and adds `DATUM_POW_FLAG_BLAKE2B` in bit 3. The
+/// decoder reads bits 0 to 2 only.
+pub const FLAG_IS_BLOCK: u8 = 0x01;
+pub const FLAG_SUBSIDY_ONLY: u8 = 0x02;
+pub const FLAG_QUICKDIFF: u8 = 0x04;
 pub const FLAG_BLAKE2B: u8 = 0x08;
 /// Bit 0 of the first reserved byte of the submit-POW message: set when the header's
 /// `FLAG_USE_TIME_OFFSET` (m_flags bit 2) is set; the header bit itself is not sent. The
@@ -36,6 +41,15 @@ pub const EXTRANONCE_V2_PAD: usize = EXTRANONCE_SIZE_V2 - EXTRANONCE_SIZE;
 pub const EXTRANONCE1_SIZE: usize = EXTRANONCE_V2_PAD + size_of::<u32>();
 /// The extranonce2 the miner fills, the rest of the header's extranonce field.
 pub const EXTRANONCE2_SIZE: usize = EXTRANONCE_SIZE_V2 - EXTRANONCE1_SIZE;
+/// A Sia stratum nonce or time field, the pair the BLAKE2b section carries. Each holds two
+/// of the version 2 header's 32-bit fields, so the halves are `size_of::<u32>()` apart.
+pub const SIA_FIELD_SIZE: usize = 2 * size_of::<u32>();
+/// Each field's halves: the low one first, as `datum_blake2b_serialize_block_header` places
+/// them.
+pub const SIA_FIELD_HALF: usize = size_of::<u32>();
+/// The bytes the gateway reserves after the username's terminator, of which bit 0 of the
+/// first is `RESERVED_USE_TIME_OFFSET`.
+pub const RESERVED_SIZE: usize = 4;
 /// The coinbase index for subsidy-only work: the gateway's literal 255 (a comment in
 /// `datum_stratum.h`; no named constant).
 pub const COINBASE_ID_SUBSIDY_ONLY: u8 = 0xFF;
@@ -131,8 +145,8 @@ impl CoinbaseSection {
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Blake2bSection {
-    pub sia_ntime: [u8; 8],
-    pub sia_nonce: [u8; 8],
+    pub sia_ntime: [u8; SIA_FIELD_SIZE],
+    pub sia_nonce: [u8; SIA_FIELD_SIZE],
     /// The job's time, as the header's time field serializes it (Knots `GetTimeOnWire`); the
     /// block time is this plus `m_time_offset` when the time-offset flag is set. The hardware
     /// never changes it.
@@ -164,23 +178,23 @@ impl Blake2bSection {
     /// into the two eight-byte Sia fields, and the time as the header serializes it. The
     /// inverse of `nonce_fields`, `time_fields` and `HeaderV2::time_on_wire`.
     pub fn from_header(h: &HeaderV2) -> Self {
-        let mut sia_nonce = [0u8; 8];
-        sia_nonce[..4].copy_from_slice(&h.nonce.to_le_bytes());
-        sia_nonce[4..].copy_from_slice(&h.nonce2.to_le_bytes());
-        let mut sia_ntime = [0u8; 8];
-        sia_ntime[..4].copy_from_slice(&h.time_offset.to_le_bytes());
-        sia_ntime[4..].copy_from_slice(&h.nonce3.to_le_bytes());
+        let mut sia_nonce = [0u8; SIA_FIELD_SIZE];
+        sia_nonce[..SIA_FIELD_HALF].copy_from_slice(&h.nonce.to_le_bytes());
+        sia_nonce[SIA_FIELD_HALF..].copy_from_slice(&h.nonce2.to_le_bytes());
+        let mut sia_ntime = [0u8; SIA_FIELD_SIZE];
+        sia_ntime[..SIA_FIELD_HALF].copy_from_slice(&h.time_offset.to_le_bytes());
+        sia_ntime[SIA_FIELD_HALF..].copy_from_slice(&h.nonce3.to_le_bytes());
         Blake2bSection { sia_ntime, sia_nonce, time_on_wire: h.time_on_wire() }
     }
 
     /// `nNonce` and `m_nonce2`, in that order.
     pub fn nonce_fields(&self) -> (u32, u32) {
-        (le32(&self.sia_nonce[..4]), le32(&self.sia_nonce[4..]))
+        (le32(&self.sia_nonce[..SIA_FIELD_HALF]), le32(&self.sia_nonce[SIA_FIELD_HALF..]))
     }
 
     /// `m_time_offset` and `m_nonce3`, in that order.
     pub fn time_fields(&self) -> (u32, u32) {
-        (le32(&self.sia_ntime[..4]), le32(&self.sia_ntime[4..]))
+        (le32(&self.sia_ntime[..SIA_FIELD_HALF]), le32(&self.sia_ntime[SIA_FIELD_HALF..]))
     }
 }
 
@@ -228,10 +242,11 @@ impl PowSubmit {
         self.job.as_ref().map_or(job.target_byte_index, |j| j.target_byte_index)
     }
 
+    /// `2^target_byte`. `diff_for_pot` masks the shift, which this relies on: it is also
+    /// called on shares that have not been checked yet, where `verify::reconstruct` rejects a
+    /// target byte above `target::MAX_TARGET_POT`.
     pub fn difficulty(&self) -> u64 {
-        // Masked because this is also called on shares that have not been checked yet,
-        // where `verify::reconstruct` rejects a target byte of 64 or more.
-        1u64 << (self.target_byte & 63)
+        crate::target::diff_for_pot(self.target_byte)
     }
 
     /// The job id, target byte and nonce from the message's fixed prefix, for the response
@@ -271,8 +286,8 @@ impl PowSubmit {
             rest.iter().take(MAX_USERNAME + 1).position(|&b| b == 0).ok_or(Error::BadUsername)?;
         let username = String::from_utf8_lossy(&rest[..nul]).into_owned();
         r.advance(nul + 1, "username")?;
-        // Four bytes the gateway reserves. Bit 0 of the first is the time-offset selector.
-        let reserved = r.take(4, "reserved")?;
+        // The bytes the gateway reserves. Bit 0 of the first is the time-offset selector.
+        let reserved = r.take(RESERVED_SIZE, "reserved")?;
         let use_time_offset = reserved[0] & RESERVED_USE_TIME_OFFSET != 0;
 
         let mut job = None;
@@ -330,8 +345,8 @@ impl PowSubmit {
                     if r.u8("algorithm")? != BLAKE2B_ALGORITHM {
                         return Err(Error::BadBlake2bSection);
                     }
-                    let sia_ntime: [u8; 8] = r.arr("sia ntime")?;
-                    let sia_nonce: [u8; 8] = r.arr("sia nonce")?;
+                    let sia_ntime: [u8; SIA_FIELD_SIZE] = r.arr("sia ntime")?;
+                    let sia_nonce: [u8; SIA_FIELD_SIZE] = r.arr("sia nonce")?;
                     if r.u8("time marker")? != BLAKE2B_TIME {
                         return Err(Error::BadBlake2bSection);
                     }
@@ -346,9 +361,9 @@ impl PowSubmit {
         Ok(PowSubmit {
             job_id,
             coinbase_id,
-            is_block: flags & 1 != 0,
-            subsidy_only: flags & 2 != 0,
-            quickdiff: flags & 4 != 0,
+            is_block: flags & FLAG_IS_BLOCK != 0,
+            subsidy_only: flags & FLAG_SUBSIDY_ONLY != 0,
+            quickdiff: flags & FLAG_QUICKDIFF != 0,
             target_byte,
             ntime,
             nonce,
@@ -368,10 +383,11 @@ impl PowSubmit {
         out.push(SUBMIT_POW);
         out.push(self.job_id);
         out.push(self.coinbase_id);
+        let flag = |set: bool, bit: u8| if set { bit } else { 0 };
         out.push(
-            (self.is_block as u8)
-                | ((self.subsidy_only as u8) << 1)
-                | ((self.quickdiff as u8) << 2)
+            flag(self.is_block, FLAG_IS_BLOCK)
+                | flag(self.subsidy_only, FLAG_SUBSIDY_ONLY)
+                | flag(self.quickdiff, FLAG_QUICKDIFF)
                 | FLAG_BLAKE2B,
         );
         out.push(self.target_byte);
@@ -382,7 +398,7 @@ impl PowSubmit {
         out.extend_from_slice(&self.extranonce);
         out.extend_from_slice(self.username.as_bytes());
         out.push(0);
-        let mut reserved = [0u8; 4];
+        let mut reserved = [0u8; RESERVED_SIZE];
         if self.use_time_offset {
             reserved[0] |= RESERVED_USE_TIME_OFFSET;
         }

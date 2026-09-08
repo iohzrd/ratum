@@ -13,7 +13,7 @@ use ratum_prime::verify::{PoolPolicy, ReplayGuard, Splits};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 /// What the node watcher maintains and every other thread reads, shared as one
 /// `Arc<NodeView>` between the watcher and `Server`.
@@ -118,7 +118,7 @@ pub(crate) fn watch_node(
                     last = Some(t.hash);
                     have_template = false;
                     let mut history = lock(&view.tip_history);
-                    history.push_back((t.height, unix_now()));
+                    history.push_back((t.height, ratum::unix_now()));
                     while history.len() > TIP_HISTORY_CAP {
                         history.pop_front();
                     }
@@ -406,10 +406,6 @@ impl PayoutPolicy {
 /// change to the fee or split parameters reaches all three.
 pub(crate) fn split_after_fee(l: &Ledger, payout: &PayoutPolicy, value: u64) -> Vec<(String, u64)> {
     l.split(payout.miners_share(value), payout.min_payout, messages::MAX_COINBASER_OUTPUTS)
-}
-
-pub(crate) fn unix_now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
 pub(crate) struct Resolver {

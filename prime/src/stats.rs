@@ -9,12 +9,12 @@
 //! started only when `--stats-listen` names an address; bind it to `127.0.0.1` unless it
 //! is behind a reverse proxy, since the page is unauthenticated.
 
-use crate::server::{Resolver, Server, split_after_fee, unix_now};
+use crate::server::{Resolver, Server, split_after_fee};
 use log::warn;
 use ratum::http;
 use ratum::lock;
 use ratum_prime::ledger::FoundBlock;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -36,17 +36,12 @@ const DESCRIPTION: &str = "Non-custodial Bitcoin BLAKE2b mining pool on the Bitc
 /// reflects a rig starting or stopping within minutes.
 const HASHRATE_SPAN_SECS: u64 = 10 * ratum::SECS_PER_MINUTE;
 
-/// Expected hashes per unit of share difficulty: a 256-bit hash meets the difficulty 1
-/// target (2^224) once in 2^32 tries. The BLAKE2b fork keeps the compact-target encoding, so
-/// the constant is unchanged.
-const HASHES_PER_DIFFICULTY: f64 = 4_294_967_296.0;
-
 /// `work` difficulty units over `secs` seconds as hashes per second.
 fn hashes_per_second(work: u128, secs: u64) -> f64 {
     if secs == 0 {
         return 0.0;
     }
-    work as f64 * HASHES_PER_DIFFICULTY / secs as f64
+    work as f64 * ratum::HASHES_PER_DIFFICULTY / secs as f64
 }
 
 /// The chain's retarget parameters, for the estimate the stats page shows. `nPowTargetSpacing`
@@ -63,30 +58,16 @@ const MAX_RETARGET_FACTOR: f64 = 4.0;
 /// How many of the newest recorded blocks the snapshot lists.
 const RECENT_BLOCKS: usize = 50;
 
-/// The pool-hashrate history the snapshot serves for the page's chart: one sample per
-/// interval, kept in memory for a day. It begins when the stats interface starts, so a
-/// restart shows as a gap in the chart.
-const HISTORY_INTERVAL_SECS: u64 = ratum::SECS_PER_MINUTE;
-const HISTORY_CAP: usize = (ratum::SECS_PER_DAY / HISTORY_INTERVAL_SECS) as usize;
-
-/// Append one sample and discard the oldest beyond the cap.
-fn push_sample(history: &mut VecDeque<(u64, f64)>, at: u64, hs: f64) {
-    history.push_back((at, hs));
-    while history.len() > HISTORY_CAP {
-        history.pop_front();
-    }
-}
-
 /// The sample ring, owned by `spawn`: the sampler thread appends and the snapshot reads,
 /// and the rest of the pool has no use for it.
-type HashrateHistory = Arc<Mutex<VecDeque<(u64, f64)>>>;
+type HashrateHistory = Arc<Mutex<ratum::web::History>>;
 
 /// Record the hashrate estimate as of now: the same figure the snapshot computes on
 /// request, from the shares accepted in the last `HASHRATE_SPAN_SECS`.
-fn sample_hashrate(server: &Server, history: &Mutex<VecDeque<(u64, f64)>>) {
-    let now = unix_now();
+fn sample_hashrate(server: &Server, history: &Mutex<ratum::web::History>) {
+    let now = ratum::unix_now();
     let (work, _) = lock(&server.ledger).work_since(now.saturating_sub(HASHRATE_SPAN_SECS));
-    push_sample(&mut lock(history), now, hashes_per_second(work, HASHRATE_SPAN_SECS));
+    ratum::web::push_sample(&mut lock(history), now, hashes_per_second(work, HASHRATE_SPAN_SECS));
 }
 
 /// Blocks found per block expected, as a percent, over the recorded block history: for each
@@ -120,12 +101,12 @@ pub(crate) fn spawn(server: Arc<Server>, listen: &str) -> Result<SocketAddr, Str
     let addr = http.server_addr().to_ip().ok_or("no socket address")?;
     // The chart's history: one sample now, so the snapshot never serves an empty list,
     // then one per interval from a thread of its own.
-    let history: HashrateHistory = Arc::new(Mutex::new(VecDeque::new()));
+    let history: HashrateHistory = Arc::new(Mutex::new(ratum::web::History::new()));
     sample_hashrate(&server, &history);
     let (sampler, sampler_history) = (Arc::clone(&server), Arc::clone(&history));
     std::thread::spawn(move || {
         loop {
-            std::thread::sleep(std::time::Duration::from_secs(HISTORY_INTERVAL_SECS));
+            std::thread::sleep(std::time::Duration::from_secs(ratum::web::HISTORY_INTERVAL_SECS));
             sample_hashrate(&sampler, &sampler_history);
         }
     });
@@ -139,7 +120,7 @@ pub(crate) fn spawn(server: Arc<Server>, listen: &str) -> Result<SocketAddr, Str
 
 fn handle(
     server: &Server,
-    history: &Mutex<VecDeque<(u64, f64)>>,
+    history: &Mutex<ratum::web::History>,
     request: Request,
 ) -> std::io::Result<()> {
     if *request.method() != Method::Get {
@@ -186,11 +167,15 @@ fn request_origin(request: &Request) -> Option<String> {
     Some(format!("{proto}://{host}"))
 }
 
+/// The longest host a `Host` header may name, the length limit RFC 1035 puts on a domain
+/// name; an IPv6 literal with its brackets and a port is far shorter.
+const MAX_HOST_CHARS: usize = 255;
+
 /// Whether a `Host` header holds only what a host name, an IPv6 literal and a port are
 /// written with, and so can be written into the page.
 fn usable_host(host: &str) -> bool {
     !host.is_empty()
-        && host.len() <= 255
+        && host.len() <= MAX_HOST_CHARS
         && host.chars().all(|c| c.is_ascii_alphanumeric() || "-.:[]".contains(c))
 }
 
@@ -286,12 +271,12 @@ fn attr(s: &str) -> String {
 /// The JSON snapshot. Every field is read from the shared state; no secret (the node
 /// credentials, the pool signing key) is included. `work` values are `u128`, which JSON
 /// numbers cannot hold in full, so they are strings.
-fn snapshot(server: &Server, history: &Mutex<VecDeque<(u64, f64)>>) -> serde_json::Value {
+fn snapshot(server: &Server, history: &Mutex<ratum::web::History>) -> serde_json::Value {
     let tip = *lock(&server.node_view.tip);
     let coinbase_value = *lock(&server.node_view.coinbase_value);
     let operator_fee = coinbase_value.map_or(0, |v| server.payout.fee_on(v));
 
-    let hashrate_cutoff = unix_now().saturating_sub(HASHRATE_SPAN_SECS);
+    let hashrate_cutoff = ratum::unix_now().saturating_sub(HASHRATE_SPAN_SECS);
     let (total_work, target_work, shares, work_by_identity, tags, split, owed, recent, blocks) = {
         let l = lock(&server.ledger);
         (
@@ -474,7 +459,7 @@ fn snapshot(server: &Server, history: &Mutex<VecDeque<(u64, f64)>>) -> serde_jso
             "pool_hs": hashes_per_second(recent_work, HASHRATE_SPAN_SECS),
             // `[unix_seconds, hashes_per_second]` pairs, oldest first, one per
             // `interval_seconds`. Whole hashes per second: the fraction carries nothing.
-            "interval_seconds": HISTORY_INTERVAL_SECS,
+            "interval_seconds": ratum::web::HISTORY_INTERVAL_SECS,
             "history": lock(history)
                 .iter()
                 .map(|&(t, hs)| serde_json::json!([t, hs as u64]))
@@ -500,7 +485,7 @@ fn snapshot(server: &Server, history: &Mutex<VecDeque<(u64, f64)>>) -> serde_jso
             "luck_blocks": luck_blocks,
             "recent": recent_blocks,
         },
-        "generated_at": unix_now(),
+        "generated_at": ratum::unix_now(),
     })
 }
 
@@ -608,15 +593,5 @@ mod tests {
         assert_eq!(luck_percent(&broken), (None, 0));
         let reset = [block(1, 500, 100.0), block(2, 100, 100.0)];
         assert_eq!(luck_percent(&reset), (None, 0));
-    }
-
-    #[test]
-    fn history_keeps_the_newest_cap_samples() {
-        let mut h = VecDeque::new();
-        for i in 0..(HISTORY_CAP as u64 + 5) {
-            push_sample(&mut h, i, 1.0);
-        }
-        assert_eq!(h.len(), HISTORY_CAP);
-        assert_eq!(h.front().copied(), Some((5, 1.0)), "the oldest five were discarded");
     }
 }

@@ -12,7 +12,6 @@ use crate::stratum::{ClientStats, Server};
 use log::{info, warn};
 use ratum::http::{self, Reply};
 use serde_json::{Value, json};
-use std::collections::VecDeque;
 use std::sync::{Arc, LazyLock, Mutex};
 use tiny_http::{Header, Method, Request, Response};
 
@@ -33,33 +32,23 @@ pub struct Context {
     pub csrf: String,
     /// The configuration file the settings page edits (`-c`).
     pub config_path: String,
-    /// The gateway-hashrate history the status page charts: one `(unix, hashes per
-    /// second)` sample per `HISTORY_INTERVAL_SECS`, a day kept, from a thread `start`
+    /// The gateway-hashrate history the status page charts, sampled by a thread `start`
     /// spawns. It begins with the process, so a restart shows as a gap.
-    pub history: Mutex<VecDeque<(u64, f64)>>,
-}
-
-const HISTORY_INTERVAL_SECS: u64 = ratum::SECS_PER_MINUTE;
-/// A day of history at one sample a minute.
-const HISTORY_CAP: usize = (ratum::SECS_PER_DAY / HISTORY_INTERVAL_SECS) as usize;
-
-fn unix_now() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+    pub history: Mutex<ratum::web::History>,
 }
 
 /// Record the hashrate the summary reports now.
 fn sample_hashrate(ctx: &Context) {
-    let hs = ctx.server.summary().hashrate_ths * 1e12;
-    let mut history = ratum::lock(&ctx.history);
-    history.push_back((unix_now(), hs));
-    while history.len() > HISTORY_CAP {
-        history.pop_front();
-    }
+    let hs = ctx.server.summary().hashrate_ths * ratum::HASHES_PER_TERAHASH;
+    ratum::web::push_sample(&mut ratum::lock(&ctx.history), ratum::unix_now(), hs);
 }
+
+/// The random bytes a CSRF token carries, written as hex.
+const CSRF_TOKEN_BYTES: usize = 16;
 
 /// A random token for `Context::csrf`.
 pub fn csrf_token() -> String {
-    let mut b = [0u8; 16];
+    let mut b = [0u8; CSRF_TOKEN_BYTES];
     dryoc::rng::copy_randombytes(&mut b);
     hex::encode(b)
 }
@@ -203,7 +192,7 @@ fn status_json(ctx: &Context, with_clients: bool) -> Value {
             "global_index": j.global_index,
             "created_seconds_ago": j.created.elapsed().as_secs_f64(),
             "height": j.template.height,
-            "value_btc": j.template.coinbase_value as f64 / 1e8,
+            "value_btc": j.template.coinbase_value as f64 / ratum::SATS_PER_BTC,
             "previous_block": j.template.prev_hash_hex,
             "target": j.template.target_hex,
             "witness_commitment": hex::encode(&j.template.witness_commitment),
@@ -228,7 +217,7 @@ fn status_json(ctx: &Context, with_clients: bool) -> Value {
             .iter()
             .map(|r| {
                 json!({
-                    "value_btc": r.value as f64 / 1e8,
+                    "value_btc": r.value as f64 / ratum::SATS_PER_BTC,
                     "address": crate::address::output_script_to_display(&r.script),
                     "remainder": r.remainder,
                 })
@@ -247,7 +236,7 @@ fn status_json(ctx: &Context, with_clients: bool) -> Value {
         "work_update_seconds": cfg.bitcoind.work_update_seconds,
         "stale_window_seconds": cfg.stale_window().as_secs(),
         "hashrate": {
-            "interval_seconds": HISTORY_INTERVAL_SECS,
+            "interval_seconds": ratum::web::HISTORY_INTERVAL_SECS,
             "history": ratum::lock(&ctx.history)
                 .iter()
                 .map(|(at, hs)| json!([at, hs.round()]))
@@ -347,10 +336,12 @@ fn miner_lookup_json(ctx: &Context, addr: Option<&str>) -> Value {
     })
 }
 
-/// The POST body, at most a megabyte.
+/// The most of a POST body the settings form is read from; a longer one is truncated.
+const MAX_BODY_BYTES: u64 = 1 << 20;
+
 fn read_body(req: &mut Request) -> String {
     let mut body = String::new();
-    let _ = req.as_reader().take(1 << 20).read_to_string(&mut body);
+    let _ = req.as_reader().take(MAX_BODY_BYTES).read_to_string(&mut body);
     body
 }
 
@@ -537,7 +528,9 @@ pub fn start(ctx: Arc<Context>) {
             .name("api-sampler".into())
             .spawn(move || {
                 loop {
-                    std::thread::sleep(std::time::Duration::from_secs(HISTORY_INTERVAL_SECS));
+                    std::thread::sleep(std::time::Duration::from_secs(
+                        ratum::web::HISTORY_INTERVAL_SECS,
+                    ));
                     sample_hashrate(&sampler);
                 }
             })

@@ -36,7 +36,7 @@ pub mod subcmd {
 /// share of PoT exponent `target_pot`. Exactly the bits the share check inspects, so share
 /// validity is verifiable without the key and block validity is not.
 pub fn clear_bits(target_pot: u8) -> u8 {
-    (u32::from(SHARE_TARGET_BASE_BITS) + u32::from(target_pot)).min(255) as u8
+    (u32::from(SHARE_TARGET_BASE_BITS) + u32::from(target_pot)).min(u32::from(u8::MAX)) as u8
 }
 
 /// The commitment to an XOR key that H1 carries and the assignment notice delivers.

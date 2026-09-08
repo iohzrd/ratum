@@ -1,6 +1,7 @@
 use super::framing::{self, Header, HeaderKeys, KeyRatchet, STRUCT_END, SessionNonces};
 use super::handshake::{
-    Channel, Error, Generation, KEYS_LEN, KeyPairs, RESPONSE_KEYS_LEN, Signature, key_at,
+    Channel, Error, Generation, KEYS_LEN, KeyPairs, POOL_BOX_KEY_INDEX, POOL_SIGN_KEY_INDEX,
+    RESPONSE_KEYS_LEN, Signature, key_at,
 };
 use dryoc::classic::crypto_box::{
     PublicKey as BoxPublicKey, crypto_box_beforenm, crypto_box_seal, crypto_box_seal_open,
@@ -13,6 +14,17 @@ use dryoc::constants::{CRYPTO_BOX_SEALBYTES, CRYPTO_SIGN_BYTES};
 /// The hello carries 1 to 200 random pad bytes after `nk`, as the C gateway sends, so the
 /// frame length does not identify the user agent.
 const HELLO_PAD_MAX: usize = 200;
+
+/// Everything a hello holds besides the keys and the user agent, at its longest: the user
+/// agent's NUL, `STRUCT_END`, `nk`, a DRS extension carrying a resume token, the pad and the
+/// signature. A capacity hint, so the longest form is what it counts.
+const HELLO_TAIL_MAX: usize = 1
+    + 1
+    + size_of::<u32>()
+    + super::handshake::DRS_TOKEN_AT
+    + super::messages::RESUME_TOKEN_LEN
+    + HELLO_PAD_MAX
+    + CRYPTO_SIGN_BYTES;
 
 /// The client side of the DATUM handshake and channel: what the gateway does.
 ///
@@ -86,7 +98,7 @@ impl Client {
         user_agent: &str,
         generation: Generation,
     ) -> Vec<u8> {
-        let mut body = Vec::with_capacity(KEYS_LEN + user_agent.len() + 96);
+        let mut body = Vec::with_capacity(KEYS_LEN + user_agent.len() + HELLO_TAIL_MAX);
         body.extend_from_slice(&self.long_term_keys.sign_pk);
         body.extend_from_slice(&self.long_term_keys.box_pk);
         body.extend_from_slice(&self.session_keys.sign_pk);
@@ -99,7 +111,7 @@ impl Client {
             body.extend_from_slice(&super::handshake::DRS_MARKER);
             match resume {
                 Some(t) => {
-                    body.push(1);
+                    body.push(super::handshake::DRS_RESUME_PRESENT);
                     body.extend_from_slice(&t);
                 }
                 None => body.push(0),
@@ -127,7 +139,7 @@ impl Client {
             proto_cmd: framing::cmd::HELLO_OR_PING,
             ..Default::default()
         };
-        let mut out = Vec::with_capacity(4 + sealed.len());
+        let mut out = Vec::with_capacity(framing::HEADER_LEN + sealed.len());
         out.extend_from_slice(&self.channel.mask_header(header));
         out.extend_from_slice(&sealed);
 
@@ -189,8 +201,8 @@ impl Client {
         }
 
         let key = |n| key_at(signed, n).expect("length checked").try_into().expect("PUBKEY_LEN");
-        let pool_sign: SignPublicKey = key(4);
-        let pool_box: BoxPublicKey = key(5);
+        let pool_sign: SignPublicKey = key(POOL_SIGN_KEY_INDEX);
+        let pool_box: BoxPublicKey = key(POOL_BOX_KEY_INDEX);
         let motd = &signed[RESPONSE_KEYS_LEN..];
         let end = motd.iter().position(|&b| b == 0).unwrap_or(motd.len());
         self.motd = String::from_utf8_lossy(&motd[..end]).into_owned();
@@ -208,14 +220,14 @@ impl Client {
         self.channel.encrypt(proto_cmd, payload, None)
     }
 
-    pub fn unmask_header(&mut self, bytes: [u8; 4]) -> Header {
+    pub fn unmask_header(&mut self, bytes: [u8; framing::HEADER_LEN]) -> Header {
         self.channel.unmask_header(bytes)
     }
 
     /// The handshake response's header, unmasked with the unadvanced server-to-client key
     /// without advancing it: `read_handshake_response` unmasks the same bytes itself. For
     /// reading the response's length before the body arrives.
-    pub fn peek_handshake_header(&self, bytes: [u8; 4]) -> Header {
+    pub fn peek_handshake_header(&self, bytes: [u8; framing::HEADER_LEN]) -> Header {
         let key = HeaderKeys::from_nk(self.nk).server_to_client;
         Header::from_bytes((u32::from_le_bytes(bytes) ^ key).to_le_bytes())
     }

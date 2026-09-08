@@ -291,8 +291,11 @@ impl Notify {
     }
 }
 
-/// Poll `getbestblockhash` every second and raise `notify` when it changes
-/// (`datum_gateway_fallback_notifier`).
+/// How often the fallback notifier asks the node for its tip.
+const FALLBACK_NOTIFY_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Poll `getbestblockhash` every `FALLBACK_NOTIFY_INTERVAL` and raise `notify` when it
+/// changes (`datum_gateway_fallback_notifier`).
 pub fn fallback_notifier(node: rpc::Client, notify: Arc<Notify>) {
     let mut last: Option<String> = None;
     loop {
@@ -308,7 +311,7 @@ pub fn fallback_notifier(node: rpc::Client, notify: Arc<Notify>) {
             }
             Err(e) => debug!("getbestblockhash failed: {e}"),
         }
-        std::thread::sleep(Duration::from_secs(1));
+        std::thread::sleep(FALLBACK_NOTIFY_INTERVAL);
     }
 }
 
@@ -319,10 +322,15 @@ pub struct Status {
 }
 
 /// How long after a block notification the thread polls for the announced tip before it
-/// stops expecting one.
+/// stops expecting one, and how long it waits between those polls. The C gateway counts the
+/// same interval as 16 attempts 250 ms apart (`wnc > 16`).
 const NOTIFY_PATIENCE: Duration = Duration::from_secs(4);
+const NOTIFY_RETRY_DELAY: Duration = Duration::from_millis(250);
 /// A notification within this long of a block change is that block announced again.
 const REPEAT_WINDOW: Duration = Duration::from_millis(2500);
+/// How long the thread waits after a `getblocktemplate` that did not return a usable
+/// template before asking again.
+const POLL_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// What the poller does with a template.
 #[derive(Debug, PartialEq, Eq)]
@@ -416,7 +424,8 @@ impl Poller {
         } else if self.was_notified {
             if self.notified_at.elapsed() > NOTIFY_PATIENCE {
                 warn!(
-                    "We received a new block notification, however after 16 attempts we did not see a new block."
+                    "We received a new block notification, however after {:.0} seconds we did not see a new block.",
+                    NOTIFY_PATIENCE.as_secs_f64()
                 );
                 self.was_notified = false;
             }
@@ -437,7 +446,10 @@ impl Poller {
             Wake::Block(_)
                 if self.last_block_change.is_some_and(|t| t.elapsed() < REPEAT_WINDOW) =>
             {
-                debug!("block notification within 2.5 s of the last block change; ignored");
+                debug!(
+                    "block notification within {:.1} s of the last block change; ignored",
+                    REPEAT_WINDOW.as_secs_f64()
+                );
             }
             Wake::Block(_) => {
                 info!("NEW NETWORK BLOCK NOTIFICATION RECEIVED");
@@ -478,13 +490,13 @@ pub fn run(
     };
     loop {
         let Some(template) = p.poll(&node, &payout_script()) else {
-            std::thread::sleep(Duration::from_secs(1));
+            std::thread::sleep(POLL_RETRY_DELAY);
             continue;
         };
         match p.classify(&template) {
             Action::Skip => {}
             Action::Retry => {
-                std::thread::sleep(Duration::from_millis(250));
+                std::thread::sleep(NOTIFY_RETRY_DELAY);
                 continue;
             }
             Action::Build { new_block } => {
@@ -493,7 +505,7 @@ pub fn run(
                     "Updating {} stratum job for block {}: {:.8} BTC, {} txns, {} bytes",
                     if new_block { "priority" } else { "standard" },
                     t.height,
-                    t.coinbase_value as f64 / 1e8,
+                    t.coinbase_value as f64 / ratum::SATS_PER_BTC,
                     t.txns.len(),
                     t.totals.size
                 );

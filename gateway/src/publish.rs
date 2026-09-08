@@ -12,6 +12,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// How long the empty (subsidy-only) job is left in force before the priority job
+/// replaces it, so a miner receives and starts on it.
+const EMPTY_JOB_HOLD: Duration = Duration::from_millis(50);
+
 pub struct Publisher {
     builder: Mutex<Builder>,
     server: Arc<Server>,
@@ -97,7 +101,7 @@ impl Publisher {
         let pool = self.shared.pool_config();
         if new_block {
             self.build_and_publish(&t, true, true, pool.as_ref(), None, "new-block");
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(EMPTY_JOB_HOLD);
             if pool.is_some() {
                 self.build_and_publish(&t, false, false, pool.as_ref(), None, "priority");
             }

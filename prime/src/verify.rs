@@ -700,6 +700,10 @@ impl Verifier {
     }
 }
 
+/// The bytes a username may hold: printable ASCII other than the space, so an identity is
+/// safe to log, to use as a ledger key and to split on `ledger::NAME_SEPARATOR`.
+const PRINTABLE_ASCII: std::ops::RangeInclusive<u8> = 0x21..=0x7e;
+
 fn check_username_and_time(
     policy: &PoolPolicy,
     s: &PowSubmit,
@@ -707,7 +711,7 @@ fn check_username_and_time(
 ) -> Result<(), RejectReason> {
     if s.username.is_empty()
         || s.username.len() > MAX_USERNAME
-        || !s.username.bytes().all(|b| (0x21..=0x7e).contains(&b))
+        || !s.username.bytes().all(|b| PRINTABLE_ASCII.contains(&b))
         // The identity is everything before the first dot, so a leading dot leaves an empty
         // one, and the share would be credited to "".
         || s.username.starts_with('.')
@@ -747,7 +751,7 @@ fn build_work(
     s: &PowSubmit,
     abw_key: Option<[u8; 16]>,
 ) -> Result<Rebuilt, RejectReason> {
-    if s.target_byte >= 64
+    if s.target_byte > target::MAX_TARGET_POT
         || u64::from(s.target_byte) < u64::from(target::floor_pot(policy.min_difficulty))
     {
         return Err(RejectReason::BadTarget);
@@ -867,7 +871,9 @@ fn locate_pot_byte(tx: &CoinbaseTx, policy: &PoolPolicy) -> Result<(usize, Strin
         .position(|(_, data)| {
             let Some(id) = data.get(UID_PUSH_PREFIX_SIZE..) else { return false };
             match data.len() {
-                UID_PUSH_SIZE_V1 => policy.prime_id <= u64::from(u32::MAX) && id == &prime[..4],
+                UID_PUSH_SIZE_V1 => {
+                    policy.prime_id <= u64::from(u32::MAX) && id == &prime[..size_of::<u32>()]
+                }
                 UID_PUSH_SIZE_V3 => id == prime,
                 _ => false,
             }

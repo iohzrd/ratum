@@ -11,6 +11,26 @@ use serde_json::{Value, json};
 /// the priority job before the coinbaser job.
 const EXTRA_JOBS_PER_TIP: u64 = 2;
 
+/// `MAX_THREADS` and `MAX_CLIENTS_THREAD` in the C gateway's `datum_sockets.h`, which size
+/// its thread table and each thread's client table.
+const MAX_THREADS: usize = 64;
+const MAX_CLIENTS_THREAD: usize = 4096;
+/// The seconds between work updates the C gateway clamps `bitcoind.work_update_seconds` to
+/// ("5-120, 40 suggested").
+const WORK_UPDATE_SECONDS_RANGE: std::ops::RangeInclusive<u64> = 5..=120;
+/// The floors `datum_conf.c` enforces on the vardiff settings.
+const MIN_VARDIFF_TARGET_SHARES_MIN: u64 = 1;
+const MIN_VARDIFF_QUICKDIFF_COUNT: u64 = 4;
+const MIN_VARDIFF_QUICKDIFF_DELTA: u64 = 3;
+/// The range `stratum.share_stale_seconds` must fall in (`datum_conf.c`, "suggest 120").
+const SHARE_STALE_SECONDS_RANGE: std::ops::RangeInclusive<u64> = 60..=150;
+/// How far `datum.protocol_global_timeout` must exceed `bitcoind.work_update_seconds`
+/// (`datum_conf.c`: "at least the work update interval plus 5 seconds").
+const GLOBAL_TIMEOUT_MARGIN_SECS: u64 = 5;
+/// The largest value a TCP port and the two-byte `mining.coinbase_unique_id` hold.
+const MAX_PORT: i64 = u16::MAX as i64;
+const MAX_COINBASE_UNIQUE_ID: i64 = u16::MAX as i64;
+
 fn t() -> bool {
     true
 }
@@ -324,17 +344,22 @@ impl Config {
         } else if self.bitcoind.rpccookiefile.is_empty() {
             return Err("Either bitcoind.rpcuser (and bitcoind.rpcpassword) or bitcoind.rpccookiefile is required.".into());
         }
-        self.bitcoind.work_update_seconds = self.bitcoind.work_update_seconds.clamp(5, 120);
+        self.bitcoind.work_update_seconds = self
+            .bitcoind
+            .work_update_seconds
+            .clamp(*WORK_UPDATE_SECONDS_RANGE.start(), *WORK_UPDATE_SECONDS_RANGE.end());
         Ok(())
     }
 
     fn validate_stratum(&mut self) -> Result<(), String> {
         let s = &self.stratum;
-        if s.max_threads > 64 {
-            return Err("stratum.max_threads must be at most 64".into());
+        if s.max_threads > MAX_THREADS {
+            return Err(format!("stratum.max_threads must be at most {MAX_THREADS}"));
         }
-        if s.max_clients_per_thread > 4096 {
-            return Err("stratum.max_clients_per_thread must be at most 4096".into());
+        if s.max_clients_per_thread > MAX_CLIENTS_THREAD {
+            return Err(format!(
+                "stratum.max_clients_per_thread must be at most {MAX_CLIENTS_THREAD}"
+            ));
         }
         if s.max_clients > s.max_clients_per_thread * s.max_threads {
             return Err("stratum.max_clients exceeds max_clients_per_thread * max_threads".into());
@@ -342,17 +367,27 @@ impl Config {
         if s.vardiff_min == 0 {
             return Err("stratum.vardiff_min must be at least 1".into());
         }
-        if s.vardiff_target_shares_min < 1 {
-            return Err("stratum.vardiff_target_shares_min must be at least 1".into());
+        if s.vardiff_target_shares_min < MIN_VARDIFF_TARGET_SHARES_MIN {
+            return Err(format!(
+                "stratum.vardiff_target_shares_min must be at least {MIN_VARDIFF_TARGET_SHARES_MIN}"
+            ));
         }
-        if s.vardiff_quickdiff_count < 4 {
-            return Err("stratum.vardiff_quickdiff_count must be at least 4".into());
+        if s.vardiff_quickdiff_count < MIN_VARDIFF_QUICKDIFF_COUNT {
+            return Err(format!(
+                "stratum.vardiff_quickdiff_count must be at least {MIN_VARDIFF_QUICKDIFF_COUNT}"
+            ));
         }
-        if s.vardiff_quickdiff_delta < 3 {
-            return Err("stratum.vardiff_quickdiff_delta must be at least 3".into());
+        if s.vardiff_quickdiff_delta < MIN_VARDIFF_QUICKDIFF_DELTA {
+            return Err(format!(
+                "stratum.vardiff_quickdiff_delta must be at least {MIN_VARDIFF_QUICKDIFF_DELTA}"
+            ));
         }
-        if !(60..=150).contains(&s.share_stale_seconds) {
-            return Err("stratum.share_stale_seconds must be 60..150".into());
+        if !SHARE_STALE_SECONDS_RANGE.contains(&s.share_stale_seconds) {
+            return Err(format!(
+                "stratum.share_stale_seconds must be {}..{}",
+                SHARE_STALE_SECONDS_RANGE.start(),
+                SHARE_STALE_SECONDS_RANGE.end()
+            ));
         }
         if !s.vardiff_min.is_power_of_two() {
             let rounded = ratum::target::pow2_floor(s.vardiff_min);
@@ -402,8 +437,11 @@ impl Config {
 
     fn validate_datum(&mut self) -> Result<(), String> {
         let d = &self.datum;
-        if !(1..=256).contains(&d.protocol_job_slots) {
-            return Err("datum.protocol_job_slots must be 1..256".into());
+        if !(1..=ratum::datum::share::MAX_JOBS).contains(&d.protocol_job_slots) {
+            return Err(format!(
+                "datum.protocol_job_slots must be 1..{}",
+                ratum::datum::share::MAX_JOBS
+            ));
         }
         // The C gateway's check counts one job per work update. A new tip builds three jobs
         // here (empty, priority, coinbaser) where C builds one and rewrites its coinbase, so
@@ -417,11 +455,13 @@ impl Config {
                 self.stratum.share_stale_seconds, self.bitcoind.work_update_seconds
             ));
         }
-        if d.protocol_global_timeout < self.bitcoind.work_update_seconds + 5 {
-            return Err(
-                "datum.protocol_global_timeout must be at least bitcoind.work_update_seconds + 5"
-                    .into(),
-            );
+        if d.protocol_global_timeout
+            < self.bitcoind.work_update_seconds + GLOBAL_TIMEOUT_MARGIN_SECS
+        {
+            return Err(format!(
+                "datum.protocol_global_timeout must be at least bitcoind.work_update_seconds + \
+                 {GLOBAL_TIMEOUT_MARGIN_SECS}"
+            ));
         }
         if d.pooled_mining_only && d.pool_host.is_empty() {
             return Err("datum.pooled_mining_only requires datum.pool_host".into());
@@ -579,7 +619,7 @@ const FIELDS: &[Field] = &[
         label: "Unique gateway ID",
         section: "mining",
         key: "coinbase_unique_id",
-        kind: Kind::Int(0, 65535),
+        kind: Kind::Int(0, MAX_COINBASE_UNIQUE_ID),
         current: |c| json!(c.mining.coinbase_unique_id),
     },
     Field {
@@ -587,7 +627,7 @@ const FIELDS: &[Field] = &[
         label: "Pool port",
         section: "datum",
         key: "pool_port",
-        kind: Kind::Int(1, 65535),
+        kind: Kind::Int(1, MAX_PORT),
         current: |c| json!(c.datum.pool_port),
     },
     Field {
@@ -635,7 +675,7 @@ const FIELDS: &[Field] = &[
         label: "Stratum port",
         section: "stratum",
         key: "listen_port",
-        kind: Kind::Int(1, 65535),
+        kind: Kind::Int(1, MAX_PORT),
         current: |c| json!(c.stratum.listen_port),
     },
     Field {
@@ -667,7 +707,10 @@ const FIELDS: &[Field] = &[
         label: "Job update interval",
         section: "bitcoind",
         key: "work_update_seconds",
-        kind: Kind::Int(5, 120),
+        kind: Kind::Int(
+            *WORK_UPDATE_SECONDS_RANGE.start() as i64,
+            *WORK_UPDATE_SECONDS_RANGE.end() as i64,
+        ),
         current: |c| json!(c.bitcoind.work_update_seconds),
     },
     Field {

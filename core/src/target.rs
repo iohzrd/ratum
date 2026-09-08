@@ -138,6 +138,11 @@ pub fn floor_pot(diff: u64) -> u8 {
     if diff == 0 { 0 } else { (u64::BITS - 1 - diff.leading_zeros()) as u8 }
 }
 
+/// The largest PoT exponent a share target can name: `diff_for_pot` computes `2^exponent` in
+/// a `u64`, so a larger exponent has no representable difficulty and the pool refuses the
+/// share (`RejectReason::BadTarget`).
+pub const MAX_TARGET_POT: u8 = (u64::BITS - 1) as u8;
+
 /// The difficulty a PoT exponent names, `2^exponent`. Masked to the shift width because it is
 /// also called on target bytes that have not been checked yet.
 pub fn diff_for_pot(exponent: u8) -> u64 {

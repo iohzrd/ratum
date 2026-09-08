@@ -34,10 +34,18 @@ use std::time::{Duration, Instant};
 const WATCH_TICK: Duration = Duration::from_millis(20);
 /// The statistics line's interval (the C gateway's 600 half-second ticks).
 const STATS_INTERVAL: Duration = Duration::from_secs(300);
-/// After this long without a first job the watch loop reports it, then every 5 s.
+/// After this long without a first job the watch loop reports it, then every
+/// `NO_JOB_REPORT_INTERVAL`.
 const FIRST_JOB_PATIENCE: Duration = Duration::from_secs(25);
-/// How long the first jobs wait for the pool connection, so they are pooled ones.
+const NO_JOB_REPORT_INTERVAL: Duration = Duration::from_secs(5);
+/// How long the first jobs wait for the pool connection, so they are pooled ones, and how
+/// often that wait reports its progress.
 const POOL_CONNECT_WAIT: Duration = Duration::from_secs(15);
+const POOL_CONNECT_POLL: Duration = Duration::from_millis(250);
+/// Consecutive sessions that did not reach the pool's configuration before the watch loop
+/// disconnects the stratum clients under `datum.pooled_mining_only`. The first failure can
+/// be an ordinary reconnect; the second means the pool is unreachable.
+const FAILURES_BEFORE_SHUTDOWN: u32 = 2;
 
 #[derive(Parser)]
 #[command(name = "ratum-gateway", version = ratum::VERSION, about = "DATUM Gateway for the Bitcoin Knots BLAKE2b hardfork")]
@@ -119,7 +127,7 @@ fn start_datum(rt: &Runtime) {
     let started = Instant::now();
     let mut last_report = 0;
     while started.elapsed() < POOL_CONNECT_WAIT && !rt.shared.is_active() {
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(POOL_CONNECT_POLL);
         let waited = started.elapsed().as_secs();
         if waited != last_report {
             last_report = waited;
@@ -200,7 +208,7 @@ fn watch_loop(rt: &Runtime, server: &stratum::Server) -> ! {
         std::thread::sleep(WATCH_TICK);
         if server.current_job().is_none()
             && started.elapsed() > FIRST_JOB_PATIENCE
-            && last_no_job_report.elapsed() >= Duration::from_secs(5)
+            && last_no_job_report.elapsed() >= NO_JOB_REPORT_INTERVAL
         {
             last_no_job_report = Instant::now();
             error!(
@@ -226,7 +234,10 @@ fn watch_loop(rt: &Runtime, server: &stratum::Server) -> ! {
             rt.shared.failures.store(0, Ordering::Relaxed);
         }
         let reject = rt.config.datum.pooled_mining_only && !active;
-        if reject && rt.shared.failures.load(Ordering::Relaxed) >= 2 && !warned {
+        if reject
+            && rt.shared.failures.load(Ordering::Relaxed) >= FAILURES_BEFORE_SHUTDOWN
+            && !warned
+        {
             warn!(
                 "The DATUM pool is unreachable and datum.pooled_mining_only is set: disconnecting stratum clients until it is reached again"
             );
@@ -258,7 +269,7 @@ fn main() {
         info!(
             "Gateway fee: {} basis points ({:.2}%) of submitted share work, credited to {}",
             config.datum.gateway_fee_bps,
-            config.datum.gateway_fee_bps as f64 / 100.0,
+            f64::from(config.datum.gateway_fee_bps) * 100.0 / ratum::BASIS_POINTS_PER_UNIT as f64,
             config.fee_address()
         );
     }

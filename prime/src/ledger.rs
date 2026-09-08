@@ -92,6 +92,8 @@ fn pack(share: &Share) -> Vec<u8> {
 
 /// The fixed part of a share row: at, difficulty, hash.
 const SHARE_PREFIX_LEN: usize = 2 * size_of::<u64>() + HASH_SIZE;
+/// Where the hash sits in a share row, for reading it without unpacking the whole row.
+const SHARE_HASH_AT: std::ops::Range<usize> = SHARE_PREFIX_LEN - HASH_SIZE..SHARE_PREFIX_LEN;
 
 fn unpack(bytes: &[u8]) -> Option<Share> {
     let mut c = Cursor::new(bytes);
@@ -455,7 +457,7 @@ impl Store {
                 .take(surplus as usize)
                 .filter_map(|entry| {
                     let (seq, value) = entry.ok()?;
-                    let hash = value.value().get(16..48)?.try_into().ok()?;
+                    let hash = value.value().get(SHARE_HASH_AT)?.try_into().ok()?;
                     Some((seq.value(), hash))
                 })
                 .collect();

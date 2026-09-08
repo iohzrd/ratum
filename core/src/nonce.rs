@@ -6,6 +6,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// How many nonces a thread tests between checks of the shared stop conditions.
 const CHECK_INTERVAL: u64 = 1 << 22;
+/// The threads used when the platform does not report its parallelism.
+const FALLBACK_THREADS: u64 = 4;
+/// The nonce is a 32-bit field, written little-endian at `splice_at`.
+const NONCE_SIZE: usize = size_of::<u32>();
 
 /// Search the 32-bit nonce space for a hash meeting `target`.
 ///
@@ -20,7 +24,7 @@ pub fn search(
     abort: impl Fn() -> bool + Sync,
 ) -> Option<u32> {
     let found = AtomicU64::new(u64::MAX);
-    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()) as u64;
+    let threads = std::thread::available_parallelism().map_or(FALLBACK_THREADS, |n| n.get() as u64);
     std::thread::scope(|scope| {
         for t in 0..threads {
             let (found, hash, abort) = (&found, &hash, &abort);
@@ -28,7 +32,8 @@ pub fn search(
                 let mut buf = input.to_vec();
                 let mut nonce = t;
                 while nonce <= u32::MAX as u64 {
-                    buf[splice_at..splice_at + 4].copy_from_slice(&(nonce as u32).to_le_bytes());
+                    buf[splice_at..splice_at + NONCE_SIZE]
+                        .copy_from_slice(&(nonce as u32).to_le_bytes());
                     if target::meets_target(&hash(&buf), target) {
                         found.fetch_min(nonce, Ordering::Relaxed);
                         return;

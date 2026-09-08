@@ -10,11 +10,21 @@
 
 use std::time::Instant;
 
+const MS_PER_SECOND: u64 = 1000;
 /// The window `stratum.vardiff_target_shares_min` counts shares over, in milliseconds.
-const MS_PER_MINUTE: u64 = 1000 * ratum::SECS_PER_MINUTE;
+const MS_PER_MINUTE: u64 = MS_PER_SECOND * ratum::SECS_PER_MINUTE;
 /// The shortest snapshot the rate is computed from, the C gateway's "we need at least 1
 /// second of data".
-const MIN_SAMPLE_MS: u64 = 1000;
+const MIN_SAMPLE_MS: u64 = MS_PER_SECOND;
+/// How far the measured interval between shares may sit either side of the target before the
+/// difficulty moves: over twice it halves, under half it doubles (`target_ms_share*2` and
+/// `target_ms_share/2` in `stratum_update_vardiff`).
+const RATE_TOLERANCE: u64 = 2;
+/// The smallest raise a quick raise applies, the C gateway's `m->current_diff << 2`.
+const MIN_QUICKDIFF_SHIFT: u32 = 2;
+/// The shares a snapshot needs before a plain doubling, the C gateway's "don't bother with
+/// looking to bump unless we have 16 shares to work with".
+const MIN_SHARES_TO_DOUBLE: u64 = 16;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Params {
@@ -158,20 +168,21 @@ impl Vardiff {
         {
             let factor = target_ms / ms_per_share;
             let raw = factor.saturating_mul(self.current);
-            self.current = ratum::target::pow2_floor(raw).max(1).max(self.current << 2);
+            self.current =
+                ratum::target::pow2_floor(raw).max(1).max(self.current << MIN_QUICKDIFF_SHIFT);
             self.reset_snapshot(now);
             return true;
         }
         // Half the difficulty when shares arrive at less than half the target rate.
-        if ms_per_share > target_ms * 2 {
+        if ms_per_share > target_ms * RATE_TOLERANCE {
             self.current = (self.current >> 1).max(self.floor());
             self.reset_snapshot(now);
             return false;
         }
-        if n < 16 {
+        if n < MIN_SHARES_TO_DOUBLE {
             return false;
         }
-        if ms_per_share < target_ms / 2 {
+        if ms_per_share < target_ms / RATE_TOLERANCE {
             self.current <<= 1;
             self.reset_snapshot(now);
         }

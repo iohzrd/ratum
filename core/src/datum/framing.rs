@@ -11,6 +11,9 @@ pub const MAX_CMD_LEN: u32 = (1 << CMD_LEN_BITS) - 1;
 pub const MAX_CMD_DATA_SIZE: u32 = 1 << CMD_LEN_BITS;
 pub const INITIAL_HELLO_KEY: u32 = 0xDC87_1829;
 pub const NONCE_LEN: usize = 24;
+/// The word the nonce derivation and the nonce counter step in: both are written as
+/// `uint32_t` arrays in the C gateway.
+const WORD: usize = size_of::<u32>();
 /// The byte the gateway writes as a structure terminator. In the hello it follows the user
 /// agent's NUL and precedes `nk` and the pad; in the config it follows a 0x00.
 pub const STRUCT_END: u8 = 0xFE;
@@ -106,13 +109,13 @@ impl KeyRatchet {
     }
 
     /// XOR the header with the current key, then advance the key.
-    pub fn mask(&mut self, h: Header) -> [u8; 4] {
+    pub fn mask(&mut self, h: Header) -> [u8; HEADER_LEN] {
         let v = u32::from_le_bytes(h.to_bytes()) ^ self.key;
         self.key = feedback(self.key);
         v.to_le_bytes()
     }
 
-    pub fn unmask(&mut self, b: [u8; 4]) -> Header {
+    pub fn unmask(&mut self, b: [u8; HEADER_LEN]) -> Header {
         let v = u32::from_le_bytes(b) ^ self.key;
         self.key = feedback(self.key);
         Header::from_bytes(v.to_le_bytes())
@@ -146,11 +149,11 @@ impl SessionNonces {
         let mut receiver = [0u8; NONCE_LEN];
         let mut sender = [0u8; NONCE_LEN];
         let mut n = nk.wrapping_sub(42);
-        n ^= u32::from_le_bytes(session_pk_ed25519[7..11].try_into().unwrap());
-        for j in (0..NONCE_LEN).step_by(4) {
+        n ^= u32::from_le_bytes(session_pk_ed25519[7..7 + WORD].try_into().unwrap());
+        for j in (0..NONCE_LEN).step_by(WORD) {
             let r = feedback(n.wrapping_sub(42));
-            receiver[j..j + 4].copy_from_slice(&r.to_le_bytes());
-            sender[j..j + 4].copy_from_slice(&(r ^ 0x5757_5757).to_le_bytes());
+            receiver[j..j + WORD].copy_from_slice(&r.to_le_bytes());
+            sender[j..j + WORD].copy_from_slice(&(r ^ 0x5757_5757).to_le_bytes());
             n = !r;
         }
         SessionNonces { client_receiver: receiver, client_sender: sender }
@@ -160,9 +163,9 @@ impl SessionNonces {
 /// Counts up in 32-bit words, least significant word first, carrying only when one wraps to
 /// zero; this matches the gateway's host-order `uint32_t` increment on little-endian hosts.
 pub fn increment_nonce(nonce: &mut [u8; NONCE_LEN]) {
-    for j in (0..NONCE_LEN).step_by(4) {
-        let w = u32::from_le_bytes(nonce[j..j + 4].try_into().unwrap()).wrapping_add(1);
-        nonce[j..j + 4].copy_from_slice(&w.to_le_bytes());
+    for j in (0..NONCE_LEN).step_by(WORD) {
+        let w = u32::from_le_bytes(nonce[j..j + WORD].try_into().unwrap()).wrapping_add(1);
+        nonce[j..j + WORD].copy_from_slice(&w.to_le_bytes());
         if w != 0 {
             return;
         }

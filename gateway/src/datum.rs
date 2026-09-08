@@ -20,7 +20,7 @@ use mio::{Events, Interest, Poll, Token, Waker};
 use ratum::datum::abw::{self, Activation, AssignmentNotice, Candidate, Reveal};
 use ratum::datum::client::Client;
 use ratum::datum::framing::{self, Header};
-use ratum::datum::handshake::KeyPairs;
+use ratum::datum::handshake::{KeyPairs, PUBKEY_LEN};
 use ratum::datum::messages::{
     ClientConfig, ClientConfigV3, CoinbaserRequest, CoinbaserResponse, MigrationRequest,
     ResumeToken, ShareResponse, ShareVerdict, server_subcmd,
@@ -62,11 +62,9 @@ const WAKE: Token = Token(1);
 /// Every mining message ends with this many random bytes at most (the C gateway pads each
 /// with 1 to 80 or 1 to 100), so a message's length does not identify its contents.
 const MINING_PAD_MAX: usize = 100;
-
-/// The offsets of a validation request's own header fields, inside the mining payload: the
-/// request selector and the job index, after the mining sub-command byte.
-const SUBCMD_AT: usize = 1;
-const JOB_INDEX_AT: usize = 2;
+/// The shares the send queue holds at the least, whatever the caller asks for: a burst
+/// arriving while the session is blocked on a write must not be discarded.
+const MIN_QUEUE_CAPACITY: usize = 64;
 
 /// The version 3 protocol's assignment slots: the key commitment each holds, indexed by
 /// wire slot, and the active one. `active` is `None` until the pool seeds an assignment;
@@ -246,7 +244,7 @@ impl Shared {
             min_difficulty: AtomicU64::new(0),
             stats: Mutex::new(Stats::default()),
             queue: Mutex::new(VecDeque::new()),
-            queue_capacity: queue_capacity.max(64),
+            queue_capacity: queue_capacity.max(MIN_QUEUE_CAPACITY),
             coinbaser: Mutex::new(None),
             slots: Mutex::new(vec![None; slots]),
             abw: Mutex::new(AbwSlots::default()),
@@ -467,13 +465,16 @@ pub fn wire_username(settings: &Settings, username: &str) -> String {
     full[..end].to_string()
 }
 
-/// Parse `datum.pool_pubkey`: 128 hex characters, the Ed25519 key then the X25519 key.
-pub fn parse_pool_pubkey(s: &str) -> Result<([u8; 32], [u8; 32]), String> {
-    if s.len() != 128 {
-        return Err(format!("pool_pubkey must be 128 hex characters, got {}", s.len()));
+/// Parse `datum.pool_pubkey`: the Ed25519 key then the X25519 key, as hex.
+pub fn parse_pool_pubkey(s: &str) -> Result<([u8; PUBKEY_LEN], [u8; PUBKEY_LEN]), String> {
+    /// Two keys, two hex characters a byte.
+    const HEX_CHARS: usize = 2 * (2 * PUBKEY_LEN);
+    if s.len() != HEX_CHARS {
+        return Err(format!("pool_pubkey must be {HEX_CHARS} hex characters, got {}", s.len()));
     }
     let bytes = hex::decode(s).map_err(|e| format!("pool_pubkey is not hex: {e}"))?;
-    Ok((bytes[..32].try_into().unwrap(), bytes[32..].try_into().unwrap()))
+    let (sign, boxed) = bytes.split_at(PUBKEY_LEN);
+    Ok((sign.try_into().unwrap(), boxed.try_into().unwrap()))
 }
 
 /// The user agent the hello carries: this crate's name and version, then the git commit.
@@ -522,19 +523,22 @@ struct Session<'a> {
     pending_header: Vec<u8>,
 }
 
+/// The coinbase ids a slot tracks, the C gateway's `server_has_coinbase[8]`.
+const COINBASE_SLOTS: usize = 8;
+
 /// The sections the pool holds for the job in a slot (`server_has_job`,
 /// `server_has_coinbase[8]`, `server_has_coinbase_empty` in the C gateway).
 #[derive(Clone, Copy)]
 struct SentSections {
     serial: u64,
     job: bool,
-    coinbases: [bool; 8],
+    coinbases: [bool; COINBASE_SLOTS],
     subsidy_only: bool,
 }
 
 impl SentSections {
     fn new(serial: u64) -> Self {
-        SentSections { serial, job: false, coinbases: [false; 8], subsidy_only: false }
+        SentSections { serial, job: false, coinbases: [false; COINBASE_SLOTS], subsidy_only: false }
     }
 
     /// Whether the pool holds `coinbase_id`'s section; marks it held.
@@ -542,7 +546,7 @@ impl SentSections {
         let slot = if coinbase_id == share::COINBASE_ID_SUBSIDY_ONLY {
             &mut self.subsidy_only
         } else {
-            &mut self.coinbases[coinbase_id as usize & 7]
+            &mut self.coinbases[coinbase_id as usize % COINBASE_SLOTS]
         };
         std::mem::replace(slot, true)
     }
@@ -1049,8 +1053,8 @@ impl<'a> Session<'a> {
     }
 
     fn on_validation(&mut self, plain: &[u8]) -> Result<(), SessionError> {
-        let Some(&sub) = plain.get(SUBCMD_AT) else { return Ok(()) };
-        let job_index = plain.get(JOB_INDEX_AT).copied();
+        let Some(&sub) = plain.get(validation::SELECTOR_AT) else { return Ok(()) };
+        let job_index = plain.get(validation::JOB_INDEX_AT).copied();
         let lookup = job_index
             .ok_or((validation::JOB_INDEX_INVALID, Status::BadRequest))
             .and_then(|i| self.shared.slot(i));
@@ -1115,7 +1119,7 @@ impl<'a> Session<'a> {
                     warn!("malformed parent fetch request ({} bytes)", plain.len());
                     return Ok(());
                 }
-                let idx = plain[JOB_INDEX_AT];
+                let idx = plain[validation::JOB_INDEX_AT];
                 let parent_hash: [u8; 32] =
                     plain[validation::REQUEST_HEADER_LEN..].try_into().expect("32 bytes");
                 let (status, block) = match lookup {
@@ -1345,7 +1349,7 @@ fn requested_ids(plain: &[u8], txn_count: usize) -> Option<Vec<usize>> {
 }
 
 fn rand_u32() -> u32 {
-    let mut b = [0u8; 4];
+    let mut b = [0u8; size_of::<u32>()];
     dryoc::rng::copy_randombytes(&mut b);
     u32::from_le_bytes(b)
 }

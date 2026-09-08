@@ -1,3 +1,4 @@
+use ratum::datum::share::{EXTRANONCE_SIZE_V2, SIA_FIELD_HALF, SIA_FIELD_SIZE};
 use ratum::header::blake2b_256;
 use ratum::target;
 use std::io::{BufRead, BufReader, Write};
@@ -5,8 +6,23 @@ use std::net::TcpStream;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
+/// The Sia work header the hashing hardware receives, as `datum_blake2b_build_work_header`
+/// lays it out: the hidden previous block hash, the eight-byte nonce field, the eight-byte
+/// time field, then the work root the first BLAKE2b produced.
 const HEADER_LEN: usize = 80;
-const EXTRANONCE_LEN: usize = 16;
+const HEADER_PREVBLOCK_HIDDEN_AT: usize = 0;
+const HEADER_NONCE_AT: usize = 32;
+const HEADER_NTIME_AT: usize = HEADER_NONCE_AT + SIA_FIELD_SIZE;
+const HEADER_ROOT_AT: usize = HEADER_NTIME_AT + SIA_FIELD_SIZE;
+/// The extranonce1 the subscribe response carries plus the extranonce2 the miner fills is
+/// the header's whole extranonce field.
+const EXTRANONCE_LEN: usize = EXTRANONCE_SIZE_V2;
+/// The stratum request ids: 1 subscribes, 2 authorizes, and a submit takes the next id above
+/// this, so a response can be told from the others by its id alone.
+const SUBMIT_ID_BASE: u64 = 100;
+/// The byte `datum_blake2b_work_root` writes ahead of the leaf (`leaf[0] = 0`); the Siacoin
+/// hasher prepends it itself, so stratum's coinb1 does not carry it.
+const WORK_ROOT_LEAF_PREFIX: u8 = 0x00;
 
 #[derive(Clone)]
 struct Job {
@@ -16,7 +32,7 @@ struct Job {
     prevhash: [u8; 32],
     coinb1: Vec<u8>,
     coinb2: Vec<u8>,
-    ntime: [u8; 8],
+    ntime: [u8; SIA_FIELD_SIZE],
     ntime_hex: String,
 }
 
@@ -35,7 +51,7 @@ struct Shared {
 
 fn leaf(coinb1: &[u8], extranonce: &[u8], coinb2: &[u8]) -> [u8; 32] {
     let mut buf = Vec::with_capacity(1 + coinb1.len() + extranonce.len() + coinb2.len());
-    buf.push(0x00);
+    buf.push(WORK_ROOT_LEAF_PREFIX);
     buf.extend_from_slice(coinb1);
     buf.extend_from_slice(extranonce);
     buf.extend_from_slice(coinb2);
@@ -56,7 +72,7 @@ fn mine(
 ) -> Outcome {
     // The search is abandoned as soon as the job it is based on is superseded.
     let superseded = || generation.load(Ordering::Relaxed) != job_generation;
-    match ratum::nonce::search(header, 32, blake2b_256, target, superseded) {
+    match ratum::nonce::search(header, HEADER_NONCE_AT, blake2b_256, target, superseded) {
         Some(nonce) => Outcome::Found(nonce),
         None if generation.load(Ordering::SeqCst) != job_generation => Outcome::Superseded,
         None => Outcome::Exhausted,
@@ -119,7 +135,7 @@ fn read_messages(
                 let ntime_hex = p[7].as_str().unwrap_or_default().to_string();
                 let ntime_raw = hex::decode(&ntime_hex).unwrap_or_default();
                 let (Ok(prevhash), Ok(ntime)) =
-                    (<[u8; 32]>::try_from(prev), <[u8; 8]>::try_from(ntime_raw))
+                    (<[u8; 32]>::try_from(prev), <[u8; SIA_FIELD_SIZE]>::try_from(ntime_raw))
                 else {
                     println!("!! notify has a {}-char ntime or a bad prevhash", ntime_hex.len());
                     continue;
@@ -152,7 +168,9 @@ fn read_messages(
                 waiting.notify_all();
             }
             _ => {
-                if v["id"].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0) > 100 {
+                if v["id"].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0)
+                    > SUBMIT_ID_BASE
+                {
                     println!("submit response: {}", line.trim());
                 }
             }
@@ -184,7 +202,7 @@ fn main() -> std::io::Result<()> {
     };
 
     let (lock, waiting) = &*state;
-    let mut submitted = 0;
+    let mut submitted = 0u64;
     let mut last_generation = 0u64;
 
     loop {
@@ -217,9 +235,9 @@ fn main() -> std::io::Result<()> {
         let hash1 = leaf(&job.coinb1, &extranonce, &job.coinb2);
 
         let mut header = [0u8; HEADER_LEN];
-        header[0..32].copy_from_slice(&job.prevhash);
-        header[40..48].copy_from_slice(&job.ntime);
-        header[48..80].copy_from_slice(&hash1);
+        header[HEADER_PREVBLOCK_HIDDEN_AT..HEADER_NONCE_AT].copy_from_slice(&job.prevhash);
+        header[HEADER_NTIME_AT..HEADER_ROOT_AT].copy_from_slice(&job.ntime);
+        header[HEADER_ROOT_AT..].copy_from_slice(&hash1);
 
         // pdiff, as the gateway checks it (`get_target_from_diff`), not Stratum.md's bdiff-1
         // target.
@@ -233,13 +251,13 @@ fn main() -> std::io::Result<()> {
                     "found nonce {nonce:#010x} in {secs:.1}s ({:.0} MH/s)",
                     (nonce as f64 / secs) / 1e6
                 );
-                let mut nonce_field = [0u8; 8];
-                nonce_field[0..4].copy_from_slice(&nonce.to_le_bytes());
+                let mut nonce_field = [0u8; SIA_FIELD_SIZE];
+                nonce_field[..SIA_FIELD_HALF].copy_from_slice(&nonce.to_le_bytes());
                 submitted += 1;
                 writeln!(
                     w,
                     r#"{{"id":"{}","method":"mining.submit","params":["{}","{}","{}","{}","{}"]}}"#,
-                    100 + submitted,
+                    SUBMIT_ID_BASE + submitted,
                     user,
                     job.job_id,
                     hex::encode(&extranonce2),

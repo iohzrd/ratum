@@ -5,17 +5,24 @@
 use crate::coinbase::{self, Coinbase};
 use crate::config::Config;
 use crate::template::Template;
+use ratum::bitcoin::HASH_SIZE;
 use ratum::datum::messages::{CoinbaseOutput, CoinbaserResponse};
-use ratum::datum::share::{EXTRANONCE_SIZE, EXTRANONCE_SIZE_V2};
+use ratum::datum::share::{EXTRANONCE_SIZE, EXTRANONCE_SIZE_V2, SIA_FIELD_HALF};
 use ratum::header::{self, HeaderV2};
 use ratum::target::{self, Target};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
-pub use ratum::datum::share::{COINBASE_ID_SUBSIDY_ONLY as COINBASE_SUBSIDY_ONLY, MAX_JOBS};
+pub use ratum::datum::share::{
+    COINBASE_ID_SUBSIDY_ONLY as COINBASE_SUBSIDY_ONLY, MAX_JOBS, SIA_FIELD_SIZE,
+};
+/// `STRATUM_JOB_INDEX_XOR` in `datum_gateway.h`.
 pub const JOB_INDEX_XOR: u16 = 0xC0DE;
+/// What the job counter is XORed with to make the two-byte extranonce prefix, the C
+/// gateway's `s->enprefix = stratum_enprefix ^ 0xB10C` (`datum_stratum_get_next_job`).
+const ENPREFIX_XOR: u16 = 0xB10C;
 
 /// The pool's 0x99 configuration, as the jobs are built from it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -184,7 +191,7 @@ impl Job {
         // them: the nonce field is nNonce then m_nonce2, the time field m_time_offset then
         // m_nonce3.
         let halves = |f: [u8; SIA_FIELD_SIZE]| {
-            let (lo, hi) = f.split_at(SIA_FIELD_SIZE / 2);
+            let (lo, hi) = f.split_at(SIA_FIELD_HALF);
             (u32::from_le_bytes(lo.try_into().unwrap()), u32::from_le_bytes(hi.try_into().unwrap()))
         };
         let c = self.commitment(id, pot)?;
@@ -225,7 +232,7 @@ pub fn merkle_branches(txids: &[[u8; 32]]) -> Vec<[u8; 32]> {
     level.push(None);
     level.extend(txids.iter().map(|t| Some(*t)));
     let mut branches = Vec::new();
-    let mut combined = [0u8; 64];
+    let mut combined = [0u8; 2 * HASH_SIZE];
     while level.len() > 1 {
         branches.push(level[1].expect("a sibling on the coinbase path is known"));
         if level.len() % 2 == 1 {
@@ -236,8 +243,8 @@ pub fn merkle_branches(txids: &[[u8; 32]]) -> Vec<[u8; 32]> {
         for pair in level.chunks(2) {
             match (pair[0], pair[1]) {
                 (Some(a), Some(b)) => {
-                    combined[..32].copy_from_slice(&a);
-                    combined[32..].copy_from_slice(&b);
+                    combined[..HASH_SIZE].copy_from_slice(&a);
+                    combined[HASH_SIZE..].copy_from_slice(&b);
                     next.push(Some(ratum::bitcoin::sha256d(&combined)));
                 }
                 _ => next.push(None),
@@ -299,7 +306,7 @@ impl Builder {
         let serial = self.serial;
         self.serial += 1;
         let global_index = (serial % MAX_JOBS as u64) as u8;
-        let enprefix = self.enprefix ^ 0xB10C;
+        let enprefix = self.enprefix ^ ENPREFIX_XOR;
         self.enprefix = self.enprefix.wrapping_add(1);
         let slots = c.datum.protocol_job_slots as u32;
         let datum_slot = self.datum_slot;
@@ -318,7 +325,8 @@ impl Builder {
             height: template.height,
             tag_primary,
             tag_secondary: &c.mining.coinbase_tag_secondary,
-            unique_id: (c.mining.coinbase_unique_id & 0xffff) as u16,
+            // The coinbase carries two bytes; a config file edited by hand can hold more.
+            unique_id: (c.mining.coinbase_unique_id & u32::from(u16::MAX)) as u16,
             prime_id,
             // The version 3 protocol pushes the 8-byte prime id whether or not the pool runs
             // ABW (`datum_coinbaser.c` writes all eight bytes).
@@ -335,7 +343,7 @@ impl Builder {
         if merkle_branches.len() > ratum::datum::share::MAX_MERKLE_BRANCHES {
             return Err(BuildError::TooManyBranches(merkle_branches.len()));
         }
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()) as u32;
+        let now = ratum::unix_now() as u32;
         let job_id =
             format!("{now:08x}{global_index:02x}{:04x}", u16::from(global_index) ^ JOB_INDEX_XOR);
         Ok(Job {
@@ -430,6 +438,9 @@ fn coinbase_set(
     CoinbaseSet { pooled, subsidy_only, target_pot_index, included }
 }
 
+/// The build time's eight hex digits at the front of a job id. A submit's job id must match
+/// them: the global index alone repeats once the job ring wraps.
+pub const JOB_ID_TIME_CHARS: usize = 8;
 /// The 14 characters of a job id: the build time as eight hex digits, the global index as
 /// two, and the index XORed with `JOB_INDEX_XOR` as four.
 const JOB_ID_CHARS: usize = 14;
@@ -454,14 +465,19 @@ pub struct JobRef {
     pub coinbase: u8,
 }
 
+/// The characters a notify prepends to the job id: `Q` for a quick-raise job, `N` for
+/// new-block empty work. A standard job carries neither.
+const QUICKDIFF_PREFIX: char = 'Q';
+const EMPTY_PREFIX: char = 'N';
+
 impl JobRef {
     /// The id `mining.notify` carries for `job`.
     pub fn notify_id(&self, job: &Job) -> String {
         let cb = self.coinbase;
         if self.quickdiff {
-            format!("Q{}{cb:02x}", job.job_id)
+            format!("{QUICKDIFF_PREFIX}{}{cb:02x}", job.job_id)
         } else if self.empty {
-            format!("N{}ff", job.job_id)
+            format!("{EMPTY_PREFIX}{}{COINBASE_SUBSIDY_ONLY:02x}", job.job_id)
         } else {
             format!("{}{cb:02x}", job.job_id)
         }
@@ -472,8 +488,8 @@ impl JobRef {
         const PREFIXED: usize = NOTIFY_ID_CHARS + 1;
         let (quickdiff, empty, rest) = match s.len() {
             NOTIFY_ID_CHARS => (false, false, s),
-            PREFIXED if s.starts_with('Q') => (true, false, &s[1..]),
-            PREFIXED if s.starts_with('N') => (false, true, &s[1..]),
+            PREFIXED if s.starts_with(QUICKDIFF_PREFIX) => (true, false, &s[1..]),
+            PREFIXED if s.starts_with(EMPTY_PREFIX) => (false, true, &s[1..]),
             _ => return None,
         };
         let job_id = &rest[..JOB_ID_CHARS];
@@ -497,22 +513,18 @@ pub fn global_index_of(job_id: &str) -> Option<u8> {
 /// miner sent alone, which fills the low four bytes.
 pub fn parse_sia_field(s: &str) -> Option<[u8; SIA_FIELD_SIZE]> {
     const HEX_CHARS: usize = 2 * SIA_FIELD_SIZE;
-    const NARROW_HEX_CHARS: usize = 2 * size_of::<u32>();
+    const NARROW_HEX_CHARS: usize = 2 * SIA_FIELD_HALF;
     match s.len() {
         HEX_CHARS => hex::decode(s).ok()?.try_into().ok(),
         NARROW_HEX_CHARS => {
             let v = u32::from_str_radix(s, 16).ok()?;
             let mut out = [0u8; SIA_FIELD_SIZE];
-            out[..size_of::<u32>()].copy_from_slice(&v.to_le_bytes());
+            out[..SIA_FIELD_HALF].copy_from_slice(&v.to_le_bytes());
             Some(out)
         }
         _ => None,
     }
 }
-
-/// The Sia stratum nonce and time fields are eight bytes each; the version 2 header takes
-/// two 32-bit values from each.
-pub const SIA_FIELD_SIZE: usize = 8;
 
 #[cfg(test)]
 mod tests {

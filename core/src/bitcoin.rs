@@ -24,6 +24,11 @@ pub mod opcode {
     /// `OP_PUSHDATA1`. `GetScriptOp` reads `opcode < OP_PUSHDATA1` as a direct push of that
     /// many bytes, so the range is `0x01..=0x4b`.
     pub const MAX_DIRECT_PUSH: usize = OP_PUSHDATA1 as usize - 1;
+
+    /// What `OP_1`..`OP_16` encode a small integer against: Core's `CScript::EncodeOP_N` is
+    /// `OP_1 + n - 1` and its `DecodeOP_N` is `opcode - (OP_1 - 1)`. `OP_0` encodes zero and
+    /// is not on this scale.
+    pub const OP_N_BASE: u8 = OP_1 - 1;
 }
 
 /// The size of a txid, a merkle node and a block hash: `uint256`.
@@ -43,9 +48,22 @@ pub const MIN_OUTPUT_SIZE: usize = VALUE_SIZE + 1;
 /// The two bytes that follow the version of a transaction serialized with witness data
 /// (BIP144): a zero marker and a nonzero flag.
 const SEGWIT_MARKER_AND_FLAG: (u8, u8) = (0x00, 0x01);
+/// The bytes `SEGWIT_MARKER_AND_FLAG` occupies.
+const SEGWIT_MARKER_AND_FLAG_SIZE: usize = 2;
 /// The block weight units a byte outside the witness costs, Core's `WITNESS_SCALE_FACTOR`
 /// (`consensus/consensus.h`). Witness bytes cost one each.
 pub const WITNESS_SCALE_FACTOR: u64 = 4;
+
+/// The output index of the null outpoint a coinbase spends: all ones.
+pub const NULL_OUTPOINT_INDEX: [u8; OUTPOINT_SIZE - HASH_SIZE] = [0xff; OUTPOINT_SIZE - HASH_SIZE];
+/// The `nSequence` a coinbase input carries, Core's `SEQUENCE_FINAL`.
+pub const SEQUENCE_FINAL: [u8; SEQUENCE_SIZE] = [0xff; SEQUENCE_SIZE];
+/// The four bytes that begin the witness commitment's data push, BIP141's
+/// `WITNESS_COMMITMENT_HEADER` (`validation.cpp`).
+pub const WITNESS_COMMITMENT_HEADER: [u8; 4] = [0xaa, 0x21, 0xa9, 0xed];
+/// The witness commitment output's script: `OP_RETURN`, a push of the header and the
+/// 32-byte commitment. This is what a node's `default_witness_commitment` always is.
+pub const WITNESS_COMMITMENT_SCRIPT_SIZE: usize = 2 + WITNESS_COMMITMENT_HEADER.len() + HASH_SIZE;
 
 pub fn sha256d(data: &[u8]) -> [u8; 32] {
     let first = Sha256::digest(data);
@@ -77,7 +95,7 @@ pub fn txid(tx: &[u8]) -> Result<[u8; 32], TxError> {
     c.advance(TX_VERSION_SIZE, "version")?;
     let has_witness = c.peek2() == Some(SEGWIT_MARKER_AND_FLAG);
     if has_witness {
-        c.advance(2, "segwit marker and flag")?;
+        c.advance(SEGWIT_MARKER_AND_FLAG_SIZE, "segwit marker and flag")?;
     }
 
     let body_start = c.pos();
@@ -207,7 +225,7 @@ pub fn parse_coinbase(tx: &[u8]) -> Result<CoinbaseTx, TxError> {
 
     let has_witness = c.peek2() == Some(SEGWIT_MARKER_AND_FLAG);
     if has_witness {
-        c.advance(2, "segwit marker and flag")?;
+        c.advance(SEGWIT_MARKER_AND_FLAG_SIZE, "segwit marker and flag")?;
     }
 
     if decode_compact_size(&mut c)? != 1 {
@@ -215,7 +233,9 @@ pub fn parse_coinbase(tx: &[u8]) -> Result<CoinbaseTx, TxError> {
     }
     // The null outpoint a coinbase spends: a zero txid and an all-ones index.
     let prevout = c.take(OUTPOINT_SIZE, "outpoint")?;
-    if prevout[..HASH_SIZE] != [0u8; HASH_SIZE] || prevout[HASH_SIZE..] != [0xffu8; 4] {
+    if prevout[..HASH_SIZE] != [0u8; HASH_SIZE]
+        || prevout[HASH_SIZE..] != [0xffu8; OUTPOINT_SIZE - HASH_SIZE]
+    {
         return Err(TxError::InputNotNull);
     }
     let script_len = decode_compact_size(&mut c)? as usize;
@@ -328,43 +348,52 @@ impl From<Truncated> for TxError {
     }
 }
 
+/// The tag byte a CompactSize longer than one byte begins with, naming the width that
+/// follows (`ReadCompactSize`/`WriteCompactSize` in Core's `serialize.h`). A first byte below
+/// `COMPACT_SIZE_U16_TAG` is the value itself.
+const COMPACT_SIZE_U16_TAG: u8 = 0xfd;
+const COMPACT_SIZE_U32_TAG: u8 = 0xfe;
+const COMPACT_SIZE_U64_TAG: u8 = 0xff;
+/// The largest value each width encodes. A decoder refuses an encoding whose value fits a
+/// narrower one, which is what `TxError::BadCompactSize` reports.
+const COMPACT_SIZE_MAX_1: u64 = COMPACT_SIZE_U16_TAG as u64 - 1;
+const COMPACT_SIZE_MAX_2: u64 = u16::MAX as u64;
+const COMPACT_SIZE_MAX_4: u64 = u32::MAX as u64;
+
 fn decode_compact_size(c: &mut Cursor<'_>) -> Result<u64, TxError> {
     let first = c.u8("compact size")?;
-    let v = match first {
-        0xfd => u64::from(c.u16("compact size")?),
-        0xfe => u64::from(c.u32("compact size")?),
-        0xff => c.u64("compact size")?,
-        n => u64::from(n),
+    let (v, minimum) = match first {
+        COMPACT_SIZE_U16_TAG => (u64::from(c.u16("compact size")?), COMPACT_SIZE_MAX_1 + 1),
+        COMPACT_SIZE_U32_TAG => (u64::from(c.u32("compact size")?), COMPACT_SIZE_MAX_2 + 1),
+        COMPACT_SIZE_U64_TAG => (c.u64("compact size")?, COMPACT_SIZE_MAX_4 + 1),
+        n => (u64::from(n), 0),
     };
-    let minimal = match first {
-        0xfd => v >= 0xfd,
-        0xfe => v > 0xffff,
-        0xff => v > 0xffff_ffff,
-        _ => true,
-    };
-    if !minimal {
+    if v < minimum {
         return Err(TxError::BadCompactSize);
     }
     Ok(v)
 }
 
+/// The bytes the longest CompactSize occupies: `COMPACT_SIZE_U64_TAG` and a 64-bit value.
+pub const MAX_COMPACT_SIZE_LEN: usize = 1 + size_of::<u64>();
+
 /// Encode a CompactSize. The inverse of `decode_compact_size`; the block serializer uses it for
 /// the transaction count.
 pub fn encode_compact_size(n: u64) -> Vec<u8> {
     match n {
-        0..=0xfc => vec![n as u8],
-        0xfd..=0xffff => {
-            let mut v = vec![0xfd];
+        0..=COMPACT_SIZE_MAX_1 => vec![n as u8],
+        _ if n <= COMPACT_SIZE_MAX_2 => {
+            let mut v = vec![COMPACT_SIZE_U16_TAG];
             v.extend_from_slice(&(n as u16).to_le_bytes());
             v
         }
-        0x1_0000..=0xffff_ffff => {
-            let mut v = vec![0xfe];
+        _ if n <= COMPACT_SIZE_MAX_4 => {
+            let mut v = vec![COMPACT_SIZE_U32_TAG];
             v.extend_from_slice(&(n as u32).to_le_bytes());
             v
         }
         _ => {
-            let mut v = vec![0xff];
+            let mut v = vec![COMPACT_SIZE_U64_TAG];
             v.extend_from_slice(&n.to_le_bytes());
             v
         }
@@ -394,7 +423,7 @@ pub fn encode_output(value: u64, script: &[u8]) -> Vec<u8> {
 /// Serialize a block for `submitblock`: the header, the transaction count, then the coinbase
 /// followed by the rest of the transactions in order.
 pub fn serialize_block(header: &[u8], coinbase: &[u8], other_txns: &[Vec<u8>]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(header.len() + coinbase.len() + 16);
+    let mut out = Vec::with_capacity(header.len() + coinbase.len() + MAX_COMPACT_SIZE_LEN);
     out.extend_from_slice(header);
     out.extend_from_slice(&encode_compact_size(other_txns.len() as u64 + 1));
     out.extend_from_slice(coinbase);

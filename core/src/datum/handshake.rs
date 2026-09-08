@@ -16,12 +16,16 @@ pub(crate) type PrecompKey = [u8; CRYPTO_BOX_BEFORENMBYTES];
 pub(crate) type Signature = [u8; CRYPTO_SIGN_BYTES];
 
 /// An ed25519 signing key and a curve25519 box key are both 32 bytes.
-pub(crate) const PUBKEY_LEN: usize = 32;
-/// Four public keys: the client's long-term pair and its session pair, in that order.
-pub(crate) const KEYS_LEN: usize = 4 * PUBKEY_LEN;
-/// The keys the pool's response echoes and appends to: the client's four and the pool's own
-/// session signing and box keys.
-pub(crate) const RESPONSE_KEYS_LEN: usize = KEYS_LEN + 2 * PUBKEY_LEN;
+pub const PUBKEY_LEN: usize = 32;
+/// The public keys a hello carries: the client's long-term signing and box keys, then its
+/// session pair, in that order.
+pub(crate) const HELLO_KEYS: usize = 4;
+pub(crate) const KEYS_LEN: usize = HELLO_KEYS * PUBKEY_LEN;
+/// The keys the pool's response appends after echoing the hello's: its own session signing
+/// key, then its session box key.
+pub(crate) const POOL_SIGN_KEY_INDEX: usize = HELLO_KEYS;
+pub(crate) const POOL_BOX_KEY_INDEX: usize = HELLO_KEYS + 1;
+pub(crate) const RESPONSE_KEYS_LEN: usize = (POOL_BOX_KEY_INDEX + 1) * PUBKEY_LEN;
 
 /// The `n`th public key in a handshake key block. `None` when the block is shorter.
 pub(crate) fn key_at(block: &[u8], n: usize) -> Option<&[u8]> {
@@ -130,6 +134,12 @@ pub const KEY_PAIRS_LEN: usize = size_of::<SignPublicKey>()
 /// ones. A ratum-gateway built before the version 3 protocol padded with independent random
 /// bytes, which match with probability 2^-32 per hello.
 pub const DRS_MARKER: [u8; 4] = *b"DRS\x01";
+/// The flag byte after the marker: the resume token follows when it is `DRS_RESUME_PRESENT`,
+/// and the extension ends at the flag when it is zero.
+pub const DRS_RESUME_PRESENT: u8 = 1;
+/// The flag byte's offset in the extension, and the resume token's.
+pub const DRS_FLAG_AT: usize = DRS_MARKER.len();
+pub const DRS_TOKEN_AT: usize = DRS_FLAG_AT + 1;
 
 /// The protocol generation a hello asks for, read from the DRS extension: absent in a
 /// version 1 hello; present in a version 3 hello, carrying the prior session's resume token
@@ -198,10 +208,10 @@ pub fn open_hello(header: Header, payload: &[u8], pool: &KeyPairs) -> Result<Hel
     let nk = u32::from_le_bytes(after[1..AFTER_UA_LEN].try_into().unwrap());
 
     let tail = &after[AFTER_UA_LEN..];
-    let generation = if tail.len() >= 5 && tail[..4] == DRS_MARKER {
-        let resume = if tail[4] != 0 {
+    let generation = if tail.len() > DRS_FLAG_AT && tail[..DRS_FLAG_AT] == DRS_MARKER {
+        let resume = if tail[DRS_FLAG_AT] != 0 {
             let token: super::messages::ResumeToken = tail
-                .get(5..5 + super::messages::RESUME_TOKEN_LEN)
+                .get(DRS_TOKEN_AT..DRS_TOKEN_AT + super::messages::RESUME_TOKEN_LEN)
                 .ok_or(Error::Malformed("DRS flag set without a token"))?
                 .try_into()
                 .expect("length checked");
@@ -266,11 +276,11 @@ impl Channel {
 
     /// Mask a bare frame header with the sending ratchet, for the handshake frames that
     /// are not channel-encrypted.
-    pub fn mask_header(&mut self, header: Header) -> [u8; 4] {
+    pub fn mask_header(&mut self, header: Header) -> [u8; framing::HEADER_LEN] {
         self.tx_headers.mask(header)
     }
 
-    pub fn unmask_header(&mut self, bytes: [u8; 4]) -> Header {
+    pub fn unmask_header(&mut self, bytes: [u8; framing::HEADER_LEN]) -> Header {
         self.rx_headers.unmask(bytes)
     }
 
@@ -370,7 +380,7 @@ impl Session {
         self.channel.encrypt(proto_cmd, payload, sign.then_some(&self.session_sign_sk))
     }
 
-    pub fn unmask_header(&mut self, bytes: [u8; 4]) -> Header {
+    pub fn unmask_header(&mut self, bytes: [u8; framing::HEADER_LEN]) -> Header {
         self.channel.unmask_header(bytes)
     }
 

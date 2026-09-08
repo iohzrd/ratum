@@ -11,7 +11,9 @@ use crate::coinbase::COINBASE_POOLED;
 use crate::config::Config;
 use crate::datum::{self, QueuedShare};
 use crate::dupes::Dupes;
-use crate::job::{COINBASE_SUBSIDY_ONLY, Job, JobRef, MAX_JOBS, parse_sia_field};
+use crate::job::{
+    COINBASE_SUBSIDY_ONLY, JOB_ID_TIME_CHARS, Job, JobRef, MAX_JOBS, parse_sia_field,
+};
 use crate::tally::Tally;
 use crate::username::{self, FeeMeter};
 use crate::vardiff::{self, Vardiff};
@@ -50,8 +52,28 @@ const SOCKET: Token = Token(0);
 /// The `Waker` a new job or a kill request calls.
 const WAKE: Token = Token(1);
 const STAT_CYCLE: Duration = Duration::from_secs(60);
-/// Difficulty to TH/s: `diff * 2^32 / 1e12` per second.
-const DIFF_TO_THS: f64 = 0.004294967296;
+/// How long after a hashrate window closes the estimate from it is still reported; past it
+/// the connection has stopped submitting and `hashrate_ths` returns `None`.
+const HASHRATE_WINDOW_VALID: Duration = Duration::from_secs(3 * 60);
+/// How long a failed `accept` waits before the next, so a listener error that repeats does
+/// not spin.
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
+/// How often the refusal of new connections is logged while `datum.pooled_mining_only` holds
+/// them off.
+const REJECT_LOG_INTERVAL: Duration = Duration::from_secs(5);
+/// How long after connecting the first idle check runs; `IDLE_CHECK_INTERVAL` paces the rest.
+const FIRST_IDLE_CHECK_DELAY: Duration = Duration::from_secs(10);
+/// The read buffer and the chunk read into it. A line holds one JSON-RPC message, and
+/// `CLIENT_BUFFER` bounds how much of one is kept before the connection is closed.
+const READ_CHUNK: usize = 4096;
+/// Difficulty to TH/s: the hashes a difficulty unit costs, per second, in terahashes.
+const DIFF_TO_THS: f64 = ratum::HASHES_PER_DIFFICULTY / ratum::HASHES_PER_TERAHASH;
+/// What the connection counter is XORed with to make the session id the subscribe response
+/// carries, the C gateway's `return i ^ 0xB10CF00D` (`datum_stratum_get_client_sid`).
+const SESSION_ID_XOR: u32 = 0xB10C_F00D;
+/// How many times a found block is logged, as the C gateway repeats the line, so it is
+/// visible in a log an operator scrolls through.
+const BLOCK_FOUND_LOG_LINES: usize = 3;
 
 /// A stratum error: the code and the text of the `error` array.
 #[derive(Clone, Copy)]
@@ -110,10 +132,11 @@ pub struct ClientStats {
 }
 
 impl ClientStats {
-    /// Estimated TH/s from the last completed window, when it ended under three minutes ago.
+    /// Estimated TH/s from the last completed window, while `HASHRATE_WINDOW_VALID` has not
+    /// passed since it ended.
     pub fn hashrate_ths(&self) -> Option<f64> {
         let ended = self.window_ended?;
-        if ended.elapsed() > Duration::from_secs(180) || self.window.is_zero() {
+        if ended.elapsed() > HASHRATE_WINDOW_VALID || self.window.is_zero() {
             return None;
         }
         Some(self.window_diff as f64 / self.window.as_secs_f64() * DIFF_TO_THS)
@@ -324,20 +347,20 @@ pub fn listen(server: Arc<Server>) -> io::Result<()> {
     let listener = listener.ok_or(last)?;
     info!("Stratum V1 Server Init complete: listening on {}", listener.local_addr()?);
     server.listening.store(true, Ordering::Relaxed);
-    let mut last_reject_log = Instant::now() - Duration::from_secs(10);
+    let mut last_reject_log = Instant::now() - REJECT_LOG_INTERVAL;
     let mut rejected = 0u64;
     for stream in listener.incoming() {
         let stream = match stream {
             Ok(s) => s,
             Err(e) => {
                 warn!("accept failed: {e}");
-                std::thread::sleep(Duration::from_millis(100));
+                std::thread::sleep(ACCEPT_RETRY_DELAY);
                 continue;
             }
         };
         if server.rejecting.load(Ordering::Relaxed) {
             rejected += 1;
-            if last_reject_log.elapsed() >= Duration::from_secs(5) {
+            if last_reject_log.elapsed() >= REJECT_LOG_INTERVAL {
                 warn!(
                     "Refusing stratum connections while the pool is unreachable and datum.pooled_mining_only is set ({rejected} refused)"
                 );
@@ -420,7 +443,7 @@ impl Connection {
         let unique_id = server.next_unique_id.fetch_add(1, Ordering::Relaxed);
         // The C gateway packs a 22-bit client index and a thread id; here the connection
         // counter is the whole 32 bits, so two live connections never share extranonce1.
-        let sid = (unique_id as u32) ^ 0xB10C_F00D;
+        let sid = (unique_id as u32) ^ SESSION_ID_XOR;
         let entry = Arc::new(ClientEntry {
             kill: AtomicBool::new(false),
             waker,
@@ -462,7 +485,7 @@ impl Connection {
             window_active: 0,
             window_started: now,
             fee: FeeMeter::default(),
-            next_idle_check: now + Duration::from_secs(10),
+            next_idle_check: now + FIRST_IDLE_CHECK_DELAY,
             server: Arc::clone(&server),
         };
         let result = c.serve();
@@ -472,8 +495,8 @@ impl Connection {
     }
 
     fn serve(&mut self) -> Result<(), Disconnect> {
-        let mut buf = Vec::with_capacity(4096);
-        let mut chunk = [0u8; 4096];
+        let mut buf = Vec::with_capacity(READ_CHUNK);
+        let mut chunk = [0u8; READ_CHUNK];
         loop {
             if self.entry.kill.load(Ordering::Relaxed) {
                 return Err(Disconnect::Killed);
@@ -823,11 +846,17 @@ impl Connection {
         // The nbits field carries `share_nbits(pot)`, not the template's bits, as the C
         // gateway sends for every BLAKE2b job: the compact target nearest to and not easier
         // than the miner's share target, so the hasher is not given the network target.
+        // coinb1 is the work root leaf's leading zero bytes and H2; there is no coinb2 and
+        // no merkle branch, since the machine never receives the coinbase.
+        let coinb1 = format!(
+            "{}{}",
+            "00".repeat(ratum::header::COINB1_LEADING_ZEROS),
+            hex::encode(commitment.h2)
+        );
         let line = format!(
-            "{{\"id\":null,\"method\":\"mining.notify\",\"params\":[\"{}\",\"{}\",\"000000{}\",\"\",[],\"\",\"{:08x}\",\"{}\",{clean_flag}]}}",
+            "{{\"id\":null,\"method\":\"mining.notify\",\"params\":[\"{}\",\"{}\",\"{coinb1}\",\"\",[],\"\",\"{:08x}\",\"{}\",{clean_flag}]}}",
             r.notify_id(job),
             hex::encode(job.prevblock_hidden),
-            hex::encode(commitment.h2),
             target::share_nbits(pot),
             job.ntime_hex,
         );
@@ -878,7 +907,7 @@ impl Connection {
         let job = ratum::lock(&self.server.jobs).ring[job_ref.global_index as usize]
             .clone()
             .ok_or(unknown)?;
-        if job.job_id.get(..8) != job_id.get(..8) {
+        if job.job_id.get(..JOB_ID_TIME_CHARS) != job_id.get(..JOB_ID_TIME_CHARS) {
             return Err(unknown);
         }
         let job_diff = self.served_diff(&job_ref).ok_or(unknown)?;
@@ -939,7 +968,7 @@ impl Connection {
         let is_block = job.abw.is_none() && target::meets_target(&hash, &job.block_target);
         if is_block {
             let display = hex::encode(hash);
-            for _ in 0..3 {
+            for _ in 0..BLOCK_FOUND_LOG_LINES {
                 warn!("******** BLOCK FOUND - {display} ********");
             }
             self.submit_block(job, r.coinbase, pot, &header.serialize(), &display);
@@ -1036,7 +1065,7 @@ impl Connection {
     fn fee_charged(&mut self, diff: u64) -> bool {
         let bps = u64::from(self.server.config.datum.gateway_fee_bps);
         let charged = self.fee.charge(diff, bps, || {
-            let mut b = [0u8; 8];
+            let mut b = [0u8; size_of::<u64>()];
             dryoc::rng::copy_randombytes(&mut b);
             u64::from_le_bytes(b)
         });

@@ -21,6 +21,10 @@ pub mod client_subcmd {
 
 pub use super::framing::STRUCT_END;
 pub const CONFIG_VERSION: u8 = 1;
+/// Everything a version 1 configuration holds besides the payout script and the coinbase
+/// tag: the subcommand, the version, the two length bytes, the 32-bit prime ID, the minimum
+/// difficulty, the zero byte and the terminator.
+const CONFIG_FIXED_LEN: usize = 4 + size_of::<u32>() + size_of::<u64>() + 2;
 /// The pool's payout script in the configuration message. The C gateway's parser refuses a
 /// longer one (`MAX_OUTPUT_SCRIPT_LEN`, 83, the RDTS output-script ceiling); the version 1
 /// fork refuses one over 64 (its `pool_addr_script` field), and `ratum-prime` limits its
@@ -65,7 +69,7 @@ impl ClientConfig {
         }
 
         let tag = self.coinbase_tag.as_bytes();
-        let mut out = Vec::with_capacity(16 + self.payout_script.len() + tag.len());
+        let mut out = Vec::with_capacity(CONFIG_FIXED_LEN + self.payout_script.len() + tag.len());
         out.push(server_subcmd::CONFIG);
         out.push(CONFIG_VERSION);
         out.push(self.payout_script.len() as u8);
@@ -105,6 +109,11 @@ impl ClientConfig {
 /// a v1 gateway rejects this, so the server picks the version from the hello's DRS
 /// extension (present only in version 3 hellos).
 pub const CONFIG_VERSION_V3: u8 = 3;
+/// A version 3 configuration's fixed part: `CONFIG_FIXED_LEN` with a 64-bit prime ID in
+/// place of the 32-bit one, plus the resume token.
+const CONFIG_V3_FIXED_LEN: usize =
+    CONFIG_FIXED_LEN + (size_of::<u64>() - size_of::<u32>()) + RESUME_TOKEN_LEN;
+
 /// `DATUM_RESUME_TOKEN_SIZE`. Bytes 0..8 must be the prime ID little-endian: the gateway
 /// treats a resume as accepted only when the configured prime ID equals that prefix and the
 /// whole token echoes what it sent.
@@ -122,15 +131,18 @@ pub const CONFIG_FLAG_ABW_DISABLED: u8 = 0x01;
 /// Whether a resume token carries `prime_id` in its first eight bytes, the invariant the
 /// gateway checks before treating a configuration as a resume.
 pub fn token_matches_prime_id(token: &ResumeToken, prime_id: u64) -> bool {
-    u64::from_le_bytes(token[..8].try_into().expect("eight bytes")) == prime_id
+    u64::from_le_bytes(token[..TOKEN_PRIME_ID_LEN].try_into().expect("eight bytes")) == prime_id
 }
+
+/// The resume token's leading prime ID, little-endian; the rest is random.
+const TOKEN_PRIME_ID_LEN: usize = size_of::<u64>();
 
 /// A token for one new session: `prime_id` little-endian, then 32 bytes from the CSPRNG.
 /// Random, so a token names one session and a pool restart declines every resume.
 pub fn new_resume_token(prime_id: u64) -> ResumeToken {
     let mut t = [0u8; RESUME_TOKEN_LEN];
-    t[..8].copy_from_slice(&prime_id.to_le_bytes());
-    dryoc::rng::copy_randombytes(&mut t[8..]);
+    t[..TOKEN_PRIME_ID_LEN].copy_from_slice(&prime_id.to_le_bytes());
+    dryoc::rng::copy_randombytes(&mut t[TOKEN_PRIME_ID_LEN..]);
     t
 }
 
@@ -163,8 +175,9 @@ impl ClientConfigV3 {
         }
 
         let tag = self.coinbase_tag.as_bytes();
-        let mut out =
-            Vec::with_capacity(64 + RESUME_TOKEN_LEN + self.payout_script.len() + tag.len());
+        let mut out = Vec::with_capacity(
+            CONFIG_V3_FIXED_LEN + self.payout_script.len() + tag.len() + DBF_MARKER.len(),
+        );
         out.push(server_subcmd::CONFIG);
         out.push(CONFIG_VERSION_V3);
         out.push(self.payout_script.len() as u8);
@@ -207,8 +220,9 @@ impl ClientConfigV3 {
         if flags & !CONFIG_FLAG_ABW_DISABLED != 0 || c.u8("terminator").ok()? != STRUCT_END {
             return None;
         }
-        // The gateway reads exactly four bytes after the terminator and ignores the rest.
-        let bulk_framing = c.rest().get(..4) == Some(&DBF_MARKER[..]);
+        // The gateway reads exactly the marker's four bytes after the terminator and ignores
+        // the rest.
+        let bulk_framing = c.rest().get(..DBF_MARKER.len()) == Some(&DBF_MARKER[..]);
         Some(ClientConfigV3 {
             payout_script,
             prime_id,
@@ -233,29 +247,45 @@ pub struct MigrationTarget {
     pub host: String,
     pub port: u16,
     /// 32 bytes ed25519 signing pubkey then 32 bytes x25519 box pubkey.
-    pub pubkey: [u8; 64],
+    pub pubkey: [u8; MIGRATION_PUBKEY_LEN],
 }
 
 pub const MIGRATION_REVISION: u8 = 0;
+/// The action byte after the revision (`datum_protocol_migration_request`): redirect to the
+/// target that follows, or return the gateway to its configured endpoint.
+pub const MIGRATION_ACTION_REDIRECT: u8 = 0;
+pub const MIGRATION_ACTION_RETURN_HOME: u8 = 1;
+/// The host a migration target may name, `sizeof(datum_config.datum_pool_migration_host)`;
+/// the C parser refuses a length of this or more, and a zero length.
+pub const MAX_MIGRATION_HOST: usize = 1024;
+/// The migration target's two public keys, concatenated.
+pub const MIGRATION_PUBKEY_LEN: usize = 2 * 32;
+/// Everything a redirect holds besides the host: the subcommand, the revision, the action,
+/// the host length, the port, the public keys and the terminator. The C parser's
+/// `expected_len = host_len + 71` counts the same bytes without the subcommand.
+const MIGRATION_REDIRECT_FIXED_LEN: usize =
+    3 + size_of::<u16>() + size_of::<u16>() + MIGRATION_PUBKEY_LEN + 1;
 
 impl MigrationRequest {
     pub fn encode(&self) -> Result<Vec<u8>, Error> {
-        let mut out = Vec::with_capacity(72 + self.target.as_ref().map_or(0, |t| t.host.len()));
+        let mut out = Vec::with_capacity(
+            MIGRATION_REDIRECT_FIXED_LEN + self.target.as_ref().map_or(0, |t| t.host.len()),
+        );
         out.push(server_subcmd::MIGRATION);
         out.push(MIGRATION_REVISION);
         match &self.target {
             None => {
-                out.push(1);
+                out.push(MIGRATION_ACTION_RETURN_HOME);
             }
             Some(t) => {
                 let host = t.host.as_bytes();
-                if host.is_empty() || host.len() >= 1024 || host.contains(&0) {
+                if host.is_empty() || host.len() >= MAX_MIGRATION_HOST || host.contains(&0) {
                     return Err(Error::OutOfRange { field: "migration host", len: host.len() });
                 }
                 if t.port == 0 {
                     return Err(Error::OutOfRange { field: "migration port", len: 0 });
                 }
-                out.push(0);
+                out.push(MIGRATION_ACTION_REDIRECT);
                 out.extend_from_slice(&(host.len() as u16).to_le_bytes());
                 out.extend_from_slice(host);
                 out.extend_from_slice(&t.port.to_le_bytes());
@@ -273,15 +303,15 @@ impl MigrationRequest {
             return None;
         }
         match c.u8("action").ok()? {
-            1 => {
+            MIGRATION_ACTION_RETURN_HOME => {
                 if c.u8("terminator").ok()? != STRUCT_END || !c.at_end() {
                     return None;
                 }
                 Some(MigrationRequest { target: None })
             }
-            0 => {
+            MIGRATION_ACTION_REDIRECT => {
                 let host_len = c.u16("host length").ok()? as usize;
-                if host_len == 0 || host_len >= 1024 {
+                if host_len == 0 || host_len >= MAX_MIGRATION_HOST {
                     return None;
                 }
                 let host = c.take(host_len, "host").ok()?;
@@ -293,7 +323,7 @@ impl MigrationRequest {
                 if port == 0 {
                     return None;
                 }
-                let pubkey: [u8; 64] = c.arr("pubkey").ok()?;
+                let pubkey: [u8; MIGRATION_PUBKEY_LEN] = c.arr("pubkey").ok()?;
                 if c.u8("terminator").ok()? != STRUCT_END || !c.at_end() {
                     return None;
                 }
@@ -304,10 +334,26 @@ impl MigrationRequest {
     }
 }
 
+/// The blob of dictated outputs a coinbaser response carries. The C gateway refuses a
+/// length of `32768` or more and a length of zero (`datum_protocol.c`: `x > 32768-1`).
 pub const MAX_COINBASER_BLOB: usize = 32767;
+/// The output script lengths `datum_coinbaser_v2_parse` accepts (`slen < 2 || slen > 64`
+/// discards the whole coinbaser).
 pub const MIN_OUTPUT_SCRIPT: usize = 2;
 pub const MAX_OUTPUT_SCRIPT: usize = 64;
+/// The outputs `datum_coinbaser_v2_parse` keeps before it stops reading the blob
+/// (`if (cbvalid >= 512) break;`).
 pub const MAX_COINBASER_OUTPUTS: usize = 512;
+/// One blob output's fixed part: the value and a one-byte script length. The C parser
+/// refuses a blob under this plus its coinbaser id (`cblen < 9`) and stops mid-blob when
+/// fewer than these bytes remain (`cidx + 8 + 1 > cblen`).
+const COINBASER_OUTPUT_FIXED_LEN: usize = size_of::<u64>() + 1;
+/// The coinbaser response before its blob: the subcommand, the block's coinbase value and
+/// the blob length.
+const COINBASER_RESPONSE_HEADER_LEN: usize = 1 + size_of::<u64>() + size_of::<u32>();
+/// A coinbaser request whole: the subcommand, the value, the previous block hash and the
+/// terminator.
+const COINBASER_REQUEST_LEN: usize = 1 + size_of::<u64>() + crate::bitcoin::HASH_SIZE + 1;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CoinbaserRequest {
@@ -328,7 +374,7 @@ impl CoinbaserRequest {
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(42);
+        let mut out = Vec::with_capacity(COINBASER_REQUEST_LEN);
         out.push(client_subcmd::COINBASER_REQUEST);
         out.extend_from_slice(&self.value.to_le_bytes());
         out.extend_from_slice(&self.prev_hash);
@@ -369,7 +415,9 @@ impl CoinbaserResponse {
         if self.outputs.len() > MAX_COINBASER_OUTPUTS {
             return Err(Error::TooLong { field: "coinbaser outputs", len: self.outputs.len() });
         }
-        let mut blob = Vec::with_capacity(1 + self.outputs.len() * 41);
+        let blob_len: usize =
+            self.outputs.iter().map(|o| COINBASER_OUTPUT_FIXED_LEN + o.script.len()).sum();
+        let mut blob = Vec::with_capacity(1 + blob_len);
         blob.push(self.coinbaser_id);
         let mut total: u64 = 0;
         for o in &self.outputs {
@@ -388,7 +436,7 @@ impl CoinbaserResponse {
             return Err(Error::TooLong { field: "coinbaser blob", len: blob.len() });
         }
 
-        let mut out = Vec::with_capacity(13 + blob.len());
+        let mut out = Vec::with_capacity(COINBASER_RESPONSE_HEADER_LEN + blob.len());
         out.push(server_subcmd::COINBASER);
         out.extend_from_slice(&self.value.to_le_bytes());
         out.extend_from_slice(&(blob.len() as u32).to_le_bytes());
@@ -415,9 +463,7 @@ impl CoinbaserResponse {
         let mut outputs = Vec::new();
         let mut total: u64 = 0;
         while !b.at_end() {
-            // Every output starts with nine fixed bytes: an 8-byte value and a 1-byte script
-            // length.
-            if b.rest().len() < 9 {
+            if b.rest().len() < COINBASER_OUTPUT_FIXED_LEN {
                 return None;
             }
             let v = b.u64("output value").ok()?;
