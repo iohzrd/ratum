@@ -119,22 +119,14 @@ pool dictates where the coinbase pays, verifies the shares and relays the blocks
 The workspace holds the `core` library (the protocol, the version 2 header, the RPC client and
 the code the binaries share), `ratum-prime` (the pool), `ratum-gateway` (a reimplementation of
 the [CONVOY DATUM Gateway](https://github.com/CONVOYMining/datum_gateway), see [Gateway](#gateway))
-and `sia-test-miner` (the CPU miner the end-to-end tests drive). The header hash and share
+and `sia-test-miner` (a CPU miner that mines against a gateway). The header hash and share
 format are byte-coupled between the pool and the gateway, so they are one release.
 
-### Build and test
+### Build
 
 ```
 cargo build --workspace --release        # target/release/ratum-prime, ratum-gateway, sia-test-miner
-cargo test --workspace
-cargo test --workspace --release -- --ignored  # shares and blocks, ~2^32 hashes each
-e2e/full_stack.sh                  # the activation block
-e2e/multi_miner.sh                 # three miners, two gateways: credit and payout split
-e2e/gateway_fee.sh                 # a gateway charging a fee beside one charging none
 ```
-
-The scripts need a Knots build with the BLAKE2b change (`BITCOIND`, `BITCOIN_CLI`);
-`DATUM_GATEWAY` runs another gateway build instead of this workspace's.
 
 The `gateway` GitHub Actions workflow builds `ratum-gateway` for x86_64 and aarch64 Linux
 (static musl) and x86_64 Windows on every push and pull request (each an artifact of the

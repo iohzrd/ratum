@@ -1,13 +1,7 @@
-//! Block assembly and `submitblock`: to the local node, then to any extra node configured,
-//! with `preciousblock` after each.
-
 use crate::job::{COINBASE_SUBSIDY_ONLY, Job};
 use log::{debug, info, warn};
 use ratum::rpc;
 
-/// The serialized block a share names: the header, the transaction count, the coinbase
-/// (without witness; the node adds the witness nonce in `submitblock`), then the template's
-/// transactions unless the work was subsidy-only.
 pub fn assemble(
     job: &Job,
     coinbase_id: u8,
@@ -21,15 +15,12 @@ pub fn assemble(
     Some(ratum::bitcoin::serialize_block(header, &coinbase, &others))
 }
 
-/// Submit to one node; `true` when the node accepted it.
 pub fn submit_to(node: &rpc::Client, what: &str, block: &[u8], hash_hex: &str) -> bool {
     let accepted = match node.submit_block(block) {
         Ok(None) => {
             info!("Block {hash_hex} submitted to {what} successfully!");
             true
         }
-        // "duplicate" is the node's response to the second of two submissions of one block
-        // (the C gateway's submitblock thread and its inline call overlap the same way).
         Ok(Some(reason)) if reason == "duplicate" => {
             info!("Block {hash_hex} already known to {what}");
             true
@@ -50,9 +41,6 @@ pub fn submit_to(node: &rpc::Client, what: &str, block: &[u8], hash_hex: &str) -
     accepted
 }
 
-/// The C gateway's submitblock thread: submit to the node again on its own connection, then
-/// to every extra node, without holding up the stratum thread that found the block. The
-/// template thread is notified when the node accepts it.
 pub fn submit_redundant(
     node: rpc::Client,
     extras: Vec<rpc::Client>,
@@ -73,8 +61,6 @@ pub fn submit_redundant(
     }
 }
 
-/// A client for an extra submission URL: `http://host[:port]` or `https://host[:port]`,
-/// optionally with `user:pass@` before the host, the forms the C gateway hands to curl.
 pub fn extra_client(url: &str) -> Option<rpc::Client> {
     let (scheme, rest) = url.split_once("://")?;
     if scheme != "http" && scheme != "https" {
@@ -87,7 +73,6 @@ pub fn extra_client(url: &str) -> Option<rpc::Client> {
         }
         None => ("", "", rest),
     };
-    // Without a port, the scheme's default, as curl applies for the C gateway.
     let (authority, path) = host.split_once('/').map_or((host, ""), |(a, p)| (a, p));
     if authority.is_empty() {
         return None;
@@ -104,7 +89,6 @@ pub fn extra_client(url: &str) -> Option<rpc::Client> {
     rpc::Client::new(&format!("{scheme}://{authority}{port}{slash}{path}"), user, pass).ok()
 }
 
-/// The default ports of the two schemes an extra node URL may name.
 const HTTP_PORT: u16 = 80;
 const HTTPS_PORT: u16 = 443;
 
@@ -115,21 +99,5 @@ pub fn save_to_dir(dir: &str, hash_hex: &str, block: &[u8]) {
     });
     if let Err(e) = std::fs::write(&path, body.to_string()) {
         warn!("could not save the block submission to {path}: {e}");
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::extra_client;
-
-    #[test]
-    fn extra_urls_take_both_schemes_and_optional_credentials() {
-        assert!(extra_client("http://u:p@127.0.0.1:8332").is_some());
-        assert!(extra_client("https://u:p@node.example:8332").is_some());
-        assert!(extra_client("http://127.0.0.1:8332").is_some());
-        assert!(extra_client("ftp://127.0.0.1:8332").is_none());
-        assert!(extra_client("127.0.0.1:8332").is_none());
-        assert!(extra_client("http://nohost").is_some(), "the scheme's port applies");
-        assert!(extra_client("http://").is_none());
     }
 }

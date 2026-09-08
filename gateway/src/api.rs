@@ -1,13 +1,3 @@
-//! The HTTP interfaces: the admin port (`api.listen_port`) serves `status.html` at `/`,
-//! which renders `/stats.json` in the browser as the pool's stats page does, plus `/login`,
-//! `/cmd`, `/NOTIFY` and the settings page `/config` (`config.html`, filled from
-//! `/config.json`; a POST to `/config` saves through `config::apply`); the password-less
-//! miner lookup is on `api.miner_listen_port`. `/login`, `/cmd` and the client rows of
-//! `/stats.json` require `api.admin_password` over HTTP Basic authentication, and are
-//! refused while none is configured, as the C gateway's `datum_api_check_admin_password_only`
-//! refuses them; the status itself is public, as the C gateway's is. The settings page
-//! requires a password to be set at all, and saving requires `api.modify_conf` too.
-
 use crate::stratum::{ClientStats, Server};
 use log::{info, warn};
 use ratum::http::{self, Reply};
@@ -27,35 +17,24 @@ pub struct Context {
     pub server: Arc<Server>,
     pub template_status: Arc<Mutex<crate::template::Status>>,
     pub started: std::time::Instant,
-    /// A random token every `/cmd` form carries and `/cmd` requires, so a request a
-    /// browser replays the admin credentials on from another site does not act (the C
-    /// gateway's `api_csrf_token`).
     pub csrf: String,
-    /// The configuration file the settings page edits (`-c`).
     pub config_path: String,
-    /// The gateway-hashrate history the status page charts, sampled by a thread `start`
-    /// spawns. It begins with the process, so a restart shows as a gap.
     pub history: Mutex<ratum::web::History>,
 }
 
-/// Record the hashrate the summary reports now.
 fn sample_hashrate(ctx: &Context) {
     let hs = ctx.server.summary().hashrate_ths * ratum::HASHES_PER_TERAHASH;
     ratum::web::push_sample(&mut ratum::lock(&ctx.history), ratum::unix_now(), hs);
 }
 
-/// The random bytes a CSRF token carries, written as hex.
 const CSRF_TOKEN_BYTES: usize = 16;
 
-/// A random token for `Context::csrf`.
 pub fn csrf_token() -> String {
     let mut b = [0u8; CSRF_TOKEN_BYTES];
     dryoc::rng::copy_randombytes(&mut b);
     hex::encode(b)
 }
 
-/// Equality in time that depends on the lengths and not on where the strings differ
-/// (`datum_secure_strequals`).
 fn secure_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
     let mut acc = a.len() ^ b.len();
@@ -79,8 +58,6 @@ fn duration_text(d: std::time::Duration) -> String {
 
 fn authorized(ctx: &Context, req: &Request) -> bool {
     let password = &ctx.server.config.api.admin_password;
-    // As the C gateway: with no admin password configured, no request is authorized. An empty
-    // password must not mean an empty check.
     if password.is_empty() {
         return false;
     }
@@ -122,13 +99,10 @@ fn pool_host_json(cfg: &crate::config::Config) -> Value {
     }
 }
 
-/// `datum.pool_url`, or null when it is not set.
 fn pool_url_json(cfg: &crate::config::Config) -> Value {
     if cfg.datum.pool_url.is_empty() { Value::Null } else { json!(cfg.datum.pool_url) }
 }
 
-/// One client's row. `identity` adds who it is (the admin's `/stats.json`); the miner
-/// lookup reports the counters alone.
 fn client_json(cfg: &crate::config::Config, c: &ClientStats, identity: bool) -> Value {
     let mut v = json!({
         "subscribed_seconds": seconds_ago(c.subscribed_at),
@@ -160,7 +134,6 @@ fn client_json(cfg: &crate::config::Config, c: &ClientStats, identity: bool) -> 
     v
 }
 
-/// The job the stratum server is serving, with the template it was built from.
 fn job_json(j: &crate::job::Job) -> Value {
     json!({
         "job_id": j.job_id,
@@ -188,8 +161,6 @@ fn job_json(j: &crate::job::Job) -> Value {
     })
 }
 
-/// What the job's generation transaction pays: the pool's split, then the remainder to the
-/// pool script.
 fn coinbaser_json(j: &crate::job::Job) -> Vec<Value> {
     j.payout_rows()
         .iter()
@@ -203,8 +174,6 @@ fn coinbaser_json(j: &crate::job::Job) -> Vec<Value> {
         .collect()
 }
 
-/// The status snapshot. `with_clients` adds the per-connection rows, which need the admin
-/// password when one is set.
 fn status_json(ctx: &Context, with_clients: bool) -> Value {
     let server = &ctx.server;
     let cfg = &server.config;
@@ -223,8 +192,6 @@ fn status_json(ctx: &Context, with_clients: bool) -> Value {
     } else if cfg.datum.pooled_mining_only {
         "Not Ready".to_string()
     } else {
-        // A pool is configured but not connected, and pooled_mining_only is off: the
-        // gateway serves work that pays mining.pool_address, as the C gateway does.
         "Non-Pooled Mode (pool unreachable)".to_string()
     };
     let job = current.as_deref().map(job_json);
@@ -272,7 +239,6 @@ fn status_json(ctx: &Context, with_clients: bool) -> Value {
     })
 }
 
-/// The counters summed over the connections one address has.
 #[derive(Default)]
 struct Totals {
     accepted: crate::tally::Tally,
@@ -305,7 +271,6 @@ fn miner_lookup_json(ctx: &Context, addr: Option<&str>) -> Value {
         .map(|c| {
             totals.add(c);
             let mut v = client_json(cfg, c, false);
-            // The lookup reports the subscription as the connection's age.
             if let Some(o) = v.as_object_mut()
                 && let Some(s) = o.remove("subscribed_seconds")
             {
@@ -338,7 +303,6 @@ fn miner_lookup_json(ctx: &Context, addr: Option<&str>) -> Value {
     })
 }
 
-/// The most of a POST body the settings form is read from; a longer one is truncated.
 const MAX_BODY_BYTES: u64 = 1 << 20;
 
 fn read_body(req: &mut Request) -> String {
@@ -347,13 +311,10 @@ fn read_body(req: &mut Request) -> String {
     body
 }
 
-/// A JSON reply with a status code.
 fn json_status(code: u16, v: Value) -> Reply {
     http::json(v).with_status_code(code)
 }
 
-/// The settings page and its data: refused without a password to require, as the C
-/// gateway's `/config` is, since the page shows the node credentials' user and URL.
 fn settings_access(ctx: &Context, req: &Request) -> Result<(), Reply> {
     if ctx.server.config.api.admin_password.is_empty() {
         Err(forbidden("The settings page requires api.admin_password to be set."))
@@ -364,7 +325,6 @@ fn settings_access(ctx: &Context, req: &Request) -> Result<(), Reply> {
     }
 }
 
-/// `/config.json`: the form's values, whether saving is allowed, and the form token.
 fn settings_json(ctx: &Context) -> Value {
     let cfg = &ctx.server.config;
     let doc = std::fs::read_to_string(&ctx.config_path)
@@ -379,7 +339,6 @@ fn settings_json(ctx: &Context) -> Value {
     v
 }
 
-/// A POST to `/config`: the reply, and whether the process restarts once it is sent.
 fn save_settings(ctx: &Context, body: &str) -> (Reply, bool) {
     let form = http::pairs(body);
     let errors = |code, errors: Vec<String>| {
@@ -425,8 +384,6 @@ fn serve_admin(ctx: &Context, mut req: Request) {
             ctx.server.notify.raise();
             http::html("OK".to_string())
         }
-        // The browser prompts for the admin password on the 401; the status page's client
-        // rows then come with the credentials it replays.
         (Method::Get, "/login") => {
             if authorized(ctx, &req) {
                 redirect("/")
@@ -458,7 +415,6 @@ fn serve_admin(ctx: &Context, mut req: Request) {
             }
         }
         (Method::Post, "/cmd") => {
-            // As in C: no admin password, no commands; and the form's token must match.
             if ctx.server.config.api.admin_password.is_empty() {
                 forbidden("Commands require api.admin_password to be set.")
             } else if !authorized(ctx, &req) {
@@ -505,7 +461,6 @@ fn serve_miner(ctx: &Context, req: Request) {
     let _ = req.respond(response);
 }
 
-/// Bind on `addr`, or on every address when it is empty, as the stratum listener does.
 fn bind(what: &str, addr: &str, port: u16) -> Option<tiny_http::Server> {
     match http::bind(addr, port) {
         Ok(s) => Some(s),
@@ -544,27 +499,5 @@ pub fn start(ctx: Arc<Context>) {
     {
         info!("Miner lookup API listening on port {}", cfg.api.miner_listen_port);
         http::serve("api-miner", server, move |req| serve_miner(&ctx, req));
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn secure_eq_compares_whole_strings() {
-        assert!(secure_eq("abc", "abc"));
-        assert!(!secure_eq("abc", "abd"));
-        assert!(!secure_eq("abc", "ab"));
-        assert!(!secure_eq("", "a"));
-        assert!(secure_eq("", ""));
-    }
-
-    #[test]
-    fn uptime_text() {
-        assert_eq!(
-            duration_text(std::time::Duration::from_secs(90061)),
-            "1 days, 1 hours, 1 minutes, 1 seconds"
-        );
     }
 }

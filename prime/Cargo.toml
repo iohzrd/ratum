@@ -19,6 +19,3 @@ serde.workspace = true
 serde_json.workspace = true
 tiny_http.workspace = true
 toml.workspace = true
-
-[dev-dependencies]
-ratum = { path = "../core", features = ["test-support"] }

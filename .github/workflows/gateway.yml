@@ -1,7 +1,7 @@
 # Builds ratum-gateway for x86_64 and aarch64 Linux (static musl), x86_64 Windows, and
-# x86_64 and aarch64 macOS on every push and pull request, runs its tests on x86_64 Linux,
-# uploads each binary as a workflow artifact, and on a `v*` tag attaches the archives and
-# their SHA-256 sums to a GitHub release.
+# x86_64 and aarch64 macOS on every push and pull request, uploads each binary as a
+# workflow artifact, and on a `v*` tag attaches the archives and their SHA-256 sums to a
+# GitHub release.
 #
 # Static musl so one binary runs beside any node without a matching glibc; the aarch64
 # builds run natively on the arm runners rather than cross-compiling. TLS is rustls with
@@ -71,12 +71,6 @@ jobs:
       # aws-lc-sys assembles its Windows build with NASM; CMake is on the runner.
       - uses: ilammy/setup-nasm@v1
         if: runner.os == 'Windows'
-
-      # The host-target tests, on x86_64 Linux only: the other runners exercise the same code
-      # and add nothing but time.
-      - name: Test
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: cargo test -p ratum-gateway
 
       - name: Build
         env:

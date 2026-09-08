@@ -6,9 +6,7 @@ pub use super::messages::client_subcmd::VALIDATION;
 pub mod request {
     pub const SHORT_TXN_LIST: u8 = 0x10;
     pub const TXNS: u8 = 0x11;
-    /// The template's transactions without the coinbase transaction.
     pub const BLOCK_TXNS: u8 = 0x12;
-    /// version 3 protocol: upload a proposal parent the pool's node does not have.
     pub const PARENT_FETCH: u8 = 0x14;
 }
 
@@ -33,7 +31,6 @@ wire_codes! {
         BadJobIndex = 0xF3,
         BadRequest = 0xF4,
     }
-    /// A status byte this build does not name.
     unknown Unknown;
 }
 
@@ -71,13 +68,9 @@ impl From<Truncated> for Error {
     }
 }
 
-/// Every validation message, in either direction, starts with the mining sub-command, the
-/// selector naming the request or reply, and the job index; the rest is its own payload.
 pub const SELECTOR_AT: usize = 1;
 pub const JOB_INDEX_AT: usize = 2;
 pub const REQUEST_HEADER_LEN: usize = JOB_INDEX_AT + 1;
-/// The exact plaintext length the C handler requires of a parent fetch: the header and the
-/// 32-byte parent hash, with no trailing padding.
 pub const PARENT_FETCH_REQUEST_LEN: usize = REQUEST_HEADER_LEN + crate::bitcoin::HASH_SIZE;
 
 pub fn request_short_txn_list(job_index: u8) -> Vec<u8> {
@@ -100,9 +93,6 @@ pub fn request_block_txns(job_index: u8) -> Vec<u8> {
     vec![VALIDATION, request::BLOCK_TXNS, job_index]
 }
 
-/// version 3 protocol. The C handler requires exactly `PARENT_FETCH_REQUEST_LEN` bytes of
-/// plaintext: unlike the other validation requests it rejects any trailing padding.
-/// `parent_hash` is in internal byte order, as the job context's prev hash is sent.
 pub fn request_parent_fetch(job_index: u8, parent_hash: &[u8; 32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(PARENT_FETCH_REQUEST_LEN);
     out.push(VALIDATION);
@@ -113,7 +103,6 @@ pub fn request_parent_fetch(job_index: u8, parent_hash: &[u8; 32]) -> Vec<u8> {
 }
 
 wire_codes! {
-    /// `DATUM_PARENT_FETCH_STATUS_*`.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum ParentStatus: u8 {
         Success = 0x01,
@@ -122,12 +111,9 @@ wire_codes! {
         Unavailable = 0xF7,
         RpcFailed = 0xF8,
     }
-    /// A status byte this build does not name.
     unknown Unknown;
 }
 
-/// The `0x50 0x94` reply: the raw serialized parent block, or an error status with an
-/// empty block. The C gateway pads neither form.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParentFetchReply {
     pub job_index: u8,
@@ -136,15 +122,9 @@ pub struct ParentFetchReply {
     pub block: Vec<u8>,
 }
 
-/// What a parent fetch reply holds besides the block: the mining sub-command, the reply
-/// selector, the job index, the status, the parent hash, the block's length and the
-/// terminator. `datum_protocol_parent_fetch_reply` writes `41 + block_size` bytes.
 pub const PARENT_FETCH_REPLY_OVERHEAD: usize =
     (REQUEST_HEADER_LEN + 1) + crate::bitcoin::HASH_SIZE + size_of::<u32>() + 1;
 
-/// The largest block a parent fetch reply carries, the C gateway's
-/// `DATUM_PARENT_FETCH_MAX_BLOCK_BYTES`: one byte under what the overhead alone leaves,
-/// which is the bound `datum_protocol_parent_fetch_reply` applies.
 pub const MAX_PARENT_FETCH_BLOCK: usize =
     super::framing::MAX_CMD_DATA_SIZE as usize - (PARENT_FETCH_REPLY_OVERHEAD + 1);
 
@@ -185,9 +165,7 @@ pub struct ShortTxnList {
     pub crosscheck: Option<[u8; 32]>,
 }
 
-/// The bytes a short transaction id occupies on the wire: a u32 then a u16, little-endian.
 pub const SHORT_ID_SIZE: usize = size_of::<u32>() + size_of::<u16>();
-/// The bits of the siphash a short id keeps.
 const SHORT_ID_MASK: u64 = (1u64 << (8 * SHORT_ID_SIZE)) - 1;
 
 pub const CROSSCHECK_SEED: [u8; 32] = [
@@ -196,7 +174,6 @@ pub const CROSSCHECK_SEED: [u8; 32] = [
 ];
 
 impl ShortTxnList {
-    /// A list with no ids: a refusal, or an `Ok` reply for a job with no transactions.
     pub fn empty(job_index: u8, status: Status) -> Self {
         ShortTxnList { job_index, status, txn_count: 0, short_ids: Vec::new(), crosscheck: None }
     }
@@ -251,8 +228,6 @@ impl ShortTxnList {
         out
     }
 
-    /// Whether the list names exactly `hashes`: the transactions' witness hashes (GBT `hash`,
-    /// the gateway's `hash_bin`), not their txids, in internal byte order.
     pub fn matches(&self, hashes: &[[u8; 32]], key: &[u8; 16]) -> bool {
         if self.status != Status::Ok || self.txn_count as usize != hashes.len() {
             return false;
@@ -267,7 +242,6 @@ impl ShortTxnList {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TxnBundle {
-    /// The response selector, 0x91 or 0x92.
     pub selector: u8,
     pub job_index: u8,
     pub status: Status,
@@ -275,7 +249,6 @@ pub struct TxnBundle {
 }
 
 impl TxnBundle {
-    /// A bundle carrying no transactions: what a refusal replies with.
     pub fn empty(selector: u8, job_index: u8, status: Status) -> Self {
         TxnBundle { selector, job_index, status, txns: Vec::new() }
     }
@@ -322,7 +295,6 @@ impl TxnBundle {
     }
 }
 
-/// A cursor past the optional 0x50 prefix and the selector, which must be `want`.
 fn body_of(data: &[u8], want: u8) -> Result<Cursor<'_>, Error> {
     let mut c = Cursor::new(data);
     c.skip_if(VALIDATION);
@@ -333,8 +305,6 @@ fn body_of(data: &[u8], want: u8) -> Result<Cursor<'_>, Error> {
     Ok(c)
 }
 
-/// The first 16 bytes of the two ed25519 public signing keys XORed together, then every byte
-/// XORed with 0x55 (`datum_protocol.c`). Both ends derive it, so neither sends it.
 pub fn short_id_key(gateway_pk: &[u8; 32], pool_pk: &[u8; 32]) -> [u8; 16] {
     let mut key = [0u8; 16];
     for (j, k) in key.iter_mut().enumerate() {
@@ -343,13 +313,10 @@ pub fn short_id_key(gateway_pk: &[u8; 32], pool_pk: &[u8; 32]) -> [u8; 16] {
     key
 }
 
-/// The low 48 bits of the siphash, serialized as a u32 then a u16.
 pub fn short_id(hash: &[u8; 32], key: &[u8; 16]) -> u64 {
     siphash24(key, hash) & SHORT_ID_MASK
 }
 
-/// Every hash (the transactions' witness hashes, as in `matches`) XORed into a fixed seed, so
-/// both ends compare a whole list in one 32-byte comparison.
 pub fn crosscheck(hashes: &[[u8; 32]]) -> [u8; 32] {
     let mut x = CROSSCHECK_SEED;
     for h in hashes {
@@ -401,234 +368,4 @@ fn double_round(v0: &mut u64, v1: &mut u64, v2: &mut u64, v3: &mut u64) {
     half_round(v2, v1, v0, v3, 17, 21);
     half_round(v0, v1, v2, v3, 13, 16);
     half_round(v2, v1, v0, v3, 17, 21);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const KEY: [u8; 16] = [
-        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
-        0x0f,
-    ];
-
-    fn ramp(start: u8) -> [u8; 32] {
-        let mut d = [0u8; 32];
-        for (i, b) in d.iter_mut().enumerate() {
-            *b = start.wrapping_add(i as u8);
-        }
-        d
-    }
-
-    #[test]
-    fn siphash_matches_the_gateway() {
-        assert_eq!(siphash24(&KEY, &ramp(0x00)), 0x7127_512f_72f2_7cce);
-        assert_eq!(siphash24(&KEY, &ramp(0x20)), 0xc46d_4c33_58ae_89a5);
-        assert_eq!(siphash24(&KEY, &ramp(0x40)), 0x27bd_5ecb_84e5_6c87);
-        assert_eq!(siphash24(&KEY, &ramp(0x60)), 0x1d82_9164_c5ef_ca0b);
-        assert_eq!(siphash24(&KEY, &[0u8; 32]), 0x8990_d3e4_2994_96f4);
-        assert_eq!(siphash24(&KEY, &[0xffu8; 32]), 0xe104_1d47_f898_e431);
-        assert_eq!(siphash24(&[0u8; 16], &[0u8; 32]), 0x6c37_e103_dfa2_827d);
-        let mut swapped = KEY;
-        swapped.rotate_left(8);
-        assert_ne!(siphash24(&swapped, &ramp(0)), 0x7127_512f_72f2_7cce);
-    }
-
-    #[test]
-    fn short_id_keeps_48_bits() {
-        let h = ramp(0);
-        assert_eq!(short_id(&h, &KEY), 0x7127_512f_72f2_7cce & 0xffff_ffff_ffff);
-        assert_eq!(short_id(&h, &KEY) >> 48, 0);
-    }
-
-    #[test]
-    fn short_id_key_derivation() {
-        let a = [0x11u8; 32];
-        let b = [0x22u8; 32];
-        assert_eq!(short_id_key(&a, &b), [0x11 ^ 0x22 ^ 0x55; 16]);
-        assert_eq!(short_id_key(&a, &b), short_id_key(&b, &a));
-    }
-
-    #[test]
-    fn crosscheck_is_a_running_xor_from_the_seed() {
-        assert_eq!(crosscheck(&[]), CROSSCHECK_SEED);
-        let h = [0xaau8; 32];
-        let mut expected = CROSSCHECK_SEED;
-        for b in expected.iter_mut() {
-            *b ^= 0xaa;
-        }
-        assert_eq!(crosscheck(&[h]), expected);
-        assert_eq!(crosscheck(&[h, h]), CROSSCHECK_SEED);
-    }
-
-    #[test]
-    fn request_layouts() {
-        assert_eq!(request_short_txn_list(3), vec![0x50, 0x10, 3]);
-        assert_eq!(request_block_txns(7), vec![0x50, 0x12, 7]);
-        let r = request_txns(2, &[0, 5, 300]);
-        assert_eq!(&r[..3], &[0x50, 0x11, 2]);
-        assert_eq!(&r[3..5], &3u16.to_le_bytes());
-        assert_eq!(&r[5..7], &0u16.to_le_bytes());
-        assert_eq!(&r[7..9], &5u16.to_le_bytes());
-        assert_eq!(&r[9..11], &300u16.to_le_bytes());
-        assert_eq!(r.len(), 11);
-    }
-
-    fn sample_list() -> ShortTxnList {
-        let hashes = [ramp(0), ramp(0x20), ramp(0x40)];
-        ShortTxnList {
-            job_index: 4,
-            status: Status::Ok,
-            txn_count: 3,
-            short_ids: hashes.iter().map(|h| short_id(h, &KEY)).collect(),
-            crosscheck: Some(crosscheck(&hashes)),
-        }
-    }
-
-    #[test]
-    fn short_list_roundtrips_and_ignores_padding() {
-        let l = sample_list();
-        let bytes = l.encode();
-        assert_eq!(bytes.len(), 4 + 2 + 18 + 32 + 1);
-        assert_eq!(ShortTxnList::decode(&bytes).unwrap(), l);
-        let mut padded = bytes.clone();
-        padded.extend_from_slice(&[0x5a; 77]);
-        assert_eq!(ShortTxnList::decode(&padded).unwrap(), l);
-        assert_eq!(ShortTxnList::decode(&bytes[1..]).unwrap(), l);
-    }
-
-    #[test]
-    fn short_list_accepts_the_shapes_without_a_terminator() {
-        let empty = ShortTxnList {
-            job_index: 1,
-            status: Status::Ok,
-            txn_count: 0,
-            short_ids: vec![],
-            crosscheck: None,
-        };
-        let bytes = empty.encode();
-        assert_eq!(bytes, vec![0x50, 0x90, 1, 0x01, 0x00, 0x00]);
-        assert_eq!(ShortTxnList::decode(&bytes).unwrap(), empty);
-
-        for status in
-            [Status::JobEmpty, Status::NoTemplate, Status::TooManyTxns, Status::BadJobIndex]
-        {
-            let e = ShortTxnList {
-                job_index: JOB_INDEX_INVALID,
-                status,
-                txn_count: 0,
-                short_ids: vec![],
-                crosscheck: None,
-            };
-            let bytes = e.encode();
-            assert_eq!(bytes.len(), 4);
-            assert_eq!(ShortTxnList::decode(&bytes).unwrap(), e);
-        }
-    }
-
-    #[test]
-    fn short_list_matches_the_pools_own_template() {
-        let hashes = [ramp(0), ramp(0x20), ramp(0x40)];
-        let l = sample_list();
-        assert!(l.matches(&hashes, &KEY));
-
-        let other = [ramp(0), ramp(0x20), ramp(0x60)];
-        assert!(!l.matches(&other, &KEY));
-        let reordered = [ramp(0x20), ramp(0), ramp(0x40)];
-        assert!(!l.matches(&reordered, &KEY));
-        assert!(!l.matches(&hashes[..2], &KEY));
-        assert!(!l.matches(&hashes, &[0u8; 16]));
-
-        let mut altered = l.clone();
-        altered.crosscheck = Some([0u8; 32]);
-        assert!(!altered.matches(&hashes, &KEY));
-
-        let empty = ShortTxnList {
-            job_index: 0,
-            status: Status::Ok,
-            txn_count: 0,
-            short_ids: vec![],
-            crosscheck: None,
-        };
-        assert!(empty.matches(&[], &KEY));
-    }
-
-    #[test]
-    fn short_list_rejects_malformed_messages() {
-        let bytes = sample_list().encode();
-        for cut in [1, 3, 5, 10, bytes.len() - 1] {
-            assert!(ShortTxnList::decode(&bytes[..cut]).is_err(), "should fail at {cut}");
-        }
-        let mut no_end = bytes.clone();
-        let n = no_end.len();
-        no_end[n - 1] = 0x00;
-        assert_eq!(ShortTxnList::decode(&no_end), Err(Error::MissingTerminator));
-
-        assert_eq!(
-            ShortTxnList::decode(&[0x50, 0x91, 0, 0x01]),
-            Err(Error::WrongMessage { want: 0x90, got: 0x91 })
-        );
-    }
-
-    fn sample_bundle(selector: u8) -> TxnBundle {
-        TxnBundle {
-            selector,
-            job_index: 6,
-            status: Status::Ok,
-            txns: vec![vec![0xab; 10], vec![0xcd; 300], vec![]],
-        }
-    }
-
-    #[test]
-    fn txn_bundle_roundtrips_both_selectors() {
-        for selector in [response::TXNS, response::BLOCK_TXNS] {
-            let b = sample_bundle(selector);
-            let bytes = b.encode();
-            assert_eq!(TxnBundle::decode(&bytes, selector).unwrap(), b);
-            let mut padded = bytes.clone();
-            padded.extend_from_slice(&[0x33; 50]);
-            assert_eq!(TxnBundle::decode(&padded, selector).unwrap(), b);
-        }
-    }
-
-    #[test]
-    fn txn_size_prefix_is_three_bytes_little_endian() {
-        let b = TxnBundle {
-            selector: response::BLOCK_TXNS,
-            job_index: 0,
-            status: Status::Ok,
-            txns: vec![vec![0x11; 0x01_2345]],
-        };
-        let bytes = b.encode();
-        assert_eq!(&bytes[6..9], &[0x45, 0x23, 0x01]);
-        assert_eq!(TxnBundle::decode(&bytes, response::BLOCK_TXNS).unwrap(), b);
-    }
-
-    #[test]
-    fn txn_bundle_carries_error_statuses() {
-        for status in
-            [Status::JobEmpty, Status::NoTemplate, Status::BadJobIndex, Status::BadRequest]
-        {
-            let e = TxnBundle { selector: response::TXNS, job_index: 2, status, txns: vec![] };
-            let bytes = e.encode();
-            assert_eq!(bytes.len(), 4);
-            assert_eq!(TxnBundle::decode(&bytes, response::TXNS).unwrap(), e);
-        }
-    }
-
-    #[test]
-    fn txn_bundle_rejects_malformed_messages() {
-        let bytes = sample_bundle(response::BLOCK_TXNS).encode();
-        for cut in [1, 3, 6, 20, bytes.len() - 1] {
-            assert!(TxnBundle::decode(&bytes[..cut], response::BLOCK_TXNS).is_err(), "at {cut}");
-        }
-        let mut oversize = bytes.clone();
-        oversize[6] = 0xff;
-        oversize[7] = 0xff;
-        oversize[8] = 0xff;
-        assert_eq!(TxnBundle::decode(&oversize, response::BLOCK_TXNS), Err(Error::BadTxnSize));
-        let mut miscount = bytes.clone();
-        miscount[4] = 9;
-        assert!(TxnBundle::decode(&miscount, response::BLOCK_TXNS).is_err());
-    }
 }

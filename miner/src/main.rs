@@ -6,29 +6,18 @@ use std::net::TcpStream;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
-/// The Sia work header the hashing hardware receives, as `datum_blake2b_build_work_header`
-/// lays it out: the hidden previous block hash, the eight-byte nonce field, the eight-byte
-/// time field, then the work root the first BLAKE2b produced.
 const HEADER_LEN: usize = 80;
 const HEADER_PREVBLOCK_HIDDEN_AT: usize = 0;
 const HEADER_NONCE_AT: usize = 32;
 const HEADER_NTIME_AT: usize = HEADER_NONCE_AT + SIA_FIELD_SIZE;
 const HEADER_ROOT_AT: usize = HEADER_NTIME_AT + SIA_FIELD_SIZE;
-/// The extranonce1 the subscribe response carries plus the extranonce2 the miner fills is
-/// the header's whole extranonce field.
 const EXTRANONCE_LEN: usize = EXTRANONCE_SIZE_V2;
-/// The stratum request ids: 1 subscribes, 2 authorizes, and a submit takes the next id above
-/// this, so a response can be told from the others by its id alone.
 const SUBMIT_ID_BASE: u64 = 100;
-/// The byte `datum_blake2b_work_root` writes ahead of the leaf (`leaf[0] = 0`); the Siacoin
-/// hasher prepends it itself, so stratum's coinb1 does not carry it.
 const WORK_ROOT_LEAF_PREFIX: u8 = 0x00;
 
 #[derive(Clone)]
 struct Job {
     job_id: String,
-    /// The notify's prevhash parameter: for a version 2 job this is the gateway's
-    /// prevblock_hidden, not the previous block hash.
     prevhash: [u8; 32],
     coinb1: Vec<u8>,
     coinb2: Vec<u8>,
@@ -36,9 +25,6 @@ struct Job {
     ntime_hex: String,
 }
 
-/// What the reader thread has received from the gateway. `generation` counts the jobs it has
-/// recorded; the mining threads compare it against the one they started on and stop when it
-/// changes, so that a search is abandoned as soon as the work it is based on is superseded.
 #[derive(Default)]
 struct Shared {
     extranonce1: Vec<u8>,
@@ -70,7 +56,6 @@ fn mine(
     generation: &AtomicU64,
     job_generation: u64,
 ) -> Outcome {
-    // The search is abandoned as soon as the job it is based on is superseded.
     let superseded = || generation.load(Ordering::Relaxed) != job_generation;
     match ratum::nonce::search(header, HEADER_NONCE_AT, blake2b_256, target, superseded) {
         Some(nonce) => Outcome::Found(nonce),
@@ -79,8 +64,6 @@ fn mine(
     }
 }
 
-/// Reads the gateway's messages and records the latest job. Runs for as long as the
-/// connection is open, so that a job arriving while the miner is hashing is read at once.
 fn read_messages(
     stream: TcpStream,
     state: Arc<(Mutex<Shared>, Condvar)>,
@@ -206,9 +189,6 @@ fn main() -> std::io::Result<()> {
     let mut last_generation = 0u64;
 
     loop {
-        // Wait for a job newer than the one last mined, and for the extranonce1 and
-        // extranonce2_size the subscribe response carries, without which the coinbase cannot be
-        // assembled.
         let (job, difficulty, extranonce1, extranonce2_size, job_generation) = {
             let mut s = lock.lock().expect("state");
             while !s.closed
@@ -239,8 +219,6 @@ fn main() -> std::io::Result<()> {
         header[HEADER_NTIME_AT..HEADER_ROOT_AT].copy_from_slice(&job.ntime);
         header[HEADER_ROOT_AT..].copy_from_slice(&hash1);
 
-        // pdiff, as the gateway checks it (`get_target_from_diff`), not Stratum.md's bdiff-1
-        // target.
         let t = target::target_for_difficulty(difficulty);
         println!("mining job {} at difficulty {difficulty}...", job.job_id);
         let started = std::time::Instant::now();

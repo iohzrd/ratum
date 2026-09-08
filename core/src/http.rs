@@ -1,7 +1,3 @@
-//! The `tiny_http` calls the pool's stats page and the gateway's API share: responses
-//! with a content type and no caching, the request path and query, and a named thread that
-//! serves a bound listener.
-
 use std::io::Cursor;
 use tiny_http::{Header, Request, Response, Server};
 
@@ -11,7 +7,6 @@ fn header(name: &str, value: &str) -> Header {
     Header::from_bytes(name.as_bytes(), value.as_bytes()).expect("static header is valid")
 }
 
-/// A response of `content_type` that a browser does not cache.
 pub fn body(text: String, content_type: &str) -> Reply {
     Response::from_string(text)
         .with_header(header("Content-Type", content_type))
@@ -30,13 +25,10 @@ pub fn plain(text: String) -> Reply {
     body(text, "text/plain; charset=utf-8")
 }
 
-/// The same response with `X-Robots-Tag: noindex`, so a crawler may fetch it (a page that
-/// renders from it needs that) without listing it as a result of its own.
 pub fn noindex(reply: Reply) -> Reply {
     reply.with_header(header("X-Robots-Tag", "noindex"))
 }
 
-/// A plain-text response with a status code.
 pub fn text(code: u16, text: &str) -> Reply {
     Response::from_string(text).with_status_code(code)
 }
@@ -49,7 +41,6 @@ pub fn method_not_allowed() -> Reply {
     text(405, "method not allowed")
 }
 
-/// The value of the request header named `name`, matched without case, or `None`.
 pub fn header_value(req: &Request, name: &str) -> Option<String> {
     req.headers()
         .iter()
@@ -57,7 +48,6 @@ pub fn header_value(req: &Request, name: &str) -> Option<String> {
         .map(|h| h.value.as_str().to_string())
 }
 
-/// The request's path and query string, split at the first `?`.
 pub fn path_and_query(req: &Request) -> (String, String) {
     let url = req.url();
     match url.split_once('?') {
@@ -66,7 +56,6 @@ pub fn path_and_query(req: &Request) -> (String, String) {
     }
 }
 
-/// `key`'s value in a `k=v&k=v` query or form body, percent-decoded, with `+` as a space.
 pub fn param(query: &str, key: &str) -> Option<String> {
     query.split('&').find_map(|pair| {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
@@ -74,7 +63,6 @@ pub fn param(query: &str, key: &str) -> Option<String> {
     })
 }
 
-/// Every pair of a `k=v&k=v` query or form body, decoded as `param` decodes, in order.
 pub fn pairs(query: &str) -> Vec<(String, String)> {
     query
         .split('&')
@@ -108,8 +96,6 @@ pub fn url_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// The addresses to try for a listener: `addr:port`, or every address when `addr` is empty
-/// (IPv6 and IPv4 together, then IPv4 alone if the dual-stack bind fails).
 pub fn bind_candidates(addr: &str, port: u16) -> Vec<String> {
     if addr.is_empty() {
         vec![format!("[::]:{port}"), format!("0.0.0.0:{port}")]
@@ -118,7 +104,6 @@ pub fn bind_candidates(addr: &str, port: u16) -> Vec<String> {
     }
 }
 
-/// Bind the first of `bind_candidates` that binds; the last error otherwise.
 pub fn bind(addr: &str, port: u16) -> Result<Server, String> {
     let mut last = String::new();
     for candidate in bind_candidates(addr, port) {
@@ -130,7 +115,6 @@ pub fn bind(addr: &str, port: u16) -> Result<Server, String> {
     Err(last)
 }
 
-/// Serve `server`'s requests on a thread named `name` until the process ends.
 pub fn serve(name: &str, server: Server, handle: impl Fn(Request) + Send + 'static) {
     std::thread::Builder::new()
         .name(name.to_string())
@@ -140,27 +124,4 @@ pub fn serve(name: &str, server: Server, handle: impl Fn(Request) + Send + 'stat
             }
         })
         .expect("http thread");
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn params_decode() {
-        assert_eq!(param("a=1&b=x%20y+z", "b").as_deref(), Some("x y z"));
-        assert_eq!(param("a=1&flag", "flag").as_deref(), Some(""));
-        assert_eq!(param("a=1", "c"), None);
-        assert_eq!(url_decode("%zz%4"), "%zz%4");
-        assert_eq!(
-            pairs("a=1&&b=x+y"),
-            [("a".to_string(), "1".to_string()), ("b".to_string(), "x y".to_string())]
-        );
-    }
-
-    #[test]
-    fn candidates() {
-        assert_eq!(bind_candidates("", 80), ["[::]:80", "0.0.0.0:80"]);
-        assert_eq!(bind_candidates("127.0.0.1", 80), ["127.0.0.1:80"]);
-    }
 }

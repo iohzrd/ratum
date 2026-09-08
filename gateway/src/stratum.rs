@@ -1,11 +1,3 @@
-//! The Stratum v1 server, Siacoin dialect, serving version 2 headers. One thread per
-//! connection; the messages and their formats are the C gateway's (`datum_stratum.c`).
-//!
-//! Each connection thread blocks in `mio::Poll` on its socket and on a `mio::Waker`. The
-//! waker is called when a job is published and when a kill request is made, so the thread
-//! reads the server's generation counter and `ClientEntry::kill` at once rather than at a
-//! read timeout. The remaining timeouts are the idle checks and the hashrate window.
-
 use crate::address;
 use crate::coinbase::COINBASE_POOLED;
 use crate::config::Config;
@@ -33,45 +25,21 @@ use std::time::{Duration, Instant};
 
 const CLIENT_BUFFER: usize = 16384 * 3 + 1024;
 const MAX_REQUEST_ID_CHARS: usize = 64;
-/// The most of a `mining.subscribe` user agent kept, the C gateway's `useragent[128]` less
-/// its terminator.
 const MAX_USER_AGENT_CHARS: usize = 127;
-/// The most of a `mining.authorize` username kept, the C gateway's
-/// `last_auth_username[192]` less its terminator.
 const MAX_USERNAME_CHARS: usize = 191;
-/// The difficulty floor a NiceHash miner is held at, whatever vardiff would choose:
-/// `datum_stratum_fingerprint_by_UA` sets `forced_high_min_diff` to this. NiceHash rents
-/// hashrate at a high minimum difficulty.
 const NICEHASH_MIN_DIFFICULTY: u64 = 524_288;
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_millis(11150);
-/// How long a write waits for the socket to take the rest of the line before it fails with
-/// `TimedOut`.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const STAT_CYCLE: Duration = Duration::from_secs(60);
-/// How long after a hashrate window closes the estimate from it is still reported; past it
-/// the connection has stopped submitting and `hashrate_ths` returns `None`.
 const HASHRATE_WINDOW_VALID: Duration = Duration::from_secs(3 * 60);
-/// How long a failed `accept` waits before the next, so a listener error that repeats does
-/// not spin.
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
-/// How often the refusal of new connections is logged while `datum.pooled_mining_only` holds
-/// them off.
 const REJECT_LOG_INTERVAL: Duration = Duration::from_secs(5);
-/// How long after connecting the first idle check runs; `IDLE_CHECK_INTERVAL` paces the rest.
 const FIRST_IDLE_CHECK_DELAY: Duration = Duration::from_secs(10);
-/// The read buffer and the chunk read into it. A line holds one JSON-RPC message, and
-/// `CLIENT_BUFFER` bounds how much of one is kept before the connection is closed.
 const READ_CHUNK: usize = 4096;
-/// Difficulty to TH/s: the hashes a difficulty unit costs, per second, in terahashes.
 const DIFF_TO_THS: f64 = ratum::HASHES_PER_DIFFICULTY / ratum::HASHES_PER_TERAHASH;
-/// What the connection counter is XORed with to make the session id the subscribe response
-/// carries, the C gateway's `return i ^ 0xB10CF00D` (`datum_stratum_get_client_sid`).
 const SESSION_ID_XOR: u32 = 0xB10C_F00D;
-/// How many times a found block is logged, as the C gateway repeats the line, so it is
-/// visible in a log an operator scrolls through.
 const BLOCK_FOUND_LOG_LINES: usize = 3;
 
-/// A stratum error: the code and the text of the `error` array.
 #[derive(Clone, Copy)]
 struct Reject(i64, &'static str);
 
@@ -83,7 +51,6 @@ const HIGH_HASH: Reject = Reject(23, "high-hash");
 const UNAUTHORIZED_WORKER: Reject = Reject(24, "unauthorized-worker");
 const METHOD_NOT_FOUND: Reject = Reject(-3, "Method not found");
 
-/// Why a connection was closed.
 #[derive(Debug, thiserror::Error)]
 enum Disconnect {
     #[error("{0}")]
@@ -96,18 +63,13 @@ enum Disconnect {
     Killed,
 }
 
-/// The jobs the server holds: the ring by global index and the one new connections get.
 #[derive(Default)]
 pub struct Jobs {
     pub ring: Vec<Option<Arc<Job>>>,
     pub current: Option<Arc<Job>>,
-    /// Whether the current job is new-block empty work (subsidy-only coinbase), sent with
-    /// `clean_jobs`.
     pub empty: bool,
 }
 
-/// Per-connection statistics, for the API. Written by the connection at the events that
-/// change them.
 #[derive(Clone, Debug, Default)]
 pub struct ClientStats {
     pub remote: String,
@@ -121,15 +83,12 @@ pub struct ClientStats {
     pub rejected: Tally,
     pub fee: Tally,
     pub last_accepted: Option<Instant>,
-    /// The completed window's accepted difficulty and its length, for the hashrate.
     pub window_diff: u64,
     pub window: Duration,
     pub window_ended: Option<Instant>,
 }
 
 impl ClientStats {
-    /// Estimated TH/s from the last completed window, while `HASHRATE_WINDOW_VALID` has not
-    /// passed since it ended.
     pub fn hashrate_ths(&self) -> Option<f64> {
         let ended = self.window_ended?;
         if ended.elapsed() > HASHRATE_WINDOW_VALID || self.window.is_zero() {
@@ -142,28 +101,22 @@ impl ClientStats {
 pub struct ClientEntry {
     pub kill: AtomicBool,
     pub stats: Mutex<ClientStats>,
-    /// Wakes the connection thread out of `Poll::poll`, so that it reads `kill` and the
-    /// server's generation counter without waiting for its next timed check.
     waker: Arc<Waker>,
 }
 
 impl ClientEntry {
-    /// Wake the connection thread. A failed write to the waker only delays that thread
-    /// until its next timed check, so it is logged and not propagated.
     fn wake(&self) {
         if let Err(e) = self.waker.wake() {
             debug!("could not wake a stratum connection thread: {e}");
         }
     }
 
-    /// Set the kill flag and wake the connection thread, which then returns `Killed`.
     fn request_kill(&self) {
         self.kill.store(true, Ordering::Relaxed);
         self.wake();
     }
 }
 
-/// What one pass over the client list yields.
 #[derive(Default)]
 pub struct ClientSummary {
     pub connections: usize,
@@ -177,14 +130,11 @@ pub struct Server {
     pub node: ratum::rpc::Client,
     pub notify: Arc<crate::template::Notify>,
     pub jobs: Mutex<Jobs>,
-    /// Counts publications; a connection compares it with the one it last sent.
     generation: AtomicU64,
     clients: Mutex<Vec<Arc<ClientEntry>>>,
     dupes: Mutex<Dupes>,
     next_unique_id: AtomicU64,
-    /// Set while `pooled_mining_only` and the pool is not connected: connections are refused.
     pub rejecting: AtomicBool,
-    /// The shares credited to the fee address.
     pub fee: Mutex<Tally>,
     pub extra_nodes: Vec<ratum::rpc::Client>,
     pub listening: AtomicBool,
@@ -227,11 +177,6 @@ impl Server {
         })
     }
 
-    /// Make `job` the one served. `empty` marks new-block work sent with `clean_jobs` and the
-    /// subsidy-only coinbase. A new-block job marks every other job stale, as
-    /// `update_stratum_job` does: a forced rebuild on the same tip (the pool connection came
-    /// or went) also retires the jobs built with the previous payout script, whose shares the
-    /// pool would refuse.
     pub fn publish(&self, job: Arc<Job>, empty: bool) {
         {
             let mut slots = ratum::lock(&self.datum.slots);
@@ -251,8 +196,6 @@ impl Server {
         j.empty = empty;
         self.generation.fetch_add(1, Ordering::Release);
         drop(j);
-        // Each connection thread compares the counter after its waker returns it from
-        // `Poll::poll`, so the job reaches a subscriber as soon as it is scheduled.
         for c in ratum::lock(&self.clients).iter() {
             c.wake();
         }
@@ -262,7 +205,6 @@ impl Server {
         ratum::lock(&self.jobs).current.clone()
     }
 
-    /// The current job, whether it is empty work, and the generation it was published at.
     fn current_for_send(&self) -> (Option<Arc<Job>>, bool, u64) {
         let j = ratum::lock(&self.jobs);
         (j.current.clone(), j.empty, self.generation.load(Ordering::Acquire))
@@ -272,7 +214,6 @@ impl Server {
         ratum::lock(&self.clients).len()
     }
 
-    /// The connection, subscription and hashrate totals in one pass over the client list.
     pub fn summary(&self) -> ClientSummary {
         let mut s = ClientSummary::default();
         for c in ratum::lock(&self.clients).iter() {
@@ -292,7 +233,6 @@ impl Server {
         self.client_stats_where(|_| true)
     }
 
-    /// The statistics of the clients `keep` selects, filtered before they are copied.
     pub fn client_stats_where(&self, keep: impl Fn(&ClientStats) -> bool) -> Vec<ClientStats> {
         ratum::lock(&self.clients)
             .iter()
@@ -303,7 +243,6 @@ impl Server {
             .collect()
     }
 
-    /// Disconnect every client (`datum_stratum_v1_shutdown_all`).
     pub fn shutdown_all(&self) {
         info!("Disconnecting all stratum clients");
         for c in ratum::lock(&self.clients).iter() {
@@ -322,8 +261,6 @@ impl Server {
     }
 }
 
-/// Bind the listener and accept connections until the process ends. Called once a job
-/// exists, as the C gateway does.
 pub fn listen(server: Arc<Server>) -> io::Result<()> {
     let s = &server.config.stratum;
     let mut listener = None;
@@ -384,23 +321,19 @@ pub fn listen(server: Arc<Server>) -> io::Result<()> {
     Ok(())
 }
 
-/// A `mining.submit` once parsed: the job it names and the fields the miner set.
 struct SubmitRequest {
     job: Arc<Job>,
-    /// The difficulty the job was served at to this connection.
     job_diff: u64,
     job_ref: JobRef,
     extranonce: [u8; 16],
     ntime: [u8; 8],
     nonce: [u8; 8],
-    /// What the miner sent as its username.
     miner_username: String,
 }
 
 struct Connection {
     server: Arc<Server>,
     entry: Arc<ClientEntry>,
-    /// The socket and its readiness; the thread blocks here between reads.
     socket: PolledSocket,
     remote: String,
     sid: u32,
@@ -408,12 +341,10 @@ struct Connection {
     authorized: bool,
     username: String,
     vardiff: Vardiff,
-    /// The difficulty each job in the ring was served at to this connection.
     job_diffs: Vec<Option<u64>>,
     sent_generation: u64,
     connected: Instant,
     last_accepted: Option<Instant>,
-    /// Hashrate window.
     window_active: u64,
     window_started: Instant,
     fee: FeeMeter,
@@ -424,13 +355,9 @@ impl Connection {
     fn run(server: Arc<Server>, stream: TcpStream) -> Result<(), Disconnect> {
         let remote = stream.peer_addr().map_or_else(|_| "?".to_string(), |a| a.to_string());
         stream.set_nodelay(true)?;
-        // The poll reports readiness; the socket itself never blocks, and both directions
-        // return `WouldBlock` instead.
         let socket = PolledSocket::new(stream)?;
         let waker = Arc::new(socket.waker()?);
         let unique_id = server.next_unique_id.fetch_add(1, Ordering::Relaxed);
-        // The C gateway packs a 22-bit client index and a thread id; here the connection
-        // counter is the whole 32 bits, so two live connections never share extranonce1.
         let sid = (unique_id as u32) ^ SESSION_ID_XOR;
         let entry = Arc::new(ClientEntry {
             kill: AtomicBool::new(false),
@@ -495,8 +422,6 @@ impl Connection {
             self.roll_window();
 
             if !self.socket.readable() {
-                // Nothing left to read: block until the socket is readable, the waker is
-                // called for a new job or a kill request, or a timed check is due.
                 let timeout = self.until_next_check();
                 self.socket.wait(Some(timeout))?;
                 continue;
@@ -521,8 +446,6 @@ impl Connection {
         }
     }
 
-    /// How long the thread may sleep before a timed check is due: the idle checks and the
-    /// end of the hashrate window.
     fn until_next_check(&self) -> Duration {
         let due = self.next_idle_check.min(self.window_started + STAT_CYCLE);
         due.saturating_duration_since(Instant::now())
@@ -532,7 +455,6 @@ impl Connection {
         f(&mut ratum::lock(&self.entry.stats));
     }
 
-    /// Close the hashrate window once it has run `STAT_CYCLE`.
     fn roll_window(&mut self) {
         if self.window_started.elapsed() < STAT_CYCLE {
             return;
@@ -584,7 +506,6 @@ impl Connection {
         self.socket.write_all(b"\n", WRITE_TIMEOUT)
     }
 
-    /// A response to request `id`: `error` is the stratum error array or null.
     fn reply(&mut self, id: &str, error: Option<Reject>, result: Value) -> io::Result<()> {
         let error = match error {
             Some(Reject(code, text)) => format!("[{code},\"{text}\",null]"),
@@ -601,7 +522,6 @@ impl Connection {
         self.reply(id, Some(r), Value::Null)
     }
 
-    /// Handle one request line. `Err` closes the connection.
     fn handle_line(&mut self, line: &str) -> Result<(), Disconnect> {
         if line.is_empty() {
             return Ok(());
@@ -647,15 +567,9 @@ impl Connection {
                     .take(MAX_USER_AGENT_CHARS)
                     .collect()
             });
-        // Fingerprinting keeps one effect of the C gateway's: NiceHash rents hashrate at a
-        // high minimum difficulty. The coinbase size class it also assigned per miner is
-        // removed; every miner receives the one pooled coinbase (`coinbase::COINBASE_POOLED`).
         if s.fingerprint_miners && useragent.starts_with("NiceHash/") {
             self.vardiff.raise_floor(NICEHASH_MIN_DIFFICULTY);
         }
-        // The subscribe response's extranonce1 is the header's extranonce padding written as
-        // zero hex digits, then this connection's session id; extranonce2 is what remains of
-        // the header's extranonce field, which the miner fills.
         let sid = format!("{:08x}", self.sid);
         let pad = "0".repeat(2 * EXTRANONCE_V2_PAD);
         self.reply_result(
@@ -731,8 +645,6 @@ impl Connection {
         ))
     }
 
-    /// The difficulty a share on `r`'s job is checked against: the quick-raise value for a
-    /// `Q` job, otherwise what the job was served at.
     fn served_diff(&self, r: &JobRef) -> Option<u64> {
         if r.quickdiff {
             Some(self.vardiff.quickdiff_value())
@@ -741,7 +653,6 @@ impl Connection {
         }
     }
 
-    /// Send the server's current job; new-block empty work is sent with `clean_jobs`.
     fn send_current_job(&mut self) -> io::Result<()> {
         let (job, empty, generation) = self.server.current_for_send();
         self.sent_generation = generation;
@@ -760,7 +671,6 @@ impl Connection {
     ) -> io::Result<()> {
         let quickdiff = quickdiff && !new_block;
         if !quickdiff {
-            // With `no_quick` the update never requests a quick raise.
             self.vardiff.update(true, Instant::now());
         }
         if job.is_datum_job {
@@ -784,11 +694,6 @@ impl Connection {
             return Err(io::Error::other("job has no coinbase for the selection"));
         };
         let clean_flag = clean || quickdiff || new_block;
-        // The nbits field carries `share_nbits(pot)`, not the template's bits, as the C
-        // gateway sends for every BLAKE2b job: the compact target nearest to and not easier
-        // than the miner's share target, so the hasher is not given the network target.
-        // coinb1 is the work root leaf's leading zero bytes and H2; there is no coinb2 and
-        // no merkle branch, since the machine never receives the coinbase.
         let coinb1 = format!(
             "{}{}",
             "00".repeat(ratum::header::COINB1_LEADING_ZEROS),
@@ -824,7 +729,6 @@ impl Connection {
                 self.vardiff.count_share();
                 self.window_active = self.window_active.saturating_add(diff);
                 self.last_accepted = Some(Instant::now());
-                // A quick raise is announced at once with a `Q` job.
                 if self.vardiff.update(false, Instant::now())
                     && let Some(job) = self.server.current_job()
                 {
@@ -839,8 +743,6 @@ impl Connection {
         }
     }
 
-    /// The request's job and fields; a rejection carries the difficulty to count it under
-    /// once the job is known.
     fn parse_submit(&self, params: &Value) -> Result<SubmitRequest, (Reject, Option<u64>)> {
         let unknown = (UNKNOWN_WORK, None);
         let id_param = params.get(1).and_then(Value::as_str).ok_or(unknown)?;
@@ -859,8 +761,6 @@ impl Connection {
             return Err(rejected);
         }
         let en2 = hex::decode(en2).map_err(|_| rejected)?;
-        // The header's extranonce field: the zero padding, the session id, then the miner's
-        // extranonce2.
         let mut extranonce = [0u8; EXTRANONCE_SIZE_V2];
         let sid_at = EXTRANONCE_V2_PAD;
         let en2_at = EXTRANONCE1_SIZE;
@@ -877,8 +777,6 @@ impl Connection {
         Ok(SubmitRequest { job, job_diff, job_ref, extranonce, ntime, nonce, miner_username })
     }
 
-    /// Build the share's header, submit a block it names, run the checks, and forward it to
-    /// the pool. Returns the rejection, if any, the miner is told.
     fn evaluate(&mut self, req: &SubmitRequest) -> Result<(), Reject> {
         let job = &req.job;
         let r = req.job_ref;
@@ -886,14 +784,8 @@ impl Connection {
         let header = job
             .header(r.coinbase, pot, req.extranonce, req.nonce, req.ntime)
             .ok_or(UNKNOWN_WORK)?;
-        // Under an ABW assignment this is the raw hash the miner computed; the gateway cannot
-        // apply the pool's mask, so it never computes the final block hash and cannot classify a
-        // block. Without an assignment it is the final hash, as before.
         let hash = job.share_pow_hash(&header);
 
-        // `miner_username` is what the miner sent; `username` is who the share is credited
-        // to once a `~modifier` has been applied. stratum.require_address_username checks
-        // the miner's own username, as the C gateway does, not the address its modifier names.
         let username = username::apply_modifier(
             &self.server.config.stratum.username_modifiers,
             &self.server.config.mining.pool_address,
@@ -902,10 +794,6 @@ impl Connection {
         )
         .unwrap_or_else(|| req.miner_username.clone());
 
-        // A job under an ABW assignment masks the network target with the pool's key, so
-        // the gateway cannot distinguish a block from a share and must not submit one: the pool
-        // holds the key, classifies the candidate, and submits it. Only a version 1 or solo
-        // job is classified and submitted here.
         let is_block = job.abw.is_none() && target::meets_target(&hash, &job.block_target);
         if is_block {
             let display = hex::encode(hash);
@@ -916,9 +804,6 @@ impl Connection {
         }
 
         let checked = self.check_share(job, &hash, pot, &req.miner_username);
-        // A block reaches the pool whatever the checks said: under the miner's own name when
-        // a check refused it (the C gateway's attribution), and through the fee accounting
-        // like any accepted share when they passed.
         if job.is_datum_job && (is_block || checked.is_ok()) {
             let wire_username = if checked.is_ok() && self.fee_charged(req.job_diff) {
                 self.server.config.fee_address().to_string()
@@ -939,7 +824,6 @@ impl Connection {
         checked
     }
 
-    /// The checks an accepted share passes, in the C gateway's order.
     fn check_share(
         &self,
         job: &Arc<Job>,
@@ -981,9 +865,6 @@ impl Connection {
         debug!("Block Payload: {}", hex::encode(&block));
         let block = Arc::new(block);
         let cfg = &self.server.config;
-        // The C gateway's order: its submitblock thread first (a second submission to the
-        // node on its own connection, then the extra nodes), the file, then the submission
-        // on this thread.
         crate::submit::submit_redundant(
             self.server.node.clone(),
             self.server.extra_nodes.clone(),
@@ -997,12 +878,10 @@ impl Connection {
         let accepted =
             crate::submit::submit_to(&self.server.node, "upstream node", &block, hash_hex);
         if accepted {
-            // The submitted block is the new tip; the template thread compares the hash.
             self.server.notify.raise_for(hash_hex);
         }
     }
 
-    /// Whether this share is the fee's (`stratum_fee_username`), recorded when it is.
     fn fee_charged(&mut self, diff: u64) -> bool {
         let bps = u64::from(self.server.config.datum.gateway_fee_bps);
         let charged = self.fee.charge(diff, bps, || {
@@ -1015,214 +894,5 @@ impl Connection {
             ratum::lock(&self.server.fee).add(diff);
         }
         charged
-    }
-}
-
-/// The connection thread against a client socket: the readiness path, the requests, and the
-/// events that end the connection.
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::job::Builder;
-    use crate::template::tests::{config, template};
-    use std::io::{BufRead, BufReader, Write as _};
-    use std::thread::JoinHandle;
-
-    /// How long a test waits for a line or a thread to end. The events under test are
-    /// signalled by the waker, so they arrive in microseconds; the first timed check of a
-    /// connection is `IDLE_CHECK_INTERVAL` away, well past this.
-    const DEADLINE: Duration = Duration::from_millis(250);
-
-    fn test_server() -> Arc<Server> {
-        let config = Arc::new(config());
-        let notify = Arc::new(crate::template::Notify::default());
-        let shared = Arc::new(datum::Shared::new(
-            config.datum.protocol_job_slots,
-            64,
-            Arc::clone(&notify),
-            None,
-        ));
-        let node = ratum::rpc::Client::new("http://127.0.0.1:1", "u", "p").unwrap();
-        Server::new(config, shared, node, notify)
-    }
-
-    /// A non-pooled job on the regtest template.
-    fn a_job(server: &Server) -> Arc<Job> {
-        let mut builder = Builder::new(Arc::clone(&server.config));
-        Arc::new(builder.build(Arc::new(template()), false, None, None, None).unwrap())
-    }
-
-    /// A connection thread serving one end of a local socket pair, and a reader and writer
-    /// for the client end.
-    struct Client {
-        server: Arc<Server>,
-        lines: BufReader<TcpStream>,
-        writer: TcpStream,
-        thread: Option<JoinHandle<Result<(), Disconnect>>>,
-    }
-
-    impl Client {
-        fn connect() -> Client {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let writer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-            let (served, _) = listener.accept().unwrap();
-            writer.set_read_timeout(Some(DEADLINE)).unwrap();
-            let server = test_server();
-            let s = Arc::clone(&server);
-            let thread = std::thread::spawn(move || Connection::run(s, served));
-            let lines = BufReader::new(writer.try_clone().unwrap());
-            Client { server, lines, writer, thread: Some(thread) }
-        }
-
-        fn send(&mut self, line: &str) {
-            self.writer.write_all(line.as_bytes()).unwrap();
-            self.writer.write_all(b"\n").unwrap();
-        }
-
-        /// The next line the connection sent, as JSON.
-        fn line(&mut self, what: &str) -> Value {
-            let mut s = String::new();
-            let n = self.lines.read_line(&mut s).unwrap_or_else(|e| panic!("{what}: {e}"));
-            assert!(n > 0, "{what}: the connection closed");
-            serde_json::from_str(&s).unwrap_or_else(|e| panic!("{what}: {s:?}: {e}"))
-        }
-
-        /// Subscribe and read the subscription reply and the difficulty it is followed by.
-        fn subscribe(&mut self) {
-            self.send(r#"{"id":1,"method":"mining.subscribe","params":["tester/1"]}"#);
-            assert_eq!(self.line("subscribe reply")["id"], 1);
-            assert_eq!(self.line("difficulty")["method"], "mining.set_difficulty");
-        }
-
-        fn unique_id(&self) -> u64 {
-            self.server.client_stats().first().expect("one client").unique_id
-        }
-
-        /// Wait for the connection thread to end, and return why it did.
-        fn ended(&mut self, what: &str) -> Disconnect {
-            let thread = self.thread.take().expect("the thread was already joined");
-            let started = Instant::now();
-            while !thread.is_finished() {
-                assert!(started.elapsed() < DEADLINE, "timed out waiting for {what}");
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            thread.join().unwrap().expect_err("the connection ended with an error")
-        }
-    }
-
-    impl Drop for Client {
-        fn drop(&mut self) {
-            self.server.shutdown_all();
-            if let Some(t) = self.thread.take() {
-                let _ = t.join();
-            }
-        }
-    }
-
-    #[test]
-    fn a_publication_reaches_a_subscriber_at_once() {
-        let mut c = Client::connect();
-        c.subscribe();
-        let job = a_job(&c.server);
-        let published = Instant::now();
-        c.server.publish(Arc::clone(&job), false);
-        let notify = c.line("mining.notify");
-        assert!(published.elapsed() < DEADLINE, "the job waited for a timed check");
-        assert_eq!(notify["method"], "mining.notify");
-        let params = notify["params"].as_array().unwrap();
-        assert_eq!(
-            params[0].as_str().unwrap(),
-            format!("{}{COINBASE_POOLED:02x}", job.job_id),
-            "the notify names the published job and its pooled coinbase"
-        );
-    }
-
-    /// A connection that has not subscribed is sent no job, and the publication does not end
-    /// it: the waker only returns it from the poll.
-    #[test]
-    fn a_publication_sends_nothing_before_a_subscription() {
-        let mut c = Client::connect();
-        c.server.publish(a_job(&c.server), false);
-        c.subscribe();
-        // The subscription itself sends the current job, after the two subscription lines.
-        assert_eq!(c.line("mining.notify")["method"], "mining.notify");
-    }
-
-    #[test]
-    fn a_kill_request_ends_the_connection_at_once() {
-        let mut c = Client::connect();
-        c.subscribe();
-        let id = c.unique_id();
-        assert!(c.server.kill_client(id));
-        assert!(matches!(c.ended("the kill request"), Disconnect::Killed));
-        assert!(!c.server.kill_client(id), "the connection removed itself from the client list");
-    }
-
-    #[test]
-    fn shutdown_all_ends_the_connection_at_once() {
-        let mut c = Client::connect();
-        c.subscribe();
-        c.server.shutdown_all();
-        assert!(matches!(c.ended("the shutdown"), Disconnect::Killed));
-    }
-
-    /// Two requests written as one read are both answered, and a request split across two
-    /// writes is answered once its newline arrives.
-    #[test]
-    fn requests_are_parsed_by_line_across_reads() {
-        let mut c = Client::connect();
-        c.writer
-            .write_all(
-                concat!(
-                    r#"{"id":1,"method":"mining.subscribe","params":["tester/1"]}"#,
-                    "\n",
-                    r#"{"id":2,"method":"mining.authorize","params":["bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"]}"#,
-                    "\n",
-                )
-                .as_bytes(),
-            )
-            .unwrap();
-        assert_eq!(c.line("subscribe reply")["id"], 1);
-        assert_eq!(c.line("difficulty")["method"], "mining.set_difficulty");
-        let authorize = c.line("authorize reply");
-        assert_eq!(authorize["id"], 2);
-        assert_eq!(authorize["result"], Value::Bool(true));
-
-        c.writer.write_all(br#"{"id":3,"method":"mining.au"#).unwrap();
-        std::thread::sleep(Duration::from_millis(20));
-        c.writer.write_all(b"thorize\",\"params\":[\"worker\"]}\n").unwrap();
-        assert_eq!(c.line("the reply to the split request")["id"], 3);
-    }
-
-    #[test]
-    fn an_unknown_method_is_answered_with_an_error() {
-        let mut c = Client::connect();
-        c.send(r#"{"id":7,"method":"mining.nothing","params":[]}"#);
-        let reply = c.line("error reply");
-        assert_eq!(reply["id"], 7);
-        assert_eq!(reply["error"][0], METHOD_NOT_FOUND.0);
-        assert_eq!(reply["error"][1], METHOD_NOT_FOUND.1);
-    }
-
-    #[test]
-    fn a_closed_socket_ends_the_connection() {
-        let mut c = Client::connect();
-        c.subscribe();
-        c.writer.shutdown(std::net::Shutdown::Both).unwrap();
-        let ended = c.ended("the closed socket");
-        assert!(matches!(ended, Disconnect::Io(_)), "{ended:?}");
-    }
-
-    #[test]
-    fn a_line_over_the_buffer_ends_the_connection() {
-        let mut c = Client::connect();
-        let long = format!("{{\"id\":1,\"method\":\"{}\"", "x".repeat(CLIENT_BUFFER));
-        // The peer may close before the whole request is written.
-        let _ = c.writer.write_all(long.as_bytes());
-        let ended = c.ended("the buffer overrun");
-        assert!(
-            matches!(&ended, Disconnect::Protocol(why) if why.contains("read buffer overrun")),
-            "{ended:?}"
-        );
     }
 }

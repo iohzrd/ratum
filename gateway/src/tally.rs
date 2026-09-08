@@ -1,6 +1,3 @@
-//! A share count with the difficulty it sums to: what every accepted, rejected and fee
-//! counter in the gateway is.
-
 use serde_json::json;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -15,7 +12,6 @@ impl Tally {
         self.diff = self.diff.saturating_add(diff);
     }
 
-    /// Add another tally's shares to this one, for a total over several connections.
     pub fn merge(&mut self, other: &Tally) {
         self.count = self.count.saturating_add(other.count);
         self.diff = self.diff.saturating_add(other.diff);

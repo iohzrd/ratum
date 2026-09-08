@@ -4,53 +4,27 @@ use blake2::digest::consts::U32;
 use sha2::Sha256;
 
 pub const HEADER_V2_SIZE: usize = 164;
-/// Set in the serialized version word to mark a version 2 header; not part of the version.
 pub const V2_FLAG: u32 = 0x8000_0000;
-/// Knots `BlockHeaderFlag::UseTimeOffset`.
 pub const FLAG_USE_TIME_OFFSET: u8 = 4;
-/// The ASIC profile, the low two bits: Knots has no named constant (`m_flags & 3` in `block.cpp`).
 pub const FLAG_PROFILE_MASK: u8 = 3;
 
-/// The bytes the ASIC hashes, indexed by ASIC profile. The profiles lay out the same
-/// fields and differ in how many zero bytes precede them: `block.cpp` GetHash writes 48
-/// zero bytes for profile 2 and 80 for profile 3 (three and five `uint128` zeros).
 pub const ASIC_INPUT_LEN: [usize; 4] = [80, 80, 128, 160];
-/// The zero bytes ahead of the fields, indexed by ASIC profile.
 const ASIC_INPUT_LEADING_ZEROS: [usize; 4] = [0, 0, 48, 80];
 
-/// The bytes hashed into H1: `Assert(h1.BytesWritten() == 0x40 + 119)` in `block.cpp`
-/// (the 0x40 is the tag SHA256 written twice), and `h1_payload[119]` in `datum_pow.c`.
 pub const H1_PREIMAGE_SIZE: usize = 119;
-/// The bytes hashed into H2: H1, 32 zero bytes written twice, and `m_mm_rhs`
-/// (`Assert(h2.BytesWritten() == 0x40 + 0x60)`; `h2_payload[96]` in `datum_pow.c`).
 pub const H2_PREIMAGE_SIZE: usize = 96;
-/// The offset of `m_mm_rhs` in the H2 preimage, after H1 and the two zero words.
 const H2_MM_RHS_OFFSET: usize = 64;
 
-/// The leaf the first BLAKE2b hashes, which is all the stratum machine receives:
-/// `Assert(ss.size() == 52)` in `block.cpp`, `leaf[52]` in `datum_blake2b_work_root`.
-/// Stratum carries 51 of the 52 bytes as coinb1 (the last three bytes of the leading zero
-/// word, then H2) and the extranonce; the leaf's first byte is the 0x00 prefix the Siacoin
-/// hasher prepends itself.
 pub const WORK_ROOT_LEAF_SIZE: usize = 52;
-/// The offset of H2 in the leaf, after the leading zero word.
 pub const WORK_ROOT_H2_OFFSET: usize = 4;
-/// The zero bytes stratum's `coinb1` carries ahead of H2: the leaf's leading zero word less
-/// its first byte, which the Siacoin hasher prepends itself.
 pub const COINB1_LEADING_ZEROS: usize = WORK_ROOT_H2_OFFSET - 1;
-/// The offset of the extranonce in the leaf, after H2.
 const WORK_ROOT_EXTRANONCE_OFFSET: usize = 36;
 
-/// The leading bytes `prevblock_hidden` clears: `std::fill_n(prevblock_hidden.begin(), 6, 0)`
-/// in `block.cpp`, `memset(out, 0, 6)` in `datum_blake2b_prevblock_hidden`.
 const PREVBLOCK_HIDDEN_CLEARED_BYTES: usize = 6;
 
 pub type U256 = [u8; 32];
 pub type U128 = [u8; 16];
 
-/// The version 2 header. Field names follow the gateway's `T_DATUM_HEADER_V2` (`prev_block`,
-/// `time`, `bits`); elsewhere in this crate the Bitcoin header fields are `prev_hash`, `ntime`
-/// and `nbits`.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct HeaderV2 {
     pub version: i32,
@@ -89,7 +63,6 @@ fn sha256(data: &[u8]) -> [u8; 32] {
     Sha256::digest(data).into()
 }
 
-/// BIP340-style tagged hash: SHA256(SHA256(tag) || SHA256(tag) || data).
 pub fn tagged_sha256(tag: &str, data: &[u8]) -> [u8; 32] {
     let t = sha256(tag.as_bytes());
     let mut h = Sha256::new();
@@ -106,9 +79,6 @@ pub fn blake2b_256(data: &[u8]) -> [u8; 32] {
 }
 
 impl HeaderV2 {
-    /// What the serialized header carries: the time less `time_offset` when
-    /// `FLAG_USE_TIME_OFFSET` is set. `deserialize` adds it back, so `time` is always the block
-    /// time (nTime) in memory.
     pub fn time_on_wire(&self) -> u32 {
         if self.flags & FLAG_USE_TIME_OFFSET == 0 {
             self.time
@@ -189,10 +159,6 @@ impl HeaderV2 {
                 ss.extend_from_slice(hash1);
                 ss.extend_from_slice(h2);
             }
-            // Profiles 0, 2 and 3 lay the fields out identically and differ in how much
-            // zero padding precedes them and in what fills the 32 bytes after it: profile
-            // 0 puts the hidden previous block hash there, where the Siacoin layout puts
-            // the parent id; 2 and 3 put h2 there, after 48 or 80 zero bytes.
             p => {
                 ss.resize(ASIC_INPUT_LEADING_ZEROS[p as usize], 0);
                 if p == 0 {
@@ -216,27 +182,16 @@ impl HeaderV2 {
         self.precompute_with_key_hash(xor_key_hash)
     }
 
-    /// `precompute` for a party that holds the XOR key's commitment but not the key: the
-    /// gateway building work under an ABW assignment. H1 commits to `xor_key_hash` directly,
-    /// so H2, hash1 and hash2 match what the pool (which derives the same hash from the key)
-    /// computes. The mask needs the key, so `Precomputed::mask` is derived from `self.xor_key`
-    /// (zero on the gateway, giving a zero mask); the gateway uses only h2 and hash1.
     pub fn precompute_with_key_hash(&self, xor_key_hash: [u8; 32]) -> Precomputed {
-        // The hardware does receive the previous block hash, but only as the tagged hash
-        // `prevblock_hidden` derives, so h1 commits to it as well.
         let mut prev_display = self.prev_block;
         prev_display.reverse();
 
         let mut h1d = Vec::with_capacity(H1_PREIMAGE_SIZE);
-        // The node hashes the complete version, with the v2 flag bit set, into h1
-        // (`block.cpp` GetHash: `h1 << GetCompleteVersion()`). `self.version` holds the
-        // version with the flag stripped, so restore it here.
         h1d.extend_from_slice(&(self.version as u32 | V2_FLAG).to_le_bytes());
         h1d.extend_from_slice(&prev_display);
         h1d.extend_from_slice(&self.height.to_le_bytes());
         h1d.extend_from_slice(&self.merkle_root);
         h1d.extend_from_slice(&self.time_on_wire().to_le_bytes());
-        // Reserved for an extended 40-bit time, per primitives/block.cpp.
         h1d.push(0);
         h1d.extend_from_slice(&self.bits.to_le_bytes());
         h1d.extend_from_slice(&(self.txcount as u32).to_le_bytes());
@@ -246,8 +201,6 @@ impl HeaderV2 {
         debug_assert_eq!(h1d.len(), H1_PREIMAGE_SIZE);
         let h1 = tagged_sha256("Bitcoin block header 1", &h1d);
 
-        // Knots writes 32 zero bytes between h1 and `m_mm_rhs` (`block.cpp`:
-        // `h2 << zeros << zeros`).
         let mut h2d = [0u8; H2_PREIMAGE_SIZE];
         h2d[..h1.len()].copy_from_slice(&h1);
         h2d[H2_MM_RHS_OFFSET..].copy_from_slice(&self.mm_rhs);
@@ -285,8 +238,6 @@ impl HeaderV2 {
         }
     }
 
-    /// The hash in the byte order Knots returns it in; `HashComponents::result` is the
-    /// reverse of it, which is the order targets are compared in.
     pub fn pow_hash(&self) -> U256 {
         let mut r = self.hash_components().result;
         r.reverse();
@@ -307,13 +258,6 @@ pub struct Precomputed {
     pub mask: [u8; 32],
 }
 
-/// The 32 bytes the hardware is given in place of the previous block hash. Profile 0
-/// hashes this rather than the previous block hash itself, so it is also what
-/// `mining.notify` carries in the previous-block-hash position.
-///
-/// The first six bytes are cleared, which is the only form block.cpp uses the value in.
-/// The Siacoin layout places a block hash in that slot, and a block hash has leading zero
-/// bytes; a bare tagged hash does not, so the clearing gives this value the same form.
 pub fn prevblock_hidden(prev_block: &U256) -> [u8; 32] {
     let mut display = *prev_block;
     display.reverse();
@@ -322,7 +266,6 @@ pub fn prevblock_hidden(prev_block: &U256) -> [u8; 32] {
     out
 }
 
-/// No key means no mask, matching `if (!m_xor_key.IsNull())` in block.cpp.
 pub fn xor_mask(xor_key: &U128, clear_bits: u8) -> [u8; 32] {
     if xor_key.iter().all(|&b| b == 0) {
         return [0u8; 32];

@@ -1,7 +1,3 @@
-//! From a template to the jobs the stratum server serves: the new-tip sequence, the
-//! coinbaser request on its own thread, and the once-per-reason reporting of a job that
-//! could not be built.
-
 use crate::datum::Shared;
 use crate::job::{BuildError, Builder, PoolConfig};
 use crate::stratum::Server;
@@ -12,19 +8,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// How long the empty (subsidy-only) job is left in force before the priority job
-/// replaces it, so a miner receives and starts on it.
 const EMPTY_JOB_HOLD: Duration = Duration::from_millis(50);
 
 pub struct Publisher {
     builder: Mutex<Builder>,
     server: Arc<Server>,
     shared: Arc<Shared>,
-    /// Counts the templates passed in; a coinbaser response for any but the latest is
-    /// discarded.
     template_serial: AtomicU64,
-    /// The last build error reported, so a permanent one (a payout script the coinbase
-    /// cannot carry) is logged once per reason rather than on every poll.
     last_error: Mutex<Option<BuildError>>,
 }
 
@@ -39,8 +29,6 @@ impl Publisher {
         })
     }
 
-    /// Build a job for `t` and publish it; `empty` marks new-block empty work. `what` names
-    /// the job in the log.
     fn build_and_publish(
         &self,
         t: &Arc<Template>,
@@ -50,13 +38,6 @@ impl Publisher {
         coinbaser: Option<CoinbaserResponse>,
         what: &str,
     ) {
-        // Under the version 3 protocol a pooled job commits to the pool's ABW assignment; until
-        // the pool has seeded one, no job is built. The C gateway builds solo work meanwhile
-        // (`datum_protocol_is_active` is false without an assignment, so its coinbaser pays
-        // its own address); this gateway serves none, since the pool sends the assignment
-        // with its configuration.
-        // With no ABW requirement (a v1 pool, or a v3 pool that disabled it) the work commits
-        // to the null key and the gateway classifies blocks itself.
         let require_abw = self.shared.require_abw();
         let abw = if require_abw { self.shared.abw_assignment() } else { None };
         if pool.is_some() && require_abw && abw.is_none() {
@@ -93,10 +74,6 @@ impl Publisher {
         }
     }
 
-    /// The jobs for a template. On a new tip, the C gateway's sequence: empty (subsidy-only)
-    /// work at once, then full work with the blank coinbase, then the job with the pool's
-    /// payout split once the coinbaser responds. Miners are never left on subsidy-only work
-    /// while the request is open.
     pub fn on_template(self: &Arc<Self>, t: Arc<Template>, new_block: bool) {
         let serial = self.template_serial.fetch_add(1, Ordering::SeqCst) + 1;
         let pool = self.shared.pool_config();
@@ -114,9 +91,6 @@ impl Publisher {
         }
     }
 
-    /// The coinbaser wait (up to `COINBASER_WAIT`) runs on its own thread, as the C
-    /// gateway's coinbaser thread does, so the template thread keeps polling the node and
-    /// answering block notifications meanwhile.
     fn spawn_coinbaser(self: &Arc<Self>, t: Arc<Template>, new_block: bool, serial: u64) {
         let this = Arc::clone(self);
         let spawned = std::thread::Builder::new().name("coinbaser".into()).spawn(move || {
@@ -126,8 +100,6 @@ impl Publisher {
                 return;
             }
             let pool = this.shared.pool_config();
-            // On a new tip the blank full job is already out; without a coinbaser there is
-            // nothing to replace it with.
             if new_block && pool.is_some() && coinbaser.is_none() {
                 return;
             }

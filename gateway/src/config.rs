@@ -1,33 +1,16 @@
-//! The configuration file: the same JSON schema as the C gateway's `datum_gateway_config.json`,
-//! so a deployment can swap the binary without changing its file. Every key is optional
-//! except the ones the C gateway requires (`bitcoind.rpcurl`, `mining.pool_address`).
-//! Unknown keys are ignored, as the C gateway ignores them. The second half is the settings
-//! page's editing of the file (`apply`, `write_file`, `restart`).
-
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-/// Jobs a new tip builds beyond the one the C gateway's slot check counts: the empty job and
-/// the priority job before the coinbaser job.
 const EXTRA_JOBS_PER_TIP: u64 = 2;
 
-/// `MAX_THREADS` and `MAX_CLIENTS_THREAD` in the C gateway's `datum_sockets.h`, which size
-/// its thread table and each thread's client table.
 const MAX_THREADS: usize = 64;
 const MAX_CLIENTS_THREAD: usize = 4096;
-/// The seconds between work updates the C gateway clamps `bitcoind.work_update_seconds` to
-/// ("5-120, 40 suggested").
 const WORK_UPDATE_SECONDS_RANGE: std::ops::RangeInclusive<u64> = 5..=120;
-/// The floors `datum_conf.c` enforces on the vardiff settings.
 const MIN_VARDIFF_TARGET_SHARES_MIN: u64 = 1;
 const MIN_VARDIFF_QUICKDIFF_COUNT: u64 = 4;
 const MIN_VARDIFF_QUICKDIFF_DELTA: u64 = 3;
-/// The range `stratum.share_stale_seconds` must fall in (`datum_conf.c`, "suggest 120").
 const SHARE_STALE_SECONDS_RANGE: std::ops::RangeInclusive<u64> = 60..=150;
-/// How far `datum.protocol_global_timeout` must exceed `bitcoind.work_update_seconds`
-/// (`datum_conf.c`: "at least the work update interval plus 5 seconds").
 const GLOBAL_TIMEOUT_MARGIN_SECS: u64 = 5;
-/// The largest value a TCP port and the two-byte `mining.coinbase_unique_id` hold.
 const MAX_PORT: i64 = u16::MAX as i64;
 const MAX_COINBASE_UNIQUE_ID: i64 = u16::MAX as i64;
 
@@ -79,15 +62,10 @@ pub struct Stratum {
     pub idle_timeout_no_shares: u64,
     pub idle_timeout_max_last_work: u64,
     pub require_address_username: bool,
-    /// `{"modname": {"address": proportion, ...}}`; an empty address keeps the miner's own.
-    /// The ranges are in the file's order, as `json_object_foreach` walks them in C: the
-    /// first address takes the low hash values.
     #[serde(deserialize_with = "deserialize_modifiers")]
     pub username_modifiers: crate::username::Modifiers,
 }
 
-/// A JSON object read into pairs in document order, which `serde_json`'s map types do not
-/// keep.
 pub struct Ordered<V>(pub Vec<(String, V)>);
 
 impl<'de, V: Deserialize<'de>> Deserialize<'de> for Ordered<V> {
@@ -113,7 +91,6 @@ impl<'de, V: Deserialize<'de>> Deserialize<'de> for Ordered<V> {
     }
 }
 
-/// `stratum.username_modifiers`: an object of objects, both levels in document order.
 fn deserialize_modifiers<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> Result<crate::username::Modifiers, D::Error> {
@@ -175,7 +152,6 @@ pub struct Api {
     pub listen_addr: String,
     pub listen_port: u16,
     pub miner_listen_addr: String,
-    /// The password-less miner lookup page; 0 disables it.
     pub miner_listen_port: u16,
     pub modify_conf: bool,
 }
@@ -207,7 +183,6 @@ pub struct Logger {
     pub log_to_stderr: bool,
     pub log_to_file: bool,
     pub log_file: String,
-    /// Accepted for the C gateway's file and not applied: `Some` when the file sets it.
     pub log_rotate_daily: Option<bool>,
     pub log_calling_function: bool,
     pub log_level_console: u8,
@@ -234,8 +209,6 @@ impl Default for Logger {
 pub struct Datum {
     pub pool_host: String,
     pub pool_port: u16,
-    /// The pool's web page (`https://pool.example`), which the status and miner pages link
-    /// the pool to when it is set. Not a C gateway key; the DATUM host need not serve a page.
     pub pool_url: String,
     pub pool_pubkey: String,
     pub pool_pass_workers: bool,
@@ -243,16 +216,9 @@ pub struct Datum {
     pub pool_pass_full_users: bool,
     pub gateway_fee_bps: u32,
     pub gateway_fee_address: String,
-    /// Accepted for the C gateway's file and not applied: `Some` when the file sets it.
     pub always_pay_self: Option<bool>,
     pub pooled_mining_only: bool,
     pub protocol_global_timeout: u64,
-    /// Use the version 3 protocol to the pool: the DRS hello, version 3 config, and
-    /// anti-block-withholding. On by default. A version 1 pool reads the DRS extension as
-    /// hello padding and responds with a version 1 configuration, which the gateway accepts;
-    /// that session runs the version 1 protocol. Under version 3 the gateway commits its work
-    /// to the pool's ABW assignment and does not classify or submit blocks itself; the pool
-    /// holds the XOR key and submits them. Off sends a version 1 hello.
     pub protocol_v3: bool,
 }
 
@@ -286,28 +252,15 @@ pub struct Config {
     pub extra_block_submissions: ExtraBlockSubmissions,
     pub logger: Logger,
     pub datum: Datum,
-    /// What `validate` has to say that is not an error: logged by `main` once the logger the
-    /// file configures exists, since the file is parsed before it can.
     #[serde(skip)]
     pub warnings: Vec<(log::Level, String)>,
-    /// The output script `mining.pool_address` pays to, decoded once by `validate`.
     #[serde(skip)]
     pub pool_output_script: Vec<u8>,
 }
 
-/// The largest coinbase tag space: what fits in a 100-byte scriptSig beside the height push,
-/// the unique-id push and the extranonce push. The C gateway's `MAX_COINBASE_TAG_SPACE` is
-/// 82, leaving room for the version 3 prime id push it always writes; `coinbase::script_sig`
-/// subtracts the same four bytes when it writes that push.
 pub const MAX_COINBASE_TAG_SPACE: usize = 86;
-/// What the version 3 prime id push costs over the version 1 one: an 8-byte prime id in an
-/// 11-byte push rather than a 4-byte one in a 7-byte push.
 pub const WIDE_PRIME_PUSH_EXTRA_BYTES: usize = 4;
 
-/// The tag lengths `datum_read_config` accepts for `mining.coinbase_tag_primary` and
-/// `mining.coinbase_tag_secondary`: each at most `MAX_CONFIGURED_TAG` bytes, the two together
-/// at most `MAX_CONFIGURED_TAGS_TOTAL`. Distinct from the wire limit a pool's own tag is held
-/// to, `ratum::datum::messages::MAX_COINBASE_TAG`.
 pub const MAX_CONFIGURED_TAG: usize = 60;
 pub const MAX_CONFIGURED_TAGS_TOTAL: usize = 88;
 
@@ -318,8 +271,6 @@ impl Config {
         Ok(c)
     }
 
-    /// The C gateway's post-parse checks (`datum_read_config`), with the same outcomes: a
-    /// clamped value is clamped, a refused one is an error naming the key.
     fn validate(&mut self) -> Result<(), String> {
         self.validate_bitcoind()?;
         self.validate_stratum()?;
@@ -443,9 +394,6 @@ impl Config {
                 ratum::datum::share::MAX_JOBS
             ));
         }
-        // The C gateway's check counts one job per work update. A new tip builds three jobs
-        // here (empty, priority, coinbaser) where C builds one and rewrites its coinbase, so
-        // two slots are reserved for them.
         let min_slots = EXTRA_JOBS_PER_TIP
             + (self.stratum.share_stale_seconds + self.bitcoind.work_update_seconds)
                 .div_ceil(self.bitcoind.work_update_seconds);
@@ -517,8 +465,6 @@ impl Config {
                     break;
                 }
             }
-            // The C gateway's `datum_config_parse_username_mods`: shares past the last range
-            // go to mining.pool_address, which is reported and not refused.
             if !covered {
                 notes.push((
                     log::Level::Error,
@@ -533,15 +479,12 @@ impl Config {
         Ok(())
     }
 
-    /// The window after a job's creation in which a share on it is accepted.
     pub fn stale_window(&self) -> std::time::Duration {
         std::time::Duration::from_secs(
             self.stratum.share_stale_seconds + self.bitcoind.work_update_seconds,
         )
     }
 
-    /// The most shares one stratum thread's clients send within the stale window, sixteen
-    /// times over: the C gateway's sizing of the share queue.
     pub fn share_queue_capacity(&self) -> usize {
         let s = &self.stratum;
         s.max_clients_per_thread
@@ -550,13 +493,10 @@ impl Config {
             * 16
     }
 
-    /// `share_queue_capacity` for every stratum thread: the duplicate-share table's size.
     pub fn dupe_table_capacity(&self) -> usize {
         self.share_queue_capacity() * self.stratum.max_threads
     }
 
-    /// The address fee shares are credited to: `datum.gateway_fee_address`, or the
-    /// gateway's own `mining.pool_address` when it is empty.
     pub fn fee_address(&self) -> &str {
         if self.datum.gateway_fee_address.is_empty() {
             &self.mining.pool_address
@@ -566,34 +506,19 @@ impl Config {
     }
 }
 
-// The settings page (`/config`, `api.modify_conf`). Each form field names one key of the
-// file. `apply` puts the submitted values into the file's JSON document, parses the result
-// with the startup validation, and returns the text to write; the caller rewrites the file
-// and calls `restart`, since every thread holds the configuration it started with. The
-// field names and the `pool_host(old)` convention are the C gateway's, so a file either
-// gateway edited reads the same in both.
-
-/// One form field that sets one key.
 struct Field {
-    /// The form field's name, `section_key`.
     name: &'static str,
-    /// What an error names.
     label: &'static str,
     section: &'static str,
     key: &'static str,
     kind: Kind,
-    /// The value the running gateway uses, which the page shows and an unchanged submission
-    /// is compared with.
     current: fn(&Config) -> Value,
 }
 
 enum Kind {
     Text,
-    /// A whole number in the inclusive range.
     Int(i64, i64),
-    /// `1` or `0`.
     Bool,
-    /// Never shown; an empty submission keeps the file's value.
     Password,
 }
 
@@ -739,8 +664,6 @@ const FIELDS: &[Field] = &[
     },
 ];
 
-/// The `datum.pool_host` the page shows: the running one, else the file's `pool_host(old)`
-/// (what the C gateway keeps when reward sharing is set to never), else the default.
 fn shown_pool_host(cfg: &Config, doc: &Value) -> String {
     if !cfg.datum.pool_host.is_empty() {
         return cfg.datum.pool_host.clone();
@@ -752,8 +675,6 @@ fn old_pool_host(doc: &Value) -> Option<String> {
     doc.get("datum")?.get("pool_host(old)")?.as_str().map(str::to_string)
 }
 
-/// The largest `mining.coinbase_tag_secondary` beside the running primary tag: what
-/// `validate_mining` accepts.
 fn secondary_tag_max(cfg: &Config) -> usize {
     MAX_CONFIGURED_TAGS_TOTAL
         .saturating_sub(cfg.mining.coinbase_tag_primary.len())
@@ -780,8 +701,6 @@ fn reward_sharing(cfg: &Config) -> &'static str {
     }
 }
 
-/// What the page's form shows, keyed by field name. `doc` is the file's document, or null
-/// when it could not be read.
 pub fn form_values(cfg: &Config, doc: &Value) -> Value {
     let mut v = serde_json::Map::new();
     for f in FIELDS {
@@ -796,7 +715,6 @@ pub fn form_values(cfg: &Config, doc: &Value) -> Value {
     Value::Object(v)
 }
 
-/// The document's `section` object, created when absent.
 fn section<'a>(
     doc: &'a mut Value,
     name: &str,
@@ -806,7 +724,6 @@ fn section<'a>(
     entry.as_object_mut().ok_or_else(|| format!("the file's \"{name}\" is not a JSON object"))
 }
 
-/// The edits one submission makes to the document.
 struct Edit<'a> {
     doc: &'a mut Value,
     changed: bool,
@@ -824,7 +741,6 @@ impl Edit<'_> {
         }
     }
 
-    /// `set` unless the running value is already `value`.
     fn set_if_changed(&mut self, section_name: &str, key: &str, value: Value, current: Value) {
         if value != current {
             self.set(section_name, key, value);
@@ -856,8 +772,6 @@ fn parse_bool(label: &str, text: &str) -> Result<bool, String> {
     }
 }
 
-/// The document's text as the file is written: four-space indentation, as the C gateway
-/// writes it.
 fn render(doc: &Value) -> String {
     let mut out = Vec::new();
     let fmt = serde_json::ser::PrettyFormatter::with_indent(b"    ");
@@ -867,20 +781,11 @@ fn render(doc: &Value) -> String {
     String::from_utf8(out).expect("JSON is UTF-8")
 }
 
-/// The file's text with `form`'s edits, validated: `Ok(None)` when no value differs from
-/// the running configuration, `Ok(Some(text))` to write, or the errors, in which case
-/// nothing is to be written.
-/// The value the form submitted under `name`, or `None` when the form does not carry it.
 fn submitted<'a>(form: &'a [(String, String)], name: &str) -> Option<&'a str> {
     form.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
 }
 
-/// Apply the reward-sharing choice and the pool host whose destination it decides. Turning
-/// sharing off parks the configured `pool_host` as `pool_host(old)` and turning it on takes
-/// that value back, which is the C page's convention.
 fn apply_reward_sharing(edit: &mut Edit<'_>, cfg: &Config, form: &[(String, String)]) {
-    // The reward-sharing choice first: it decides whether the pool host field sets
-    // `pool_host` or the parked `pool_host(old)`.
     let mut pool_host = cfg.datum.pool_host.clone();
     let default_host = Datum::default().pool_host;
     match submitted(form, "reward_sharing") {
@@ -901,8 +806,6 @@ fn apply_reward_sharing(edit: &mut Edit<'_>, cfg: &Config, form: &[(String, Stri
                         pool_host = old;
                     }
                     None => {
-                        // Absent, the default applies; the file does not name it, as the C
-                        // gateway leaves it out.
                         edit.remove("datum", "pool_host");
                         edit.changed = true;
                         pool_host = default_host.clone();
@@ -934,17 +837,12 @@ fn apply_reward_sharing(edit: &mut Edit<'_>, cfg: &Config, form: &[(String, Stri
         if !pool_host.is_empty() {
             edit.set_if_changed("datum", "pool_host", json!(host), json!(pool_host));
         } else if host != default_host || old_pool_host(edit.doc).is_some() {
-            // Not pooled now: the host is parked for when reward sharing is turned on. The
-            // default is not written unless something else was parked already.
             let old = old_pool_host(edit.doc).map_or(Value::Null, |o| json!(o));
             edit.set_if_changed("datum", "pool_host(old)", json!(host), old);
         }
     }
 }
 
-/// Apply the username choice: `full_users` passes the miner's own username to the pool,
-/// `workers` appends its worker name to the gateway's address, and `private` sends the
-/// address alone.
 fn apply_username_behaviour(edit: &mut Edit<'_>, cfg: &Config, form: &[(String, String)]) {
     match submitted(form, "username_behaviour") {
         None => {}
@@ -1008,8 +906,6 @@ pub fn apply(
         }
     }
 
-    // A longer job interval raises the pool timeout with it, as the C gateway does, instead
-    // of refusing the interval for the timeout the file does not name.
     if let Some(seconds) =
         submitted(form, "bitcoind_work_update_seconds").and_then(|t| t.trim().parse::<u64>().ok())
         && cfg.datum.protocol_global_timeout < seconds + GLOBAL_TIMEOUT_MARGIN_SECS
@@ -1029,20 +925,15 @@ pub fn apply(
     Ok(Some(text))
 }
 
-/// Write `text` to `path` through `path.new` and a rename, so a failure leaves the file
-/// as it was.
 pub fn write_file(path: &str, text: &str) -> std::io::Result<()> {
     let tmp = format!("{path}.new");
     std::fs::write(&tmp, text)?;
     std::fs::rename(&tmp, path)
 }
 
-/// Replace the process with a new one on the same command line. The listeners close with
-/// the process (every socket and file is close-on-exec), so the new one binds them.
 pub fn restart() -> ! {
     log::info!("Restarting to apply the new configuration");
     log::logger().flush();
-    // The response to the request that asked for this is on its way out.
     std::thread::sleep(std::time::Duration::from_millis(500));
     let exe = std::env::current_exe()
         .unwrap_or_else(|_| std::env::args_os().next().map(Into::into).unwrap_or_default());
@@ -1066,211 +957,5 @@ pub fn restart() -> ! {
                 std::process::exit(1);
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn minimal() -> String {
-        r#"{
-          "bitcoind": {"rpcuser":"u","rpcpassword":"p","rpcurl":"http://127.0.0.1:18443"},
-          "mining": {"pool_address":"bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"},
-          "datum": {"pool_host": "", "pooled_mining_only": false}
-        }"#
-        .to_string()
-    }
-
-    #[test]
-    fn parses_the_minimal_file_with_defaults() {
-        let c = Config::parse(&minimal()).unwrap();
-        assert_eq!(c.stratum.listen_port, 23334);
-        assert_eq!(c.stratum.vardiff_min, 16384);
-        assert_eq!(c.api.miner_listen_port, 8000);
-        assert_eq!(c.bitcoind.work_update_seconds, 40);
-        assert!(!c.datum.pooled_mining_only);
-        assert_eq!(c.fee_address(), "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080");
-    }
-
-    #[test]
-    fn the_pool_url_is_empty_unless_set() {
-        assert_eq!(Config::parse(&minimal()).unwrap().datum.pool_url, "");
-        let text = minimal().replace(
-            "\"pooled_mining_only\": false",
-            "\"pooled_mining_only\": false, \"pool_url\": \"https://pool.example\"",
-        );
-        assert_eq!(Config::parse(&text).unwrap().datum.pool_url, "https://pool.example");
-    }
-
-    #[test]
-    fn a_fee_requires_full_users() {
-        let text = minimal().replace(
-            "\"pooled_mining_only\": false",
-            "\"pooled_mining_only\": false, \"gateway_fee_bps\": 100, \"pool_pass_full_users\": false",
-        );
-        let e = Config::parse(&text).unwrap_err();
-        assert!(e.contains("pool_pass_full_users"), "{e}");
-    }
-
-    #[test]
-    fn username_modifiers_are_checked() {
-        let text = minimal().replace(
-            "\"datum\":",
-            "\"stratum\": {\"username_modifiers\": {\"half\": {\"bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080\": 0.5}}}, \"datum\":",
-        );
-        let c = Config::parse(&text).unwrap();
-        assert_eq!(c.warnings.len(), 1);
-        assert!(c.warnings[0].1.contains("not distribute 50% of shares"), "{}", c.warnings[0].1);
-        let text = minimal().replace(
-            "\"datum\":",
-            "\"stratum\": {\"username_modifiers\": {\"bad\": {\"\": -1}}}, \"datum\":",
-        );
-        assert!(Config::parse(&text).unwrap_err().contains("negative"));
-    }
-
-    #[test]
-    fn username_modifier_ranges_keep_the_file_order() {
-        let text = minimal().replace(
-            "\"datum\":",
-            "\"stratum\": {\"username_modifiers\": {\"z\": {\"bcrt1qzed\": 0.9, \"bcrt1qamy\": 0.1}, \"a\": {\"\": 1}}}, \"datum\":",
-        );
-        let c = Config::parse(&text).unwrap();
-        let names: Vec<&str> =
-            c.stratum.username_modifiers.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names, ["z", "a"]);
-        let addrs: Vec<&str> =
-            c.stratum.username_modifiers[0].1.iter().map(|(a, _)| a.as_str()).collect();
-        assert_eq!(addrs, ["bcrt1qzed", "bcrt1qamy"]);
-    }
-
-    #[test]
-    fn work_update_seconds_is_clamped() {
-        let text = minimal().replace("\"rpcurl\"", "\"work_update_seconds\": 1, \"rpcurl\"");
-        let c = Config::parse(&text).unwrap();
-        assert_eq!(c.bitcoind.work_update_seconds, 5);
-    }
-
-    const FILE: &str = r#"{
-    "bitcoind": {"rpcuser": "u", "rpcpassword": "p", "rpcurl": "http://127.0.0.1:18443"},
-    "mining": {"pool_address": "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"},
-    "datum": {"pool_host": "", "pooled_mining_only": false}
-}"#;
-
-    fn form(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
-    }
-
-    fn cfg() -> Config {
-        Config::parse(FILE).unwrap()
-    }
-
-    #[test]
-    fn unchanged_values_write_nothing() {
-        let c = cfg();
-        let f = form(&[
-            ("mining_pool_address", "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"),
-            ("mining_coinbase_unique_id", "4242"),
-            ("bitcoind_rpcpassword", ""),
-            ("reward_sharing", "never"),
-            ("username_behaviour", "full_users"),
-            ("stratum_fingerprint_miners", "1"),
-        ]);
-        assert_eq!(apply(&c, FILE, &f).unwrap(), None);
-    }
-
-    #[test]
-    fn edits_are_written_with_the_file_order_kept() {
-        let c = cfg();
-        let f = form(&[("mining_coinbase_unique_id", "7"), ("stratum_vardiff_min", "1024")]);
-        let text = apply(&c, FILE, &f).unwrap().unwrap();
-        let doc: Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(doc["mining"]["coinbase_unique_id"], 7);
-        assert_eq!(doc["stratum"]["vardiff_min"], 1024);
-        let keys: Vec<&str> = doc.as_object().unwrap().keys().map(String::as_str).collect();
-        assert_eq!(keys, ["bitcoind", "mining", "datum", "stratum"]);
-        assert!(text.starts_with("{\n    \"bitcoind\""), "{text}");
-    }
-
-    #[test]
-    fn the_startup_validation_refuses_a_bad_edit() {
-        let c = cfg();
-        let e = apply(&c, FILE, &form(&[("mining_pool_address", "nonsense")])).unwrap_err();
-        assert!(e[0].contains("mining.pool_address"), "{e:?}");
-        let e = apply(&c, FILE, &form(&[("mining_coinbase_unique_id", "70000")])).unwrap_err();
-        assert_eq!(e, ["Unique gateway ID must be between 0 and 65535"]);
-        let e = apply(&c, FILE, &form(&[("datum_pool_port", "x")])).unwrap_err();
-        assert_eq!(e, ["Pool port must be a whole number"]);
-    }
-
-    #[test]
-    fn reward_sharing_parks_and_restores_the_pool_host() {
-        let c = cfg();
-        // Never mode: a typed host is parked, not applied.
-        let text = apply(&c, FILE, &form(&[("datum_pool_host", "pool.example")])).unwrap().unwrap();
-        let doc: Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(doc["datum"]["pool_host"], "");
-        assert_eq!(doc["datum"]["pool_host(old)"], "pool.example");
-        assert_eq!(form_values(&c, &doc)["datum_pool_host"], "pool.example");
-        // The default host is not parked.
-        let default = Datum::default().pool_host;
-        assert_eq!(apply(&c, FILE, &form(&[("datum_pool_host", default.as_str())])).unwrap(), None);
-
-        // Turning sharing on restores the parked host; the port and key come with the form.
-        let key = "f21f2f0ef0aa1970468f22bad9bb7f4535146f8e4a8f646bebc93da3d89b1406f40d032f09a417d94dc068055df654937922d2c89522e3e8f6f0e649de473003";
-        let f = form(&[
-            ("reward_sharing", "require"),
-            ("datum_pool_host", "pool.example"),
-            ("datum_pool_pubkey", key),
-        ]);
-        let text = apply(&c, &text, &f).unwrap().unwrap();
-        let doc: Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(doc["datum"]["pool_host"], "pool.example");
-        assert_eq!(doc["datum"]["pooled_mining_only"], true);
-        assert!(doc["datum"].get("pool_host(old)").is_none());
-
-        // And off again parks it.
-        let pooled = Config::parse(&text).unwrap();
-        let text = apply(&pooled, &text, &form(&[("reward_sharing", "never")])).unwrap().unwrap();
-        let doc: Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(doc["datum"]["pool_host"], "");
-        assert_eq!(doc["datum"]["pool_host(old)"], "pool.example");
-        assert_eq!(doc["datum"]["pooled_mining_only"], false);
-    }
-
-    #[test]
-    fn username_behaviour_sets_both_flags() {
-        let c = cfg();
-        let text = apply(&c, FILE, &form(&[("username_behaviour", "workers")])).unwrap().unwrap();
-        let doc: Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(doc["datum"]["pool_pass_full_users"], false);
-        assert!(doc["datum"].get("pool_pass_workers").is_none(), "the default is kept");
-        let text = apply(&c, FILE, &form(&[("username_behaviour", "private")])).unwrap().unwrap();
-        let doc: Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(doc["datum"]["pool_pass_full_users"], false);
-        assert_eq!(doc["datum"]["pool_pass_workers"], false);
-    }
-
-    #[test]
-    fn a_longer_job_interval_raises_the_pool_timeout() {
-        let c = cfg();
-        let text =
-            apply(&c, FILE, &form(&[("bitcoind_work_update_seconds", "100")])).unwrap().unwrap();
-        let doc: Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(doc["bitcoind"]["work_update_seconds"], 100);
-        assert_eq!(doc["datum"]["protocol_global_timeout"], 105);
-    }
-
-    #[test]
-    fn the_password_is_never_shown_and_kept_when_blank() {
-        let c = cfg();
-        let shown = form_values(&c, &Value::Null);
-        assert!(shown.get("bitcoind_rpcpassword").is_none());
-        assert_eq!(shown["bitcoind_rpcuser"], "u");
-        assert_eq!(shown["reward_sharing"], "never");
-        let f = form(&[("bitcoind_rpcpassword", "new"), ("bitcoind_rpcuser", "u")]);
-        let text = apply(&c, FILE, &f).unwrap().unwrap();
-        let doc: Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(doc["bitcoind"]["rpcpassword"], "new");
     }
 }

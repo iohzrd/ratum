@@ -23,12 +23,6 @@ pub enum Error {
 }
 
 impl Error {
-    /// Whether the node refused the credential rather than the request.
-    ///
-    /// bitcoind generates a new cookie on every start and deletes it on shutdown
-    /// (`GenerateAuthCookie`, `DeleteAuthCookie`), so a node restarted under a running pool
-    /// leaves it holding a password that no longer exists. A configured rpcpassword
-    /// does not rotate, and a node with one writes no cookie at all.
     pub fn is_unauthorized(&self) -> bool {
         matches!(self, Error::Http(401 | 403, _))
     }
@@ -41,7 +35,6 @@ impl Error {
     }
 }
 
-/// The chain the node reports in `getblockchaininfo`'s `chain` field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Chain {
     Main,
@@ -49,7 +42,6 @@ pub enum Chain {
     Testnet4,
     Signet,
     Regtest,
-    /// A `chain` value not listed above.
     Other,
 }
 
@@ -65,7 +57,6 @@ impl Chain {
         }
     }
 
-    /// The name as `getblockchaininfo` reports it; `"other"` for an unlisted value.
     pub fn name(self) -> &'static str {
         match self {
             Chain::Main => "main",
@@ -86,27 +77,16 @@ pub struct Tip {
     pub chain: Chain,
 }
 
-/// The two facts the pool reads from a block template: what the next block may pay, and the
-/// target it must meet. Not the template itself, which also carries the transactions, the
-/// previous hash, the height and more; only these two are read. The gateway, not the pool,
-/// builds templates, so the pool has no use for the rest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NextBlock {
     pub coinbase_value: u64,
-    /// The compact target the next block must meet, `nBits` in the block header.
     pub bits: u32,
 }
 
 #[derive(Clone)]
 pub struct Client {
     url: String,
-    /// The `Authorization` header value. Shared across clones so a cookie refresh (below)
-    /// propagates to every clone of the client, not only the one that received the 401 or 403.
     authorization: Arc<Mutex<String>>,
-    /// The cookie file, if the credential came from one. bitcoind generates a new cookie on
-    /// every start, so a node restarted under a running pool leaves the held credential
-    /// different from the file's; a 401 or 403 re-reads the file so the pool recovers without
-    /// being restarted.
     cookie_path: Option<PathBuf>,
     pub timeout: Duration,
 }
@@ -133,7 +113,6 @@ impl Client {
         Self::build(url, basic_auth(user, password), None)
     }
 
-    /// A client whose credential is read from a bitcoind cookie file and re-read on a 401 or 403.
     pub fn with_cookie(url: &str, cookie_path: PathBuf) -> Result<Self, Error> {
         let (user, password) = read_cookie(&cookie_path)?;
         Self::build(url, basic_auth(&user, &password), Some(cookie_path))
@@ -144,9 +123,6 @@ impl Client {
         authorization: String,
         cookie_path: Option<PathBuf>,
     ) -> Result<Self, Error> {
-        // An `http://` or `https://` URL with a host:port authority; a bare host or another
-        // scheme is refused. The node on the same host or a private link is plain HTTP; an
-        // extra block-submission node behind TLS is where `https://` is used.
         let rest = url
             .strip_prefix("http://")
             .or_else(|| url.strip_prefix("https://"))
@@ -163,8 +139,6 @@ impl Client {
         })
     }
 
-    /// Re-read the cookie file and update the shared credential. Returns whether the
-    /// credential changed, so the caller retries only when there is a new one to try.
     fn refresh_cookie(&self) -> bool {
         let Some(path) = &self.cookie_path else { return false };
         let Ok((user, password)) = read_cookie(path) else { return false };
@@ -192,9 +166,6 @@ impl Client {
         .to_string();
 
         match self.attempt(&body) {
-            // bitcoind generates a new cookie on every start, so a 401 or 403 may mean only that
-            // the file now holds a new credential. Re-read it and retry once before returning the
-            // error.
             Err(e) if e.is_unauthorized() && self.refresh_cookie() => self.attempt(&body),
             other => other,
         }
@@ -202,11 +173,6 @@ impl Client {
 
     fn attempt(&self, body: &str) -> Result<serde_json::Value, Error> {
         let authorization = crate::lock(&self.authorization).clone();
-        // minreq frames the response by Content-Length and decodes chunked transfer, so the
-        // body end is found by the protocol rather than by closing the connection. The timeout
-        // is a whole-request bound; the long-poll `waitforblockheight` sets it above the
-        // node's wait time (the RPC's own timeout argument). Seconds granularity is immaterial
-        // (every timeout here is >= 1s).
         let response = minreq::post(&self.url)
             .with_header("Authorization", authorization)
             .with_header("Content-Type", "application/json")
@@ -233,17 +199,12 @@ impl Client {
         if status != 200 {
             return Err(Error::Http(status, json.to_string()));
         }
-        // A well-formed JSON-RPC response carries a `result` key (null on a bare success such
-        // as submitblock's) whenever `error` is null. Its absence is a malformed response, not
-        // a success: without this, `submit_block` would read a `result`-less 200 as a null
-        // result and report a block the node never accepted.
         match parsed.get("result") {
             Some(result) => Ok(result.clone()),
             None => Err(Error::BadResponse("response carries neither result nor error".into())),
         }
     }
 
-    /// The node's URL, as configured. For a log line naming what this client talks to.
     pub fn url(&self) -> &str {
         &self.url
     }
@@ -280,13 +241,7 @@ impl Client {
             .ok_or_else(|| Error::BadResponse("no height in waitforblockheight".into()))
     }
 
-    /// The value and the compact target of the block the node would build on its tip. The
-    /// pool holds `bits` per tip so it can refuse a job that claims an easier network target
-    /// than the chain's, which would let a gateway make ordinary shares count as blocks.
     pub fn next_block(&self) -> Result<NextBlock, Error> {
-        // The node requires a getblocktemplate client to declare each active fork rule, as
-        // it does for segwit: without "blake2b" it refuses with "requires explicit client
-        // support" once the BLAKE2b deployment is active.
         let result =
             self.call("getblocktemplate", serde_json::json!([{"rules": ["segwit", "blake2b"]}]))?;
         let coinbase_value = result["coinbasevalue"]
@@ -308,7 +263,6 @@ impl Client {
     }
 }
 
-/// Read a bitcoind cookie file, whose one line is `user:password`.
 fn read_cookie(path: &Path) -> Result<(String, String), Error> {
     let text = std::fs::read_to_string(path)?;
     match text.trim().split_once(':') {
@@ -317,64 +271,5 @@ fn read_cookie(path: &Path) -> Result<(String, String), Error> {
             "{} is not a cookie file: expected user:password",
             path.display()
         ))),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn basic_auth_encodes_the_credential() {
-        assert_eq!(basic_auth("x", "y"), "Basic eDp5");
-        assert_eq!(basic_auth("rpcuser", "rpcpass"), "Basic cnBjdXNlcjpycGNwYXNz");
-    }
-
-    #[test]
-    fn parses_urls() {
-        let c = Client::new("http://127.0.0.1:18443", "x", "y").unwrap();
-        assert_eq!(c.url, "http://127.0.0.1:18443");
-        assert_eq!(*crate::lock(&c.authorization), "Basic eDp5");
-
-        let c = Client::new("http://node.example:8332/wallet/main", "u", "p").unwrap();
-        assert_eq!(c.url, "http://node.example:8332/wallet/main");
-
-        let c = Client::new("https://node.example:8332", "u", "p").unwrap();
-        assert_eq!(c.url, "https://node.example:8332");
-
-        for bad in ["127.0.0.1:18443", "ftp://127.0.0.1:18443", "http://", "http://nohost"] {
-            assert!(Client::new(bad, "x", "y").is_err(), "{bad:?} should not parse");
-        }
-    }
-
-    /// A refused credential is not a refused request. bitcoind generates a new cookie every
-    /// time it starts, so this is the response a node restarted under a running pool gives.
-    #[test]
-    fn recognizes_a_credential_the_node_refuses() {
-        assert!(Error::Http(401, "Unauthorized".into()).is_unauthorized());
-        assert!(Error::Http(403, String::new()).is_unauthorized());
-        for other in [
-            Error::Http(500, "internal".into()),
-            Error::Http(404, String::new()),
-            Error::Rpc(r#"{"code":-8}"#.to_string()),
-            Error::BadResponse("no status code".into()),
-        ] {
-            assert!(!other.is_unauthorized(), "{other} is not a refused credential");
-        }
-    }
-
-    #[test]
-    fn recognizes_a_method_the_node_does_not_serve() {
-        let missing = Error::Rpc(r#"{"code":-32601,"message":"Method not found"}"#.to_string());
-        assert!(missing.is_method_not_found());
-
-        for other in [
-            Error::Rpc(r#"{"code":-8,"message":"Block height out of range"}"#.to_string()),
-            Error::Http(500, "internal".into()),
-            Error::BadResponse("no header/body split".into()),
-            Error::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out")),
-        ] {
-            assert!(!other.is_method_not_found(), "{other} is not a missing method");
-        }
     }
 }

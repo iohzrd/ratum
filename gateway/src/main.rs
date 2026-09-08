@@ -1,10 +1,3 @@
-//! ratum-gateway: the DATUM Gateway for the Bitcoin Knots BLAKE2b hardfork.
-//!
-//! Threads: the template thread polls the node and builds jobs; the stratum server serves
-//! them to mining hardware, one thread per connection; the DATUM thread holds the pool
-//! connection; the API threads serve HTTP. `main` starts them and then runs the watch loop:
-//! the `pooled_mining_only` check, the first-job diagnostic, the periodic statistics line.
-
 mod address;
 mod api;
 mod coinbase;
@@ -30,32 +23,21 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// How often the watch loop runs.
 const WATCH_TICK: Duration = Duration::from_millis(20);
-/// The statistics line's interval (the C gateway's 600 half-second ticks).
 const STATS_INTERVAL: Duration = Duration::from_secs(300);
-/// After this long without a first job the watch loop reports it, then every
-/// `NO_JOB_REPORT_INTERVAL`.
 const FIRST_JOB_PATIENCE: Duration = Duration::from_secs(25);
 const NO_JOB_REPORT_INTERVAL: Duration = Duration::from_secs(5);
-/// How long the first jobs wait for the pool connection, so they are pooled ones, and how
-/// often that wait reports its progress.
 const POOL_CONNECT_WAIT: Duration = Duration::from_secs(15);
 const POOL_CONNECT_POLL: Duration = Duration::from_millis(250);
-/// Consecutive sessions that did not reach the pool's configuration before the watch loop
-/// disconnects the stratum clients under `datum.pooled_mining_only`. The first failure can
-/// be an ordinary reconnect; the second means the pool is unreachable.
 const FAILURES_BEFORE_SHUTDOWN: u32 = 2;
 
 #[derive(Parser)]
 #[command(name = "ratum-gateway", version = ratum::VERSION, about = "DATUM Gateway for the Bitcoin Knots BLAKE2b hardfork")]
 struct Cli {
-    /// The configuration file (the C gateway's JSON schema).
     #[arg(short = 'c', long = "config", default_value = "datum_gateway_config.json")]
     config: String,
 }
 
-/// What every thread shares.
 #[derive(Clone)]
 struct Runtime {
     config: Arc<Config>,
@@ -64,9 +46,6 @@ struct Runtime {
     shared: Arc<datum::Shared>,
 }
 
-/// A panic on any thread ends the process, as the C gateway's `panic_from_thread` does, so a
-/// supervisor restarts it instead of a gateway with a dead template or pool thread serving
-/// stale work.
 fn install_panic_exit() {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -77,8 +56,6 @@ fn install_panic_exit() {
     }));
 }
 
-/// The configuration file, or exit 1 with the reason on stderr (the logger it configures
-/// does not exist yet).
 fn load_config(path: &str) -> Config {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
@@ -96,7 +73,6 @@ fn load_config(path: &str) -> Config {
     }
 }
 
-/// The node client `bitcoind.*` names, or exit 1.
 fn connect_node(config: &Config) -> ratum::rpc::Client {
     let b = &config.bitcoind;
     let node = if !b.rpcuser.is_empty() {
@@ -110,7 +86,6 @@ fn connect_node(config: &Config) -> ratum::rpc::Client {
     })
 }
 
-/// Start the DATUM thread and wait up to `POOL_CONNECT_WAIT` for its configuration.
 fn start_datum(rt: &Runtime) {
     let identity = ratum::datum::handshake::KeyPairs::generate();
     info!(
@@ -142,8 +117,6 @@ fn start_datum(rt: &Runtime) {
     }
 }
 
-/// The template thread: builds jobs from each template and publishes them. The stratum
-/// listener starts with the first job, as the C gateway's does.
 fn start_template_thread(
     rt: &Runtime,
     server: Arc<stratum::Server>,
@@ -194,10 +167,6 @@ fn start_template_thread(
         .expect("template thread");
 }
 
-/// The watch loop: the pooled_mining_only check (new connections are refused whenever the
-/// pool is not connected, as the C accept loop does; connected miners are disconnected
-/// after two connection attempts that did not reach the pool's configuration), the
-/// first-job diagnostic, the statistics line.
 fn watch_loop(rt: &Runtime, server: &stratum::Server) -> ! {
     let pooled = !rt.config.datum.pool_host.is_empty();
     let started = Instant::now();

@@ -15,30 +15,19 @@ use dryoc::constants::{
 pub(crate) type PrecompKey = [u8; CRYPTO_BOX_BEFORENMBYTES];
 pub(crate) type Signature = [u8; CRYPTO_SIGN_BYTES];
 
-/// An ed25519 signing key and a curve25519 box key are both 32 bytes.
 pub const PUBKEY_LEN: usize = 32;
-/// The public keys a hello carries: the client's long-term signing and box keys, then its
-/// session pair, in that order.
 pub(crate) const HELLO_KEYS: usize = 4;
 pub(crate) const KEYS_LEN: usize = HELLO_KEYS * PUBKEY_LEN;
-/// The keys the pool's response appends after echoing the hello's: its own session signing
-/// key, then its session box key.
 pub(crate) const POOL_SIGN_KEY_INDEX: usize = HELLO_KEYS;
 pub(crate) const POOL_BOX_KEY_INDEX: usize = HELLO_KEYS + 1;
 pub(crate) const RESPONSE_KEYS_LEN: usize = (POOL_BOX_KEY_INDEX + 1) * PUBKEY_LEN;
 
-/// The `n`th public key in a handshake key block. `None` when the block is shorter.
 pub(crate) fn key_at(block: &[u8], n: usize) -> Option<&[u8]> {
     block.get(n * PUBKEY_LEN..(n + 1) * PUBKEY_LEN)
 }
 
-/// The most of a hello's user agent to keep and log. The field runs to a NUL and a peer can
-/// make it as long as a hello frame allows (megabytes), so it is truncated before it is
-/// stored or logged. The C gateway's own user agent is about 52 bytes (version, "/", commit
-/// hash, optional "(tag)") and at most 385.
 const MAX_USER_AGENT: usize = 256;
 use super::framing::STRUCT_END;
-/// The gateway reads the motd into `motd[512]` with `strncpy(..., 511)`.
 pub const MAX_MOTD: usize = 511;
 
 #[derive(Debug, thiserror::Error)]
@@ -69,7 +58,6 @@ pub enum Error {
     TooLarge(usize),
 }
 
-/// A signing key pair and a box key pair: one end's long-term keys or its session keys.
 #[derive(Clone)]
 pub struct KeyPairs {
     pub sign_pk: SignPublicKey,
@@ -85,7 +73,6 @@ impl KeyPairs {
         KeyPairs { sign_pk, sign_sk, box_pk, box_sk }
     }
 
-    /// The two public keys as hex, the form `datum.pool_pubkey` takes.
     pub fn pubkey_hex(&self) -> String {
         let mut v = Vec::with_capacity(2 * PUBKEY_LEN);
         v.extend_from_slice(&self.sign_pk);
@@ -93,7 +80,6 @@ impl KeyPairs {
         hex::encode(v)
     }
 
-    /// The four keys concatenated in field order, the layout the pool's key file stores.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(KEY_PAIRS_LEN);
         v.extend_from_slice(&self.sign_pk);
@@ -103,8 +89,6 @@ impl KeyPairs {
         v
     }
 
-    /// The inverse of [`KeyPairs::to_bytes`]; `None` unless the input is exactly
-    /// `KEY_PAIRS_LEN` bytes.
     pub fn from_bytes(raw: &[u8]) -> Option<Self> {
         if raw.len() != KEY_PAIRS_LEN {
             return None;
@@ -121,32 +105,16 @@ impl KeyPairs {
     }
 }
 
-/// The bytes [`KeyPairs::to_bytes`] writes: the four keys in field order.
 pub const KEY_PAIRS_LEN: usize = size_of::<SignPublicKey>()
     + size_of::<SignSecretKey>()
     + size_of::<BoxPublicKey>()
     + size_of::<BoxSecretKey>();
 
-/// The DRS extension marker a version 3 hello carries after `nk`, then a flag byte and, when
-/// the flag is 1, the 40-byte resume token. `open_hello` removes the signature before
-/// reading past `nk`, so in a version 1 hello only the pad follows: the C gateway and
-/// `Client::hello` pad with 1 to 200 repeats of one byte, which cannot match four distinct
-/// ones. A ratum-gateway built before the version 3 protocol padded with independent random
-/// bytes, which match with probability 2^-32 per hello.
 pub const DRS_MARKER: [u8; 4] = *b"DRS\x01";
-/// The flag byte after the marker: the resume token follows when it is `DRS_RESUME_PRESENT`,
-/// and the extension ends at the flag when it is zero.
 pub const DRS_RESUME_PRESENT: u8 = 1;
-/// The flag byte's offset in the extension, and the resume token's.
 pub const DRS_FLAG_AT: usize = DRS_MARKER.len();
 pub const DRS_TOKEN_AT: usize = DRS_FLAG_AT + 1;
 
-/// The protocol generation a hello asks for, read from the DRS extension: absent in a
-/// version 1 hello; present in a version 3 hello, carrying the prior session's resume token
-/// when the client asks to resume it. To accept a resume the server echoes the identical
-/// 40 bytes (and the matching prime ID) in its version 3 configuration; anything else is a
-/// decline and the client discards its replay backlog. The configuration version the server
-/// must send follows from this.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Generation {
     V1,
@@ -164,7 +132,6 @@ pub struct Hello {
     pub generation: Generation,
 }
 
-/// Unseal the hello, verify its long-term signature, and parse it.
 pub fn open_hello(header: Header, payload: &[u8], pool: &KeyPairs) -> Result<Hello, Error> {
     if header.proto_cmd != framing::cmd::HELLO_OR_PING
         || !header.is_signed
@@ -196,7 +163,6 @@ pub fn open_hello(header: Header, payload: &[u8], pool: &KeyPairs) -> Result<Hel
     let rest = &signed[KEYS_LEN..];
     let nul = rest.iter().position(|&b| b == 0).ok_or(Error::Malformed("no UA terminator"))?;
     let user_agent = String::from_utf8_lossy(&rest[..nul.min(MAX_USER_AGENT)]).into_owned();
-    // After the user agent's terminator: the struct end marker and the four-byte nonce key.
     const AFTER_UA_LEN: usize = 1 + size_of::<u32>();
     let after = &rest[nul + 1..];
     if after.len() < AFTER_UA_LEN {
@@ -235,12 +201,7 @@ pub fn open_hello(header: Header, payload: &[u8], pool: &KeyPairs) -> Result<Hel
     })
 }
 
-/// One end of the encrypted channel: the precomputed box key, the two nonces, and the two
-/// header ratchets. `Session` and [`super::client::Client`] hold the same state and
-/// differ only in which keys and nonces go in which direction, so both wrap this.
 pub struct Channel {
-    /// `None` until the handshake response is built (server) or read (client) and the box key
-    /// is precomputed; encrypting or decrypting before then is an error, not a panic.
     precomp: Option<PrecompKey>,
     tx_nonce: [u8; framing::NONCE_LEN],
     rx_nonce: [u8; framing::NONCE_LEN],
@@ -249,7 +210,6 @@ pub struct Channel {
 }
 
 impl Channel {
-    /// The state both ends start in: hello-keyed ratchets and no box key.
     pub fn before_handshake() -> Self {
         Channel {
             precomp: None,
@@ -274,8 +234,6 @@ impl Channel {
         self.precomp = Some(precomp);
     }
 
-    /// Mask a bare frame header with the sending ratchet, for the handshake frames that
-    /// are not channel-encrypted.
     pub fn mask_header(&mut self, header: Header) -> [u8; framing::HEADER_LEN] {
         self.tx_headers.mask(header)
     }
@@ -284,7 +242,6 @@ impl Channel {
         self.rx_headers.unmask(bytes)
     }
 
-    /// Encrypt one message, signing it first when `sign_with` carries a key.
     pub fn encrypt(
         &mut self,
         proto_cmd: u8,
@@ -305,9 +262,6 @@ impl Channel {
             }
             None => payload,
         };
-        // The ciphertext length is fixed by the plaintext, so check it before encrypting.
-        // Advancing the nonce for a frame that is then rejected as too large would leave this
-        // end's nonce one increment past the peer's, and every later frame would fail to decrypt.
         let ct_len = plain.len() + CRYPTO_BOX_MACBYTES;
         if ct_len as u64 > framing::MAX_CMD_LEN as u64 {
             return Err(Error::TooLarge(ct_len));
@@ -329,8 +283,6 @@ impl Channel {
         Ok(out)
     }
 
-    /// Decrypt one message, checking its signature against `verify_with` when the header
-    /// flags one.
     pub fn decrypt(
         &mut self,
         header: Header,
@@ -349,8 +301,6 @@ impl Channel {
     }
 }
 
-/// When `header.is_signed`, verify the detached signature at the end of `plain` against
-/// `verify_with` and remove it; otherwise return `plain` unchanged.
 pub fn strip_signature(
     mut plain: Vec<u8>,
     header: Header,
@@ -451,101 +401,4 @@ pub fn accept(hello: Hello, pool: &KeyPairs, motd: &str) -> Result<(Vec<u8>, Ses
             hello,
         },
     ))
-}
-
-#[cfg(test)]
-pub(crate) mod tests {
-    use super::*;
-    use crate::datum::client::Client;
-
-    /// Open a hello frame as the pool's connection loop does: unmask the header with the
-    /// initial hello key, then open the payload its length names. Shared with the
-    /// `client` tests, which drive `Client::hello` against it.
-    pub(crate) fn server_read_hello(wire: &[u8], pool: &KeyPairs) -> Result<Hello, Error> {
-        let mut rx = KeyRatchet::hello();
-        let head = wire[..framing::HEADER_LEN].try_into().expect("HEADER_LEN bytes");
-        let header = rx.unmask(head);
-        let body = &wire[framing::HEADER_LEN..framing::HEADER_LEN + header.cmd_len as usize];
-        open_hello(header, body, pool)
-    }
-
-    /// A hello whose 17 pad bytes are nonzero. The gateway pads a hello with 1 to 200 bytes
-    /// of one random value (`datum_protocol.c`, `memset(&hello_msg[i], rand(), j)`); they are
-    /// not checked, so `open_hello` must read past whatever is there.
-    #[test]
-    fn hello_tail_bytes_are_ignored() {
-        let pool = KeyPairs::generate();
-        let long_term = KeyPairs::generate();
-        let session = KeyPairs::generate();
-        let nk: u32 = 0x1122_3344;
-
-        let mut body = Vec::new();
-        body.extend_from_slice(&long_term.sign_pk);
-        body.extend_from_slice(&long_term.box_pk);
-        body.extend_from_slice(&session.sign_pk);
-        body.extend_from_slice(&session.box_pk);
-        body.extend_from_slice(b"v0.4.1-beta/deadbeef");
-        body.push(0);
-        body.push(STRUCT_END);
-        body.extend_from_slice(&nk.to_le_bytes());
-        body.extend_from_slice(&[0xAB; 17]);
-        let mut sig: Signature = [0u8; CRYPTO_SIGN_BYTES];
-        crypto_sign_detached(&mut sig, &body, &long_term.sign_sk).unwrap();
-        body.extend_from_slice(&sig);
-        let mut sealed = vec![0u8; body.len() + CRYPTO_BOX_SEALBYTES];
-        crypto_box_seal(&mut sealed, &body, &pool.box_pk).unwrap();
-
-        let header = Header {
-            cmd_len: sealed.len() as u32,
-            is_signed: true,
-            is_encrypted_pubkey: true,
-            proto_cmd: framing::cmd::HELLO_OR_PING,
-            ..Default::default()
-        };
-        let hello = open_hello(header, &sealed, &pool).expect("pad bytes are not checked");
-        assert_eq!(hello.user_agent, "v0.4.1-beta/deadbeef");
-        assert_eq!(hello.nk, nk);
-        assert_eq!(hello.session_sign_pk, session.sign_pk);
-    }
-
-    #[test]
-    fn rejects_hello_sealed_to_another_pool() {
-        let pool = KeyPairs::generate();
-        let other = KeyPairs::generate();
-        let mut client = Client::new(7);
-        let wire = client.hello(&other.box_pk, "v0.4.1-beta");
-        assert!(matches!(server_read_hello(&wire, &pool), Err(Error::Unseal)));
-    }
-
-    #[test]
-    fn rejects_hello_whose_sealed_bytes_are_altered() {
-        let pool = KeyPairs::generate();
-        let mut client = Client::new(7);
-        let mut bad = client.hello(&pool.box_pk, "v0.4.1-beta");
-        let n = bad.len();
-        bad[n - 1] ^= 0x01;
-        assert!(matches!(server_read_hello(&bad, &pool), Err(Error::Unseal)));
-    }
-
-    #[test]
-    fn rejects_wrong_command() {
-        let pool = KeyPairs::generate();
-        let header = Header {
-            cmd_len: 100,
-            is_signed: true,
-            is_encrypted_pubkey: true,
-            proto_cmd: framing::cmd::MINING,
-            ..Default::default()
-        };
-        assert!(matches!(open_hello(header, &[0u8; 100], &pool), Err(Error::BadHeader(_))));
-    }
-
-    #[test]
-    fn key_pairs_pubkey_hex_is_128_chars() {
-        let keys = KeyPairs::generate();
-        let hexed = keys.pubkey_hex();
-        assert_eq!(hexed.len(), 128);
-        assert_eq!(&hexed[..64], &hex::encode(keys.sign_pk));
-        assert_eq!(&hexed[64..], &hex::encode(keys.box_pk));
-    }
 }

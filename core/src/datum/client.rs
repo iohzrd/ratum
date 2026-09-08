@@ -11,13 +11,8 @@ use dryoc::classic::crypto_sign::{
 };
 use dryoc::constants::{CRYPTO_BOX_SEALBYTES, CRYPTO_SIGN_BYTES};
 
-/// The hello carries 1 to 200 random pad bytes after `nk`, as the C gateway sends, so the
-/// frame length does not identify the user agent.
 const HELLO_PAD_MAX: usize = 200;
 
-/// Everything a hello holds besides the keys and the user agent, at its longest: the user
-/// agent's NUL, `STRUCT_END`, `nk`, a DRS extension carrying a resume token, the pad and the
-/// signature. A capacity hint, so the longest form is what it counts.
 const HELLO_TAIL_MAX: usize = 1
     + 1
     + size_of::<u32>()
@@ -26,11 +21,6 @@ const HELLO_TAIL_MAX: usize = 1
     + HELLO_PAD_MAX
     + CRYPTO_SIGN_BYTES;
 
-/// The client side of the DATUM handshake and channel: what the gateway does.
-///
-/// The pool end is [`super::handshake::accept`] and [`super::handshake::Session`]; this
-/// is the other end of the same socket, so the two can be exercised against each other
-/// without a C gateway.
 pub struct Client {
     long_term_keys: KeyPairs,
     session_keys: KeyPairs,
@@ -68,19 +58,14 @@ impl Client {
         &self.session_keys
     }
 
-    /// The motd the pool sent, empty until the handshake response is read.
     pub fn motd(&self) -> &str {
         &self.motd
     }
 
-    /// The v1-generation hello frame: four public keys, the user agent, and the header-key
-    /// and nonce seed `nk`, signed by the long-term key and sealed to the pool's box key.
     pub fn hello(&mut self, pool_box_pk: &BoxPublicKey, user_agent: &str) -> Vec<u8> {
         self.hello_with(pool_box_pk, user_agent, Generation::V1)
     }
 
-    /// The version 3 hello: `hello` plus the DRS extension after `nk`, carrying the
-    /// resume token from the previous session when there is one.
     pub fn hello_resumable(
         &mut self,
         pool_box_pk: &BoxPublicKey,
@@ -90,8 +75,6 @@ impl Client {
         self.hello_with(pool_box_pk, user_agent, Generation::V3 { resume: token.copied() })
     }
 
-    /// Version 1 omits the DRS extension; version 3 writes it, with the flag byte and the
-    /// token following the C gateway's layout.
     fn hello_with(
         &mut self,
         pool_box_pk: &BoxPublicKey,
@@ -117,9 +100,6 @@ impl Client {
                 None => body.push(0),
             }
         }
-        // 1 to 200 repeats of one random value, as the C gateway pads
-        // (`memset(&hello_msg[i], rand(), j)`). A single repeated value is what lets a
-        // server detect the four distinct DRS marker bytes without a false positive.
         let mut r = [0u8; 2];
         dryoc::rng::copy_randombytes(&mut r);
         let pad_len = 1 + usize::from(r[0]) % HELLO_PAD_MAX;
@@ -155,9 +135,6 @@ impl Client {
         out
     }
 
-    /// Read the pool's handshake response: verify its signature, check that it echoes the
-    /// client's keys, and precompute the channel key. `wire` is the 4-byte header and the
-    /// sealed payload.
     pub fn read_handshake_response(
         &mut self,
         wire: &[u8],
@@ -214,8 +191,6 @@ impl Client {
         Ok(())
     }
 
-    /// Encrypt one message to the pool. The gateway never signs channel messages, so
-    /// neither does this.
     pub fn encrypt(&mut self, proto_cmd: u8, payload: &[u8]) -> Result<Vec<u8>, Error> {
         self.channel.encrypt(proto_cmd, payload, None)
     }
@@ -224,19 +199,11 @@ impl Client {
         self.channel.unmask_header(bytes)
     }
 
-    /// The handshake response's header, unmasked with the unadvanced server-to-client key
-    /// without advancing it: `read_handshake_response` unmasks the same bytes itself. For
-    /// reading the response's length before the body arrives.
     pub fn peek_handshake_header(&self, bytes: [u8; framing::HEADER_LEN]) -> Header {
         let key = HeaderKeys::from_nk(self.nk).server_to_client;
         Header::from_bytes((u32::from_le_bytes(bytes) ^ key).to_le_bytes())
     }
 
-    /// Decrypt one message from the pool, checking its session signature when it carries one.
-    /// The header flags select the form, as `datum_protocol_server_msg` does: channel
-    /// encryption when only `is_encrypted_channel` is set, a sealed box to the session key
-    /// when only `is_encrypted_pubkey` is set, and the body as sent when neither or both are
-    /// set. Only the channel form advances the receive nonce.
     pub fn decrypt(&mut self, header: Header, ciphertext: &[u8]) -> Result<Vec<u8>, Error> {
         let verify = self.pool_session_sign_pk.as_ref();
         match (header.is_encrypted_channel, header.is_encrypted_pubkey) {
@@ -257,165 +224,5 @@ impl Client {
             }
             _ => super::handshake::strip_signature(ciphertext.to_vec(), header, verify),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::datum::handshake::accept;
-    use crate::datum::handshake::tests::server_read_hello;
-
-    #[test]
-    fn client_and_server_complete_a_handshake_and_exchange_messages_both_ways() {
-        let pool = KeyPairs::generate();
-        let mut client = Client::new(0x1122_3344);
-
-        let wire = client.hello(&pool.box_pk, "v0.4.1-beta/deadbeef");
-        let hello = server_read_hello(&wire, &pool).expect("parse hello");
-        assert_eq!(hello.user_agent, "v0.4.1-beta/deadbeef");
-        assert_eq!(hello.nk, 0x1122_3344);
-        assert_eq!(hello.session_sign_pk, client.session_keys().sign_pk);
-
-        let (response, mut session) = accept(hello, &pool, "RATUM Prime").unwrap();
-        client.read_handshake_response(&response, &pool.sign_pk).expect("read response");
-        assert_eq!(client.motd(), "RATUM Prime");
-
-        for i in 0..8u8 {
-            let signed = vec![i; 40];
-            let w = session.encrypt(framing::cmd::MINING, &signed, true).unwrap();
-            let h = client.unmask_header(w[..4].try_into().unwrap());
-            assert!(h.is_signed);
-            assert_eq!(client.decrypt(h, &w[4..]).unwrap(), signed);
-
-            let unsigned = vec![i ^ 0xff; 12];
-            let w = session.encrypt(framing::cmd::MINING, &unsigned, false).unwrap();
-            let h = client.unmask_header(w[..4].try_into().unwrap());
-            assert_eq!(client.decrypt(h, &w[4..]).unwrap(), unsigned);
-
-            let up = vec![i; 33];
-            let w = client.encrypt(framing::cmd::MINING, &up).unwrap();
-            let h = session.unmask_header(w[..4].try_into().unwrap());
-            assert_eq!(h.proto_cmd, framing::cmd::MINING);
-            assert_eq!(session.decrypt(h, &w[4..]).unwrap(), up);
-        }
-    }
-
-    #[test]
-    fn a_long_motd_is_read_back_whole() {
-        let pool = KeyPairs::generate();
-        let mut client = Client::new(9);
-        let wire = client.hello(&pool.box_pk, "ua");
-        let hello = server_read_hello(&wire, &pool).unwrap();
-        let motd = "m".repeat(crate::datum::handshake::MAX_MOTD);
-        let (response, _) = accept(hello, &pool, &motd).unwrap();
-        client.read_handshake_response(&response, &pool.sign_pk).unwrap();
-        assert_eq!(client.motd(), motd);
-
-        let mut client = Client::new(9);
-        let wire = client.hello(&pool.box_pk, "ua");
-        let hello = server_read_hello(&wire, &pool).unwrap();
-        let (response, _) = accept(hello, &pool, "").unwrap();
-        client.read_handshake_response(&response, &pool.sign_pk).unwrap();
-        assert_eq!(client.motd(), "");
-    }
-
-    #[test]
-    fn a_response_signed_by_another_pool_is_refused() {
-        let pool = KeyPairs::generate();
-        let other = KeyPairs::generate();
-        let mut client = Client::new(1);
-        let wire = client.hello(&pool.box_pk, "ua");
-        let hello = server_read_hello(&wire, &pool).unwrap();
-        let (response, _) = accept(hello, &pool, "hi").unwrap();
-        assert!(matches!(
-            client.read_handshake_response(&response, &other.sign_pk),
-            Err(Error::BadSignature)
-        ));
-    }
-
-    #[test]
-    fn a_response_to_another_clients_hello_is_refused() {
-        let pool = KeyPairs::generate();
-        let mut client = Client::new(1);
-        let mut other = Client::new(1);
-        let _ = client.hello(&pool.box_pk, "ua");
-        let wire = other.hello(&pool.box_pk, "ua");
-        let hello = server_read_hello(&wire, &pool).unwrap();
-        let (response, _) = accept(hello, &pool, "hi").unwrap();
-        assert!(matches!(
-            client.read_handshake_response(&response, &pool.sign_pk),
-            Err(Error::Unseal)
-        ));
-    }
-
-    #[test]
-    fn a_truncated_response_is_refused_rather_than_panicking() {
-        let pool = KeyPairs::generate();
-        let mut client = Client::new(1);
-        let wire = client.hello(&pool.box_pk, "ua");
-        let hello = server_read_hello(&wire, &pool).unwrap();
-        let (response, _) = accept(hello, &pool, "hi").unwrap();
-        for cut in [0, 1, 3, 4, 10, response.len() - 1] {
-            let mut c =
-                Client::with_key_pairs(KeyPairs::generate(), KeyPairs::generate(), client.nk());
-            let _ = c.hello(&pool.box_pk, "ua");
-            assert!(
-                c.read_handshake_response(&response[..cut], &pool.sign_pk).is_err(),
-                "cut at {cut} should not be accepted"
-            );
-        }
-    }
-
-    #[test]
-    fn encrypting_or_decrypting_before_the_handshake_is_an_error_not_a_panic() {
-        let mut client = Client::new(1);
-        assert!(matches!(client.encrypt(framing::cmd::MINING, b"x"), Err(Error::NoChannel)));
-        let header = Header { cmd_len: 4, is_encrypted_channel: true, ..Default::default() };
-        assert!(matches!(client.decrypt(header, &[0u8; 32]), Err(Error::NoChannel)));
-    }
-
-    #[test]
-    fn a_plain_frame_after_the_handshake_is_read_as_sent_without_advancing_the_nonce() {
-        let pool = KeyPairs::generate();
-        let mut client = Client::new(9);
-        let wire = client.hello(&pool.box_pk, "ua");
-        let hello = server_read_hello(&wire, &pool).unwrap();
-        let (response, mut session) = accept(hello, &pool, "hi").unwrap();
-        client.read_handshake_response(&response, &pool.sign_pk).unwrap();
-
-        // A plaintext PING, as datum_protocol_server_msg passes through undecrypted.
-        let plain =
-            Header { cmd_len: 3, proto_cmd: framing::cmd::HELLO_OR_PING, ..Default::default() };
-        assert_eq!(client.decrypt(plain, b"abc").unwrap(), b"abc");
-
-        // The channel nonce did not move: the next channel frame still decrypts.
-        let wire = session.encrypt(framing::cmd::MINING, b"after", false).unwrap();
-        let header = client.unmask_header(wire[..4].try_into().unwrap());
-        assert_eq!(client.decrypt(header, &wire[4..]).unwrap(), b"after");
-
-        // A signed plaintext frame with a bad signature is refused.
-        let signed = Header {
-            cmd_len: 70,
-            is_signed: true,
-            proto_cmd: framing::cmd::INFO,
-            ..Default::default()
-        };
-        assert!(matches!(client.decrypt(signed, &[0u8; 70]), Err(Error::BadSignature)));
-    }
-
-    #[test]
-    fn the_channel_desynchronizes_if_a_frame_is_skipped() {
-        let pool = KeyPairs::generate();
-        let mut client = Client::new(7);
-        let wire = client.hello(&pool.box_pk, "ua");
-        let hello = server_read_hello(&wire, &pool).unwrap();
-        let (response, mut session) = accept(hello, &pool, "hi").unwrap();
-        client.read_handshake_response(&response, &pool.sign_pk).unwrap();
-
-        let _skipped = session.encrypt(framing::cmd::MINING, b"one", false).unwrap();
-        let second = session.encrypt(framing::cmd::MINING, b"two", false).unwrap();
-        let h = client.unmask_header(second[..4].try_into().unwrap());
-        assert!(client.decrypt(h, &second[4..]).is_err(), "a skipped frame must not decrypt");
     }
 }

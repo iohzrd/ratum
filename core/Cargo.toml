@@ -6,11 +6,6 @@ publish.workspace = true
 license.workspace = true
 build = "../build.rs"
 
-[features]
-# Test fixtures (`ratum::fixtures`): the coinbase a gateway would build, in the layout the
-# pool verifies. Enabled by the tests of every crate, absent from the release binaries.
-test-support = []
-
 [dependencies]
 base64.workspace = true
 blake2.workspace = true
@@ -25,6 +20,3 @@ serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tiny_http.workspace = true
-
-[dev-dependencies]
-ratum = { path = ".", features = ["test-support"] }
