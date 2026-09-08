@@ -30,7 +30,7 @@ pub fn apply_modifier(
     let rnd = u32::from(u16::from_le_bytes([hash[31], hash[30]]));
     let worker = base.find('.').map_or("", |d| &base[d..]);
     let mut sum = 0f64;
-    for (addr, proportion) in ranges.iter() {
+    for (addr, proportion) in ranges {
         sum += proportion.max(0.0);
         let max = ((sum * SELECTOR_SPACE).ceil() as i64 - 1).min(SELECTOR_MAX);
         if max < 0 {

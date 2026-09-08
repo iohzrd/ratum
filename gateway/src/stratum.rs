@@ -31,7 +31,7 @@ const NICEHASH_MIN_DIFFICULTY: u64 = 524_288;
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_millis(11150);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const STAT_CYCLE: Duration = Duration::from_secs(60);
-const HASHRATE_WINDOW_VALID: Duration = Duration::from_secs(3 * 60);
+const HASHRATE_WINDOW_VALID: Duration = Duration::from_secs(3 * ratum::SECS_PER_MINUTE);
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
 const REJECT_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const FIRST_IDLE_CHECK_DELAY: Duration = Duration::from_secs(10);
@@ -280,7 +280,7 @@ pub fn listen(server: Arc<Server>) -> io::Result<()> {
     let listener = listener.ok_or(last)?;
     info!("Stratum V1 Server Init complete: listening on {}", listener.local_addr()?);
     server.listening.store(true, Ordering::Relaxed);
-    let mut last_reject_log = Instant::now() - REJECT_LOG_INTERVAL;
+    let mut last_reject_log: Option<Instant> = None;
     let mut rejected = 0u64;
     for stream in listener.incoming() {
         let stream = match stream {
@@ -293,11 +293,11 @@ pub fn listen(server: Arc<Server>) -> io::Result<()> {
         };
         if server.rejecting.load(Ordering::Relaxed) {
             rejected += 1;
-            if last_reject_log.elapsed() >= REJECT_LOG_INTERVAL {
+            if last_reject_log.is_none_or(|t| t.elapsed() >= REJECT_LOG_INTERVAL) {
                 warn!(
                     "Refusing stratum connections while the pool is unreachable and datum.pooled_mining_only is set ({rejected} refused)"
                 );
-                last_reject_log = Instant::now();
+                last_reject_log = Some(Instant::now());
             }
             continue;
         }

@@ -6,6 +6,7 @@ pub const DIFF1_EXPONENT: u32 = 224;
 const COMPACT_SIZE_SHIFT: u32 = 24;
 const COMPACT_MANTISSA_MASK: u32 = 0x007f_ffff;
 const COMPACT_SIGN_BIT: u32 = 0x0080_0000;
+const COMPACT_MANTISSA_SIGN: u32 = 0x80;
 const COMPACT_MANTISSA_BYTES: usize = 3;
 const MAX_COMPACT_SIZE: usize = 34;
 
@@ -84,24 +85,37 @@ fn be_to_f64(v: &Target) -> f64 {
     v.iter().fold(0.0f64, |out, b| out * 256.0 + f64::from(*b))
 }
 
-pub fn share_nbits(exponent: u8) -> u32 {
-    if u32::from(exponent) >= DIFF1_EXPONENT {
-        return 0;
-    }
+/// The largest target a share at difficulty `2^exponent` may have: difficulty-1's target
+/// with every bit below its leading bit set, shifted down by `exponent`. An exponent at or
+/// above `DIFF1_EXPONENT` leaves no bit to set and gives a zero target.
+fn share_target(exponent: u8) -> Target {
     const HIGH_ZERO_BYTES: usize = TARGET_BYTES - (DIFF1_EXPONENT as usize / 8);
     let mut t = [0u8; TARGET_BYTES];
-    let first_set = HIGH_ZERO_BYTES + usize::from(exponent / 8);
-    t[first_set..].fill(0xff);
-    t[first_set] = 0xff >> (exponent % 8);
-    let first = t.iter().position(|&b| b != 0).expect("nonzero below DIFF1_EXPONENT");
+    if u32::from(exponent) < DIFF1_EXPONENT {
+        let first_set = HIGH_ZERO_BYTES + usize::from(exponent / 8);
+        t[first_set..].fill(0xff);
+        t[first_set] = 0xff >> (exponent % 8);
+    }
+    t
+}
+
+/// The inverse of `bits_to_target`. A zero target encodes as 0.
+fn target_to_bits(target: &Target) -> u32 {
+    let Some(first) = target.iter().position(|&b| b != 0) else { return 0 };
     let size = (TARGET_BYTES - first) as u32;
-    let at = |i: usize| u32::from(t.get(i).copied().unwrap_or(0));
+    let at = |i: usize| u32::from(target.get(i).copied().unwrap_or(0));
     let (m0, m1, m2) = (at(first), at(first + 1), at(first + 2));
-    if m0 & 0x80 != 0 {
+    // A mantissa whose top byte has its high bit set would read as negative, so it is
+    // shifted down a byte and the size raised to compensate.
+    if m0 & COMPACT_MANTISSA_SIGN != 0 {
         ((size + 1) << COMPACT_SIZE_SHIFT) | (m0 << 8) | m1
     } else {
         (size << COMPACT_SIZE_SHIFT) | (m0 << 16) | (m1 << 8) | m2
     }
+}
+
+pub fn share_nbits(exponent: u8) -> u32 {
+    target_to_bits(&share_target(exponent))
 }
 
 pub fn floor_pot(diff: u64) -> u8 {

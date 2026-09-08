@@ -27,10 +27,10 @@ pub fn random_key() -> [u8; 16] {
     crate::rand::bytes()
 }
 
+/// The proof-of-work hash in the little-endian order an ABW reference carries it in,
+/// the reverse of the display order a hash is logged in.
 pub fn raw_hash_le(hash2: &[u8; 32]) -> [u8; 32] {
-    let mut le = *hash2;
-    le.reverse();
-    le
+    crate::bitcoin::reversed(hash2)
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -77,6 +77,19 @@ pub struct Reveal {
     pub xor_key: [u8; 16],
 }
 
+/// Every ABW message is a sub-command byte, the revision, a body of at most a slot and a
+/// 32-byte hash, then the 0xFE terminator.
+const MAX_FRAME_LEN: usize = 2 + 1 + 32 + 1;
+
+fn frame(subcmd: u8, body: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
+    let mut out = Vec::with_capacity(MAX_FRAME_LEN);
+    out.push(subcmd);
+    out.push(DRAFT_REVISION);
+    body(&mut out);
+    out.push(STRUCT_END);
+    out
+}
+
 fn open(data: &[u8], subcmd: u8) -> Result<Cursor<'_>, Error> {
     let mut c = Cursor::new(data);
     c.skip_if(subcmd);
@@ -103,14 +116,11 @@ fn close(c: &mut Cursor<'_>) -> Result<(), Error> {
 
 impl AssignmentNotice {
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(37);
-        out.push(subcmd::ASSIGNMENT_NOTICE);
-        out.push(DRAFT_REVISION);
-        out.push(self.active as u8);
-        out.push(self.slot);
-        out.extend_from_slice(&self.key_hash);
-        out.push(STRUCT_END);
-        out
+        frame(subcmd::ASSIGNMENT_NOTICE, |out| {
+            out.push(self.active as u8);
+            out.push(self.slot);
+            out.extend_from_slice(&self.key_hash);
+        })
     }
 
     pub fn decode(data: &[u8]) -> Result<Self, Error> {
@@ -128,7 +138,7 @@ impl AssignmentNotice {
 
 impl Activation {
     pub fn encode(&self) -> Vec<u8> {
-        vec![subcmd::ACTIVATION, DRAFT_REVISION, self.slot, STRUCT_END]
+        frame(subcmd::ACTIVATION, |out| out.push(self.slot))
     }
 
     pub fn decode(data: &[u8]) -> Result<Self, Error> {
@@ -142,13 +152,10 @@ impl Activation {
 impl Candidate {
     pub fn encode(&self, subcmd: u8) -> Vec<u8> {
         debug_assert!(matches!(subcmd, subcmd::CANDIDATE_RECEIPT | subcmd::CANDIDATE_RELEASE));
-        let mut out = Vec::with_capacity(36);
-        out.push(subcmd);
-        out.push(DRAFT_REVISION);
-        out.push(self.slot);
-        out.extend_from_slice(&self.raw_pow_hash);
-        out.push(STRUCT_END);
-        out
+        frame(subcmd, |out| {
+            out.push(self.slot);
+            out.extend_from_slice(&self.raw_pow_hash);
+        })
     }
 
     pub fn decode(data: &[u8], subcmd: u8) -> Result<Self, Error> {
@@ -162,13 +169,10 @@ impl Candidate {
 
 impl Reveal {
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(20);
-        out.push(subcmd::REVEAL);
-        out.push(DRAFT_REVISION);
-        out.push(self.slot);
-        out.extend_from_slice(&self.xor_key);
-        out.push(STRUCT_END);
-        out
+        frame(subcmd::REVEAL, |out| {
+            out.push(self.slot);
+            out.extend_from_slice(&self.xor_key);
+        })
     }
 
     pub fn decode(data: &[u8]) -> Result<Self, Error> {

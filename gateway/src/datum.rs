@@ -711,12 +711,8 @@ impl<'a> Session<'a> {
     }
 
     fn on_abw_notice(&mut self, plain: &[u8]) {
-        let notice = match AssignmentNotice::decode(plain) {
-            Ok(n) => n,
-            Err(e) => {
-                error!("malformed ABW assignment notice: {e}");
-                return;
-            }
+        let Some(notice) = decoded("assignment notice", AssignmentNotice::decode(plain)) else {
+            return;
         };
         ratum::lock(&self.shared.abw).install(notice.slot, notice.key_hash, notice.active);
         debug!("ABW assignment for slot {} (active {})", notice.slot, notice.active);
@@ -726,13 +722,7 @@ impl<'a> Session<'a> {
     }
 
     fn on_abw_activation(&mut self, plain: &[u8]) {
-        let act = match Activation::decode(plain) {
-            Ok(a) => a,
-            Err(e) => {
-                error!("malformed ABW activation: {e}");
-                return;
-            }
-        };
+        let Some(act) = decoded("activation", Activation::decode(plain)) else { return };
         if ratum::lock(&self.shared.abw).activate(act.slot) {
             debug!("ABW slot {} activated", act.slot);
             self.shared.notify.rebuild();
@@ -742,13 +732,7 @@ impl<'a> Session<'a> {
     }
 
     fn on_abw_reveal(&mut self, plain: &[u8]) {
-        let reveal = match Reveal::decode(plain) {
-            Ok(r) => r,
-            Err(e) => {
-                error!("malformed ABW reveal: {e}");
-                return;
-            }
-        };
+        let Some(reveal) = decoded("reveal", Reveal::decode(plain)) else { return };
         if !ratum::lock(&self.shared.abw).reveal(reveal.slot, &reveal.xor_key) {
             error!("ABW reveal for slot {} does not match its commitment; ignored", reveal.slot);
             return;
@@ -993,6 +977,10 @@ impl<'a> Session<'a> {
         self.last_share_sent = Some(now);
         Ok(())
     }
+}
+
+fn decoded<T>(what: &str, decoded: Result<T, abw::Error>) -> Option<T> {
+    decoded.inspect_err(|e| error!("malformed ABW {what}: {e}")).ok()
 }
 
 fn log_migration_request(plain: &[u8]) {

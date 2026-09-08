@@ -43,7 +43,7 @@ impl PolledSocket {
             Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(()),
             Err(e) => return Err(e),
         }
-        for ev in self.events.iter() {
+        for ev in &self.events {
             if ev.token() == SOCKET && (ev.is_readable() || ev.is_read_closed() || ev.is_error()) {
                 self.readable = true;
             }

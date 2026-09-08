@@ -87,13 +87,12 @@ fn block_hash_arg(flag: &str, arg: &str, also: &str) -> [u8; 32] {
     hash
 }
 
-fn print_or_refuse(arg: &str, record: Option<ledger::OwedBlock>) -> io::Result<()> {
+fn print_or_refuse(arg: &str, record: Option<ledger::OwedBlock>) {
     let Some(owed) = record else {
         eprintln!("no owed block under {arg}; --settle-block list prints them");
         std::process::exit(2);
     };
     print_owed(&owed);
-    Ok(())
 }
 
 fn dump_ledger(location: &LedgerLocation) -> io::Result<()> {
@@ -201,13 +200,15 @@ fn settle_block(location: &LedgerLocation, arg: &str) -> io::Result<()> {
         return Ok(());
     }
     let hash = block_hash_arg("--settle-block", arg, " or 'list'");
-    print_or_refuse(arg, ledger.settle_owed(&hash, ratum::unix_now())?)
+    print_or_refuse(arg, ledger.settle_owed(&hash, ratum::unix_now())?);
+    Ok(())
 }
 
 fn void_block(location: &LedgerLocation, arg: &str) -> io::Result<()> {
     let mut ledger = open_ledger(location, "--void-block")?;
     let hash = block_hash_arg("--void-block", arg, "");
-    print_or_refuse(arg, ledger.void_owed(&hash)?)
+    print_or_refuse(arg, ledger.void_owed(&hash)?);
+    Ok(())
 }
 
 fn load_or_create_keys(path: &Path) -> io::Result<KeyPairs> {
@@ -421,10 +422,10 @@ fn settings(c: &cli::Cli, f: ratum_prime::config::Config) -> Settings {
 }
 
 fn connect_node(
-    rpc_url: &Option<String>,
+    rpc_url: Option<&str>,
     rpc_user: &str,
     rpc_pass: &str,
-    rpc_cookie: &Option<String>,
+    rpc_cookie: Option<&str>,
     rpc_pass_on_argv: bool,
 ) -> io::Result<rpc::Client> {
     if rpc_pass_on_argv {
@@ -757,7 +758,13 @@ fn main() -> io::Result<()> {
     let pool_keys = load_or_create_keys(&key_path)?;
     info!("pool_pubkey: {}", pool_keys.pubkey_hex());
 
-    let node = connect_node(&rpc_url, &rpc_user, &rpc_pass, &rpc_cookie, rpc_pass_on_argv)?;
+    let node = connect_node(
+        rpc_url.as_deref(),
+        &rpc_user,
+        &rpc_pass,
+        rpc_cookie.as_deref(),
+        rpc_pass_on_argv,
+    )?;
     let payout_script = payout_script(&node, payout);
     info!("pool payout script: {}", hex::encode(&payout_script));
 

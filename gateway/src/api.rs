@@ -1,4 +1,5 @@
 use crate::stratum::{ClientStats, Server};
+use base64::Engine as _;
 use log::{info, warn};
 use ratum::http::{self, Reply};
 use serde_json::{Value, json};
@@ -62,7 +63,6 @@ fn authorized(ctx: &Context, req: &Request) -> bool {
     }
     let Some(value) = http::header_value(req, "Authorization") else { return false };
     let Some(b64) = value.strip_prefix("Basic ") else { return false };
-    use base64::Engine as _;
     let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(b64.trim()) else {
         return false;
     };
@@ -325,7 +325,7 @@ fn settings_json(ctx: &Context) -> Value {
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
         .unwrap_or(Value::Null);
-    let mut v = crate::config::form_values(cfg, &doc);
+    let mut v = crate::settings::form_values(cfg, &doc);
     let o = v.as_object_mut().expect("an object");
     o.insert("editable".into(), json!(cfg.api.modify_conf));
     o.insert("config_path".into(), json!(ctx.config_path));
@@ -345,10 +345,10 @@ fn save_settings(ctx: &Context, body: &str) -> (Reply, bool) {
         Ok(t) => t,
         Err(e) => return errors(500, vec![format!("could not read {}: {e}", ctx.config_path)]),
     };
-    match crate::config::apply(&ctx.server.config, &text, &form) {
+    match crate::settings::apply(&ctx.server.config, &text, &form) {
         Err(e) => errors(400, e),
         Ok(None) => (http::json(json!({"ok": true, "restart": false})), false),
-        Ok(Some(new_text)) => match crate::config::write_file(&ctx.config_path, &new_text) {
+        Ok(Some(new_text)) => match crate::settings::write_file(&ctx.config_path, &new_text) {
             Ok(()) => {
                 info!("Wrote the new configuration to {}", ctx.config_path);
                 (http::json(json!({"ok": true, "restart": true})), true)
@@ -437,7 +437,7 @@ fn serve_admin(ctx: &Context, mut req: Request) {
     };
     let _ = req.respond(response);
     if restart {
-        crate::config::restart();
+        crate::settings::restart();
     }
 }
 
@@ -472,19 +472,8 @@ pub fn start(ctx: Arc<Context>) {
         info!("No API port configured. API disabled.");
     } else if let Some(server) = bind("API", &cfg.api.listen_addr, cfg.api.listen_port) {
         info!("API listening on port {}", cfg.api.listen_port);
-        sample_hashrate(&ctx);
         let sampler = Arc::clone(&ctx);
-        std::thread::Builder::new()
-            .name("api-sampler".into())
-            .spawn(move || {
-                loop {
-                    std::thread::sleep(std::time::Duration::from_secs(
-                        ratum::web::HISTORY_INTERVAL_SECS,
-                    ));
-                    sample_hashrate(&sampler);
-                }
-            })
-            .expect("api sampler thread");
+        ratum::web::sample_periodically("api-sampler", move || sample_hashrate(&sampler));
         let ctx = Arc::clone(&ctx);
         http::serve("api", server, move |req| serve_admin(&ctx, req));
     }

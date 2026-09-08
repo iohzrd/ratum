@@ -49,6 +49,8 @@ pub fn sha256d(data: &[u8]) -> [u8; 32] {
     Sha256::digest(first).into()
 }
 
+/// A hash in the opposite byte order, which converts between the internal order hashes
+/// are computed in and the display order they are printed and parsed in.
 pub fn reversed(hash: &[u8; 32]) -> [u8; 32] {
     let mut out = *hash;
     out.reverse();
@@ -66,13 +68,11 @@ pub fn merkle_root(coinbase_txid: &[u8; 32], branches: &[[u8; 32]]) -> [u8; 32] 
     acc
 }
 
+/// The transaction id: the double-SHA256 of the serialization with any witness data
+/// stripped, which is version, the input and output body, then lock_time.
 pub fn txid(tx: &[u8]) -> Result<[u8; 32], TxError> {
     let mut c = Cursor::new(tx);
-    c.advance(TX_VERSION_SIZE, "version")?;
-    let has_witness = c.peek2() == Some(SEGWIT_MARKER_AND_FLAG);
-    if has_witness {
-        c.advance(SEGWIT_MARKER_AND_FLAG_SIZE, "segwit marker and flag")?;
-    }
+    let (version, has_witness) = read_version_and_marker(&mut c)?;
 
     let body_start = c.pos();
     let inputs = decode_compact_size(&mut c)?;
@@ -94,26 +94,48 @@ pub fn txid(tx: &[u8]) -> Result<[u8; 32], TxError> {
     let body_end = c.pos();
 
     if has_witness {
-        for _ in 0..inputs {
-            let items = decode_compact_size(&mut c)?;
-            for _ in 0..items {
-                let len = decode_compact_size(&mut c)? as usize;
-                c.advance(len, "witness item")?;
-            }
-        }
+        skip_witnesses(&mut c, inputs)?;
     }
-    let lock_start = c.pos();
-    c.advance(LOCK_TIME_SIZE, "lock time")?;
-    if !c.at_end() {
-        return Err(TxError::TrailingBytes(tx.len() - c.pos()));
-    }
+    let lock_time = read_lock_time(&mut c, tx.len())?;
 
     let framing = TX_VERSION_SIZE + LOCK_TIME_SIZE;
     let mut stripped = Vec::with_capacity(framing + (body_end - body_start));
-    stripped.extend_from_slice(&tx[..TX_VERSION_SIZE]);
+    stripped.extend_from_slice(&version.to_le_bytes());
     stripped.extend_from_slice(&tx[body_start..body_end]);
-    stripped.extend_from_slice(&tx[lock_start..lock_start + LOCK_TIME_SIZE]);
+    stripped.extend_from_slice(&lock_time.to_le_bytes());
     Ok(sha256d(&stripped))
+}
+
+/// Reads the version and the optional SegWit marker and flag, reporting whether the
+/// transaction carries witness data.
+fn read_version_and_marker(c: &mut Cursor<'_>) -> Result<(u32, bool), TxError> {
+    let version = c.u32("version")?;
+    let has_witness = c.peek2() == Some(SEGWIT_MARKER_AND_FLAG);
+    if has_witness {
+        c.advance(SEGWIT_MARKER_AND_FLAG_SIZE, "segwit marker and flag")?;
+    }
+    Ok((version, has_witness))
+}
+
+/// Advances past one witness stack per input.
+fn skip_witnesses(c: &mut Cursor<'_>, inputs: u64) -> Result<(), TxError> {
+    for _ in 0..inputs {
+        let items = decode_compact_size(c)?;
+        for _ in 0..items {
+            let len = decode_compact_size(c)? as usize;
+            c.advance(len, "witness item")?;
+        }
+    }
+    Ok(())
+}
+
+/// Reads the closing lock_time and requires that it end the transaction.
+fn read_lock_time(c: &mut Cursor<'_>, tx_len: usize) -> Result<u32, TxError> {
+    let lock_time = c.u32("lock time")?;
+    if !c.at_end() {
+        return Err(TxError::TrailingBytes(tx_len - c.pos()));
+    }
+    Ok(lock_time)
 }
 
 pub fn merkle_root_of(txids: &[[u8; 32]]) -> Option<([u8; 32], bool)> {
@@ -188,12 +210,7 @@ impl From<Truncated> for TxError {
 
 pub fn parse_coinbase(tx: &[u8]) -> Result<CoinbaseTx, TxError> {
     let mut c = Cursor::new(tx);
-    let version = c.u32("version")?;
-
-    let has_witness = c.peek2() == Some(SEGWIT_MARKER_AND_FLAG);
-    if has_witness {
-        c.advance(SEGWIT_MARKER_AND_FLAG_SIZE, "segwit marker and flag")?;
-    }
+    let (version, has_witness) = read_version_and_marker(&mut c)?;
 
     if decode_compact_size(&mut c)? != 1 {
         return Err(TxError::NotCoinbase);
@@ -220,16 +237,9 @@ pub fn parse_coinbase(tx: &[u8]) -> Result<CoinbaseTx, TxError> {
     }
 
     if has_witness {
-        let items = decode_compact_size(&mut c)? as usize;
-        for _ in 0..items {
-            let len = decode_compact_size(&mut c)? as usize;
-            c.advance(len, "witness item")?;
-        }
+        skip_witnesses(&mut c, 1)?;
     }
-    let lock_time = c.u32("lock time")?;
-    if !c.at_end() {
-        return Err(TxError::TrailingBytes(tx.len() - c.pos()));
-    }
+    let lock_time = read_lock_time(&mut c, tx.len())?;
 
     Ok(CoinbaseTx {
         version,

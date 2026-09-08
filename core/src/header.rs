@@ -1,3 +1,4 @@
+use crate::cursor::Cursor;
 use blake2::Blake2b;
 use blake2::digest::Digest as _;
 use blake2::digest::consts::U32;
@@ -92,54 +93,52 @@ impl HeaderV2 {
     }
 
     pub fn serialize(&self) -> [u8; HEADER_V2_SIZE] {
-        let mut out = [0u8; HEADER_V2_SIZE];
-        let mut w = Writer::new(&mut out);
-        w.u32(V2_FLAG | (self.version as u32 & !V2_FLAG));
-        w.bytes(&self.prev_block);
-        w.bytes(&self.merkle_root);
-        w.u32(self.time_on_wire());
-        w.u32(self.bits);
-        w.u32(self.nonce);
-        w.u32(self.nonce2);
-        w.u32(self.nonce3);
-        w.bytes(&self.extranonce);
-        w.u32(self.time_offset);
-        w.u16(self.txcount);
-        w.u8(self.flags);
-        w.u8(self.xor_key_mask_clear_bits);
-        w.bytes(&self.xor_key);
-        w.i32(self.height);
-        w.bytes(&self.mm_rhs);
-        debug_assert_eq!(w.pos, HEADER_V2_SIZE);
-        out
+        let mut out = Vec::with_capacity(HEADER_V2_SIZE);
+        out.extend_from_slice(&(V2_FLAG | (self.version as u32 & !V2_FLAG)).to_le_bytes());
+        out.extend_from_slice(&self.prev_block);
+        out.extend_from_slice(&self.merkle_root);
+        out.extend_from_slice(&self.time_on_wire().to_le_bytes());
+        out.extend_from_slice(&self.bits.to_le_bytes());
+        out.extend_from_slice(&self.nonce.to_le_bytes());
+        out.extend_from_slice(&self.nonce2.to_le_bytes());
+        out.extend_from_slice(&self.nonce3.to_le_bytes());
+        out.extend_from_slice(&self.extranonce);
+        out.extend_from_slice(&self.time_offset.to_le_bytes());
+        out.extend_from_slice(&self.txcount.to_le_bytes());
+        out.push(self.flags);
+        out.push(self.xor_key_mask_clear_bits);
+        out.extend_from_slice(&self.xor_key);
+        out.extend_from_slice(&self.height.to_le_bytes());
+        out.extend_from_slice(&self.mm_rhs);
+        out.try_into().expect("the fields above total HEADER_V2_SIZE bytes")
     }
 
     pub fn deserialize(b: &[u8]) -> Option<Self> {
         if b.len() != HEADER_V2_SIZE {
             return None;
         }
-        let mut r = Reader::new(b);
-        let v = r.u32();
+        let mut r = Cursor::new(b);
+        let v = r.u32("version").ok()?;
         if v & V2_FLAG == 0 {
             return None;
         }
         let mut h = HeaderV2 {
             version: (v & !V2_FLAG) as i32,
-            prev_block: r.arr(),
-            merkle_root: r.arr(),
-            time: r.u32(),
-            bits: r.u32(),
-            nonce: r.u32(),
-            nonce2: r.u32(),
-            nonce3: r.u32(),
-            extranonce: r.arr(),
-            time_offset: r.u32(),
-            txcount: r.u16(),
-            flags: r.u8(),
-            xor_key_mask_clear_bits: r.u8(),
-            xor_key: r.arr(),
-            height: r.u32() as i32,
-            mm_rhs: r.arr(),
+            prev_block: r.arr("prev block").ok()?,
+            merkle_root: r.arr("merkle root").ok()?,
+            time: r.u32("time").ok()?,
+            bits: r.u32("bits").ok()?,
+            nonce: r.u32("nonce").ok()?,
+            nonce2: r.u32("nonce2").ok()?,
+            nonce3: r.u32("nonce3").ok()?,
+            extranonce: r.arr("extranonce").ok()?,
+            time_offset: r.u32("time offset").ok()?,
+            txcount: r.u16("txcount").ok()?,
+            flags: r.u8("flags").ok()?,
+            xor_key_mask_clear_bits: r.u8("xor key mask clear bits").ok()?,
+            xor_key: r.arr("xor key").ok()?,
+            height: r.u32("height").ok()? as i32,
+            mm_rhs: r.arr("mm rhs").ok()?,
         };
         if h.flags & FLAG_USE_TIME_OFFSET != 0 {
             h.time = h.time.wrapping_add(h.time_offset);
@@ -182,8 +181,7 @@ impl HeaderV2 {
     }
 
     pub fn precompute_with_key_hash(&self, xor_key_hash: [u8; 32]) -> Precomputed {
-        let mut prev_display = self.prev_block;
-        prev_display.reverse();
+        let prev_display = crate::bitcoin::reversed(&self.prev_block);
 
         let mut h1d = Vec::with_capacity(H1_PREIMAGE_SIZE);
         h1d.extend_from_slice(&(self.version as u32 | V2_FLAG).to_le_bytes());
@@ -254,8 +252,7 @@ pub fn xor_key_hash(xor_key: &U128) -> [u8; 32] {
 }
 
 pub fn prevblock_hidden(prev_block: &U256) -> [u8; 32] {
-    let mut display = *prev_block;
-    display.reverse();
+    let display = crate::bitcoin::reversed(prev_block);
     let mut out = tagged_sha256("Bitcoin prevblock header, hashed", &display);
     out[..PREVBLOCK_HIDDEN_CLEARED_BYTES].fill(0);
     out
@@ -278,62 +275,6 @@ pub fn xor_mask(xor_key: &U128, clear_bits: u8) -> [u8; 32] {
 }
 
 pub fn u256_from_display_hex(s: &str) -> Option<U256> {
-    let mut v: U256 = hex::decode(s).ok()?.try_into().ok()?;
-    v.reverse();
-    Some(v)
-}
-
-struct Writer<'a> {
-    buf: &'a mut [u8],
-    pos: usize,
-}
-
-impl<'a> Writer<'a> {
-    fn new(buf: &'a mut [u8]) -> Self {
-        Writer { buf, pos: 0 }
-    }
-    fn bytes(&mut self, b: &[u8]) {
-        self.buf[self.pos..self.pos + b.len()].copy_from_slice(b);
-        self.pos += b.len();
-    }
-    fn u8(&mut self, v: u8) {
-        self.bytes(&[v]);
-    }
-    fn u16(&mut self, v: u16) {
-        self.bytes(&v.to_le_bytes());
-    }
-    fn u32(&mut self, v: u32) {
-        self.bytes(&v.to_le_bytes());
-    }
-    fn i32(&mut self, v: i32) {
-        self.bytes(&v.to_le_bytes());
-    }
-}
-
-struct Reader<'a> {
-    buf: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Reader<'a> {
-    fn new(buf: &'a [u8]) -> Self {
-        Reader { buf, pos: 0 }
-    }
-    fn take(&mut self, n: usize) -> &'a [u8] {
-        let s = &self.buf[self.pos..self.pos + n];
-        self.pos += n;
-        s
-    }
-    fn arr<const N: usize>(&mut self) -> [u8; N] {
-        self.take(N).try_into().unwrap()
-    }
-    fn u8(&mut self) -> u8 {
-        self.take(1)[0]
-    }
-    fn u16(&mut self) -> u16 {
-        u16::from_le_bytes(self.arr())
-    }
-    fn u32(&mut self) -> u32 {
-        u32::from_le_bytes(self.arr())
-    }
+    let v: U256 = hex::decode(s).ok()?.try_into().ok()?;
+    Some(crate::bitcoin::reversed(&v))
 }

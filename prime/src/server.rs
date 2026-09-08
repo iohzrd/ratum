@@ -41,11 +41,66 @@ impl NodeView {
         lock(&self.wakers).retain(|w| !Arc::ptr_eq(w, waker));
     }
 
+    /// Logs a tip the watcher has not seen before and adds it to the bounded history the
+    /// stats page reads the observed block interval from.
+    fn record_tip(&self, t: &rpc::Tip) {
+        info!(
+            "node tip: height {} difficulty {} {} (chain {})",
+            t.height,
+            t.difficulty,
+            hex::encode(ratum::bitcoin::reversed(&t.hash)),
+            t.chain.name()
+        );
+        let mut history = lock(&self.tip_history);
+        history.push_back((t.height, ratum::unix_now()));
+        while history.len() > TIP_HISTORY_CAP {
+            history.pop_front();
+        }
+    }
+
     fn wake_connections(&self) {
         for w in lock(&self.wakers).iter() {
             if let Err(e) = w.wake() {
                 debug!("could not wake a gateway connection thread: {e}");
             }
+        }
+    }
+}
+
+/// A ledger serves one chain, so a node that has moved to another one must not be read.
+fn exit_on_wrong_chain(t: &rpc::Tip, expected: Option<rpc::Chain>) {
+    let Some(expected) = expected else { return };
+    if t.chain == expected {
+        return;
+    }
+    error!(
+        "the node is on chain {} but this pool started on chain {} and its ledger holds {} \
+         shares; exiting rather than credit shares of one chain to the ledger of another",
+        t.chain.name(),
+        expected.name(),
+        expected.name()
+    );
+    std::process::exit(1);
+}
+
+/// Reads the next block's coinbase value and bits into `view`, reporting whether it now
+/// holds a template. A failed read clears both, so a stale value is never served.
+fn refresh_next_block(node: &rpc::Client, view: &NodeView) -> bool {
+    match node.next_block() {
+        Ok(n) => {
+            info!(
+                "node template: the next coinbase may pay {} sats at bits {:#010x}",
+                n.coinbase_value, n.bits
+            );
+            *lock(&view.coinbase_value) = Some(n.coinbase_value);
+            *lock(&view.next_bits) = Some(n.bits);
+            true
+        }
+        Err(e) => {
+            warn!("could not read a template: {e}");
+            *lock(&view.coinbase_value) = None;
+            *lock(&view.next_bits) = None;
+            false
         }
     }
 }
@@ -62,56 +117,16 @@ pub(crate) fn watch_node(
     loop {
         let height = match node.tip() {
             Ok(t) => {
-                if let Some(expected) = expected_chain
-                    && t.chain != expected
-                {
-                    error!(
-                        "the node is on chain {} but this pool started on chain {} and its \
-                         ledger holds {} shares; exiting rather than credit shares of one \
-                         chain to the ledger of another",
-                        t.chain.name(),
-                        expected.name(),
-                        expected.name()
-                    );
-                    std::process::exit(1);
-                }
+                exit_on_wrong_chain(&t, expected_chain);
                 let tip_changed = last != Some(t.hash);
                 let previous_bits = *lock(&view.next_bits);
                 if tip_changed {
-                    let mut display = t.hash;
-                    display.reverse();
-                    info!(
-                        "node tip: height {} difficulty {} {} (chain {})",
-                        t.height,
-                        t.difficulty,
-                        hex::encode(display),
-                        t.chain.name()
-                    );
+                    view.record_tip(&t);
                     last = Some(t.hash);
                     have_template = false;
-                    let mut history = lock(&view.tip_history);
-                    history.push_back((t.height, ratum::unix_now()));
-                    while history.len() > TIP_HISTORY_CAP {
-                        history.pop_front();
-                    }
                 }
                 if !have_template {
-                    match node.next_block() {
-                        Ok(n) => {
-                            info!(
-                                "node template: the next coinbase may pay {} sats at bits {:#010x}",
-                                n.coinbase_value, n.bits
-                            );
-                            *lock(&view.coinbase_value) = Some(n.coinbase_value);
-                            *lock(&view.next_bits) = Some(n.bits);
-                            have_template = true;
-                        }
-                        Err(e) => {
-                            warn!("could not read a template: {e}");
-                            *lock(&view.coinbase_value) = None;
-                            *lock(&view.next_bits) = None;
-                        }
-                    }
+                    have_template = refresh_next_block(&node, &view);
                 }
                 *lock(&view.tip) = Some(t);
                 if tip_changed || *lock(&view.next_bits) != previous_bits {

@@ -19,3 +19,17 @@ pub fn assemble(page: &str) -> String {
     page.replace("<!--shared-css-->", &format!("<style>\n{CSS}</style>"))
         .replace("<!--shared-js-->", &format!("<script>\n{JS}</script>"))
 }
+
+/// Takes a sample now, then one every `HISTORY_INTERVAL_SECS` on a thread named `name`.
+pub fn sample_periodically(name: &str, sample: impl Fn() + Send + 'static) {
+    sample();
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(HISTORY_INTERVAL_SECS));
+                sample();
+            }
+        })
+        .expect("hashrate sampler thread");
+}

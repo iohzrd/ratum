@@ -179,21 +179,21 @@ pub fn build(p: &Params<'_>) -> (Coinbase, usize, Vec<CoinbaseOutput>) {
     coinb1.extend_from_slice(&NULL_OUTPOINT_INDEX);
     let n_out = included.len() as u64 + 1 + u64::from(p.witness_commitment.is_some());
     let extranonce_push_opcode = (EXTRANONCE_PUSH_SIZE - 1) as u8;
-    let pot_index;
+    let script_sig_len = p.script_sig.len() + if in_script { EXTRANONCE_PUSH_SIZE } else { 0 };
+    coinb1.extend_from_slice(&encode_compact_size(script_sig_len as u64));
+    let pot_index = coinb1.len() + p.pot_index_in_script;
+    coinb1.extend_from_slice(p.script_sig);
+
+    // coinb1 ends where the miner splices its extranonce in, so the split point moves with
+    // the extranonce: into the scriptSig when it fits, otherwise into a leading OP_RETURN
+    // output that carries it instead.
     let mut coinb2 = Vec::new();
     if in_script {
-        let script_sig_len = (p.script_sig.len() + EXTRANONCE_PUSH_SIZE) as u64;
-        coinb1.extend_from_slice(&encode_compact_size(script_sig_len));
-        pot_index = coinb1.len() + p.pot_index_in_script;
-        coinb1.extend_from_slice(p.script_sig);
         coinb1.push(extranonce_push_opcode);
         coinb1.extend_from_slice(&p.enprefix.to_be_bytes());
         coinb2.extend_from_slice(&SEQUENCE_FINAL);
         coinb2.extend_from_slice(&encode_compact_size(n_out));
     } else {
-        coinb1.extend_from_slice(&encode_compact_size(p.script_sig.len() as u64));
-        pot_index = coinb1.len() + p.pot_index_in_script;
-        coinb1.extend_from_slice(p.script_sig);
         coinb1.extend_from_slice(&SEQUENCE_FINAL);
         coinb1.extend_from_slice(&encode_compact_size(n_out + 1));
         coinb1.extend_from_slice(&0u64.to_le_bytes());

@@ -35,6 +35,14 @@ struct Shared {
     closed: bool,
 }
 
+impl Shared {
+    /// There is work to mine once a job newer than `last_generation` has arrived and the
+    /// subscription has settled how the extranonce is split.
+    fn has_work_after(&self, last_generation: u64) -> bool {
+        self.generation > last_generation && self.job.is_some() && self.extranonce2_size != 0
+    }
+}
+
 fn leaf(coinb1: &[u8], extranonce: &[u8], coinb2: &[u8]) -> [u8; 32] {
     let mut buf = Vec::with_capacity(1 + coinb1.len() + extranonce.len() + coinb2.len());
     buf.push(WORK_ROOT_LEAF_PREFIX);
@@ -191,9 +199,7 @@ fn main() -> std::io::Result<()> {
     loop {
         let (job, difficulty, extranonce1, extranonce2_size, job_generation) = {
             let mut s = lock.lock().expect("state");
-            while !s.closed
-                && !(s.generation > last_generation && s.job.is_some() && s.extranonce2_size != 0)
-            {
+            while !s.closed && !s.has_work_after(last_generation) {
                 s = waiting.wait(s).expect("state");
             }
             if s.closed {

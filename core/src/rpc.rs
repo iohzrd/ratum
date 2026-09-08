@@ -222,12 +222,11 @@ impl Client {
         let chain = Chain::parse(
             info["chain"].as_str().ok_or_else(|| Error::BadResponse("no chain".into()))?,
         );
-        let mut hash: [u8; 32] = hex::decode(display)
+        let hash: [u8; 32] = hex::decode(display)
             .ok()
             .and_then(|b| b.try_into().ok())
             .ok_or_else(|| Error::BadResponse(format!("bestblockhash {display:?}")))?;
-        hash.reverse();
-        Ok(Tip { hash, height, difficulty, chain })
+        Ok(Tip { hash: crate::bitcoin::reversed(&hash), height, difficulty, chain })
     }
 
     pub fn wait_for_block_height(&self, height: u32, timeout: Duration) -> Result<u32, Error> {

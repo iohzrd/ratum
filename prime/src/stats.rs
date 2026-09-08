@@ -60,13 +60,9 @@ pub(crate) fn spawn(server: Arc<Server>, listen: &str) -> Result<SocketAddr, Str
     let http = HttpServer::http(listen).map_err(|e| e.to_string())?;
     let addr = http.server_addr().to_ip().ok_or("no socket address")?;
     let history: HashrateHistory = Arc::new(Mutex::new(ratum::web::History::new()));
-    sample_hashrate(&server, &history);
     let (sampler, sampler_history) = (Arc::clone(&server), Arc::clone(&history));
-    std::thread::spawn(move || {
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(ratum::web::HISTORY_INTERVAL_SECS));
-            sample_hashrate(&sampler, &sampler_history);
-        }
+    ratum::web::sample_periodically("stats-sampler", move || {
+        sample_hashrate(&sampler, &sampler_history)
     });
     http::serve("stats", http, move |request| {
         if let Err(e) = handle(&server, &history, request) {

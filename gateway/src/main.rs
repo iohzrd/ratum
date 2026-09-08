@@ -7,6 +7,7 @@ mod dupes;
 mod job;
 mod logger;
 mod publish;
+mod settings;
 #[cfg(unix)]
 mod signals;
 mod stratum;

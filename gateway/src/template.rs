@@ -205,8 +205,26 @@ pub struct Notify {
 
 #[derive(Default)]
 struct Pending {
-    block: Option<Option<String>>,
+    block: Option<PendingBlock>,
     rebuild: bool,
+}
+
+/// A raised but unread block notification. `AnyBlock` names no hash, so it stands for a
+/// tip this thread has not identified and a later hash-carrying notification cannot
+/// narrow it.
+#[derive(Clone, Debug)]
+enum PendingBlock {
+    AnyBlock,
+    Hash(String),
+}
+
+impl PendingBlock {
+    fn hash(self) -> Option<String> {
+        match self {
+            PendingBlock::AnyBlock => None,
+            PendingBlock::Hash(h) => Some(h),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -227,10 +245,11 @@ impl Notify {
 
     fn raise_block(&self, hash: Option<String>) {
         let mut p = ratum::lock(&self.pending);
-        p.block = match (p.block.take(), hash) {
-            (Some(None), _) | (_, None) => Some(None),
-            (_, Some(h)) => Some(Some(h)),
-        };
+        let pending_is_unnamed = matches!(p.block, Some(PendingBlock::AnyBlock));
+        p.block = Some(match hash {
+            Some(h) if !pending_is_unnamed => PendingBlock::Hash(h),
+            _ => PendingBlock::AnyBlock,
+        });
         self.signal.notify_all();
     }
 
@@ -245,9 +264,9 @@ impl Notify {
             .signal
             .wait_timeout_while(g, d, |p| p.block.is_none() && !p.rebuild)
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(hash) = g.block.take() {
+        if let Some(pending) = g.block.take() {
             g.rebuild = false;
-            Wake::Block(hash)
+            Wake::Block(pending.hash())
         } else if g.rebuild {
             g.rebuild = false;
             Wake::Rebuild
