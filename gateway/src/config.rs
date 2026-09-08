@@ -276,8 +276,20 @@ pub struct Config {
 }
 
 /// The largest coinbase tag space: what fits in a 100-byte scriptSig beside the height push,
-/// the unique-id push and the extranonce push.
+/// the unique-id push and the extranonce push. The C gateway's `MAX_COINBASE_TAG_SPACE` is
+/// 82, leaving room for the version 3 prime id push it always writes; `coinbase::script_sig`
+/// subtracts the same four bytes when it writes that push.
 pub const MAX_COINBASE_TAG_SPACE: usize = 86;
+/// What the version 3 prime id push costs over the version 1 one: an 8-byte prime id in an
+/// 11-byte push rather than a 4-byte one in a 7-byte push.
+pub const WIDE_PRIME_PUSH_EXTRA_BYTES: usize = 4;
+
+/// The tag lengths `datum_read_config` accepts for `mining.coinbase_tag_primary` and
+/// `mining.coinbase_tag_secondary`: each at most `MAX_CONFIGURED_TAG` bytes, the two together
+/// at most `MAX_CONFIGURED_TAGS_TOTAL`. Distinct from the wire limit a pool's own tag is held
+/// to, `ratum::datum::messages::MAX_COINBASE_TAG`.
+pub const MAX_CONFIGURED_TAG: usize = 60;
+pub const MAX_CONFIGURED_TAGS_TOTAL: usize = 88;
 
 impl Config {
     pub fn parse(text: &str) -> Result<Config, String> {
@@ -360,8 +372,14 @@ impl Config {
             return Err("Required configuration option (mining.pool_address) not found".into());
         }
         let tags = m.coinbase_tag_primary.len() + m.coinbase_tag_secondary.len();
-        if tags > 88 || m.coinbase_tag_primary.len() > 60 || m.coinbase_tag_secondary.len() > 60 {
-            return Err("mining.coinbase_tag_primary and mining.coinbase_tag_secondary must be at most 60 bytes each and 88 bytes together".into());
+        if tags > MAX_CONFIGURED_TAGS_TOTAL
+            || m.coinbase_tag_primary.len() > MAX_CONFIGURED_TAG
+            || m.coinbase_tag_secondary.len() > MAX_CONFIGURED_TAG
+        {
+            return Err(format!(
+                "mining.coinbase_tag_primary and mining.coinbase_tag_secondary must be at most \
+                 {MAX_CONFIGURED_TAG} bytes each and {MAX_CONFIGURED_TAGS_TOTAL} bytes together"
+            ));
         }
         self.pool_output_script = crate::address::to_output_script(&m.pool_address)
             .ok_or("mining.pool_address is not an address a coinbase output can pay")?;
@@ -408,8 +426,11 @@ impl Config {
         if d.pooled_mining_only && d.pool_host.is_empty() {
             return Err("datum.pooled_mining_only requires datum.pool_host".into());
         }
-        if d.gateway_fee_bps > 10000 {
-            return Err("datum.gateway_fee_bps must be 0..10000".into());
+        if u64::from(d.gateway_fee_bps) > ratum::BASIS_POINTS_PER_UNIT {
+            return Err(format!(
+                "datum.gateway_fee_bps must be 0..{}",
+                ratum::BASIS_POINTS_PER_UNIT
+            ));
         }
         if d.gateway_fee_bps > 0 {
             if !d.pool_pass_full_users {
@@ -449,7 +470,9 @@ impl Config {
                     return Err(format!("stratum.username_modifiers.{modname}.{addr} is negative"));
                 }
                 sum += proportion;
-                if (sum * 65536.0).ceil() - 1.0 >= 65535.0 {
+                if (sum * crate::username::SELECTOR_SPACE).ceil() - 1.0
+                    >= crate::username::SELECTOR_MAX as f64
+                {
                     covered = true;
                     break;
                 }
@@ -483,7 +506,7 @@ impl Config {
         let s = &self.stratum;
         s.max_clients_per_thread
             * s.vardiff_target_shares_min as usize
-            * (s.share_stale_seconds / 60) as usize
+            * (s.share_stale_seconds / ratum::SECS_PER_MINUTE) as usize
             * 16
     }
 
@@ -596,7 +619,7 @@ const FIELDS: &[Field] = &[
         label: "Gateway fee",
         section: "datum",
         key: "gateway_fee_bps",
-        kind: Kind::Int(0, 10000),
+        kind: Kind::Int(0, ratum::BASIS_POINTS_PER_UNIT as i64),
         current: |c| json!(c.datum.gateway_fee_bps),
     },
     Field {
@@ -689,7 +712,9 @@ fn old_pool_host(doc: &Value) -> Option<String> {
 /// The largest `mining.coinbase_tag_secondary` beside the running primary tag: what
 /// `validate_mining` accepts.
 fn secondary_tag_max(cfg: &Config) -> usize {
-    (88usize.saturating_sub(cfg.mining.coinbase_tag_primary.len())).min(60)
+    MAX_CONFIGURED_TAGS_TOTAL
+        .saturating_sub(cfg.mining.coinbase_tag_primary.len())
+        .min(MAX_CONFIGURED_TAG)
 }
 
 fn username_behaviour(cfg: &Config) -> &'static str {

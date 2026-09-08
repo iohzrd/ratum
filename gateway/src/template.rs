@@ -9,6 +9,13 @@ use std::time::{Duration, Instant};
 
 pub const MAX_TXNS: usize = 16383;
 
+/// The hex-string lengths the GBT fields are accepted at, as `datum_gbt_parser` checks them.
+/// A `uint256` is 64 characters and compact bits 8; `default_witness_commitment` is a 38-byte
+/// script, so 76 characters, and the C parser takes 38 to 95 rather than that exact length.
+const HASH_HEX_CHARS: std::ops::RangeInclusive<usize> = 64..=64;
+const BITS_HEX_CHARS: std::ops::RangeInclusive<usize> = 8..=8;
+const WITNESS_COMMITMENT_HEX_CHARS: std::ops::RangeInclusive<usize> = 38..=95;
+
 #[derive(Clone, Debug)]
 pub struct Txn {
     pub raw: Vec<u8>,
@@ -91,7 +98,7 @@ fn str_field<'a>(
 }
 
 fn hash_field(v: &serde_json::Value, key: &'static str) -> Result<[u8; 32], TemplateError> {
-    ratum::header::u256_from_display_hex(str_field(v, key, 64..=64)?)
+    ratum::header::u256_from_display_hex(str_field(v, key, HASH_HEX_CHARS)?)
         .ok_or(TemplateError::Missing(key))
 }
 
@@ -129,8 +136,9 @@ fn check_rules(
         if announced.payout != Some(height) {
             announced.payout = Some(height);
             error!(
-                "Pool payout output script is {} bytes, but the node enforces the reduced_data rule for block {height}, which limits a non-OP_RETURN coinbase output script to 34 bytes. Serving no work for this block.",
-                payout_script.len()
+                "Pool payout output script is {} bytes, but the node enforces the reduced_data rule for block {height}, which limits a non-OP_RETURN coinbase output script to {} bytes. Serving no work for this block.",
+                payout_script.len(),
+                ratum::bitcoin::MAX_OUTPUT_SCRIPT_SIZE
             );
         }
         return Err(TemplateError::Refused("payout script over the reduced_data limit".into()));
@@ -148,10 +156,10 @@ fn decode(v: &serde_json::Value, reduced_data: bool) -> Result<Template, Templat
     let sizelimit = u64_field(v, "sizelimit")?;
     let weightlimit = u64_field(v, "weightlimit")?;
     let version = u64_field(v, "version")? as u32;
-    let bits = str_field(v, "bits", 8..=8)?.to_string();
-    let prev_hash_hex = str_field(v, "previousblockhash", 64..=64)?.to_string();
-    let target_hex = str_field(v, "target", 64..=64)?.to_string();
-    let wc_hex = str_field(v, "default_witness_commitment", 38..=95)?;
+    let bits = str_field(v, "bits", BITS_HEX_CHARS)?.to_string();
+    let prev_hash_hex = str_field(v, "previousblockhash", HASH_HEX_CHARS)?.to_string();
+    let target_hex = str_field(v, "target", HASH_HEX_CHARS)?.to_string();
+    let wc_hex = str_field(v, "default_witness_commitment", WITNESS_COMMITMENT_HEX_CHARS)?;
     let witness_commitment =
         hex::decode(wc_hex).map_err(|_| TemplateError::Missing("default_witness_commitment"))?;
     let nbits = u32::from_str_radix(&bits, 16).map_err(|_| TemplateError::Missing("bits"))?;

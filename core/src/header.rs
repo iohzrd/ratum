@@ -11,7 +11,36 @@ pub const FLAG_USE_TIME_OFFSET: u8 = 4;
 /// The ASIC profile, the low two bits: Knots has no named constant (`m_flags & 3` in `block.cpp`).
 pub const FLAG_PROFILE_MASK: u8 = 3;
 
+/// The bytes the ASIC hashes, indexed by ASIC profile. The profiles lay out the same
+/// fields and differ in how many zero bytes precede them: `block.cpp` GetHash writes 48
+/// zero bytes for profile 2 and 80 for profile 3 (three and five `uint128` zeros).
 pub const ASIC_INPUT_LEN: [usize; 4] = [80, 80, 128, 160];
+/// The zero bytes ahead of the fields, indexed by ASIC profile.
+const ASIC_INPUT_LEADING_ZEROS: [usize; 4] = [0, 0, 48, 80];
+
+/// The bytes hashed into H1: `Assert(h1.BytesWritten() == 0x40 + 119)` in `block.cpp`
+/// (the 0x40 is the tag SHA256 written twice), and `h1_payload[119]` in `datum_pow.c`.
+pub const H1_PREIMAGE_SIZE: usize = 119;
+/// The bytes hashed into H2: H1, 32 zero bytes written twice, and `m_mm_rhs`
+/// (`Assert(h2.BytesWritten() == 0x40 + 0x60)`; `h2_payload[96]` in `datum_pow.c`).
+pub const H2_PREIMAGE_SIZE: usize = 96;
+/// The offset of `m_mm_rhs` in the H2 preimage, after H1 and the two zero words.
+const H2_MM_RHS_OFFSET: usize = 64;
+
+/// The leaf the first BLAKE2b hashes, which is all the stratum machine receives:
+/// `Assert(ss.size() == 52)` in `block.cpp`, `leaf[52]` in `datum_blake2b_work_root`.
+/// Stratum carries 51 of the 52 bytes as coinb1 (the last three bytes of the leading zero
+/// word, then H2) and the extranonce; the leaf's first byte is the 0x00 prefix the Siacoin
+/// hasher prepends itself.
+pub const WORK_ROOT_LEAF_SIZE: usize = 52;
+/// The offset of H2 in the leaf, after the leading zero word.
+const WORK_ROOT_H2_OFFSET: usize = 4;
+/// The offset of the extranonce in the leaf, after H2.
+const WORK_ROOT_EXTRANONCE_OFFSET: usize = 36;
+
+/// The leading bytes `prevblock_hidden` clears: `std::fill_n(prevblock_hidden.begin(), 6, 0)`
+/// in `block.cpp`, `memset(out, 0, 6)` in `datum_blake2b_prevblock_hidden`.
+const PREVBLOCK_HIDDEN_CLEARED_BYTES: usize = 6;
 
 pub type U256 = [u8; 32];
 pub type U128 = [u8; 16];
@@ -162,12 +191,7 @@ impl HeaderV2 {
             // 0 puts the hidden previous block hash there, where the Siacoin layout puts
             // the parent id; 2 and 3 put h2 there, after 48 or 80 zero bytes.
             p => {
-                let zeros = match p {
-                    2 => 48,
-                    3 => 80,
-                    _ => 0,
-                };
-                ss.resize(zeros, 0);
+                ss.resize(ASIC_INPUT_LEADING_ZEROS[p as usize], 0);
                 if p == 0 {
                     ss.extend_from_slice(&prevblock_hidden(&self.prev_block));
                 } else {
@@ -200,7 +224,7 @@ impl HeaderV2 {
         let mut prev_display = self.prev_block;
         prev_display.reverse();
 
-        let mut h1d = Vec::with_capacity(119);
+        let mut h1d = Vec::with_capacity(H1_PREIMAGE_SIZE);
         // The node hashes the complete version, with the v2 flag bit set, into h1
         // (`block.cpp` GetHash: `h1 << GetCompleteVersion()`). `self.version` holds the
         // version with the flag stripped, so restore it here.
@@ -216,23 +240,20 @@ impl HeaderV2 {
         h1d.push(self.flags);
         h1d.push(self.xor_key_mask_clear_bits);
         h1d.extend_from_slice(&xor_key_hash);
-        debug_assert_eq!(h1d.len(), 119);
+        debug_assert_eq!(h1d.len(), H1_PREIMAGE_SIZE);
         let h1 = tagged_sha256("Bitcoin block header 1", &h1d);
 
         // Knots writes 32 zero bytes between h1 and `m_mm_rhs` (`block.cpp`:
         // `h2 << zeros << zeros`).
-        let mut h2d = [0u8; 96];
-        h2d[..32].copy_from_slice(&h1);
-        h2d[64..].copy_from_slice(&self.mm_rhs);
+        let mut h2d = [0u8; H2_PREIMAGE_SIZE];
+        h2d[..h1.len()].copy_from_slice(&h1);
+        h2d[H2_MM_RHS_OFFSET..].copy_from_slice(&self.mm_rhs);
         let h2 = tagged_sha256("Merge-mining hook", &h2d);
 
-        // Stratum carries 51 of these 52 bytes: coinb1 (the last three bytes of the zero word,
-        // then h2: 35 bytes) and the 16-byte extranonce. The word's first byte is the 0x00 leaf
-        // prefix the Siacoin hasher adds itself, so coinb1 does not carry it.
-        let mut ss = [0u8; 52];
-        ss[4..36].copy_from_slice(&h2);
-        ss[36..].copy_from_slice(&self.extranonce);
-        let hash1 = blake2b_256(&ss);
+        let mut leaf = [0u8; WORK_ROOT_LEAF_SIZE];
+        leaf[WORK_ROOT_H2_OFFSET..WORK_ROOT_EXTRANONCE_OFFSET].copy_from_slice(&h2);
+        leaf[WORK_ROOT_EXTRANONCE_OFFSET..].copy_from_slice(&self.extranonce);
+        let hash1 = blake2b_256(&leaf);
 
         let mask = xor_mask(&self.xor_key, self.xor_key_mask_clear_bits);
 
@@ -243,9 +264,9 @@ impl HeaderV2 {
         let pre = self.precompute();
         let asic_input = self.asic_input_with(&pre.hash1, &pre.h2);
         let hash2 = blake2b_256(&asic_input);
-        let mut result = [0u8; 32];
-        for i in 0..32 {
-            result[i] = hash2[i] ^ pre.mask[i];
+        let mut result = hash2;
+        for (r, m) in result.iter_mut().zip(pre.mask) {
+            *r ^= m;
         }
         HashComponents {
             xor_key_hash: pre.xor_key_hash,
@@ -294,7 +315,7 @@ pub fn prevblock_hidden(prev_block: &U256) -> [u8; 32] {
     let mut display = *prev_block;
     display.reverse();
     let mut out = tagged_sha256("Bitcoin prevblock header, hashed", &display);
-    out[..6].fill(0);
+    out[..PREVBLOCK_HIDDEN_CLEARED_BYTES].fill(0);
     out
 }
 
@@ -304,12 +325,12 @@ pub fn xor_mask(xor_key: &U128, clear_bits: u8) -> [u8; 32] {
         return [0u8; 32];
     }
     let mut m = tagged_sha256("Bitcoin block hash PoW XOR mask", xor_key);
-    let clear_bytes = (clear_bits / 8) as usize;
-    for b in m.iter_mut().take(clear_bytes.min(32)) {
+    let clear_bytes = usize::from(clear_bits / 8);
+    for b in m.iter_mut().take(clear_bytes) {
         *b = 0;
     }
-    if clear_bytes < 32 {
-        m[clear_bytes] &= 0xffu8 >> (clear_bits % 8);
+    if let Some(b) = m.get_mut(clear_bytes) {
+        *b &= 0xffu8 >> (clear_bits % 8);
     }
     m
 }

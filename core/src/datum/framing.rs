@@ -1,8 +1,14 @@
+/// The frame header: one little-endian u32 of length, reserved bits, three flags and the
+/// command. Every read of the wire starts by taking this many bytes.
+pub const HEADER_LEN: usize = size_of::<u32>();
+
+/// The bits of the header the length field occupies.
+const CMD_LEN_BITS: u32 = 22;
 /// The largest value the header's 22-bit length field can hold.
-pub const MAX_CMD_LEN: u32 = (1 << 22) - 1;
+pub const MAX_CMD_LEN: u32 = (1 << CMD_LEN_BITS) - 1;
 /// The gateway's `DATUM_PROTOCOL_MAX_CMD_DATA_SIZE`, one larger than the largest length the
 /// 22-bit field holds.
-pub const MAX_CMD_DATA_SIZE: u32 = 1 << 22;
+pub const MAX_CMD_DATA_SIZE: u32 = 1 << CMD_LEN_BITS;
 pub const INITIAL_HELLO_KEY: u32 = 0xDC87_1829;
 pub const NONCE_LEN: usize = 24;
 /// The byte the gateway writes as a structure terminator. In the hello it follows the user
@@ -18,6 +24,15 @@ pub mod cmd {
     pub const INFO: u8 = 7;
 }
 
+/// The header's fields above the length, from bit 22 up.
+const RESERVED_SHIFT: u32 = CMD_LEN_BITS;
+const RESERVED_MASK: u32 = 0x3;
+const SIGNED_BIT: u32 = 24;
+const ENCRYPTED_PUBKEY_BIT: u32 = 25;
+const ENCRYPTED_CHANNEL_BIT: u32 = 26;
+const PROTO_CMD_SHIFT: u32 = 27;
+const PROTO_CMD_MASK: u32 = 0x1f;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Header {
     pub cmd_len: u32,
@@ -29,25 +44,25 @@ pub struct Header {
 }
 
 impl Header {
-    pub fn to_bytes(self) -> [u8; 4] {
+    pub fn to_bytes(self) -> [u8; HEADER_LEN] {
         let v = (self.cmd_len & MAX_CMD_LEN)
-            | ((self.reserved as u32 & 0x3) << 22)
-            | ((self.is_signed as u32) << 24)
-            | ((self.is_encrypted_pubkey as u32) << 25)
-            | ((self.is_encrypted_channel as u32) << 26)
-            | ((self.proto_cmd as u32 & 0x1f) << 27);
+            | ((self.reserved as u32 & RESERVED_MASK) << RESERVED_SHIFT)
+            | ((self.is_signed as u32) << SIGNED_BIT)
+            | ((self.is_encrypted_pubkey as u32) << ENCRYPTED_PUBKEY_BIT)
+            | ((self.is_encrypted_channel as u32) << ENCRYPTED_CHANNEL_BIT)
+            | ((self.proto_cmd as u32 & PROTO_CMD_MASK) << PROTO_CMD_SHIFT);
         v.to_le_bytes()
     }
 
-    pub fn from_bytes(b: [u8; 4]) -> Self {
+    pub fn from_bytes(b: [u8; HEADER_LEN]) -> Self {
         let v = u32::from_le_bytes(b);
         Header {
             cmd_len: v & MAX_CMD_LEN,
-            reserved: ((v >> 22) & 0x3) as u8,
-            is_signed: v & (1 << 24) != 0,
-            is_encrypted_pubkey: v & (1 << 25) != 0,
-            is_encrypted_channel: v & (1 << 26) != 0,
-            proto_cmd: ((v >> 27) & 0x1f) as u8,
+            reserved: ((v >> RESERVED_SHIFT) & RESERVED_MASK) as u8,
+            is_signed: v & (1 << SIGNED_BIT) != 0,
+            is_encrypted_pubkey: v & (1 << ENCRYPTED_PUBKEY_BIT) != 0,
+            is_encrypted_channel: v & (1 << ENCRYPTED_CHANNEL_BIT) != 0,
+            proto_cmd: ((v >> PROTO_CMD_SHIFT) & PROTO_CMD_MASK) as u8,
         }
     }
 }

@@ -1,6 +1,52 @@
 use crate::cursor::{Cursor, Truncated};
 use sha2::{Digest, Sha256};
 
+/// The script opcodes this crate and its callers name, with the values and spellings of
+/// Bitcoin Core's `opcodetype` (`src/script/script.h`).
+pub mod opcode {
+    pub const OP_0: u8 = 0x00;
+    pub const OP_PUSHDATA1: u8 = 0x4c;
+    pub const OP_PUSHDATA2: u8 = 0x4d;
+    pub const OP_PUSHDATA4: u8 = 0x4e;
+    pub const OP_1: u8 = 0x51;
+    pub const OP_16: u8 = 0x60;
+    pub const OP_RETURN: u8 = 0x6a;
+    pub const OP_DUP: u8 = 0x76;
+    pub const OP_EQUAL: u8 = 0x87;
+    pub const OP_EQUALVERIFY: u8 = 0x88;
+    pub const OP_HASH160: u8 = 0xa9;
+    pub const OP_CHECKSIG: u8 = 0xac;
+    pub const OP_CHECKSIGVERIFY: u8 = 0xad;
+    pub const OP_CHECKMULTISIG: u8 = 0xae;
+    pub const OP_CHECKMULTISIGVERIFY: u8 = 0xaf;
+
+    /// The largest byte count a bare push opcode encodes; past it a script uses
+    /// `OP_PUSHDATA1`. `GetScriptOp` reads `opcode < OP_PUSHDATA1` as a direct push of that
+    /// many bytes, so the range is `0x01..=0x4b`.
+    pub const MAX_DIRECT_PUSH: usize = OP_PUSHDATA1 as usize - 1;
+}
+
+/// The size of a txid, a merkle node and a block hash: `uint256`.
+pub const HASH_SIZE: usize = 32;
+/// The `nVersion` at the front of a serialized transaction.
+pub const TX_VERSION_SIZE: usize = 4;
+/// A `COutPoint`: the 32-byte txid and the 4-byte output index.
+pub const OUTPOINT_SIZE: usize = HASH_SIZE + 4;
+/// A `CTxIn`'s `nSequence`.
+pub const SEQUENCE_SIZE: usize = 4;
+/// A `CTxOut`'s `nValue`, a `CAmount`.
+pub const VALUE_SIZE: usize = 8;
+/// The `nLockTime` at the end of a serialized transaction.
+pub const LOCK_TIME_SIZE: usize = 4;
+/// The fewest bytes a `CTxOut` occupies: the value and a one-byte script length.
+pub const MIN_OUTPUT_SIZE: usize = VALUE_SIZE + 1;
+/// The two bytes that follow the version of a transaction serialized with witness data
+/// (BIP144): a zero marker and a nonzero flag.
+const SEGWIT_MARKER_AND_FLAG: (u8, u8) = (0x00, 0x01);
+/// The block weight units a byte outside the witness costs, Core's `WITNESS_SCALE_FACTOR`
+/// (`consensus/consensus.h`). Witness bytes cost one each.
+pub const WITNESS_SCALE_FACTOR: u64 = 4;
+
 pub fn sha256d(data: &[u8]) -> [u8; 32] {
     let first = Sha256::digest(data);
     Sha256::digest(first).into()
@@ -16,10 +62,10 @@ pub fn reversed(hash: &[u8; 32]) -> [u8; 32] {
 /// a whole tree instead; this walks the one path a miner is given.
 pub fn merkle_root(coinbase_txid: &[u8; 32], branches: &[[u8; 32]]) -> [u8; 32] {
     let mut acc = *coinbase_txid;
-    let mut combined = [0u8; 64];
+    let mut combined = [0u8; 2 * HASH_SIZE];
     for b in branches {
-        combined[..32].copy_from_slice(&acc);
-        combined[32..].copy_from_slice(b);
+        combined[..HASH_SIZE].copy_from_slice(&acc);
+        combined[HASH_SIZE..].copy_from_slice(b);
         acc = sha256d(&combined);
     }
     acc
@@ -28,8 +74,8 @@ pub fn merkle_root(coinbase_txid: &[u8; 32], branches: &[[u8; 32]]) -> [u8; 32] 
 /// The txid, which commits to the serialization with the witness removed.
 pub fn txid(tx: &[u8]) -> Result<[u8; 32], TxError> {
     let mut c = Cursor::new(tx);
-    c.advance(4, "version")?;
-    let has_witness = matches!(c.peek2(), Some((0x00, 0x01)));
+    c.advance(TX_VERSION_SIZE, "version")?;
+    let has_witness = c.peek2() == Some(SEGWIT_MARKER_AND_FLAG);
     if has_witness {
         c.advance(2, "segwit marker and flag")?;
     }
@@ -40,14 +86,14 @@ pub fn txid(tx: &[u8]) -> Result<[u8; 32], TxError> {
         return Err(TxError::NoInputs);
     }
     for _ in 0..inputs {
-        c.advance(36, "outpoint")?;
+        c.advance(OUTPOINT_SIZE, "outpoint")?;
         let len = decode_compact_size(&mut c)? as usize;
         c.advance(len, "scriptSig")?;
-        c.advance(4, "sequence")?;
+        c.advance(SEQUENCE_SIZE, "sequence")?;
     }
     let outputs = decode_compact_size(&mut c)?;
     for _ in 0..outputs {
-        c.advance(8, "value")?;
+        c.advance(VALUE_SIZE, "value")?;
         let len = decode_compact_size(&mut c)? as usize;
         c.advance(len, "scriptPubKey")?;
     }
@@ -63,15 +109,16 @@ pub fn txid(tx: &[u8]) -> Result<[u8; 32], TxError> {
         }
     }
     let lock_start = c.pos();
-    c.advance(4, "lock time")?;
+    c.advance(LOCK_TIME_SIZE, "lock time")?;
     if !c.at_end() {
         return Err(TxError::TrailingBytes(tx.len() - c.pos()));
     }
 
-    let mut stripped = Vec::with_capacity(8 + (body_end - body_start));
-    stripped.extend_from_slice(&tx[..4]);
+    let framing = TX_VERSION_SIZE + LOCK_TIME_SIZE;
+    let mut stripped = Vec::with_capacity(framing + (body_end - body_start));
+    stripped.extend_from_slice(&tx[..TX_VERSION_SIZE]);
     stripped.extend_from_slice(&tx[body_start..body_end]);
-    stripped.extend_from_slice(&tx[lock_start..lock_start + 4]);
+    stripped.extend_from_slice(&tx[lock_start..lock_start + LOCK_TIME_SIZE]);
     Ok(sha256d(&stripped))
 }
 
@@ -85,7 +132,7 @@ pub fn merkle_root_of(txids: &[[u8; 32]]) -> Option<([u8; 32], bool)> {
         return None;
     }
     let mut level = txids.to_vec();
-    let mut combined = [0u8; 64];
+    let mut combined = [0u8; 2 * HASH_SIZE];
     let mut mutated = false;
     while level.len() > 1 {
         // Detect a pair of identical adjacent hashes, before the odd-level duplication below,
@@ -104,8 +151,8 @@ pub fn merkle_root_of(txids: &[[u8; 32]]) -> Option<([u8; 32], bool)> {
         }
         let mut next = Vec::with_capacity(level.len() / 2);
         for pair in level.chunks(2) {
-            combined[..32].copy_from_slice(&pair[0]);
-            combined[32..].copy_from_slice(&pair[1]);
+            combined[..HASH_SIZE].copy_from_slice(&pair[0]);
+            combined[HASH_SIZE..].copy_from_slice(&pair[1]);
             next.push(sha256d(&combined));
         }
         level = next;
@@ -158,17 +205,17 @@ pub fn parse_coinbase(tx: &[u8]) -> Result<CoinbaseTx, TxError> {
     let mut c = Cursor::new(tx);
     let version = c.u32("version")?;
 
-    let mut has_witness = false;
-    if c.peek2() == Some((0x00, 0x01)) {
+    let has_witness = c.peek2() == Some(SEGWIT_MARKER_AND_FLAG);
+    if has_witness {
         c.advance(2, "segwit marker and flag")?;
-        has_witness = true;
     }
 
     if decode_compact_size(&mut c)? != 1 {
         return Err(TxError::NotCoinbase);
     }
-    let prevout = c.take(36, "outpoint")?;
-    if prevout[..32] != [0u8; 32] || prevout[32..] != [0xffu8; 4] {
+    // The null outpoint a coinbase spends: a zero txid and an all-ones index.
+    let prevout = c.take(OUTPOINT_SIZE, "outpoint")?;
+    if prevout[..HASH_SIZE] != [0u8; HASH_SIZE] || prevout[HASH_SIZE..] != [0xffu8; 4] {
         return Err(TxError::InputNotNull);
     }
     let script_len = decode_compact_size(&mut c)? as usize;
@@ -177,8 +224,9 @@ pub fn parse_coinbase(tx: &[u8]) -> Result<CoinbaseTx, TxError> {
     let sequence = c.u32("sequence")?;
 
     let n_out = decode_compact_size(&mut c)? as usize;
-    // Every output starts with nine fixed bytes: an 8-byte value and a 1-byte script length.
-    if n_out.saturating_mul(9) > c.rest().len() {
+    // No output is shorter than MIN_OUTPUT_SIZE, so a count implying more bytes than remain
+    // cannot decode; refuse it before reserving that many.
+    if n_out.saturating_mul(MIN_OUTPUT_SIZE) > c.rest().len() {
         return Err(TxError::LengthOverflow("output count"));
     }
     let mut outputs = Vec::with_capacity(n_out);
@@ -218,8 +266,8 @@ pub fn script_pushes(script: &[u8]) -> Vec<(usize, &[u8])> {
     while i < script.len() {
         let op = script[i];
         let (data_at, len) = match op {
-            0x01..=0x4b => (i + 1, op as usize),
-            0x4c => {
+            0x01..=MAX_DIRECT_PUSH_OPCODE => (i + 1, op as usize),
+            opcode::OP_PUSHDATA1 => {
                 let Some(&n) = script.get(i + 1) else { break };
                 (i + 2, n as usize)
             }
@@ -257,9 +305,6 @@ pub fn script_pushes(script: &[u8]) -> Vec<(usize, &[u8])> {
 /// through `validateaddress`, which returns up to 42 bytes for a future witness version:
 /// over the limit, under the 64-byte cap `CoinbaserResponse` applies.
 pub fn output_script_size_is_valid(script: &[u8]) -> bool {
-    const MAX_OUTPUT_SCRIPT_SIZE: usize = 34;
-    const MAX_OUTPUT_DATA_SIZE: usize = 83;
-
     // Skipped before the first byte is read, as CheckOutputSizes does.
     if script.is_empty() {
         return true;
@@ -268,7 +313,14 @@ pub fn output_script_size_is_valid(script: &[u8]) -> bool {
     script.len() <= limit
 }
 
-pub const OP_RETURN: u8 = 0x6a;
+/// The RDTS limits `Consensus::CheckOutputSizes` applies, by their names there.
+pub const MAX_OUTPUT_SCRIPT_SIZE: usize = 34;
+pub const MAX_OUTPUT_DATA_SIZE: usize = 83;
+
+pub use opcode::OP_RETURN;
+
+/// The largest opcode that is itself a direct push, for use in a match pattern.
+const MAX_DIRECT_PUSH_OPCODE: u8 = opcode::MAX_DIRECT_PUSH as u8;
 
 impl From<Truncated> for TxError {
     fn from(t: Truncated) -> Self {
@@ -321,9 +373,12 @@ pub fn encode_compact_size(n: u64) -> Vec<u8> {
 
 /// A script data push: a direct push for up to 75 bytes, `OP_PUSHDATA1` up to 255.
 pub fn encode_push(data: &[u8]) -> Vec<u8> {
-    debug_assert!(data.len() <= 255);
-    let mut out =
-        if data.len() <= 75 { vec![data.len() as u8] } else { vec![0x4c, data.len() as u8] };
+    debug_assert!(data.len() <= usize::from(u8::MAX));
+    let mut out = if data.len() <= opcode::MAX_DIRECT_PUSH {
+        vec![data.len() as u8]
+    } else {
+        vec![opcode::OP_PUSHDATA1, data.len() as u8]
+    };
     out.extend_from_slice(data);
     out
 }

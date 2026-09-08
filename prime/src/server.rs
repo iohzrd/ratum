@@ -391,7 +391,8 @@ impl PayoutPolicy {
     /// The operator fee taken from a coinbase value of `value` sats: `fee_bps` hundredths of a
     /// percent, rounded down so the operator never takes more than the exact rate.
     pub(crate) fn fee_on(&self, value: u64) -> u64 {
-        (u128::from(value) * u128::from(self.fee_bps) / 10_000) as u64
+        (u128::from(value) * u128::from(self.fee_bps) / u128::from(ratum::BASIS_POINTS_PER_UNIT))
+            as u64
     }
 
     /// The sats the split divides among the miners: `value` minus the operator fee.

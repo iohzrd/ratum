@@ -37,11 +37,11 @@ pub fn read_exact_deadline(
 /// `MAX_CMD_DATA_SIZE`. `started` and `deadline` bound both reads together.
 pub fn read_frame(
     s: &mut impl Read,
-    unmask: impl FnOnce([u8; 4]) -> Header,
+    unmask: impl FnOnce([u8; framing::HEADER_LEN]) -> Header,
     started: Instant,
     deadline: Duration,
 ) -> io::Result<(Header, Vec<u8>)> {
-    let head = read_exact_deadline(s, 4, started, deadline)?;
+    let head = read_exact_deadline(s, framing::HEADER_LEN, started, deadline)?;
     let header = unmask(head.try_into().expect("four bytes"));
     if header.cmd_len > framing::MAX_CMD_DATA_SIZE {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "frame exceeds the protocol limit"));

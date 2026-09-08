@@ -34,11 +34,11 @@ const DESCRIPTION: &str = "Non-custodial Bitcoin BLAKE2b mining pool on the Bitc
 /// The span the hashrate estimate averages over. Long enough that a miner at the minimum
 /// share difficulty has several shares accepted within it; short enough that the estimate
 /// reflects a rig starting or stopping within minutes.
-const HASHRATE_SPAN_SECS: u64 = 600;
+const HASHRATE_SPAN_SECS: u64 = 10 * ratum::SECS_PER_MINUTE;
 
-/// Expected hashes per unit of share difficulty: difficulty 1 is the 0x1d00ffff target,
-/// 2^32 hashes on average. The BLAKE2b fork keeps the compact-target encoding, so the
-/// constant is unchanged.
+/// Expected hashes per unit of share difficulty: a 256-bit hash meets the difficulty 1
+/// target (2^224) once in 2^32 tries. The BLAKE2b fork keeps the compact-target encoding, so
+/// the constant is unchanged.
 const HASHES_PER_DIFFICULTY: f64 = 4_294_967_296.0;
 
 /// `work` difficulty units over `secs` seconds as hashes per second.
@@ -49,12 +49,16 @@ fn hashes_per_second(work: u128, secs: u64) -> f64 {
     work as f64 * HASHES_PER_DIFFICULTY / secs as f64
 }
 
-/// Blocks per difficulty period and the block spacing the chain targets, for the retarget
-/// estimate. The next adjustment is at the next multiple of the interval, and the factor is
-/// the target spacing over the observed spacing, bounded to the consensus limit of 4 either
-/// way.
-const RETARGET_INTERVAL: u32 = 2016;
-const TARGET_BLOCK_SECS: f64 = 600.0;
+/// The chain's retarget parameters, for the estimate the stats page shows. `nPowTargetSpacing`
+/// is ten minutes and `nPowTargetTimespan` two weeks, so `DifficultyAdjustmentInterval()` is
+/// 2016 blocks. The next adjustment is at the next multiple of the interval, and the factor
+/// is the target spacing over the observed spacing.
+const TARGET_BLOCK_SECS: f64 = 10.0 * ratum::SECS_PER_MINUTE as f64;
+const RETARGET_TIMESPAN_SECS: f64 = 14.0 * ratum::SECS_PER_DAY as f64;
+const RETARGET_INTERVAL: u32 = (RETARGET_TIMESPAN_SECS / TARGET_BLOCK_SECS) as u32;
+/// `CalculateNextWorkRequired` clamps the observed timespan to a quarter and four times the
+/// target one, so one retarget moves the difficulty by at most a factor of four either way.
+const MAX_RETARGET_FACTOR: f64 = 4.0;
 
 /// How many of the newest recorded blocks the snapshot lists.
 const RECENT_BLOCKS: usize = 50;
@@ -62,8 +66,8 @@ const RECENT_BLOCKS: usize = 50;
 /// The pool-hashrate history the snapshot serves for the page's chart: one sample per
 /// interval, kept in memory for a day. It begins when the stats interface starts, so a
 /// restart shows as a gap in the chart.
-const HISTORY_INTERVAL_SECS: u64 = 60;
-const HISTORY_CAP: usize = 24 * 60;
+const HISTORY_INTERVAL_SECS: u64 = ratum::SECS_PER_MINUTE;
+const HISTORY_CAP: usize = (ratum::SECS_PER_DAY / HISTORY_INTERVAL_SECS) as usize;
 
 /// Append one sample and discard the oldest beyond the cap.
 fn push_sample(history: &mut VecDeque<(u64, f64)>, at: u64, hs: f64) {
@@ -263,10 +267,12 @@ fn summary(snapshot: &serde_json::Value) -> String {
 /// `hashrate` in `page.js` formats it.
 fn hashrate_text(hs: f64) -> String {
     const UNITS: [&str; 7] = ["H/s", "kH/s", "MH/s", "GH/s", "TH/s", "PH/s", "EH/s"];
+    /// The step between the SI prefixes above: k, M, G and the rest are powers of a thousand.
+    const SI_STEP: f64 = 1000.0;
     let mut hs = hs;
     let mut i = 0;
-    while hs >= 1000.0 && i < UNITS.len() - 1 {
-        hs /= 1000.0;
+    while hs >= SI_STEP && i < UNITS.len() - 1 {
+        hs /= SI_STEP;
         i += 1;
     }
     format!("{hs:.1} {}", UNITS[i])
@@ -418,7 +424,10 @@ fn snapshot(server: &Server, history: &Mutex<VecDeque<(u64, f64)>>) -> serde_jso
                 "height": (t.height / RETARGET_INTERVAL + 1) * RETARGET_INTERVAL,
                 "blocks_remaining": RETARGET_INTERVAL - t.height % RETARGET_INTERVAL,
                 "estimated_factor": observed_block_secs
-                    .map(|s| (TARGET_BLOCK_SECS / s).clamp(0.25, 4.0)),
+                    .map(|s| {
+                        (TARGET_BLOCK_SECS / s)
+                            .clamp(1.0 / MAX_RETARGET_FACTOR, MAX_RETARGET_FACTOR)
+                    }),
             },
         }),
         None => serde_json::json!({

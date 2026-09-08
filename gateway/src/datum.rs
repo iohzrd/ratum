@@ -63,6 +63,11 @@ const WAKE: Token = Token(1);
 /// with 1 to 80 or 1 to 100), so a message's length does not identify its contents.
 const MINING_PAD_MAX: usize = 100;
 
+/// The offsets of a validation request's own header fields, inside the mining payload: the
+/// request selector and the job index, after the mining sub-command byte.
+const SUBCMD_AT: usize = 1;
+const JOB_INDEX_AT: usize = 2;
+
 /// The version 3 protocol's assignment slots: the key commitment each holds, indexed by
 /// wire slot, and the active one. `active` is `None` until the pool seeds an assignment;
 /// under the version 3 protocol the gateway serves no pooled work until then, as the C
@@ -594,7 +599,12 @@ impl<'a> Session<'a> {
         // `read_handshake_response` takes the frame as sent and unmasks the header itself;
         // it is peeked here for the body's length only.
         let started = Instant::now();
-        let mut frame = read_exact_deadline(&mut stream, 4, started, settings.global_timeout)?;
+        let mut frame = read_exact_deadline(
+            &mut stream,
+            framing::HEADER_LEN,
+            started,
+            settings.global_timeout,
+        )?;
         let peeked = client.peek_handshake_header(frame[..].try_into().expect("four bytes"));
         if peeked.cmd_len > framing::MAX_CMD_DATA_SIZE {
             return Err(
@@ -633,7 +643,7 @@ impl<'a> Session<'a> {
             last_share_accepted: None,
             sent_job: vec![None; slots],
             requested: None,
-            pending_header: Vec::with_capacity(4),
+            pending_header: Vec::with_capacity(framing::HEADER_LEN),
         })
     }
 
@@ -738,17 +748,17 @@ impl<'a> Session<'a> {
     }
 
     /// The next frame's header, accumulated across reads so the pending sends run between
-    /// them; `None` until four bytes have arrived.
+    /// them; `None` until the whole header has arrived.
     fn poll_header(&mut self) -> Result<Option<Header>, SessionError> {
-        let mut byte = [0u8; 4];
-        match self.stream.read(&mut byte[..4 - self.pending_header.len()]) {
+        let mut byte = [0u8; framing::HEADER_LEN];
+        match self.stream.read(&mut byte[..framing::HEADER_LEN - self.pending_header.len()]) {
             Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into()),
             Ok(n) => self.pending_header.extend_from_slice(&byte[..n]),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => self.readable = false,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(e) => return Err(e.into()),
         }
-        if self.pending_header.len() < 4 {
+        if self.pending_header.len() < framing::HEADER_LEN {
             return Ok(None);
         }
         let header = self.client.unmask_header(self.pending_header[..].try_into().unwrap());
@@ -1039,8 +1049,8 @@ impl<'a> Session<'a> {
     }
 
     fn on_validation(&mut self, plain: &[u8]) -> Result<(), SessionError> {
-        let Some(&sub) = plain.get(1) else { return Ok(()) };
-        let job_index = plain.get(2).copied();
+        let Some(&sub) = plain.get(SUBCMD_AT) else { return Ok(()) };
+        let job_index = plain.get(JOB_INDEX_AT).copied();
         let lookup = job_index
             .ok_or((validation::JOB_INDEX_INVALID, Status::BadRequest))
             .and_then(|i| self.shared.slot(i));
@@ -1101,12 +1111,13 @@ impl<'a> Session<'a> {
                 // The C handler takes exactly the job index and the parent hash after the
                 // selector, and serves the parent when it is the job's
                 // (`datum_protocol_job_validation_parent_fetch`).
-                if plain.len() != 35 {
+                if plain.len() != validation::PARENT_FETCH_REQUEST_LEN {
                     warn!("malformed parent fetch request ({} bytes)", plain.len());
                     return Ok(());
                 }
-                let idx = plain[2];
-                let parent_hash: [u8; 32] = plain[3..35].try_into().expect("32 bytes");
+                let idx = plain[JOB_INDEX_AT];
+                let parent_hash: [u8; 32] =
+                    plain[validation::REQUEST_HEADER_LEN..].try_into().expect("32 bytes");
                 let (status, block) = match lookup {
                     Ok(job) if job.template.prev_hash == parent_hash => {
                         self.fetch_parent(&job.template.prev_hash_hex)
@@ -1136,8 +1147,7 @@ impl<'a> Session<'a> {
         match node.call("getblock", serde_json::json!([hash_hex, 0])) {
             Ok(serde_json::Value::String(hex)) => match hex::decode(&hex) {
                 Ok(block)
-                    if !block.is_empty()
-                        && block.len() <= framing::MAX_CMD_DATA_SIZE as usize - 42 =>
+                    if !block.is_empty() && block.len() <= validation::MAX_PARENT_FETCH_BLOCK =>
                 {
                     (ParentStatus::Success, block)
                 }
@@ -1318,14 +1328,18 @@ impl<'a> Session<'a> {
 /// The transaction indexes a `TXNS` request names, in order; `None` when the count is zero,
 /// over the job's, or an index is.
 fn requested_ids(plain: &[u8], txn_count: usize) -> Option<Vec<usize>> {
-    let count = u16::from_le_bytes([*plain.get(3)?, *plain.get(4)?]) as usize;
+    let mut c = ratum::cursor::Cursor::new(plain.get(validation::REQUEST_HEADER_LEN..)?);
+    let count = usize::from(c.u16("index count").ok()?);
     if count == 0 || count > txn_count {
         return None;
     }
-    let ids: Vec<usize> = plain
-        .get(5..5 + 2 * count)?
-        .chunks(2)
-        .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)
+    let ids: Vec<usize> = c
+        .take(count * size_of::<u16>(), "indexes")
+        .ok()?
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| usize::from(u16::from_le_bytes(*b)))
         .collect();
     ids.iter().all(|&i| i < txn_count).then_some(ids)
 }
@@ -1335,6 +1349,11 @@ fn rand_u32() -> u32 {
     dryoc::rng::copy_randombytes(&mut b);
     u32::from_le_bytes(b)
 }
+
+/// How long the gateway waits before reconnecting: five seconds plus up to fifteen more, so
+/// gateways that lost the same pool do not all return at once.
+const RECONNECT_DELAY_MIN: Duration = Duration::from_secs(5);
+const RECONNECT_DELAY_SPREAD: Duration = Duration::from_secs(15);
 
 /// Run sessions until the process ends. After every session a rebuild is requested so the
 /// template thread stops serving pooled jobs; `Shared::failures` counts consecutive sessions
@@ -1356,7 +1375,10 @@ pub fn run_forever(settings: Settings, shared: Arc<Shared>, identity: KeyPairs) 
         } else {
             shared.failures.fetch_add(1, Ordering::Relaxed);
         }
-        let delay = Duration::from_millis(5000 + u64::from(rand_u32() % 15001));
+        let delay = RECONNECT_DELAY_MIN
+            + Duration::from_millis(u64::from(
+                rand_u32() % (RECONNECT_DELAY_SPREAD.as_millis() as u32 + 1),
+            ));
         info!("reconnecting to the pool in {:.1}s", delay.as_secs_f64());
         std::thread::sleep(delay);
     }

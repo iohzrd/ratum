@@ -16,12 +16,94 @@
 //! OP_RETURN output instead, and coinb1 then ends inside that output's script.
 
 use crate::template::Template;
-use ratum::bitcoin::{encode_compact_size, encode_output, encode_push};
+use ratum::bitcoin::opcode::{
+    OP_CHECKMULTISIG, OP_CHECKMULTISIGVERIFY, OP_CHECKSIG, OP_CHECKSIGVERIFY, OP_PUSHDATA1,
+    OP_PUSHDATA2, OP_PUSHDATA4, OP_RETURN,
+};
+use ratum::bitcoin::{
+    HASH_SIZE, LOCK_TIME_SIZE, MIN_OUTPUT_SIZE, OUTPOINT_SIZE, SEQUENCE_SIZE, TX_VERSION_SIZE,
+    WITNESS_SCALE_FACTOR, encode_compact_size, encode_output, encode_push,
+};
+use ratum::datum::coinbase::{
+    POT_TARGET_PLACEHOLDER, TAG_END, TAG_SEPARATOR, UID_PUSH_SIZE_NO_PRIME, UID_PUSH_SIZE_V1,
+    UID_PUSH_SIZE_V3,
+};
 use ratum::datum::messages::CoinbaseOutput;
 use ratum::datum::share::{EXTRANONCE_SIZE, MAX_COINBASE_SECTION_BYTES};
 
-/// The scriptSig length up to which the extranonce push fits inside it (100 - 15).
-const SCRIPT_SIG_ROOM_FOR_EXTRANONCE: usize = 85;
+/// The consensus limit on a coinbase's scriptSig: `tx.vin[0].scriptSig.size() > 100` is
+/// `bad-cb-length` in `consensus/tx_check.cpp`.
+pub const MAX_COINBASE_SCRIPT_SIG: usize = 100;
+
+/// The extranonce push the assembler writes into the scriptSig: a one-byte push opcode
+/// covering the 2-byte enprefix and the 12 extranonce bytes.
+const EXTRANONCE_PUSH_SIZE: usize = 1 + ENPREFIX_SIZE + EXTRANONCE_SIZE;
+const ENPREFIX_SIZE: usize = 2;
+
+/// The scriptSig length up to which the extranonce push fits inside it.
+pub const SCRIPT_SIG_ROOM_FOR_EXTRANONCE: usize = MAX_COINBASE_SCRIPT_SIG - EXTRANONCE_PUSH_SIZE;
+
+/// The zero-value output that carries the extranonce when the scriptSig has no room: the
+/// value and the one-byte script length, then a 16-byte script of `OP_RETURN` and the same
+/// push the scriptSig would have held.
+const OP_RETURN_EXTRANONCE_OUTPUT_SIZE: usize = MIN_OUTPUT_SIZE + 1 + EXTRANONCE_PUSH_SIZE;
+
+/// What the OP_RETURN form costs over the in-scriptSig one, the C gateway's "it costs 10
+/// extra bytes to do the OP_RETURN based extranonce".
+const OP_RETURN_EXTRANONCE_EXTRA_BYTES: usize =
+    OP_RETURN_EXTRANONCE_OUTPUT_SIZE - EXTRANONCE_PUSH_SIZE;
+
+/// The bytes a coinbase occupies other than its scriptSig, the pool payout script and the
+/// dictated outputs, as `datum_coinbaser.c` counts them (`total static bytes = 124`):
+///
+/// ```text
+///  4  version
+///  1  input count
+/// 36  the null outpoint
+///  1  scriptSig length
+///  4  sequence
+///  3  output count, counted at its three-byte CompactSize size
+/// 15  the extranonce push
+///  9  the pool output's value and script length
+/// 47  the witness commitment output (8 value, 1 length, and the 38-byte script the node's
+///     `default_witness_commitment` always is: OP_RETURN and a 36-byte push)
+///  4  lock time
+/// ```
+///
+/// The output count is one byte up to 252 outputs; counted at three so a coinbase built to
+/// the budget never exceeds the room `output_budget` reported.
+fn static_bytes(witness_commitment_len: usize) -> usize {
+    /// The one input: its count, the null outpoint and the one-byte scriptSig length.
+    const NULL_INPUT: usize = 1 + OUTPOINT_SIZE + 1;
+    /// The output count, at the three-byte CompactSize size.
+    const OUTPUT_COUNT: usize = 3;
+    TX_VERSION_SIZE
+        + NULL_INPUT
+        + SEQUENCE_SIZE
+        + OUTPUT_COUNT
+        + EXTRANONCE_PUSH_SIZE
+        + MIN_OUTPUT_SIZE
+        + (MIN_OUTPUT_SIZE + witness_commitment_len)
+        + LOCK_TIME_SIZE
+}
+
+/// The coinbase's bytes before its dictated outputs: the static framing, the scriptSig, the
+/// pool payout script, and the extra an OP_RETURN extranonce output costs when the scriptSig
+/// has no room for the push.
+pub fn fixed_bytes(
+    script_sig_len: usize,
+    pool_script_len: usize,
+    witness_commitment_len: usize,
+) -> usize {
+    static_bytes(witness_commitment_len)
+        + script_sig_len
+        + pool_script_len
+        + if script_sig_len > SCRIPT_SIG_ROOM_FOR_EXTRANONCE {
+            OP_RETURN_EXTRANONCE_EXTRA_BYTES
+        } else {
+            0
+        }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Coinbase {
@@ -85,7 +167,8 @@ pub fn script_sig(t: &Tagging<'_>) -> Result<(Vec<u8>, usize), String> {
         let mut tag1 = t.tag_secondary.as_bytes();
         // The version 3 prime push is 11 bytes rather than 7, so the tags have 4 fewer bytes
         // of the scriptSig to fit in (the C gateway's MAX_COINBASE_TAG_SPACE went 86 to 82).
-        let tag_space = crate::config::MAX_COINBASE_TAG_SPACE - if t.wide_prime { 4 } else { 0 };
+        let tag_space = crate::config::MAX_COINBASE_TAG_SPACE
+            - if t.wide_prime { crate::config::WIDE_PRIME_PUSH_EXTRA_BYTES } else { 0 };
         let mut k = tag0.len() + tag1.len() + 2;
         if tag1.is_empty() {
             k -= 1;
@@ -110,40 +193,34 @@ pub fn script_sig(t: &Tagging<'_>) -> Result<(Vec<u8>, usize), String> {
             let mut data = Vec::with_capacity(k);
             if !tag0.is_empty() {
                 data.extend_from_slice(tag0);
-                data.push(if tag1.is_empty() { 0x00 } else { 0x0f });
+                data.push(if tag1.is_empty() { TAG_END } else { TAG_SEPARATOR });
             } else if !tag1.is_empty() {
-                data.push(0x0f);
+                data.push(TAG_SEPARATOR);
             }
             if !tag1.is_empty() {
                 data.extend_from_slice(tag1);
-                data.push(0x00);
+                data.push(TAG_END);
             }
             script.extend_from_slice(&encode_push(&data));
         } else {
-            script.extend_from_slice(&[0x01, 0x00]);
+            // A one-byte push of TAG_END, so the uid push that follows is not read as a tag.
+            script.extend_from_slice(&[0x01, TAG_END]);
         }
     }
-    let pot_index;
-    if t.prime_id == 0 && !t.datum_active {
-        script.push(0x03);
-        pot_index = script.len();
-        script.push(0xff);
-        script.extend_from_slice(&t.unique_id.to_le_bytes());
+    // The uid push: its size names which prime id form follows the placeholder and unique id.
+    let (push_size, prime_id) = if t.prime_id == 0 && !t.datum_active {
+        (UID_PUSH_SIZE_NO_PRIME, &[][..])
     } else if t.wide_prime {
-        // version 3 protocol: PoT placeholder, 2-byte unique id, 8-byte prime id.
-        script.push(0x0b);
-        pot_index = script.len();
-        script.push(0xff);
-        script.extend_from_slice(&t.unique_id.to_le_bytes());
-        script.extend_from_slice(&t.prime_id.to_le_bytes());
+        (UID_PUSH_SIZE_V3, &t.prime_id.to_le_bytes()[..])
     } else {
-        // Version 1: the prime id is a 32-bit value in a 7-byte push.
-        script.push(0x07);
-        pot_index = script.len();
-        script.push(0xff);
-        script.extend_from_slice(&t.unique_id.to_le_bytes());
-        script.extend_from_slice(&(t.prime_id as u32).to_le_bytes());
-    }
+        (UID_PUSH_SIZE_V1, &(t.prime_id as u32).to_le_bytes()[..])
+    };
+    script.push(push_size as u8);
+    let pot_index = script.len();
+    script.push(POT_TARGET_PLACEHOLDER);
+    script.extend_from_slice(&t.unique_id.to_le_bytes());
+    script.extend_from_slice(prime_id);
+    debug_assert_eq!(script.len(), pot_index + push_size);
     Ok((script, pot_index))
 }
 
@@ -164,6 +241,16 @@ pub struct Params<'a> {
     pub force_op_return_extranonce: bool,
 }
 
+/// The output index of the null outpoint a coinbase spends: all ones.
+const NULL_OUTPOINT_INDEX: [u8; OUTPOINT_SIZE - HASH_SIZE] = [0xff; OUTPOINT_SIZE - HASH_SIZE];
+/// The `nSequence` the coinbase input carries, Core's `SEQUENCE_FINAL`.
+const SEQUENCE_FINAL: [u8; SEQUENCE_SIZE] = [0xff; SEQUENCE_SIZE];
+
+/// The room below which `build` stops considering further outputs, matching the C gateway's
+/// `if (i < 30) break;`: no standard output fits, the smallest being a 22-byte P2WPKH script
+/// and its nine bytes of value and length.
+const MIN_USEFUL_OUTPUT_ROOM: usize = 30;
+
 /// Build a coinbase. Returns it, the offset of the PoT byte in the assembled transaction, and
 /// the outputs that were included.
 pub fn build(p: &Params<'_>) -> (Coinbase, usize, Vec<CoinbaseOutput>) {
@@ -175,10 +262,10 @@ pub fn build(p: &Params<'_>) -> (Coinbase, usize, Vec<CoinbaseOutput>) {
     let mut remaining = p.output_budget;
     let mut sigops_left = p.sigop_budget;
     for o in p.outputs {
-        if remaining < 30 || paid >= p.coinbase_value {
+        if remaining < MIN_USEFUL_OUTPUT_ROOM || paid >= p.coinbase_value {
             break;
         }
-        let cost = o.script.len() + 9;
+        let cost = o.script.len() + MIN_OUTPUT_SIZE;
         let sigops = output_sigop_cost(&o.script);
         if paid.saturating_add(o.value) > p.coinbase_value
             || cost > remaining
@@ -192,29 +279,36 @@ pub fn build(p: &Params<'_>) -> (Coinbase, usize, Vec<CoinbaseOutput>) {
         included.push(o.clone());
     }
 
+    // Version 1, then one input spending the null outpoint.
     let mut coinb1 = vec![0x01, 0x00, 0x00, 0x00, 0x01];
-    coinb1.extend_from_slice(&[0u8; 32]);
-    coinb1.extend_from_slice(&[0xff; 4]);
+    coinb1.extend_from_slice(&[0u8; HASH_SIZE]);
+    coinb1.extend_from_slice(&NULL_OUTPOINT_INDEX);
     let n_out = included.len() as u64 + 1 + u64::from(p.witness_commitment.is_some());
+    // The push opcode covering the enprefix and the extranonce, one byte short of the
+    // 15-byte push because the opcode itself is not part of the data.
+    let extranonce_push_opcode = (EXTRANONCE_PUSH_SIZE - 1) as u8;
     let pot_index;
     let mut coinb2 = Vec::new();
     if in_script {
-        coinb1.extend_from_slice(&encode_compact_size(p.script_sig.len() as u64 + 15));
+        let script_sig_len = (p.script_sig.len() + EXTRANONCE_PUSH_SIZE) as u64;
+        coinb1.extend_from_slice(&encode_compact_size(script_sig_len));
         pot_index = coinb1.len() + p.pot_index_in_script;
         coinb1.extend_from_slice(p.script_sig);
-        coinb1.push(0x0e);
+        coinb1.push(extranonce_push_opcode);
         coinb1.extend_from_slice(&p.enprefix.to_be_bytes());
-        coinb2.extend_from_slice(&[0xff; 4]);
+        coinb2.extend_from_slice(&SEQUENCE_FINAL);
         coinb2.extend_from_slice(&encode_compact_size(n_out));
     } else {
         coinb1.extend_from_slice(&encode_compact_size(p.script_sig.len() as u64));
         pot_index = coinb1.len() + p.pot_index_in_script;
         coinb1.extend_from_slice(p.script_sig);
-        coinb1.extend_from_slice(&[0xff; 4]);
+        coinb1.extend_from_slice(&SEQUENCE_FINAL);
+        // The extranonce OP_RETURN is the first output, so coinb1 ends inside its script and
+        // the assembler's twelve bytes land in the data push.
         coinb1.extend_from_slice(&encode_compact_size(n_out + 1));
         coinb1.extend_from_slice(&0u64.to_le_bytes());
-        coinb1.push(0x10);
-        coinb1.extend_from_slice(&[0x6a, 0x0e]);
+        coinb1.push((OP_RETURN_EXTRANONCE_OUTPUT_SIZE - MIN_OUTPUT_SIZE) as u8);
+        coinb1.extend_from_slice(&[OP_RETURN, extranonce_push_opcode]);
         coinb1.extend_from_slice(&p.enprefix.to_be_bytes());
     }
     for o in &included {
@@ -223,12 +317,14 @@ pub fn build(p: &Params<'_>) -> (Coinbase, usize, Vec<CoinbaseOutput>) {
     if p.coinbase_value > paid {
         coinb2.extend_from_slice(&encode_output(p.coinbase_value - paid, p.pool_script));
     } else {
-        coinb2.extend_from_slice(&encode_output(0, &[0x6a, 0x01, 0x00]));
+        // Every satoshi went to the dictated outputs, but an output was already counted for
+        // the pool; make it a prunable zero-value OP_RETURN rather than shifting the count.
+        coinb2.extend_from_slice(&encode_output(0, &[OP_RETURN, 0x01, 0x00]));
     }
     if let Some(wc) = p.witness_commitment {
         coinb2.extend_from_slice(&encode_output(0, wc));
     }
-    coinb2.extend_from_slice(&[0u8; 4]);
+    coinb2.extend_from_slice(&[0u8; LOCK_TIME_SIZE]);
     (Coinbase { coinb1, coinb2 }, pot_index, included)
 }
 
@@ -256,17 +352,25 @@ pub const MAX_COINBASE_BYTES: usize = MAX_COINBASE_SECTION_BYTES;
 /// `-blockreservedweight` (8,000 by default), so a node serving a pool with many identities
 /// is run with a larger one.
 pub fn output_budget(fixed_bytes: usize, t: &Template) -> usize {
-    // The block around the coinbase: the header, a transaction count of at most five bytes,
-    // and the 36 bytes of witness the node adds to the coinbase (marker, flag, one 32-byte
-    // item), which weigh one unit a byte where the rest weigh four.
-    let around = (ratum::header::HEADER_V2_SIZE + 5) as u64;
-    let size_used = t.totals.size as u64 + around + 36;
+    // The block around the coinbase: the header and a transaction count of at most five
+    // bytes, which weigh four units a byte like the coinbase itself.
+    let around = (ratum::header::HEADER_V2_SIZE + MAX_TXN_COUNT_SIZE) as u64;
+    let size_used = t.totals.size as u64 + around + COINBASE_WITNESS_BYTES;
     let by_size = t.sizelimit.saturating_sub(size_used);
-    let weight_used = t.totals.weight as u64 + 4 * around + 36;
-    let by_weight = t.weightlimit.saturating_sub(weight_used) >> 2;
+    let weight_used =
+        t.totals.weight as u64 + WITNESS_SCALE_FACTOR * around + COINBASE_WITNESS_BYTES;
+    let by_weight = t.weightlimit.saturating_sub(weight_used) / WITNESS_SCALE_FACTOR;
     let room = by_size.min(by_weight).min(MAX_COINBASE_BYTES as u64) as usize;
     room.saturating_sub(fixed_bytes)
 }
+
+/// The largest CompactSize a block's transaction count occupies; `MAX_TXNS` needs three, but
+/// the C gateway counts five and the difference is two bytes of coinbase room.
+const MAX_TXN_COUNT_SIZE: usize = 5;
+
+/// The witness the node adds to the coinbase: the marker and flag and a single 32-byte
+/// reserved item with its count and length. These weigh one unit a byte, not four.
+const COINBASE_WITNESS_BYTES: u64 = 36;
 
 /// The sigop cost of an output script as the block limit counts it: legacy sigops times
 /// four (`GetLegacySigOpCount` counts output scripts, and the coinbase's count is scaled by
@@ -274,19 +378,23 @@ pub fn output_budget(fixed_bytes: usize, t: &Template) -> usize {
 /// and OP_CHECKMULTISIGVERIFY twenty (the inaccurate count the limit uses); push data is
 /// skipped. A segwit output (P2WPKH, P2WSH, P2TR) costs nothing, a P2PKH output four.
 pub fn output_sigop_cost(script: &[u8]) -> u64 {
+    /// What `GetSigOpCount(false)` charges a CHECKMULTISIG whose key count it does not read.
+    const MAX_PUBKEYS_PER_MULTISIG: u64 = 20;
+    const MAX_DIRECT_PUSH_OPCODE: u8 = ratum::bitcoin::opcode::MAX_DIRECT_PUSH as u8;
+
     let mut cost = 0u64;
     let mut i = 0usize;
     while i < script.len() {
         let op = script[i];
         i += 1;
         let push = match op {
-            0x01..=0x4b => usize::from(op),
-            0x4c => {
+            0x01..=MAX_DIRECT_PUSH_OPCODE => usize::from(op),
+            OP_PUSHDATA1 => {
                 let n = script.get(i).map_or(0, |&b| usize::from(b));
                 i += 1;
                 n
             }
-            0x4d => {
+            OP_PUSHDATA2 => {
                 let n = match script.get(i..i + 2) {
                     Some(b) => usize::from(u16::from_le_bytes([b[0], b[1]])),
                     None => 0,
@@ -294,7 +402,7 @@ pub fn output_sigop_cost(script: &[u8]) -> u64 {
                 i += 2;
                 n
             }
-            0x4e => {
+            OP_PUSHDATA4 => {
                 let n = match script.get(i..i + 4) {
                     Some(b) => u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize,
                     None => 0,
@@ -302,12 +410,12 @@ pub fn output_sigop_cost(script: &[u8]) -> u64 {
                 i += 4;
                 n
             }
-            0xac | 0xad => {
-                cost += 4;
+            OP_CHECKSIG | OP_CHECKSIGVERIFY => {
+                cost += WITNESS_SCALE_FACTOR;
                 0
             }
-            0xae | 0xaf => {
-                cost += 80;
+            OP_CHECKMULTISIG | OP_CHECKMULTISIGVERIFY => {
+                cost += MAX_PUBKEYS_PER_MULTISIG * WITNESS_SCALE_FACTOR;
                 0
             }
             _ => 0,

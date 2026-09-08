@@ -15,8 +15,18 @@ use dryoc::constants::{
 pub(crate) type PrecompKey = [u8; CRYPTO_BOX_BEFORENMBYTES];
 pub(crate) type Signature = [u8; CRYPTO_SIGN_BYTES];
 
-/// Four 32-byte public keys: the client's long-term pair and its session pair.
-pub(crate) const KEYS_LEN: usize = 128;
+/// An ed25519 signing key and a curve25519 box key are both 32 bytes.
+pub(crate) const PUBKEY_LEN: usize = 32;
+/// Four public keys: the client's long-term pair and its session pair, in that order.
+pub(crate) const KEYS_LEN: usize = 4 * PUBKEY_LEN;
+/// The keys the pool's response echoes and appends to: the client's four and the pool's own
+/// session signing and box keys.
+pub(crate) const RESPONSE_KEYS_LEN: usize = KEYS_LEN + 2 * PUBKEY_LEN;
+
+/// The `n`th public key in a handshake key block. `None` when the block is shorter.
+pub(crate) fn key_at(block: &[u8], n: usize) -> Option<&[u8]> {
+    block.get(n * PUBKEY_LEN..(n + 1) * PUBKEY_LEN)
+}
 
 /// The most of a hello's user agent to keep and log. The field runs to a NUL and a peer can
 /// make it as long as a hello frame allows (megabytes), so it is truncated before it is
@@ -71,13 +81,47 @@ impl KeyPairs {
         KeyPairs { sign_pk, sign_sk, box_pk, box_sk }
     }
 
+    /// The two public keys as hex, the form `datum.pool_pubkey` takes.
     pub fn pubkey_hex(&self) -> String {
-        let mut v = Vec::with_capacity(64);
+        let mut v = Vec::with_capacity(2 * PUBKEY_LEN);
         v.extend_from_slice(&self.sign_pk);
         v.extend_from_slice(&self.box_pk);
         hex::encode(v)
     }
+
+    /// The four keys concatenated in field order, the layout the pool's key file stores.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(KEY_PAIRS_LEN);
+        v.extend_from_slice(&self.sign_pk);
+        v.extend_from_slice(&self.sign_sk);
+        v.extend_from_slice(&self.box_pk);
+        v.extend_from_slice(&self.box_sk);
+        v
+    }
+
+    /// The inverse of [`KeyPairs::to_bytes`]; `None` unless the input is exactly
+    /// `KEY_PAIRS_LEN` bytes.
+    pub fn from_bytes(raw: &[u8]) -> Option<Self> {
+        if raw.len() != KEY_PAIRS_LEN {
+            return None;
+        }
+        let (sign_pk, rest) = raw.split_at(size_of::<SignPublicKey>());
+        let (sign_sk, rest) = rest.split_at(size_of::<SignSecretKey>());
+        let (box_pk, box_sk) = rest.split_at(size_of::<BoxPublicKey>());
+        Some(KeyPairs {
+            sign_pk: sign_pk.try_into().ok()?,
+            sign_sk: sign_sk.try_into().ok()?,
+            box_pk: box_pk.try_into().ok()?,
+            box_sk: box_sk.try_into().ok()?,
+        })
+    }
 }
+
+/// The bytes [`KeyPairs::to_bytes`] writes: the four keys in field order.
+pub const KEY_PAIRS_LEN: usize = size_of::<SignPublicKey>()
+    + size_of::<SignSecretKey>()
+    + size_of::<BoxPublicKey>()
+    + size_of::<BoxSecretKey>();
 
 /// The DRS extension marker a version 3 hello carries after `nk`, then a flag byte and, when
 /// the flag is 1, the 40-byte resume token. `open_hello` removes the signature before
@@ -131,26 +175,29 @@ pub fn open_hello(header: Header, payload: &[u8], pool: &KeyPairs) -> Result<Hel
     }
     let (signed, sig) = plain.split_at(plain.len() - CRYPTO_SIGN_BYTES);
     let sig: Signature = sig.try_into().map_err(|_| Error::Truncated)?;
-    let client_sign_pk: SignPublicKey = signed[0..32].try_into().unwrap();
+    let key = |n| key_at(signed, n).expect("KEYS_LEN checked").try_into().expect("PUBKEY_LEN");
+    let client_sign_pk: SignPublicKey = key(0);
     crypto_sign_verify_detached(&sig, signed, &client_sign_pk).map_err(|_| Error::BadSignature)?;
 
-    let client_box_pk: BoxPublicKey = signed[32..64].try_into().unwrap();
-    let session_sign_pk: SignPublicKey = signed[64..96].try_into().unwrap();
-    let session_box_pk: BoxPublicKey = signed[96..128].try_into().unwrap();
+    let client_box_pk: BoxPublicKey = key(1);
+    let session_sign_pk: SignPublicKey = key(2);
+    let session_box_pk: BoxPublicKey = key(3);
 
     let rest = &signed[KEYS_LEN..];
     let nul = rest.iter().position(|&b| b == 0).ok_or(Error::Malformed("no UA terminator"))?;
     let user_agent = String::from_utf8_lossy(&rest[..nul.min(MAX_USER_AGENT)]).into_owned();
+    // After the user agent's terminator: the struct end marker and the four-byte nonce key.
+    const AFTER_UA_LEN: usize = 1 + size_of::<u32>();
     let after = &rest[nul + 1..];
-    if after.len() < 5 {
+    if after.len() < AFTER_UA_LEN {
         return Err(Error::Truncated);
     }
     if after[0] != STRUCT_END {
         return Err(Error::Malformed("no 0xFE after user agent"));
     }
-    let nk = u32::from_le_bytes(after[1..5].try_into().unwrap());
+    let nk = u32::from_le_bytes(after[1..AFTER_UA_LEN].try_into().unwrap());
 
-    let tail = &after[5..];
+    let tail = &after[AFTER_UA_LEN..];
     let generation = if tail.len() >= 5 && tail[..4] == DRS_MARKER {
         let resume = if tail[4] != 0 {
             let token: super::messages::ResumeToken = tail
@@ -341,7 +388,7 @@ pub fn accept(hello: Hello, pool: &KeyPairs, motd: &str) -> Result<(Vec<u8>, Ses
     let (session_sign_pk, session_sign_sk) = crypto_sign_keypair();
     let (session_box_pk, session_box_sk) = crypto_box_keypair();
 
-    let mut body = Vec::with_capacity(KEYS_LEN + 64 + motd.len() + 1);
+    let mut body = Vec::with_capacity(RESPONSE_KEYS_LEN + motd.len() + 1);
     body.extend_from_slice(&hello.client_sign_pk);
     body.extend_from_slice(&hello.client_box_pk);
     body.extend_from_slice(&hello.session_sign_pk);

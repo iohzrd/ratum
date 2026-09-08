@@ -4,10 +4,42 @@
 //! network check: an address of any of these chains is accepted whatever chain the node is on.
 
 use bech32::Hrp;
+use ratum::bitcoin::opcode::{
+    OP_0, OP_1, OP_16, OP_CHECKSIG, OP_DUP, OP_EQUAL, OP_EQUALVERIFY, OP_HASH160, OP_RETURN,
+};
+
+/// `base58Prefixes[PUBKEY_ADDRESS]` and `[SCRIPT_ADDRESS]` (`kernel/chainparams.cpp`):
+/// mainnet, then the value testnet, signet and regtest share.
+const PUBKEY_ADDRESS_MAIN: u8 = 0;
+const PUBKEY_ADDRESS_TEST: u8 = 111;
+const SCRIPT_ADDRESS_MAIN: u8 = 5;
+const SCRIPT_ADDRESS_TEST: u8 = 196;
+
+/// A base58check payload: the one-byte version prefix and a HASH160.
+const HASH160_SIZE: usize = 20;
+const BASE58_PAYLOAD_SIZE: usize = 1 + HASH160_SIZE;
+
+/// `OP_DUP OP_HASH160 <20> ... OP_EQUALVERIFY OP_CHECKSIG`.
+const P2PKH_SIZE: usize = 25;
+/// `OP_HASH160 <20> ... OP_EQUAL`.
+const P2SH_SIZE: usize = 23;
+/// The witness program lengths a witness version 0 output may carry: P2WPKH and P2WSH.
+const WITNESS_V0_PROGRAM_SIZES: [usize; 2] = [HASH160_SIZE, 32];
+/// A witness version 1 output carries only the 32-byte P2TR program.
+const WITNESS_V1_PROGRAM_SIZE: usize = 32;
+/// The witness program lengths BIP141 allows at all.
+const WITNESS_PROGRAM_SIZES: std::ops::RangeInclusive<usize> = 2..=40;
+
+/// The shortest string `addr_2_output_script` examines at all.
+const MIN_ADDRESS_CHARS: usize = 16;
+/// The longest string [`to_output_script`] is called on, a bound on the work a stratum
+/// username or a configured address can cost before it is decoded. Every accepted form is
+/// far shorter: the longest is a 62-character bech32m P2TR address.
+pub const MAX_ADDRESS_CHARS: usize = 128;
 
 /// The output script an address pays to, or `None` when it is not one of the accepted forms.
 pub fn to_output_script(addr: &str) -> Option<Vec<u8>> {
-    if addr.len() < 16 {
+    if addr.len() < MIN_ADDRESS_CHARS {
         return None;
     }
     let lower = addr.to_ascii_lowercase();
@@ -24,37 +56,43 @@ pub fn to_output_script(addr: &str) -> Option<Vec<u8>> {
             return None;
         }
         let v = version.to_u8();
-        let ok = (v == 0 && (program.len() == 20 || program.len() == 32))
-            || (v == 1 && program.len() == 32);
+        let ok = (v == 0 && WITNESS_V0_PROGRAM_SIZES.contains(&program.len()))
+            || (v == 1 && program.len() == WITNESS_V1_PROGRAM_SIZE);
         if !ok {
             return None;
         }
         let mut script = Vec::with_capacity(2 + program.len());
-        script.push(if v == 0 { 0x00 } else { 0x50 + v });
+        script.push(witness_version_opcode(v));
         script.push(program.len() as u8);
         script.extend_from_slice(&program);
         return Some(script);
     }
     let decoded = bs58::decode(addr).with_check(None).into_vec().ok()?;
-    if decoded.len() != 21 {
+    if decoded.len() != BASE58_PAYLOAD_SIZE {
         return None;
     }
     let (version, hash) = (decoded[0], &decoded[1..]);
     match version {
-        0 | 111 => {
-            let mut s = vec![0x76, 0xa9, 0x14];
+        PUBKEY_ADDRESS_MAIN | PUBKEY_ADDRESS_TEST => {
+            let mut s = vec![OP_DUP, OP_HASH160, HASH160_SIZE as u8];
             s.extend_from_slice(hash);
-            s.extend_from_slice(&[0x88, 0xac]);
+            s.extend_from_slice(&[OP_EQUALVERIFY, OP_CHECKSIG]);
             Some(s)
         }
-        5 | 196 => {
-            let mut s = vec![0xa9, 0x14];
+        SCRIPT_ADDRESS_MAIN | SCRIPT_ADDRESS_TEST => {
+            let mut s = vec![OP_HASH160, HASH160_SIZE as u8];
             s.extend_from_slice(hash);
-            s.push(0x87);
+            s.push(OP_EQUAL);
             Some(s)
         }
         _ => None,
     }
+}
+
+/// The opcode a witness program's version is written as: `OP_0` for version 0, `OP_1`
+/// through `OP_16` above it (`CScript() << CScript::EncodeOP_N(version)`).
+fn witness_version_opcode(version: u8) -> u8 {
+    if version == 0 { OP_0 } else { OP_1 - 1 + version }
 }
 
 pub fn is_valid(addr: &str) -> bool {
@@ -67,33 +105,36 @@ pub fn username_address(username: &str) -> &str {
     &username[..end]
 }
 
-/// Whether a username begins with an address a coinbase output can pay
-/// (`datum_stratum_username_is_payable`).
+/// Whether a username begins with an address a coinbase output can pay.
 pub fn username_is_payable(username: &str) -> bool {
     let a = username_address(username);
-    !a.is_empty() && a.len() < 128 && is_valid(a)
+    !a.is_empty() && a.len() < MAX_ADDRESS_CHARS && is_valid(a)
 }
 
 /// The display form of an output script (`output_script_2_addr`): mainnet prefixes whatever
 /// the chain, `OP_RETURN` for a data output, `UNKNOWN` otherwise.
 pub fn output_script_to_display(script: &[u8]) -> String {
-    if script.first() == Some(&0x6a) {
+    if script.first() == Some(&OP_RETURN) {
         return "OP_RETURN".to_string();
     }
-    if script.len() == 23 && script[0] == 0xa9 && script[1] == 0x14 && script[22] == 0x87 {
-        let mut payload = vec![5u8];
-        payload.extend_from_slice(&script[2..22]);
-        return bs58::encode(payload).with_check().into_string();
+    if script.len() == P2SH_SIZE
+        && script[0] == OP_HASH160
+        && script[1] == HASH160_SIZE as u8
+        && script[P2SH_SIZE - 1] == OP_EQUAL
+    {
+        return base58check(SCRIPT_ADDRESS_MAIN, &script[2..2 + HASH160_SIZE]);
     }
-    if script.len() == 25 && script[0] == 0x76 && script[1] == 0xa9 && script[2] == 0x14 {
-        let mut payload = vec![0u8];
-        payload.extend_from_slice(&script[3..23]);
-        return bs58::encode(payload).with_check().into_string();
+    if script.len() == P2PKH_SIZE
+        && script[0] == OP_DUP
+        && script[1] == OP_HASH160
+        && script[2] == HASH160_SIZE as u8
+    {
+        return base58check(PUBKEY_ADDRESS_MAIN, &script[3..3 + HASH160_SIZE]);
     }
-    if script.len() >= 4 && (script[0] == 0x00 || (0x51..=0x60).contains(&script[0])) {
-        let version = if script[0] == 0x00 { 0 } else { script[0] - 0x50 };
+    if script.len() >= 4 && (script[0] == OP_0 || (OP_1..=OP_16).contains(&script[0])) {
+        let version = if script[0] == OP_0 { 0 } else { script[0] - (OP_1 - 1) };
         let len = script[1] as usize;
-        if (2..=40).contains(&len)
+        if WITNESS_PROGRAM_SIZES.contains(&len)
             && script.len() == 2 + len
             && let (Ok(hrp), Ok(v)) = (Hrp::parse("bc"), bech32::Fe32::try_from(version))
             && let Ok(s) = bech32::segwit::encode(hrp, v, &script[2..])
@@ -102,6 +143,13 @@ pub fn output_script_to_display(script: &[u8]) -> String {
         }
     }
     "UNKNOWN".to_string()
+}
+
+fn base58check(version: u8, hash: &[u8]) -> String {
+    let mut payload = Vec::with_capacity(BASE58_PAYLOAD_SIZE);
+    payload.push(version);
+    payload.extend_from_slice(hash);
+    bs58::encode(payload).with_check().into_string()
 }
 
 #[cfg(test)]

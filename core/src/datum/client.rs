@@ -1,5 +1,7 @@
 use super::framing::{self, Header, HeaderKeys, KeyRatchet, STRUCT_END, SessionNonces};
-use super::handshake::{Channel, Error, Generation, KEYS_LEN, KeyPairs, Signature};
+use super::handshake::{
+    Channel, Error, Generation, KEYS_LEN, KeyPairs, RESPONSE_KEYS_LEN, Signature, key_at,
+};
 use dryoc::classic::crypto_box::{
     PublicKey as BoxPublicKey, crypto_box_beforenm, crypto_box_seal, crypto_box_seal_open,
 };
@@ -149,7 +151,8 @@ impl Client {
         wire: &[u8],
         pool_sign_pk: &SignPublicKey,
     ) -> Result<(), Error> {
-        let head: [u8; 4] = wire.get(..4).ok_or(Error::Truncated)?.try_into().unwrap();
+        let head: [u8; framing::HEADER_LEN] =
+            wire.get(..framing::HEADER_LEN).ok_or(Error::Truncated)?.try_into().unwrap();
         let header = self.channel.unmask_header(head);
         if header.proto_cmd != framing::cmd::HANDSHAKE_RESPONSE
             || !header.is_signed
@@ -157,7 +160,9 @@ impl Client {
         {
             return Err(Error::BadHeader(header));
         }
-        let ct = wire.get(4..4 + header.cmd_len as usize).ok_or(Error::Truncated)?;
+        let ct = wire
+            .get(framing::HEADER_LEN..framing::HEADER_LEN + header.cmd_len as usize)
+            .ok_or(Error::Truncated)?;
         if ct.len() < CRYPTO_BOX_SEALBYTES {
             return Err(Error::Truncated);
         }
@@ -165,7 +170,7 @@ impl Client {
         let mut plain = vec![0u8; ct.len() - CRYPTO_BOX_SEALBYTES];
         crypto_box_seal_open(&mut plain, ct, &self.session_keys.box_pk, &self.session_keys.box_sk)
             .map_err(|_| Error::Unseal)?;
-        if plain.len() < KEYS_LEN + 64 + CRYPTO_SIGN_BYTES {
+        if plain.len() < RESPONSE_KEYS_LEN + CRYPTO_SIGN_BYTES {
             return Err(Error::Truncated);
         }
 
@@ -173,17 +178,20 @@ impl Client {
         let sig: Signature = sig.try_into().map_err(|_| Error::Truncated)?;
         crypto_sign_verify_detached(&sig, signed, pool_sign_pk).map_err(|_| Error::BadSignature)?;
 
-        if signed[0..32] != self.long_term_keys.sign_pk[..]
-            || signed[32..64] != self.long_term_keys.box_pk[..]
-            || signed[64..96] != self.session_keys.sign_pk[..]
-            || signed[96..128] != self.session_keys.box_pk[..]
-        {
+        let sent = [
+            &self.long_term_keys.sign_pk[..],
+            &self.long_term_keys.box_pk[..],
+            &self.session_keys.sign_pk[..],
+            &self.session_keys.box_pk[..],
+        ];
+        if sent.iter().enumerate().any(|(n, k)| key_at(signed, n) != Some(*k)) {
             return Err(Error::Malformed("response does not echo the client's keys"));
         }
 
-        let pool_sign: SignPublicKey = signed[128..160].try_into().unwrap();
-        let pool_box: BoxPublicKey = signed[160..192].try_into().unwrap();
-        let motd = &signed[192..];
+        let key = |n| key_at(signed, n).expect("length checked").try_into().expect("PUBKEY_LEN");
+        let pool_sign: SignPublicKey = key(4);
+        let pool_box: BoxPublicKey = key(5);
+        let motd = &signed[RESPONSE_KEYS_LEN..];
         let end = motd.iter().position(|&b| b == 0).unwrap_or(motd.len());
         self.motd = String::from_utf8_lossy(&motd[..end]).into_owned();
         self.pool_session_sign_pk = Some(pool_sign);

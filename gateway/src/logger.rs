@@ -64,16 +64,26 @@ pub struct Logger {
     calling_function: bool,
 }
 
-/// `YYYY-MM-DD HH:MM:SS.mmm` for `secs` since the Unix epoch, in UTC, by the civil-from-days
-/// conversion of the epoch day.
+/// Days from 0000-03-01, the civil-from-days algorithm's epoch, to 1970-01-01. The algorithm
+/// starts the year in March so the leap day falls at a year's end and the month-length
+/// pattern is regular.
+const DAYS_TO_UNIX_EPOCH: i64 = 719_468;
+/// Days in a 400-year era, over which the Gregorian calendar repeats.
+const DAYS_PER_ERA: i64 = 146_097;
+const YEARS_PER_ERA: i64 = 400;
+
+/// `YYYY-MM-DD HH:MM:SS.mmm` for `secs` since the Unix epoch, in UTC, by Howard Hinnant's
+/// `civil_from_days` conversion of the epoch day. The remaining constants are that
+/// algorithm's: 1460, 36524 and 146096 are the days in 4, 100 and 400 years less one, and
+/// 153 and 5 recover a month from the day of the March-based year.
 fn format_time(secs: u64, millis: u32) -> String {
-    let days = (secs / 86400) as i64;
-    let sod = secs % 86400;
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
+    let days = (secs / ratum::SECS_PER_DAY) as i64;
+    let sod = secs % ratum::SECS_PER_DAY;
+    let z = days + DAYS_TO_UNIX_EPOCH;
+    let era = z.div_euclid(DAYS_PER_ERA);
+    let doe = z.rem_euclid(DAYS_PER_ERA);
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
+    let y = yoe + era * YEARS_PER_ERA;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
     let d = doy - (153 * mp + 2) / 5 + 1;
@@ -81,9 +91,9 @@ fn format_time(secs: u64, millis: u32) -> String {
     let y = if m <= 2 { y + 1 } else { y };
     format!(
         "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}.{millis:03}",
-        sod / 3600,
-        (sod % 3600) / 60,
-        sod % 60
+        sod / ratum::SECS_PER_HOUR,
+        (sod % ratum::SECS_PER_HOUR) / ratum::SECS_PER_MINUTE,
+        sod % ratum::SECS_PER_MINUTE
     )
 }
 

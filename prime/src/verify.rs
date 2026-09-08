@@ -1,4 +1,7 @@
 use ratum::bitcoin::{self, CoinbaseTx};
+use ratum::datum::coinbase::{
+    TAG_END, TAG_SEPARATOR, UID_PUSH_PREFIX_SIZE, UID_PUSH_SIZE_V1, UID_PUSH_SIZE_V3,
+};
 use ratum::datum::messages::{ClientConfig, CoinbaseOutput, CoinbaserResponse, RejectReason};
 use ratum::datum::share::{
     self, COINBASE_ID_SUBSIDY_ONLY, CoinbaseSection, JobSection, MAX_COINBASE_SECTION_BYTES,
@@ -856,53 +859,52 @@ fn build_header_v2(
 fn locate_pot_byte(tx: &CoinbaseTx, policy: &PoolPolicy) -> Result<(usize, String), RejectReason> {
     let pushes = bitcoin::script_pushes(&tx.script_sig);
     let prime = policy.prime_id.to_le_bytes();
-    // The push is the PoT byte, the 2-byte unique id, then the prime ID: 4 bytes in the v1
-    // gateway's 7-byte push, 8 in the version 3 protocol's 11-byte push. The 7-byte form only
-    // names a prime ID that fits in 32 bits.
+    // The uid push is the PoT byte, the 2-byte unique id, then the prime id: 4 bytes in the
+    // version 1 form, 8 in the version 3 one. The version 1 form only names a prime id that
+    // fits in 32 bits.
     let uid_push = pushes
         .iter()
-        .position(|(_, data)| match data.len() {
-            7 => policy.prime_id <= u64::from(u32::MAX) && data[3..7] == prime[..4],
-            11 => data[3..11] == prime,
-            _ => false,
+        .position(|(_, data)| {
+            let Some(id) = data.get(UID_PUSH_PREFIX_SIZE..) else { return false };
+            match data.len() {
+                UID_PUSH_SIZE_V1 => policy.prime_id <= u64::from(u32::MAX) && id == &prime[..4],
+                UID_PUSH_SIZE_V3 => id == prime,
+                _ => false,
+            }
         })
         .ok_or(RejectReason::MissingPoolTag)?;
 
     let mut tag_secondary = String::new();
+    // The tag push, when there is one, is the push before the uid push.
+    let tag_push = uid_push.checked_sub(1).map(|i| pushes[i].1);
     if !policy.coinbase_tag.is_empty() {
         let tag = policy.coinbase_tag.as_bytes();
-        let ok = uid_push > 0 && {
-            let (_, data) = pushes[uid_push - 1];
-            data.len() > tag.len()
-                && &data[..tag.len()] == tag
-                // What the gateway writes after the primary tag: 0x00 when it
-                // is the only tag, 0x0F when a secondary one follows.
-                && matches!(data[tag.len()], 0x00 | 0x0f)
-        };
-        if !ok {
-            return Err(RejectReason::MissingPoolTag);
+        // What the gateway writes after the primary tag: TAG_END when it is the only tag,
+        // TAG_SEPARATOR when a secondary one follows.
+        let after_tag = tag_push
+            .filter(|data| data.len() > tag.len() && &data[..tag.len()] == tag)
+            .map(|data| (data, data[tag.len()]))
+            .filter(|(_, marker)| matches!(*marker, TAG_END | TAG_SEPARATOR))
+            .ok_or(RejectReason::MissingPoolTag)?;
+        if after_tag.1 == TAG_SEPARATOR {
+            tag_secondary = decode_tag(&after_tag.0[tag.len() + 1..]);
         }
-        let (_, data) = pushes[uid_push - 1];
-        if data[tag.len()] == 0x0f {
-            tag_secondary = decode_tag(&data[tag.len() + 1..]);
-        }
-    } else if uid_push > 0 {
-        // With no pool tag to anchor on, a push starting with the 0x0F marker is a
-        // secondary tag with an empty primary (`coinbase::script_sig` in the gateway).
-        let (_, data) = pushes[uid_push - 1];
-        if data.first() == Some(&0x0f) {
-            tag_secondary = decode_tag(&data[1..]);
-        }
+    } else if let Some(data) = tag_push
+        // With no pool tag to anchor on, a push starting with TAG_SEPARATOR is a secondary
+        // tag with an empty primary (`coinbase::script_sig` in the gateway).
+        && data.first() == Some(&TAG_SEPARATOR)
+    {
+        tag_secondary = decode_tag(&data[1..]);
     }
 
     Ok((tx.script_sig_offset + pushes[uid_push].0, tag_secondary))
 }
 
-/// Decode the bytes between the 0x0F marker and the end of the tag push for display: the
-/// gateway terminates the tag with 0x00, so one trailing 0x00 is removed; the bytes are
-/// client-chosen, so invalid UTF-8 is replaced and control characters are dropped.
+/// Decode the bytes between the `TAG_SEPARATOR` and the end of the tag push for display: the
+/// gateway terminates the tag with `TAG_END`, so one trailing `TAG_END` is removed; the bytes
+/// are client-chosen, so invalid UTF-8 is replaced and control characters are dropped.
 fn decode_tag(bytes: &[u8]) -> String {
-    let bytes = bytes.strip_suffix(&[0x00]).unwrap_or(bytes);
+    let bytes = bytes.strip_suffix(&[TAG_END]).unwrap_or(bytes);
     String::from_utf8_lossy(bytes).chars().filter(|c| !c.is_control()).collect()
 }
 

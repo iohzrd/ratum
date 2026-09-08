@@ -39,8 +39,9 @@ pub struct Context {
     pub history: Mutex<VecDeque<(u64, f64)>>,
 }
 
-const HISTORY_INTERVAL_SECS: u64 = 60;
-const HISTORY_CAP: usize = 24 * 60;
+const HISTORY_INTERVAL_SECS: u64 = ratum::SECS_PER_MINUTE;
+/// A day of history at one sample a minute.
+const HISTORY_CAP: usize = (ratum::SECS_PER_DAY / HISTORY_INTERVAL_SECS) as usize;
 
 fn unix_now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
@@ -75,13 +76,14 @@ fn secure_eq(a: &str, b: &str) -> bool {
 }
 
 fn duration_text(d: std::time::Duration) -> String {
+    use ratum::{SECS_PER_DAY, SECS_PER_HOUR, SECS_PER_MINUTE};
     let s = d.as_secs();
     format!(
         "{} days, {} hours, {} minutes, {} seconds",
-        s / 86400,
-        (s % 86400) / 3600,
-        (s % 3600) / 60,
-        s % 60
+        s / SECS_PER_DAY,
+        (s % SECS_PER_DAY) / SECS_PER_HOUR,
+        (s % SECS_PER_HOUR) / SECS_PER_MINUTE,
+        s % SECS_PER_MINUTE
     )
 }
 
@@ -299,7 +301,8 @@ impl Totals {
 
 fn miner_lookup_json(ctx: &Context, addr: Option<&str>) -> Value {
     let cfg = &ctx.server.config;
-    let valid = addr.filter(|a| a.len() < 128 && crate::address::is_valid(a));
+    let valid =
+        addr.filter(|a| a.len() < crate::address::MAX_ADDRESS_CHARS && crate::address::is_valid(a));
     let clients = valid.map_or_else(Vec::new, |a| {
         ctx.server.client_stats_where(|c| {
             c.subscribed && crate::address::username_address(&c.username) == a

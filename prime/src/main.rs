@@ -23,6 +23,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// Bitcoin Core's dust threshold for a P2PKH output, the highest among the common output
+/// types (P2WPKH 294, P2TR 330), so an output at or above it is not dust for any of them.
+/// The default `--min-payout`.
+const DUST_THRESHOLD_P2PKH: u64 = 546;
+
+/// The largest `--fee-bps` accepted: one percent.
+const MAX_FEE_BPS: u16 = 100;
+
 /// Where the share ledger lives, as far as the command line settles it.
 enum LedgerLocation {
     /// `--ledger <file>`: this file, whatever chain the node is on.
@@ -254,26 +262,18 @@ fn load_or_create_keys(path: &Path) -> io::Result<KeyPairs> {
         let text = std::fs::read_to_string(path)?;
         let raw =
             hex::decode(text.trim()).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        if raw.len() != 160 {
-            return Err(io::Error::new(
+        KeyPairs::from_bytes(&raw).ok_or_else(|| {
+            io::Error::new(
                 io::ErrorKind::InvalidData,
-                "key file must decode to 160 bytes of hex",
-            ));
-        }
-        Ok(KeyPairs {
-            sign_pk: raw[0..32].try_into().unwrap(),
-            sign_sk: raw[32..96].try_into().unwrap(),
-            box_pk: raw[96..128].try_into().unwrap(),
-            box_sk: raw[128..160].try_into().unwrap(),
+                format!(
+                    "key file must decode to {} bytes of hex",
+                    ratum::datum::handshake::KEY_PAIRS_LEN
+                ),
+            )
         })
     } else {
         let keys = KeyPairs::generate();
-        let mut raw = Vec::with_capacity(160);
-        raw.extend_from_slice(&keys.sign_pk);
-        raw.extend_from_slice(&keys.sign_sk);
-        raw.extend_from_slice(&keys.box_pk);
-        raw.extend_from_slice(&keys.box_sk);
-        write_private(path, hex::encode(raw).as_bytes())?;
+        write_private(path, hex::encode(keys.to_bytes()).as_bytes())?;
         info!("generated new pool keys at {}", path.display());
         Ok(keys)
     }
@@ -421,29 +421,29 @@ fn main() -> io::Result<()> {
         |_| true,
     )
     .max(1);
-    // 546 is Bitcoin Core's dust threshold for a P2PKH output, the highest among the common
-    // output types (P2WPKH 294, P2TR 330), so an output at or above it is not dust for any of
-    // them. What is withheld goes to the other miners, not to the pool: an identity under the
+    // What is withheld goes to the other miners, not to the pool: an identity under the
     // minimum receives no output and its work leaves the denominator.
     let min_payout = cli::resolve::<u64>(
         c.min_payout.as_deref(),
         f.min_payout,
-        546,
+        DUST_THRESHOLD_P2PKH,
         "--min-payout",
         "a count of satoshis",
         |_| true,
     );
-    // The operator fee in basis points (hundredths of a percent), 0 to 100, so at most 1%. It
-    // is deducted from the coinbase value before the split; the gateway pays it to the pool's
-    // payout script as the remainder. The default 0 deducts nothing, so the whole value is
-    // split among miners.
+    // The operator fee in basis points (hundredths of a percent). It is deducted from the
+    // coinbase value before the split; the gateway pays it to the pool's payout script as the
+    // remainder. The default 0 deducts nothing, so the whole value is split among miners.
     let fee_bps = cli::resolve::<u16>(
         c.fee_bps.as_deref(),
         f.fee_bps,
         0,
         "--fee-bps",
-        "basis points from 0 to 100 (a fee of at most 1%)",
-        |n| *n <= 100,
+        &format!(
+            "basis points from 0 to {MAX_FEE_BPS} (a fee of at most {}%)",
+            f64::from(MAX_FEE_BPS) / 100.0
+        ),
+        |n| *n <= MAX_FEE_BPS,
     );
     let rpc_url = c.rpc.clone().or(f.rpc);
     let mut rpc_user = cli::resolve_str(c.rpc_user.clone(), f.rpc_user, "");
@@ -616,8 +616,9 @@ fn main() -> io::Result<()> {
         let flag = if payout_address.is_some() { "--payout-address" } else { "--payout-script" };
         eprintln!(
             "{flag} gives a {}-byte script, which a block carrying it would be rejected for: \
-             a coinbase output script may be at most 34 bytes",
-            payout_script.len()
+             a coinbase output script may be at most {} bytes",
+            payout_script.len(),
+            ratum::bitcoin::MAX_OUTPUT_SCRIPT_SIZE
         );
         std::process::exit(2);
     }

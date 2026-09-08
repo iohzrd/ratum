@@ -6,7 +6,7 @@ use crate::coinbase::{self, Coinbase};
 use crate::config::Config;
 use crate::template::Template;
 use ratum::datum::messages::{CoinbaseOutput, CoinbaserResponse};
-use ratum::datum::share::EXTRANONCE_SIZE;
+use ratum::datum::share::{EXTRANONCE_SIZE, EXTRANONCE_SIZE_V2};
 use ratum::header::{self, HeaderV2};
 use ratum::target::{self, Target};
 use std::collections::HashMap;
@@ -176,17 +176,22 @@ impl Job {
         &self,
         id: u8,
         pot: u8,
-        extranonce: [u8; 16],
-        sia_nonce: [u8; 8],
-        sia_ntime: [u8; 8],
+        extranonce: [u8; EXTRANONCE_SIZE_V2],
+        sia_nonce: [u8; SIA_FIELD_SIZE],
+        sia_ntime: [u8; SIA_FIELD_SIZE],
     ) -> Option<HeaderV2> {
+        // The two halves of each Sia field, as `datum_blake2b_serialize_block_header` places
+        // them: the nonce field is nNonce then m_nonce2, the time field m_time_offset then
+        // m_nonce3.
+        let halves = |f: [u8; SIA_FIELD_SIZE]| {
+            let (lo, hi) = f.split_at(SIA_FIELD_SIZE / 2);
+            (u32::from_le_bytes(lo.try_into().unwrap()), u32::from_le_bytes(hi.try_into().unwrap()))
+        };
         let c = self.commitment(id, pot)?;
         let mut h = self.header_base(c.merkle_root, c.txcount, pot);
         h.extranonce = extranonce;
-        h.nonce = u32::from_le_bytes(sia_nonce[..4].try_into().unwrap());
-        h.nonce2 = u32::from_le_bytes(sia_nonce[4..].try_into().unwrap());
-        h.time_offset = u32::from_le_bytes(sia_ntime[..4].try_into().unwrap());
-        h.nonce3 = u32::from_le_bytes(sia_ntime[4..].try_into().unwrap());
+        (h.nonce, h.nonce2) = halves(sia_nonce);
+        (h.time_offset, h.nonce3) = halves(sia_ntime);
         Some(h)
     }
 
@@ -251,7 +256,8 @@ pub enum BuildError {
     PayoutScriptSize(usize),
     #[error("{0}")]
     Tagging(String),
-    #[error("{0} merkle branches; the protocol carries at most 24")]
+    #[error("{0} merkle branches; the protocol carries at most {max}",
+            max = ratum::datum::share::MAX_MERKLE_BRANCHES)]
     TooManyBranches(usize),
     #[error("the template's bits do not decode")]
     BadBits,
@@ -303,7 +309,9 @@ impl Builder {
             Some(p) => (p.payout_script.clone(), p.prime_id, p.coinbase_tag.as_str()),
             None => (c.pool_output_script.clone(), 0, c.mining.coinbase_tag_primary.as_str()),
         };
-        if pool_addr_script.is_empty() || pool_addr_script.len() > 64 {
+        if pool_addr_script.is_empty()
+            || pool_addr_script.len() > ratum::datum::messages::MAX_OUTPUT_SCRIPT
+        {
             return Err(BuildError::PayoutScriptSize(pool_addr_script.len()));
         }
         let (script, pot_in_script) = coinbase::script_sig(&coinbase::Tagging {
@@ -407,15 +415,10 @@ fn coinbase_set(
         force_op_return_extranonce: false,
     };
     let (subsidy_only, target_pot_index, _) = coinbase::build(&params(&[], 0, 0, true));
-    // The transaction's bytes around the outputs: 124 of framing (the version, the input
-    // with its null outpoint, scriptSig length, 15-byte extranonce push and sequence, a
-    // three-byte output count, the pool output's value and script length, the 47-byte
-    // witness commitment output and the lock time), the scriptSig, the pool script, and the
-    // OP_RETURN output that holds the extranonce placeholder when the scriptSig has no room
-    // for it (25 bytes, less the 15 the scriptSig no longer holds). The output count is one
-    // byte up to 252 outputs; counted at three so the budget never exceeds the room. The C
-    // gateway counts 119 and never fills the room, its size classes being far smaller.
-    let fixed = 124 + pool_script.len() + script.len() + if script.len() > 85 { 10 } else { 0 };
+    // The count must be exact: unlike the C gateway, whose SHA256d-era size classes are far
+    // smaller than a template's room, this gateway fills the room it is told it has.
+    let fixed =
+        coinbase::fixed_bytes(script.len(), pool_script.len(), template.witness_commitment.len());
     let budget = if outputs.is_empty() { 0 } else { coinbase::output_budget(fixed, template) };
     // The sigop cost the block has left after its transactions and the pool script's output.
     let sigops = template
@@ -426,6 +429,14 @@ fn coinbase_set(
     debug_assert_eq!(pot, target_pot_index);
     CoinbaseSet { pooled, subsidy_only, target_pot_index, included }
 }
+
+/// The 14 characters of a job id: the build time as eight hex digits, the global index as
+/// two, and the index XORed with `JOB_INDEX_XOR` as four.
+const JOB_ID_CHARS: usize = 14;
+/// Where the XORed global index sits in the job id.
+const JOB_ID_INDEX_AT: std::ops::Range<usize> = 10..JOB_ID_CHARS;
+/// The two hex digits of the coinbase id a notify appends to the job id.
+const NOTIFY_ID_CHARS: usize = JOB_ID_CHARS + 2;
 
 /// What a stratum job id names: the 14-character job id, the job's global index, and the
 /// suffix and prefix the notify added.
@@ -456,17 +467,18 @@ impl JobRef {
         }
     }
 
-    /// Parse the id a `mining.submit` names; also the 14-character job id it carries.
+    /// Parse the id a `mining.submit` names; also the job id it carries.
     pub fn parse(s: &str) -> Option<(JobRef, &str)> {
+        const PREFIXED: usize = NOTIFY_ID_CHARS + 1;
         let (quickdiff, empty, rest) = match s.len() {
-            16 => (false, false, s),
-            17 if s.starts_with('Q') => (true, false, &s[1..]),
-            17 if s.starts_with('N') => (false, true, &s[1..]),
+            NOTIFY_ID_CHARS => (false, false, s),
+            PREFIXED if s.starts_with('Q') => (true, false, &s[1..]),
+            PREFIXED if s.starts_with('N') => (false, true, &s[1..]),
             _ => return None,
         };
-        let job_id = &rest[..14];
+        let job_id = &rest[..JOB_ID_CHARS];
         let global_index = global_index_of(job_id)?;
-        let coinbase = u8::from_str_radix(&rest[14..16], 16).ok()?;
+        let coinbase = u8::from_str_radix(&rest[JOB_ID_CHARS..NOTIFY_ID_CHARS], 16).ok()?;
         if empty && coinbase != COINBASE_SUBSIDY_ONLY {
             return None;
         }
@@ -474,27 +486,33 @@ impl JobRef {
     }
 }
 
-/// The stratum job id's global index: characters 10..14 of the 14-character id, XORed.
+/// The stratum job id's global index: its last four characters, XORed.
 pub fn global_index_of(job_id: &str) -> Option<u8> {
-    let raw = u16::from_str_radix(job_id.get(10..14)?, 16).ok()?;
+    let raw = u16::from_str_radix(job_id.get(JOB_ID_INDEX_AT)?, 16).ok()?;
     let idx = raw ^ JOB_INDEX_XOR;
     if idx as usize >= MAX_JOBS { None } else { Some(idx as u8) }
 }
 
 /// An eight-byte Sia stratum field: sixteen hex characters, or eight for a 32-bit value the
 /// miner sent alone, which fills the low four bytes.
-pub fn parse_sia_field(s: &str) -> Option<[u8; 8]> {
+pub fn parse_sia_field(s: &str) -> Option<[u8; SIA_FIELD_SIZE]> {
+    const HEX_CHARS: usize = 2 * SIA_FIELD_SIZE;
+    const NARROW_HEX_CHARS: usize = 2 * size_of::<u32>();
     match s.len() {
-        16 => hex::decode(s).ok()?.try_into().ok(),
-        8 => {
+        HEX_CHARS => hex::decode(s).ok()?.try_into().ok(),
+        NARROW_HEX_CHARS => {
             let v = u32::from_str_radix(s, 16).ok()?;
-            let mut out = [0u8; 8];
-            out[..4].copy_from_slice(&v.to_le_bytes());
+            let mut out = [0u8; SIA_FIELD_SIZE];
+            out[..size_of::<u32>()].copy_from_slice(&v.to_le_bytes());
             Some(out)
         }
         _ => None,
     }
 }
+
+/// The Sia stratum nonce and time fields are eight bytes each; the version 2 header takes
+/// two 32-bit values from each.
+pub const SIA_FIELD_SIZE: usize = 8;
 
 #[cfg(test)]
 mod tests {

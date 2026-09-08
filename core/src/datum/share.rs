@@ -21,18 +21,21 @@ pub const FLAG_BLAKE2B: u8 = 0x08;
 /// at all, because profile 0 is the only one either end produces.
 pub const RESERVED_USE_TIME_OFFSET: u8 = 0x01;
 pub use super::framing::STRUCT_END;
-/// The extranonce bytes a share carries: extranonce1 then extranonce2.
-///
-/// The header's extranonce is a 16-byte field (`m_extranonce`) whose leading four bytes are
-/// zero: the gateway's extranonce1 is eight bytes (`DATUM_HEADER_V2_EXTRANONCE1_SIZE`): four
-/// zero bytes (`DATUM_HEADER_V2_EXTRANONCE_PAD`) then the four-byte session id. The share
-/// sends the twelve that vary, in the field the upstream DATUM format sizes for them, and the
-/// pool restores the padding.
+/// The extranonce bytes a share carries: the part of the header's extranonce field that
+/// varies, in the field the upstream DATUM format sizes for them. The pool restores the
+/// padding.
 pub const EXTRANONCE_SIZE: usize = 12;
-/// The header field the twelve are restored into (`DATUM_HEADER_V2_EXTRANONCE_SIZE`).
+/// The header's extranonce field, Knots' `m_extranonce`. `datum_blake2b_serialize_block_header`
+/// writes four zero bytes at offset 88 and the twelve at 92, which is this field.
 pub const EXTRANONCE_SIZE_V2: usize = 16;
 /// How many leading bytes of that field the gateway holds at zero.
 pub const EXTRANONCE_V2_PAD: usize = EXTRANONCE_SIZE_V2 - EXTRANONCE_SIZE;
+/// The extranonce1 the gateway sends in its `mining.subscribe` response: the zero padding and
+/// the four-byte session id, so extranonce1 followed by extranonce2 is the header field
+/// whole. The C gateway sends the session id alone and leaves the padding implicit.
+pub const EXTRANONCE1_SIZE: usize = EXTRANONCE_V2_PAD + size_of::<u32>();
+/// The extranonce2 the miner fills, the rest of the header's extranonce field.
+pub const EXTRANONCE2_SIZE: usize = EXTRANONCE_SIZE_V2 - EXTRANONCE1_SIZE;
 /// The coinbase index for subsidy-only work: the gateway's literal 255 (a comment in
 /// `datum_stratum.h`; no named constant).
 pub const COINBASE_ID_SUBSIDY_ONLY: u8 = 0xFF;

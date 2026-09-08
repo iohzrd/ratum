@@ -3,7 +3,9 @@
 //! the integration tests must use that layout byte for byte, so it is written once here
 //! rather than once per test tree. The pool binary does not use this module.
 
+use crate::bitcoin::opcode::OP_RETURN;
 use crate::bitcoin::{encode_compact_size, encode_output, encode_push};
+use crate::datum::coinbase::{POT_TARGET_PLACEHOLDER, TAG_END, TAG_SEPARATOR, UID_PUSH_SIZE_V1};
 use crate::datum::messages::CoinbaseOutput;
 use crate::datum::share::{self, CoinbaseSection};
 
@@ -21,9 +23,9 @@ pub fn out(value: u64, script: &[u8]) -> Vec<u8> {
     encode_output(value, script)
 }
 
-/// How the coinbase identifies the pool: the tag push the pool searches for, then the 7-byte
-/// push whose last four bytes are its prime id. The PoT (power-of-two difficulty) byte is the
-/// first byte of that 7-byte push.
+/// How the coinbase identifies the pool: the tag push the pool searches for, then the
+/// `UID_PUSH_SIZE_V1` push whose last four bytes are its prime id. The PoT (power-of-two
+/// difficulty) byte is the first byte of that push.
 pub struct Tagging<'a> {
     pub tag: &'a str,
     /// The gateway operator's own tag, written after the pool's tag and a 0x0f marker;
@@ -41,38 +43,41 @@ pub fn coinbase(
     outputs: &[CoinbaseOutput],
     coinbase_value: u64,
 ) -> (CoinbaseSection, usize) {
+    // The BIP34 height push, for the fixture height 2_544_140.
     let mut script = push(&[0x0c, 0xd2, 0x26]);
-    // The tag push, in the gateway's layout: the primary tag, then 0x00 when it is the only
-    // tag or 0x0f followed by the secondary tag and 0x00 when one follows.
+    // The tag push, in the gateway's layout: the primary tag, then TAG_END when it is the
+    // only tag or TAG_SEPARATOR followed by the secondary tag and TAG_END when one follows.
     let (tag0, tag1) = (tagging.tag.as_bytes(), tagging.tag_secondary.as_bytes());
     let mut tag = Vec::with_capacity(tag0.len() + tag1.len() + 2);
     if !tag0.is_empty() {
         tag.extend_from_slice(tag0);
-        tag.push(if tag1.is_empty() { 0x00 } else { 0x0f });
+        tag.push(if tag1.is_empty() { TAG_END } else { TAG_SEPARATOR });
     } else if !tag1.is_empty() {
-        tag.push(0x0f);
+        tag.push(TAG_SEPARATOR);
     }
     if !tag1.is_empty() {
         tag.extend_from_slice(tag1);
-        tag.push(0x00);
+        tag.push(TAG_END);
     }
     if tag.is_empty() {
-        tag.push(0x00);
+        tag.push(TAG_END);
     }
     script.extend_from_slice(&push(&tag));
-    // The uid push (`generate_coinbase_uid_tag`): the PoT placeholder 0xFF, the 2-byte
-    // `coinbase_unique_id` little-endian (0x1234 here; the gateway default is 4242), then the
-    // prime id.
-    let mut uid = vec![0xff, 0x34, 0x12];
+    // The uid push: the PoT placeholder, the 2-byte `coinbase_unique_id` little-endian
+    // (0x1234 here; the gateway default is 4242), then the prime id.
+    let mut uid = vec![POT_TARGET_PLACEHOLDER, 0x34, 0x12];
     uid.extend_from_slice(&tagging.prime_id.to_le_bytes());
+    debug_assert_eq!(uid.len(), UID_PUSH_SIZE_V1);
     script.extend_from_slice(&push(&uid));
-    let pot_in_script = script.len() - 7;
-    // PUSH 14: the 2-byte enprefix, then the 12-byte extranonce the assembler inserts.
-    script.push(0x0e);
+    let pot_in_script = script.len() - UID_PUSH_SIZE_V1;
+    // The extranonce push: the 2-byte enprefix, then the 12-byte extranonce the assembler
+    // inserts.
+    script.push((2 + share::EXTRANONCE_SIZE) as u8);
     script.extend_from_slice(&[0xab, 0xcd]);
 
+    // Version 1, then one input spending the null outpoint.
     let mut coinb1 = vec![0x01, 0x00, 0x00, 0x00, 0x01];
-    coinb1.extend_from_slice(&[0u8; 32]);
+    coinb1.extend_from_slice(&[0u8; crate::bitcoin::HASH_SIZE]);
     coinb1.extend_from_slice(&[0xff; 4]);
     coinb1.extend_from_slice(&encode_compact_size((script.len() + share::EXTRANONCE_SIZE) as u64));
     let script_sig_offset = coinb1.len();
@@ -86,7 +91,7 @@ pub fn coinbase(
         coinb2.extend_from_slice(&out(o.value, &o.script));
     }
     coinb2.extend_from_slice(&out(coinbase_value - paid, payout_script));
-    let mut commitment = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+    let mut commitment = vec![OP_RETURN, 0x24, 0xaa, 0x21, 0xa9, 0xed];
     commitment.extend_from_slice(&[0x00; 32]);
     coinb2.extend_from_slice(&out(0, &commitment));
     coinb2.extend_from_slice(&[0u8; 4]);

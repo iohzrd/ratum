@@ -94,7 +94,12 @@ pub(crate) fn handle(mut stream: TcpStream, server: &Server) -> io::Result<()> {
 
     let handshake_started = Instant::now();
     let mut rx = KeyRatchet::hello();
-    let header_bytes = read_exact_deadline(&mut stream, 4, handshake_started, HANDSHAKE_DEADLINE)?;
+    let header_bytes = read_exact_deadline(
+        &mut stream,
+        framing::HEADER_LEN,
+        handshake_started,
+        HANDSHAKE_DEADLINE,
+    )?;
     let header = rx.unmask(header_bytes.try_into().unwrap());
     debug!(
         "[{peer}] hello header: cmd={} len={} signed={} encrypted_pubkey={}",
@@ -394,7 +399,7 @@ impl Connection<'_> {
 
     /// Reads a frame header, distinguishing a connection that sent nothing from one that
     /// stopped partway through a header. Only the latter is a timeout.
-    fn read_header(&mut self, hdr: &mut [u8; 4]) -> io::Result<Framing> {
+    fn read_header(&mut self, hdr: &mut [u8; framing::HEADER_LEN]) -> io::Result<Framing> {
         let mut got = 0usize;
         let mut partial_since: Option<Instant> = None;
         while got < hdr.len() {
@@ -648,7 +653,7 @@ impl Connection<'_> {
                 self.wait(Some(timeout))?;
                 continue;
             }
-            let mut hdr = [0u8; 4];
+            let mut hdr = [0u8; framing::HEADER_LEN];
             match self.read_header(&mut hdr)? {
                 Framing::Closed => {
                     debug!("[{peer}] disconnected");

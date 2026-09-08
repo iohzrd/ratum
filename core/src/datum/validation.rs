@@ -94,12 +94,19 @@ impl From<Truncated> for Error {
     }
 }
 
+/// Every validation request starts with the mining sub-command, the request selector and the
+/// job index; the rest is the request's own payload.
+pub const REQUEST_HEADER_LEN: usize = 3;
+/// The exact plaintext length the C handler requires of a parent fetch: the header and the
+/// 32-byte parent hash, with no trailing padding.
+pub const PARENT_FETCH_REQUEST_LEN: usize = REQUEST_HEADER_LEN + 32;
+
 pub fn request_short_txn_list(job_index: u8) -> Vec<u8> {
     vec![VALIDATION, request::SHORT_TXN_LIST, job_index]
 }
 
 pub fn request_txns(job_index: u8, indices: &[u16]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(5 + indices.len() * 2);
+    let mut out = Vec::with_capacity(REQUEST_HEADER_LEN + size_of::<u16>() + size_of_val(indices));
     out.push(VALIDATION);
     out.push(request::TXNS);
     out.push(job_index);
@@ -114,11 +121,11 @@ pub fn request_block_txns(job_index: u8) -> Vec<u8> {
     vec![VALIDATION, request::BLOCK_TXNS, job_index]
 }
 
-/// version 3 protocol. The C handler requires this exact 35-byte plaintext: unlike the other
-/// validation requests it rejects any trailing padding. `parent_hash` is in internal byte
-/// order, as the job context's prev hash is sent.
+/// version 3 protocol. The C handler requires exactly `PARENT_FETCH_REQUEST_LEN` bytes of
+/// plaintext: unlike the other validation requests it rejects any trailing padding.
+/// `parent_hash` is in internal byte order, as the job context's prev hash is sent.
 pub fn request_parent_fetch(job_index: u8, parent_hash: &[u8; 32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(35);
+    let mut out = Vec::with_capacity(PARENT_FETCH_REQUEST_LEN);
     out.push(VALIDATION);
     out.push(request::PARENT_FETCH);
     out.push(job_index);
@@ -171,9 +178,20 @@ pub struct ParentFetchReply {
     pub block: Vec<u8>,
 }
 
+/// What a parent fetch reply holds besides the block: the mining sub-command, the reply
+/// selector, the job index, the status, the parent hash, the block's length and the
+/// terminator. `datum_protocol_parent_fetch_reply` writes `41 + block_size` bytes.
+pub const PARENT_FETCH_REPLY_OVERHEAD: usize = 4 + 32 + size_of::<u32>() + 1;
+
+/// The largest block a parent fetch reply carries, the C gateway's
+/// `DATUM_PARENT_FETCH_MAX_BLOCK_BYTES`: one byte under what the overhead alone leaves,
+/// which is the bound `datum_protocol_parent_fetch_reply` applies.
+pub const MAX_PARENT_FETCH_BLOCK: usize =
+    super::framing::MAX_CMD_DATA_SIZE as usize - (PARENT_FETCH_REPLY_OVERHEAD + 1);
+
 impl ParentFetchReply {
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(42 + self.block.len());
+        let mut out = Vec::with_capacity(PARENT_FETCH_REPLY_OVERHEAD + self.block.len());
         out.push(VALIDATION);
         out.push(response::PARENT_FETCH);
         out.push(self.job_index);
@@ -208,6 +226,11 @@ pub struct ShortTxnList {
     pub crosscheck: Option<[u8; 32]>,
 }
 
+/// The bytes a short transaction id occupies on the wire: a u32 then a u16, little-endian.
+pub const SHORT_ID_SIZE: usize = size_of::<u32>() + size_of::<u16>();
+/// The bits of the siphash a short id keeps.
+const SHORT_ID_MASK: u64 = (1u64 << (8 * SHORT_ID_SIZE)) - 1;
+
 pub const CROSSCHECK_SEED: [u8; 32] = [
     0xA3, 0x4F, 0xC1, 0x9C, 0x5E, 0x88, 0x76, 0x12, 0x0A, 0x79, 0x3E, 0xF1, 0x6C, 0x93, 0x54, 0xAF,
     0xB8, 0x1D, 0xE8, 0x5A, 0x20, 0xC7, 0x94, 0x38, 0x6F, 0xA1, 0x02, 0xD9, 0x4A, 0x7B, 0xF0, 0x11,
@@ -237,9 +260,9 @@ impl ShortTxnList {
                 crosscheck: None,
             });
         }
-        let ids = c.take(txn_count as usize * 6, "short ids")?;
+        let ids = c.take(txn_count as usize * SHORT_ID_SIZE, "short ids")?;
         let short_ids = ids
-            .as_chunks::<6>()
+            .as_chunks::<SHORT_ID_SIZE>()
             .0
             .iter()
             .map(|c| {
@@ -267,7 +290,7 @@ impl ShortTxnList {
         }
         for id in &self.short_ids {
             out.extend_from_slice(&(*id as u32).to_le_bytes());
-            out.extend_from_slice(&(((*id >> 32) & 0xffff) as u16).to_le_bytes());
+            out.extend_from_slice(&((*id >> 32) as u16).to_le_bytes());
         }
         if let Some(x) = self.crosscheck {
             out.extend_from_slice(&x);
@@ -365,7 +388,7 @@ pub fn short_id_key(gateway_pk: &[u8; 32], pool_pk: &[u8; 32]) -> [u8; 16] {
 
 /// The low 48 bits of the siphash, serialized as a u32 then a u16.
 pub fn short_id(hash: &[u8; 32], key: &[u8; 16]) -> u64 {
-    siphash24(key, hash) & 0x0000_ffff_ffff_ffff
+    siphash24(key, hash) & SHORT_ID_MASK
 }
 
 /// Every hash (the transactions' witness hashes, as in `matches`) XORed into a fixed seed, so

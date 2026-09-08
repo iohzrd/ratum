@@ -18,6 +18,9 @@ use crate::vardiff::{self, Vardiff};
 use log::{debug, error, info, warn};
 use mio::net::TcpStream as PolledStream;
 use mio::{Events, Interest, Poll, Token, Waker};
+use ratum::datum::share::{
+    EXTRANONCE_SIZE_V2, EXTRANONCE_V2_PAD, EXTRANONCE1_SIZE, EXTRANONCE2_SIZE,
+};
 use ratum::target;
 use serde_json::{Value, json};
 use std::io::{self, Read, Write};
@@ -28,6 +31,16 @@ use std::time::{Duration, Instant};
 
 const CLIENT_BUFFER: usize = 16384 * 3 + 1024;
 const MAX_REQUEST_ID_CHARS: usize = 64;
+/// The most of a `mining.subscribe` user agent kept, the C gateway's `useragent[128]` less
+/// its terminator.
+const MAX_USER_AGENT_CHARS: usize = 127;
+/// The most of a `mining.authorize` username kept, the C gateway's
+/// `last_auth_username[192]` less its terminator.
+const MAX_USERNAME_CHARS: usize = 191;
+/// The difficulty floor a NiceHash miner is held at, whatever vardiff would choose:
+/// `datum_stratum_fingerprint_by_UA` sets `forced_high_min_diff` to this. NiceHash rents
+/// hashrate at a high minimum difficulty.
+const NICEHASH_MIN_DIFFICULTY: u64 = 524_288;
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_millis(11150);
 /// How long a write waits for the socket to take the rest of the line before it fails with
 /// `TimedOut`.
@@ -667,16 +680,20 @@ impl Connection {
             params.get(0).and_then(Value::as_str).map_or_else(String::new, |ua| {
                 ua.chars()
                     .filter(|c| c.is_ascii_alphanumeric() || ". -_=@,|/:<>';".contains(*c))
-                    .take(127)
+                    .take(MAX_USER_AGENT_CHARS)
                     .collect()
             });
         // Fingerprinting keeps one effect of the C gateway's: NiceHash rents hashrate at a
         // high minimum difficulty. The coinbase size class it also assigned per miner is
         // removed; every miner receives the one pooled coinbase (`coinbase::COINBASE_POOLED`).
         if s.fingerprint_miners && useragent.starts_with("NiceHash/") {
-            self.vardiff.raise_floor(524_288);
+            self.vardiff.raise_floor(NICEHASH_MIN_DIFFICULTY);
         }
+        // The subscribe response's extranonce1 is the header's extranonce padding written as
+        // zero hex digits, then this connection's session id; extranonce2 is what remains of
+        // the header's extranonce field, which the miner fills.
         let sid = format!("{:08x}", self.sid);
+        let pad = "0".repeat(2 * EXTRANONCE_V2_PAD);
         self.reply_result(
             id,
             json!([
@@ -684,8 +701,8 @@ impl Connection {
                     ["mining.notify", format!("{sid}1")],
                     ["mining.set_difficulty", format!("{sid}2")]
                 ],
-                format!("00000000{sid}"),
-                8
+                format!("{pad}{sid}"),
+                EXTRANONCE2_SIZE
             ]),
         )?;
         self.send_difficulty()?;
@@ -706,7 +723,7 @@ impl Connection {
 
     fn on_authorize(&mut self, id: &str, params: &Value) -> io::Result<()> {
         let username = params.get(0).and_then(Value::as_str).unwrap_or("NULL");
-        self.username = username.chars().take(191).collect();
+        self.username = username.chars().take(MAX_USERNAME_CHARS).collect();
         let name = self.username.clone();
         self.with_stats(|st| st.username = name);
         if self.server.config.stratum.require_address_username
@@ -868,13 +885,17 @@ impl Connection {
         let rejected = (UNKNOWN_WORK, Some(job_diff));
 
         let en2 = params.get(2).and_then(Value::as_str).ok_or(rejected)?;
-        if en2.len() != 16 {
+        if en2.len() != 2 * EXTRANONCE2_SIZE {
             return Err(rejected);
         }
         let en2 = hex::decode(en2).map_err(|_| rejected)?;
-        let mut extranonce = [0u8; 16];
-        extranonce[4..8].copy_from_slice(&self.sid.to_be_bytes());
-        extranonce[8..].copy_from_slice(&en2);
+        // The header's extranonce field: the zero padding, the session id, then the miner's
+        // extranonce2.
+        let mut extranonce = [0u8; EXTRANONCE_SIZE_V2];
+        let sid_at = EXTRANONCE_V2_PAD;
+        let en2_at = EXTRANONCE1_SIZE;
+        extranonce[sid_at..en2_at].copy_from_slice(&self.sid.to_be_bytes());
+        extranonce[en2_at..].copy_from_slice(&en2);
         if !job_ref.empty && job_ref.coinbase != COINBASE_POOLED {
             return Err(rejected);
         }
@@ -980,7 +1001,7 @@ impl Connection {
         job: &Arc<Job>,
         coinbase_index: u8,
         pot: u8,
-        header: &[u8; 164],
+        header: &[u8; ratum::header::HEADER_V2_SIZE],
         hash_hex: &str,
     ) {
         let Some(block) = crate::submit::assemble(job, coinbase_index, pot, header) else {

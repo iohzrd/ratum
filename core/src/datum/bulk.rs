@@ -4,12 +4,15 @@
 //! offsets strictly ascending. The reassembled payload is byte-identical to the command-5
 //! payload it replaces and is dispatched the same way.
 
+use crate::cursor::Cursor;
+
 pub use super::messages::DBF_MARKER;
 
 /// The marker of an acknowledgement.
 pub const ACK_MARKER: [u8; 4] = *b"DBA\x01";
-/// `DATUM_BULK_FRAGMENT_HEADER_SIZE`.
-pub const FRAGMENT_HEADER_SIZE: usize = 16;
+/// `DATUM_BULK_FRAGMENT_HEADER_SIZE`: the marker, the transfer id, the total size and the
+/// offset.
+pub const FRAGMENT_HEADER_SIZE: usize = DBF_MARKER.len() + 3 * size_of::<u32>();
 /// `DATUM_BULK_FRAGMENT_DATA_SIZE`.
 pub const FRAGMENT_DATA_SIZE: usize = 16 * 1024;
 /// The C sender refuses transfers at or above `DATUM_PROTOCOL_MAX_CMD_DATA_SIZE`.
@@ -59,22 +62,18 @@ impl<'a> Fragment<'a> {
     }
 
     pub fn decode(data: &'a [u8]) -> Result<Self, Error> {
-        if data.len() < FRAGMENT_HEADER_SIZE {
-            return Err(Error::Truncated);
-        }
-        if data[..4] != DBF_MARKER {
+        let mut c = Cursor::new(data);
+        if c.arr::<{ DBF_MARKER.len() }>("marker").map_err(|_| Error::Truncated)? != DBF_MARKER {
             return Err(Error::BadMarker);
         }
-        let chunk = &data[FRAGMENT_HEADER_SIZE..];
+        let id = c.u32("transfer id").map_err(|_| Error::Truncated)?;
+        let total_size = c.u32("total size").map_err(|_| Error::Truncated)?;
+        let offset = c.u32("offset").map_err(|_| Error::Truncated)?;
+        let chunk = c.rest();
         if chunk.is_empty() || chunk.len() > FRAGMENT_DATA_SIZE {
             return Err(Error::BadChunk(chunk.len()));
         }
-        Ok(Fragment {
-            id: u32::from_le_bytes(data[4..8].try_into().expect("four bytes")),
-            total_size: u32::from_le_bytes(data[8..12].try_into().expect("four bytes")),
-            offset: u32::from_le_bytes(data[12..16].try_into().expect("four bytes")),
-            data: chunk,
-        })
+        Ok(Fragment { id, total_size, offset, data: chunk })
     }
 }
 
@@ -87,14 +86,17 @@ pub struct Ack {
     pub next_offset: u32,
 }
 
-pub const ACK_LEN: usize = 12;
+/// The marker, the transfer id and the next offset.
+pub const ACK_LEN: usize = ACK_MARKER.len() + 2 * size_of::<u32>();
 
 impl Ack {
     pub fn encode(&self) -> [u8; ACK_LEN] {
         let mut out = [0u8; ACK_LEN];
-        out[..4].copy_from_slice(&ACK_MARKER);
-        out[4..8].copy_from_slice(&self.id.to_le_bytes());
-        out[8..].copy_from_slice(&self.next_offset.to_le_bytes());
+        let (marker, rest) = out.split_at_mut(ACK_MARKER.len());
+        let (id, next_offset) = rest.split_at_mut(size_of::<u32>());
+        marker.copy_from_slice(&ACK_MARKER);
+        id.copy_from_slice(&self.id.to_le_bytes());
+        next_offset.copy_from_slice(&self.next_offset.to_le_bytes());
         out
     }
 
@@ -102,12 +104,13 @@ impl Ack {
         if data.len() != ACK_LEN {
             return Err(Error::Truncated);
         }
-        if data[..4] != ACK_MARKER {
+        let mut c = Cursor::new(data);
+        if c.arr::<{ ACK_MARKER.len() }>("marker").map_err(|_| Error::Truncated)? != ACK_MARKER {
             return Err(Error::BadMarker);
         }
         Ok(Ack {
-            id: u32::from_le_bytes(data[4..8].try_into().expect("four bytes")),
-            next_offset: u32::from_le_bytes(data[8..12].try_into().expect("four bytes")),
+            id: c.u32("transfer id").map_err(|_| Error::Truncated)?,
+            next_offset: c.u32("next offset").map_err(|_| Error::Truncated)?,
         })
     }
 }

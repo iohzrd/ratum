@@ -7,6 +7,11 @@
 /// gateway's `json_object_foreach` walk does.
 pub type Modifiers = Vec<(String, Vec<(String, f64)>)>;
 
+/// The range selector's space: the two low-order bytes of the share hash, so a proportion is
+/// scaled by this and a range that reaches `SELECTOR_MAX` covers every share.
+pub const SELECTOR_SPACE: f64 = 65536.0;
+pub const SELECTOR_MAX: i64 = u16::MAX as i64;
+
 /// `~modname` username modifiers: the two low-order bytes of the share hash select an
 /// address range. `hash` is the BLAKE2b output in display order, whose last two bytes are
 /// the C gateway's `upk_u16le(share_hash, 0)` (its `share_hash` is the byte reversal); the
@@ -28,18 +33,18 @@ pub fn apply_modifier(
     let mut sum = 0f64;
     for (addr, proportion) in ranges.iter() {
         sum += proportion.max(0.0);
-        let max = ((sum * 65536.0).ceil() as i64 - 1).min(0xffff);
+        let max = ((sum * SELECTOR_SPACE).ceil() as i64 - 1).min(SELECTOR_MAX);
         if max < 0 {
             continue;
         }
-        if rnd as i64 <= max {
+        if i64::from(rnd) <= max {
             return Some(if addr.is_empty() {
                 base.to_string()
             } else {
                 format!("{addr}{worker}")
             });
         }
-        if max >= 0xffff {
+        if max >= SELECTOR_MAX {
             break;
         }
     }
@@ -63,7 +68,7 @@ impl FeeMeter {
         if bps == 0 {
             return false;
         }
-        let share_work = diff.saturating_mul(10_000);
+        let share_work = diff.saturating_mul(ratum::BASIS_POINTS_PER_UNIT);
         if !self.started {
             self.started = true;
             self.owed = seed() % share_work.max(1);

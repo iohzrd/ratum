@@ -10,6 +10,12 @@
 
 use std::time::Instant;
 
+/// The window `stratum.vardiff_target_shares_min` counts shares over, in milliseconds.
+const MS_PER_MINUTE: u64 = 1000 * ratum::SECS_PER_MINUTE;
+/// The shortest snapshot the rate is computed from, the C gateway's "we need at least 1
+/// second of data".
+const MIN_SAMPLE_MS: u64 = 1000;
+
 #[derive(Clone, Copy, Debug)]
 pub struct Params {
     pub min: u64,
@@ -131,15 +137,18 @@ impl Vardiff {
         }
         let delta = now.saturating_duration_since(self.snap_at).as_millis() as u64;
         let n = self.snap_count;
-        let target_ms = 60_000 / p.target_shares_min.max(1);
+        // `target_shares_min` is shares a minute, so the target interval between shares is a
+        // minute over it (the C gateway's `target_ms_share`).
+        let target_ms = MS_PER_MINUTE / p.target_shares_min.max(1);
         if n == 0 {
-            if delta > 60_000 {
+            if delta > MS_PER_MINUTE {
                 self.current = (self.current >> 1).max(self.floor());
                 self.reset_snapshot(now);
             }
             return false;
         }
-        if delta < 1000 {
+        // At least one second of data, as the C gateway requires.
+        if delta < MIN_SAMPLE_MS {
             return false;
         }
         let ms_per_share = (delta / n).max(1);
@@ -153,6 +162,7 @@ impl Vardiff {
             self.reset_snapshot(now);
             return true;
         }
+        // Half the difficulty when shares arrive at less than half the target rate.
         if ms_per_share > target_ms * 2 {
             self.current = (self.current >> 1).max(self.floor());
             self.reset_snapshot(now);

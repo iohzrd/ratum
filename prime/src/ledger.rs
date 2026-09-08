@@ -1,3 +1,4 @@
+use ratum::cursor::Cursor;
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::path::Path;
@@ -78,29 +79,26 @@ pub struct ReadBack {
 /// separator. A row written before the tag field existed ends at the identity and reads
 /// back with an empty tag.
 fn pack(share: &Share) -> Vec<u8> {
-    let hash = share.hash.unwrap_or([0u8; 32]);
-    let mut v = Vec::with_capacity(49 + share.identity.len() + share.tag.len());
+    let hash = share.hash.unwrap_or([0u8; HASH_SIZE]);
+    let mut v = Vec::with_capacity(SHARE_PREFIX_LEN + 1 + share.identity.len() + share.tag.len());
     v.extend_from_slice(&share.at.to_le_bytes());
     v.extend_from_slice(&share.difficulty.to_le_bytes());
     v.extend_from_slice(&hash);
     v.extend_from_slice(share.identity.as_bytes());
-    v.push(0x00);
+    v.push(NAME_SEPARATOR);
     v.extend_from_slice(share.tag.as_bytes());
     v
 }
 
+/// The fixed part of a share row: at, difficulty, hash.
+const SHARE_PREFIX_LEN: usize = 2 * size_of::<u64>() + HASH_SIZE;
+
 fn unpack(bytes: &[u8]) -> Option<Share> {
-    if bytes.len() < 48 {
-        return None;
-    }
-    let at = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
-    let difficulty = u64::from_le_bytes(bytes[8..16].try_into().ok()?);
-    let hash: [u8; 32] = bytes[16..48].try_into().ok()?;
-    let rest = &bytes[48..];
-    let (identity, tag) = match rest.iter().position(|&b| b == 0x00) {
-        Some(i) => (&rest[..i], &rest[i + 1..]),
-        None => (rest, [].as_slice()),
-    };
+    let mut c = Cursor::new(bytes);
+    let at = c.u64("at").ok()?;
+    let difficulty = c.u64("difficulty").ok()?;
+    let hash: [u8; HASH_SIZE] = c.arr("hash").ok()?;
+    let (identity, tag) = split_at_separator(c.rest());
     Some(Share {
         at,
         identity: String::from_utf8_lossy(identity).into_owned(),
@@ -108,6 +106,24 @@ fn unpack(bytes: &[u8]) -> Option<Share> {
         hash: Some(hash),
         tag: String::from_utf8_lossy(tag).into_owned(),
     })
+}
+
+/// The byte between the identity and the secondary coinbase tag in a share or block row.
+/// Neither field can contain it: the identity's bytes are printable ASCII
+/// (`verify::check_username_and_time` requires 0x21..=0x7e) and the tag's control characters
+/// are dropped at extraction (`verify::decode_tag`).
+const NAME_SEPARATOR: u8 = 0x00;
+
+/// A proof-of-work hash, the key of the block and owed tables.
+const HASH_SIZE: usize = ratum::bitcoin::HASH_SIZE;
+
+/// Split a row's trailing identity and tag. A row written before the tag field existed ends
+/// at the identity and reads back with an empty tag.
+fn split_at_separator(rest: &[u8]) -> (&[u8], &[u8]) {
+    match rest.iter().position(|&b| b == NAME_SEPARATOR) {
+        Some(i) => (&rest[..i], &rest[i + 1..]),
+        None => (rest, [].as_slice()),
+    }
 }
 
 /// What the pool owes the window for one block: the value its coinbase paid to the pool's
@@ -133,7 +149,8 @@ pub struct OwedBlock {
 /// settled_at (8, LE, 0 for unsettled), entry count (2, LE), then per entry the identity
 /// length (2, LE), the identity bytes, and the sats (8, LE).
 fn pack_owed(o: &OwedBlock) -> Vec<u8> {
-    let mut v = Vec::with_capacity(30 + o.entries.iter().map(|(i, _)| 10 + i.len()).sum::<usize>());
+    let entries: usize = o.entries.iter().map(|(i, _)| OWED_ENTRY_PREFIX_LEN + i.len()).sum();
+    let mut v = Vec::with_capacity(OWED_PREFIX_LEN + entries);
     v.extend_from_slice(&o.at.to_le_bytes());
     v.extend_from_slice(&o.height.to_le_bytes());
     v.extend_from_slice(&o.total.to_le_bytes());
@@ -149,24 +166,25 @@ fn pack_owed(o: &OwedBlock) -> Vec<u8> {
     v
 }
 
+/// The fixed part of an owed-block row: at, height, total, settled_at, entry count.
+const OWED_PREFIX_LEN: usize =
+    size_of::<u64>() + size_of::<u32>() + 2 * size_of::<u64>() + size_of::<u16>();
+/// The fixed part of one entry: the identity length and the sats.
+const OWED_ENTRY_PREFIX_LEN: usize = size_of::<u16>() + size_of::<u64>();
+
 fn unpack_owed(hash: &[u8], bytes: &[u8]) -> Option<OwedBlock> {
-    let block_hash: [u8; 32] = hash.try_into().ok()?;
-    if bytes.len() < 30 {
-        return None;
-    }
-    let at = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
-    let height = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
-    let total = u64::from_le_bytes(bytes[12..20].try_into().ok()?);
-    let settled = u64::from_le_bytes(bytes[20..28].try_into().ok()?);
-    let count = u16::from_le_bytes(bytes[28..30].try_into().ok()?);
+    let block_hash: [u8; HASH_SIZE] = hash.try_into().ok()?;
+    let mut c = Cursor::new(bytes);
+    let at = c.u64("at").ok()?;
+    let height = c.u32("height").ok()?;
+    let total = c.u64("total").ok()?;
+    let settled = c.u64("settled_at").ok()?;
+    let count = c.u16("entry count").ok()?;
     let mut entries = Vec::with_capacity(count as usize);
-    let mut rest = &bytes[30..];
     for _ in 0..count {
-        let len = u16::from_le_bytes(rest.get(0..2)?.try_into().ok()?) as usize;
-        let identity = String::from_utf8_lossy(rest.get(2..2 + len)?).into_owned();
-        let sats = u64::from_le_bytes(rest.get(2 + len..10 + len)?.try_into().ok()?);
-        entries.push((identity, sats));
-        rest = &rest[10 + len..];
+        let len = c.u16("identity length").ok()? as usize;
+        let identity = String::from_utf8_lossy(c.take(len, "identity").ok()?).into_owned();
+        entries.push((identity, c.u64("sats").ok()?));
     }
     Some(OwedBlock {
         at,
@@ -210,7 +228,7 @@ pub struct FoundBlock {
 /// appears only as the separator. A row written before the tag field existed ends at the
 /// identity and reads back with an empty tag.
 fn pack_block(b: &FoundBlock) -> Vec<u8> {
-    let mut v = Vec::with_capacity(53 + b.finder.len() + b.tag.len());
+    let mut v = Vec::with_capacity(BLOCK_PREFIX_LEN + 1 + b.finder.len() + b.tag.len());
     v.extend_from_slice(&b.at.to_le_bytes());
     v.extend_from_slice(&b.height.to_le_bytes());
     v.extend_from_slice(&b.paid_to_split.to_le_bytes());
@@ -218,29 +236,34 @@ fn pack_block(b: &FoundBlock) -> Vec<u8> {
     v.extend_from_slice(&b.difficulty.to_bits().to_le_bytes());
     v.extend_from_slice(&b.cumulative_work.to_le_bytes());
     v.extend_from_slice(b.finder.as_bytes());
-    v.push(0x00);
+    v.push(NAME_SEPARATOR);
     v.extend_from_slice(b.tag.as_bytes());
     v
 }
 
+/// The fixed part of a found-block row: at, height, paid_to_split, paid_to_pool, difficulty,
+/// cumulative_work.
+const BLOCK_PREFIX_LEN: usize =
+    size_of::<u64>() + size_of::<u32>() + 3 * size_of::<u64>() + size_of::<u128>();
+
 fn unpack_block(hash: &[u8], bytes: &[u8]) -> Option<FoundBlock> {
-    let block_hash: [u8; 32] = hash.try_into().ok()?;
-    if bytes.len() < 52 {
-        return None;
-    }
-    let rest = &bytes[52..];
-    let (finder, tag) = match rest.iter().position(|&b| b == 0x00) {
-        Some(i) => (&rest[..i], &rest[i + 1..]),
-        None => (rest, [].as_slice()),
-    };
+    let block_hash: [u8; HASH_SIZE] = hash.try_into().ok()?;
+    let mut c = Cursor::new(bytes);
+    let at = c.u64("at").ok()?;
+    let height = c.u32("height").ok()?;
+    let paid_to_split = c.u64("paid_to_split").ok()?;
+    let paid_to_pool = c.u64("paid_to_pool").ok()?;
+    let difficulty = f64::from_bits(c.u64("difficulty").ok()?);
+    let cumulative_work = u128::from_le_bytes(c.arr("cumulative work").ok()?);
+    let (finder, tag) = split_at_separator(c.rest());
     Some(FoundBlock {
-        at: u64::from_le_bytes(bytes[0..8].try_into().ok()?),
-        height: u32::from_le_bytes(bytes[8..12].try_into().ok()?),
+        at,
+        height,
         block_hash,
-        paid_to_split: u64::from_le_bytes(bytes[12..20].try_into().ok()?),
-        paid_to_pool: u64::from_le_bytes(bytes[20..28].try_into().ok()?),
-        difficulty: f64::from_bits(u64::from_le_bytes(bytes[28..36].try_into().ok()?)),
-        cumulative_work: u128::from_le_bytes(bytes[36..52].try_into().ok()?),
+        paid_to_split,
+        paid_to_pool,
+        difficulty,
+        cumulative_work,
         finder: String::from_utf8_lossy(finder).into_owned(),
         tag: String::from_utf8_lossy(tag).into_owned(),
     })

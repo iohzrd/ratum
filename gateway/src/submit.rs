@@ -8,7 +8,12 @@ use ratum::rpc;
 /// The serialized block a share names: the header, the transaction count, the coinbase
 /// (without witness; the node adds the witness nonce in `submitblock`), then the template's
 /// transactions unless the work was subsidy-only.
-pub fn assemble(job: &Job, coinbase_id: u8, pot: u8, header: &[u8; 164]) -> Option<Vec<u8>> {
+pub fn assemble(
+    job: &Job,
+    coinbase_id: u8,
+    pot: u8,
+    header: &[u8; ratum::header::HEADER_V2_SIZE],
+) -> Option<Vec<u8>> {
     let coinbase = job.full_coinbase(coinbase_id, pot)?;
     let empty = coinbase_id == COINBASE_SUBSIDY_ONLY;
     let others: Vec<Vec<u8>> =
@@ -82,7 +87,7 @@ pub fn extra_client(url: &str) -> Option<rpc::Client> {
         }
         None => ("", "", rest),
     };
-    // Without a port, the scheme's, as curl applies for the C gateway.
+    // Without a port, the scheme's default, as curl applies for the C gateway.
     let (authority, path) = host.split_once('/').map_or((host, ""), |(a, p)| (a, p));
     if authority.is_empty() {
         return None;
@@ -91,13 +96,17 @@ pub fn extra_client(url: &str) -> Option<rpc::Client> {
     let port = if has_port {
         String::new()
     } else if scheme == "https" {
-        ":443".to_string()
+        format!(":{HTTPS_PORT}")
     } else {
-        ":80".to_string()
+        format!(":{HTTP_PORT}")
     };
     let slash = if path.is_empty() && !host.contains('/') { "" } else { "/" };
     rpc::Client::new(&format!("{scheme}://{authority}{port}{slash}{path}"), user, pass).ok()
 }
+
+/// The default ports of the two schemes an extra node URL may name.
+const HTTP_PORT: u16 = 80;
+const HTTPS_PORT: u16 = 443;
 
 pub fn save_to_dir(dir: &str, hash_hex: &str, block: &[u8]) {
     let path = format!("{dir}/datum_submitblock_{hash_hex}.json");

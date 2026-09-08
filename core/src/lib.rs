@@ -19,6 +19,17 @@ pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("RATUM_G
 /// The git commit alone, as `build.rs` recorded it.
 pub const GIT_COMMIT: &str = env!("RATUM_GIT_COMMIT");
 
+/// Seconds in a minute, an hour and a day: the units the uptime and history displays split a
+/// duration into.
+pub const SECS_PER_MINUTE: u64 = 60;
+pub const SECS_PER_HOUR: u64 = 60 * SECS_PER_MINUTE;
+pub const SECS_PER_DAY: u64 = 24 * SECS_PER_HOUR;
+
+/// One hundred percent in basis points. The fee rates both ends carry
+/// (`datum.gateway_fee_bps` in the gateway, `--fee-bps` in the pool) are a numerator over
+/// this.
+pub const BASIS_POINTS_PER_UNIT: u64 = 10_000;
+
 /// The lock, recovered if a panicking thread left it poisoned: the pool serves each
 /// connection on its own thread, and a lock poisoned by one thread's panic must not stop the rest.
 pub fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
