@@ -67,7 +67,7 @@ pub struct Stratum {
     pub username_modifiers: crate::username::Modifiers,
 }
 
-pub struct Ordered<V>(pub Vec<(String, V)>);
+struct Ordered<V>(Vec<(String, V)>);
 
 impl<'de, V: Deserialize<'de>> Deserialize<'de> for Ordered<V> {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {

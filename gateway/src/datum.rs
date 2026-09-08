@@ -537,10 +537,10 @@ impl<'a> Session<'a> {
     }
 
     fn poll_header(&mut self) -> Result<Option<Header>, SessionError> {
-        let mut byte = [0u8; framing::HEADER_LEN];
-        match self.socket.read(&mut byte[..framing::HEADER_LEN - self.pending_header.len()])? {
+        let mut buf = [0u8; framing::HEADER_LEN];
+        match self.socket.read(&mut buf[..framing::HEADER_LEN - self.pending_header.len()])? {
             Some(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into()),
-            Some(n) => self.pending_header.extend_from_slice(&byte[..n]),
+            Some(n) => self.pending_header.extend_from_slice(&buf[..n]),
             None => {}
         }
         if self.pending_header.len() < framing::HEADER_LEN {
@@ -897,7 +897,7 @@ impl<'a> Session<'a> {
         let job_section = (!std::mem::replace(&mut sent.job, true)).then(|| JobSection {
             prev_hash: job.template.prev_hash,
             target_byte_index: job.target_pot_index as u16,
-            nbits: job.template.nbits_bytes,
+            nbits: job.template.nbits.to_le_bytes(),
             coinbaser_id: job.coinbaser_id,
             height: job.template.height,
             coinbase_value: job.template.coinbase_value,
@@ -1041,10 +1041,8 @@ const RECONNECT_DELAY_SPREAD: Duration = Duration::from_secs(15);
 pub fn run_forever(settings: Settings, shared: Arc<Shared>, identity: KeyPairs) {
     loop {
         info!("connecting to DATUM pool {}:{}", settings.host, settings.port);
-        let outcome = match Session::open(&settings, &shared, &identity) {
-            Ok(mut session) => session.run(),
-            Err(e) => Err(e),
-        };
+        let outcome =
+            Session::open(&settings, &shared, &identity).and_then(|mut session| session.run());
         let was_active = shared.disconnected();
         if let Err(e) = outcome {
             error!("DATUM connection ended: {e}");

@@ -176,7 +176,7 @@ impl Client {
         let response = minreq::post(&self.url)
             .with_header("Authorization", authorization)
             .with_header("Content-Type", "application/json")
-            .with_body(body.to_string())
+            .with_body(body)
             .with_timeout(self.timeout.as_secs().max(1))
             .send()?;
         let status = response.status_code as u16;
@@ -257,7 +257,8 @@ impl Client {
         let result = self.call("submitblock", serde_json::json!([hex::encode(block)]))?;
         Ok(match result {
             serde_json::Value::Null => None,
-            other => Some(other.as_str().map_or_else(|| other.to_string(), str::to_string)),
+            serde_json::Value::String(reason) => Some(reason),
+            other => Some(other.to_string()),
         })
     }
 }

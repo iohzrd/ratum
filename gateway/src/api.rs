@@ -146,11 +146,11 @@ fn job_json(j: &crate::job::Job) -> Value {
         "height": j.template.height,
         "value_btc": j.template.coinbase_value as f64 / ratum::SATS_PER_BTC,
         "previous_block": j.template.prev_hash_hex,
-        "target": j.template.target_hex,
+        "target": hex::encode(j.block_target),
         "witness_commitment": hex::encode(&j.template.witness_commitment),
         "difficulty": ratum::target::difficulty_from_bits(j.template.nbits),
         "version": format!("{:08x}", j.template.version),
-        "bits": j.template.bits,
+        "bits": format!("{:08x}", j.template.nbits),
         "curtime": j.template.curtime,
         "mintime": j.template.mintime,
         "sizelimit": j.template.sizelimit,
@@ -309,14 +309,21 @@ fn json_status(code: u16, v: Value) -> Reply {
     http::json(v).with_status_code(code)
 }
 
-fn settings_access(ctx: &Context, req: &Request) -> Result<(), Reply> {
+/// Every admin action requires `api.admin_password` to be set and the request to carry
+/// HTTP Basic credentials matching it. `without_password` is the reply body when it is
+/// unset, which names the action the caller asked for.
+fn admin_access(ctx: &Context, req: &Request, without_password: &str) -> Result<(), Reply> {
     if ctx.server.config.api.admin_password.is_empty() {
-        Err(forbidden("The settings page requires api.admin_password to be set."))
-    } else if !authorized(ctx, req) {
-        Err(unauthorized())
-    } else {
+        Err(forbidden(without_password))
+    } else if authorized(ctx, req) {
         Ok(())
+    } else {
+        Err(unauthorized())
     }
+}
+
+fn settings_access(ctx: &Context, req: &Request) -> Result<(), Reply> {
+    admin_access(ctx, req, "The settings page requires api.admin_password to be set.")
 }
 
 fn settings_json(ctx: &Context) -> Value {
@@ -374,11 +381,8 @@ fn post_settings(ctx: &Context, req: &mut Request) -> (Reply, bool) {
 }
 
 fn post_command(ctx: &Context, req: &mut Request) -> Reply {
-    if ctx.server.config.api.admin_password.is_empty() {
-        return forbidden("Commands require api.admin_password to be set.");
-    }
-    if !authorized(ctx, req) {
-        return unauthorized();
+    if let Err(reply) = admin_access(ctx, req, "Commands require api.admin_password to be set.") {
+        return reply;
     }
     let body = read_body(req);
     if !http::param(&body, "csrf").is_some_and(|t| secure_eq(&t, &ctx.csrf)) {

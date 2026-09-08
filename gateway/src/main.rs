@@ -76,10 +76,10 @@ fn load_config(path: &str) -> Config {
 
 fn connect_node(config: &Config) -> ratum::rpc::Client {
     let b = &config.bitcoind;
-    let node = if !b.rpcuser.is_empty() {
-        ratum::rpc::Client::new(&b.rpcurl, &b.rpcuser, &b.rpcpassword)
-    } else {
+    let node = if b.rpcuser.is_empty() {
         ratum::rpc::Client::with_cookie(&b.rpcurl, b.rpccookiefile.clone().into())
+    } else {
+        ratum::rpc::Client::new(&b.rpcurl, &b.rpcuser, &b.rpcpassword)
     };
     node.unwrap_or_else(|e| {
         error!("bitcoind.rpcurl: {e}");

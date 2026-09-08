@@ -35,12 +35,9 @@ pub struct Template {
     pub weightlimit: u64,
     pub sigoplimit: u64,
     pub version: u32,
-    pub bits: String,
     pub nbits: u32,
-    pub nbits_bytes: [u8; 4],
     pub prev_hash_hex: String,
     pub prev_hash: [u8; 32],
-    pub target_hex: String,
     pub witness_commitment: Vec<u8>,
     pub v2: bool,
     pub reduced_data: bool,
@@ -135,13 +132,12 @@ fn decode(v: &serde_json::Value, reduced_data: bool) -> Result<Template, Templat
     let sizelimit = u64_field(v, "sizelimit")?;
     let weightlimit = u64_field(v, "weightlimit")?;
     let version = u64_field(v, "version")? as u32;
-    let bits = str_field(v, "bits", BITS_HEX_CHARS)?.to_string();
+    let bits = str_field(v, "bits", BITS_HEX_CHARS)?;
     let prev_hash_hex = str_field(v, "previousblockhash", HASH_HEX_CHARS)?.to_string();
-    let target_hex = str_field(v, "target", HASH_HEX_CHARS)?.to_string();
     let wc_hex = str_field(v, "default_witness_commitment", WITNESS_COMMITMENT_HEX_CHARS)?;
     let witness_commitment =
         hex::decode(wc_hex).map_err(|_| TemplateError::Missing("default_witness_commitment"))?;
-    let nbits = u32::from_str_radix(&bits, 16).map_err(|_| TemplateError::Missing("bits"))?;
+    let nbits = u32::from_str_radix(bits, 16).map_err(|_| TemplateError::Missing("bits"))?;
     let prev_hash = hash_field(v, "previousblockhash")?;
     let v2 = rule_present(v, "!blake2b");
 
@@ -179,12 +175,9 @@ fn decode(v: &serde_json::Value, reduced_data: bool) -> Result<Template, Templat
         weightlimit,
         sigoplimit,
         version,
-        nbits_bytes: nbits.to_le_bytes(),
-        bits,
         nbits,
         prev_hash_hex,
         prev_hash,
-        target_hex,
         witness_commitment,
         v2,
         reduced_data,
@@ -360,11 +353,11 @@ impl Poller {
             }
             Err(TemplateError::Refused(why)) => {
                 ratum::lock(&self.status).error = Some(why.clone());
-                if self.last_refusal.as_deref() != Some(why.as_str()) {
+                if self.last_refusal.as_deref() == Some(why.as_str()) {
+                    debug!("template refused: {why}");
+                } else {
                     error!("template refused: {why}");
                     self.last_refusal = Some(why);
-                } else {
-                    debug!("template refused: {why}");
                 }
                 None
             }

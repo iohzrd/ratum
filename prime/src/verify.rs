@@ -146,7 +146,7 @@ fn coinbase_bytes(cb: &CoinbaseSection) -> usize {
     cb.coinb1.len() + cb.coinb2.len()
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Verifier {
     policy: PoolPolicy,
     jobs: Vec<Option<JobState>>,
@@ -560,11 +560,11 @@ fn build_work(
 
     let h = build_header_v2(job, s, &s.blake2b, &merkle_root, abw_key)?;
 
-    let hc = h.hash_components();
+    let (raw_hash, block_hash) = h.pow_and_block_hash();
     Ok(Rebuilt {
         difficulty: s.difficulty(),
-        block_hash: hc.result,
-        raw_hash: hc.hash2,
+        block_hash,
+        raw_hash,
         job_bits: u32::from_le_bytes(job.nbits),
         header: h.serialize(),
         coinbase_tx,

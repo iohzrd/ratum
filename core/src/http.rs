@@ -56,40 +56,49 @@ pub fn path_and_query(req: &Request) -> (String, String) {
     }
 }
 
-pub fn param(query: &str, key: &str) -> Option<String> {
-    query.split('&').find_map(|pair| {
-        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-        (k == key).then(|| url_decode(v))
-    })
-}
-
-pub fn pairs(query: &str) -> Vec<(String, String)> {
+/// The `key=value` pairs of a query string or form body, still percent-encoded.
+fn split_pairs(query: &str) -> impl Iterator<Item = (&str, &str)> {
     query
         .split('&')
         .filter(|pair| !pair.is_empty())
-        .map(|pair| {
-            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-            (url_decode(k), url_decode(v))
-        })
-        .collect()
+        .map(|pair| pair.split_once('=').unwrap_or((pair, "")))
 }
 
+pub fn param(query: &str, key: &str) -> Option<String> {
+    split_pairs(query).find(|(k, _)| *k == key).map(|(_, v)| url_decode(v))
+}
+
+pub fn pairs(query: &str) -> Vec<(String, String)> {
+    split_pairs(query).map(|(k, v)| (url_decode(k), url_decode(v))).collect()
+}
+
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Decodes percent-escapes and `+`. A `%` not followed by two hex digits stands for
+/// itself, and bytes that do not form UTF-8 become the replacement character.
 pub fn url_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        match bytes[i] {
-            b'+' => out.push(b' '),
-            b'%' if i + 2 < bytes.len() => {
-                if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                    out.push(v);
-                    i += 2;
-                } else {
-                    out.push(b'%');
-                }
+        let escape = (bytes[i] == b'%')
+            .then(|| bytes.get(i + 1..i + 3))
+            .flatten()
+            .and_then(|pair| Some(hex_digit(pair[0])? << 4 | hex_digit(pair[1])?));
+        match (escape, bytes[i]) {
+            (Some(v), _) => {
+                out.push(v);
+                i += 2;
             }
-            b => out.push(b),
+            (None, b'+') => out.push(b' '),
+            (None, b) => out.push(b),
         }
         i += 1;
     }

@@ -306,17 +306,15 @@ pub fn listen(server: Arc<Server>) -> io::Result<()> {
             continue;
         }
         let server = Arc::clone(&server);
-        std::thread::Builder::new()
-            .name("stratum-client".into())
-            .spawn(move || match Connection::run(server, stream) {
+        let spawned = std::thread::Builder::new().name("stratum-client".into()).spawn(move || {
+            match Connection::run(server, stream) {
                 Ok(()) | Err(Disconnect::Io(_) | Disconnect::Killed | Disconnect::Idle(_)) => {}
                 Err(e @ Disconnect::Protocol(_)) => info!("Stratum client connection closed: {e}"),
-            })
-            .map_err(|e| {
-                warn!("could not start a client thread: {e}");
-                e
-            })
-            .ok();
+            }
+        });
+        if let Err(e) = spawned {
+            warn!("could not start a client thread: {e}");
+        }
     }
     Ok(())
 }

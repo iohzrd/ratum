@@ -46,20 +46,6 @@ pub struct HeaderV2 {
     pub mm_rhs: U256,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HashComponents {
-    pub xor_key_hash: [u8; 32],
-    pub prevblock_hidden: [u8; 32],
-    pub h1: [u8; 32],
-    pub h2: [u8; 32],
-    pub hash1: [u8; 32],
-    pub asic_profile: u8,
-    pub asic_input: Vec<u8>,
-    pub hash2: [u8; 32],
-    pub mask: [u8; 32],
-    pub result: [u8; 32],
-}
-
 fn sha256(data: &[u8]) -> [u8; 32] {
     Sha256::digest(data).into()
 }
@@ -210,36 +196,25 @@ impl HeaderV2 {
 
         let mask = xor_mask(&self.xor_key, self.xor_key_mask_clear_bits);
 
-        Precomputed { xor_key_hash, h1, h2, hash1, mask }
+        Precomputed { h2, hash1, mask }
     }
 
-    pub fn hash_components(&self) -> HashComponents {
+    /// The proof-of-work hash a mining machine produces for this header, and the block
+    /// hash it XORs to. The two are equal whenever the XOR key is zero, whose mask is all
+    /// zeroes.
+    pub fn pow_and_block_hash(&self) -> ([u8; 32], [u8; 32]) {
         let pre = self.precompute();
-        let asic_input = self.asic_input_with(&pre.hash1, &pre.h2);
-        let hash2 = blake2b_256(&asic_input);
-        let mut result = hash2;
-        for (r, m) in result.iter_mut().zip(pre.mask) {
-            *r ^= m;
+        let pow = blake2b_256(&self.asic_input_with(&pre.hash1, &pre.h2));
+        let mut block = pow;
+        for (b, m) in block.iter_mut().zip(pre.mask) {
+            *b ^= m;
         }
-        HashComponents {
-            xor_key_hash: pre.xor_key_hash,
-            prevblock_hidden: prevblock_hidden(&self.prev_block),
-            h1: pre.h1,
-            h2: pre.h2,
-            hash1: pre.hash1,
-            asic_profile: self.asic_profile(),
-            asic_input,
-            hash2,
-            mask: pre.mask,
-            result,
-        }
+        (pow, block)
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Precomputed {
-    pub xor_key_hash: [u8; 32],
-    pub h1: [u8; 32],
     pub h2: [u8; 32],
     pub hash1: [u8; 32],
     pub mask: [u8; 32],

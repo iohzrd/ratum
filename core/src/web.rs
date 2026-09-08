@@ -31,5 +31,5 @@ pub fn sample_periodically(name: &str, sample: impl Fn() + Send + 'static) {
                 sample();
             }
         })
-        .expect("hashrate sampler thread");
+        .unwrap_or_else(|e| panic!("could not start the {name} thread: {e}"));
 }

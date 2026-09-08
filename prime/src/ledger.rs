@@ -721,19 +721,15 @@ impl Ledger {
             self.drop_oldest();
             count_trimmed = true;
         }
-        if count_trimmed {
-            if !self.count_capped {
-                self.count_capped = true;
-                log::warn!(
-                    "the share window is capped at {MAX_SHARES} shares, which hold less work \
-                     than the configured window times network difficulty; miners are paid over \
-                     the newest {MAX_SHARES} shares. Raise the assigned share difficulty to \
-                     cover the intended span."
-                );
-            }
-        } else {
-            self.count_capped = false;
+        if count_trimmed && !self.count_capped {
+            log::warn!(
+                "the share window is capped at {MAX_SHARES} shares, which hold less work than \
+                 the configured window times network difficulty; miners are paid over the \
+                 newest {MAX_SHARES} shares. Raise the assigned share difficulty to cover the \
+                 intended span."
+            );
         }
+        self.count_capped = count_trimmed;
     }
 
     fn drop_oldest(&mut self) {
