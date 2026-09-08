@@ -1,5 +1,9 @@
-//! A read-only HTTP interface: a JSON snapshot of the pool's state at `/stats.json` and a
-//! single page at `/` that fetches and renders it. It reads the same `Arc<Server>` the
+//! A read-only HTTP interface: a JSON snapshot of the pool's state at `/stats.json`, a
+//! single page at `/` that renders it, and `/robots.txt`. The page is served with that
+//! snapshot embedded, so its first paint needs no fetch (it fetches the snapshot every 5 s
+//! after that), and with a one-paragraph summary of the same figures inside `<noscript>`
+//! for a reader or crawler that runs no script. Its head names the chain and carries the
+//! link-preview tags. It reads the same `Arc<Server>` the
 //! connection threads share and serves only GET; its one write is the hashrate history it
 //! samples once a minute for the page's chart, so it adds no way to change the pool. It is
 //! started only when `--stats-listen` names an address; bind it to `127.0.0.1` unless it
@@ -16,8 +20,16 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, LazyLock, Mutex};
 use tiny_http::{Method, Request, Server as HttpServer};
 
-static INDEX_HTML: LazyLock<String> =
+/// The page with the shared stylesheet and script in place, holding the `<!--head-->`,
+/// `<!--summary-->` and `<!--snapshot-->` markers `page` fills per request.
+static PAGE_TEMPLATE: LazyLock<String> =
     LazyLock::new(|| ratum::web::assemble(include_str!("stats.html")));
+
+/// What the head's description and the page's own text call this pool. The chain is named
+/// with it so a testnet pool's title is not a mainnet pool's.
+const DESCRIPTION: &str = "Non-custodial Bitcoin BLAKE2b mining pool on the Bitcoin Knots \
+                           hardfork chain: miners run a DATUM gateway, build their own \
+                           blocks and are paid from the coinbase.";
 
 /// The span the hashrate estimate averages over. Long enough that a miner at the minimum
 /// share difficulty has several shares accepted within it; short enough that the estimate
@@ -132,16 +144,143 @@ fn handle(
     // The paths carry no parameters.
     let (path, _) = http::path_and_query(&request);
     match path.as_str() {
-        "/" | "/index.html" => request.respond(http::html(INDEX_HTML.clone())),
-        "/stats.json" => request.respond(http::body(snapshot(server, history), "application/json")),
+        "/" | "/index.html" => {
+            let origin = request_origin(&request);
+            let page = page(&snapshot(server, history), origin.as_deref());
+            request.respond(http::html(page))
+        }
+        // Crawlable, so a search engine that renders the page can fetch what it renders
+        // from, but not a search result of its own.
+        "/stats.json" => request.respond(http::noindex(http::body(
+            snapshot(server, history).to_string(),
+            "application/json",
+        ))),
+        "/robots.txt" => {
+            request.respond(http::body(ROBOTS.to_string(), "text/plain; charset=utf-8"))
+        }
         _ => request.respond(http::not_found()),
     }
+}
+
+/// Crawling is allowed everywhere: `/stats.json` must be fetchable for a crawler that runs
+/// the page's script to see anything, and its `X-Robots-Tag` keeps it out of results.
+const ROBOTS: &str = "User-agent: *\nAllow: /\n";
+
+/// The scheme and host the request arrived on, for the canonical and Open Graph URLs:
+/// the `Host` header, with the scheme a reverse proxy reports in `X-Forwarded-Proto`.
+/// Both are values a client sets, so a host outside the characters a host name and port use
+/// is discarded rather than written into the page.
+fn request_origin(request: &Request) -> Option<String> {
+    let host = http::header_value(request, "Host")?;
+    if !usable_host(&host) {
+        return None;
+    }
+    let proto = match http::header_value(request, "X-Forwarded-Proto").as_deref() {
+        Some("https") => "https",
+        _ => "http",
+    };
+    Some(format!("{proto}://{host}"))
+}
+
+/// Whether a `Host` header holds only what a host name, an IPv6 literal and a port are
+/// written with, and so can be written into the page.
+fn usable_host(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 255
+        && host.chars().all(|c| c.is_ascii_alphanumeric() || "-.:[]".contains(c))
+}
+
+/// The page for one request: the head tags, a summary for a reader whose browser runs no
+/// script, and the snapshot the page renders its first paint from rather than waiting for
+/// its first fetch (which is also what a crawler that renders the page reads).
+fn page(snapshot: &serde_json::Value, origin: Option<&str>) -> String {
+    let chain = snapshot["network"]["chain"].as_str();
+    PAGE_TEMPLATE
+        .replace("<!--head-->", &head(chain, origin))
+        .replace("<!--summary-->", &summary(snapshot))
+        // `</` inside a `<script>` element would end it, and the snapshot carries text a
+        // miner chose (its coinbase tag); `<\/` is the same string to a JSON reader.
+        .replace("<!--snapshot-->", &snapshot.to_string().replace("</", "<\\/"))
+}
+
+/// The title, description, link preview tags and icon. The title leads with what the pool
+/// mines because that is what a search for it names; the chain follows when it is not
+/// mainnet, so a test pool is not taken for a mainnet one.
+fn head(chain: Option<&str>, origin: Option<&str>) -> String {
+    let network = match chain {
+        Some(c) if c != "main" && !c.is_empty() => format!(" {c}"),
+        _ => String::new(),
+    };
+    let title = attr(&format!("Bitcoin BLAKE2b{network} mining pool - RATUM Prime"));
+    let description = attr(DESCRIPTION);
+    // An icon drawn in the page's accent color rather than a file to request; a search
+    // result shows it beside the title.
+    let icon = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'\
+                %3E%3Crect width='16' height='16' rx='3' fill='%230f1115'/%3E%3Ctext x='8' \
+                y='12' font-size='11' font-family='monospace' font-weight='bold' \
+                text-anchor='middle' fill='%236ea8fe'%3ER%3C/text%3E%3C/svg%3E";
+    let canonical = origin.map_or(String::new(), |o| {
+        let url = attr(&format!("{o}/"));
+        format!(
+            "<link rel=\"canonical\" href=\"{url}\">\n<meta property=\"og:url\" content=\"{url}\">\n"
+        )
+    });
+    format!(
+        "<title>{title}</title>\n\
+         <meta name=\"description\" content=\"{description}\">\n\
+         <link rel=\"icon\" href=\"{icon}\">\n\
+         {canonical}\
+         <meta property=\"og:type\" content=\"website\">\n\
+         <meta property=\"og:site_name\" content=\"RATUM Prime\">\n\
+         <meta property=\"og:title\" content=\"{title}\">\n\
+         <meta property=\"og:description\" content=\"{description}\">\n\
+         <meta name=\"twitter:card\" content=\"summary\">\n"
+    )
+}
+
+/// What the page says when its script does not run: the figures every other element on it
+/// is drawn from, in one sentence.
+fn summary(snapshot: &serde_json::Value) -> String {
+    let chain = snapshot["network"]["chain"].as_str().unwrap_or("");
+    let height = snapshot["network"]["tip_height"].as_u64();
+    let rate = snapshot["hashrate"]["pool_hs"].as_f64().unwrap_or(0.0);
+    let miners = snapshot["window"]["miners"].as_array().map_or(0, Vec::len);
+    let found = snapshot["blocks"]["found"].as_u64().unwrap_or(0);
+    let at = match (chain.is_empty(), height) {
+        (false, Some(h)) => format!(" on {} at height {h}", attr(chain)),
+        (false, None) => format!(" on {}", attr(chain)),
+        (true, _) => String::new(),
+    };
+    format!(
+        "{DESCRIPTION} It is mining{at}, at about {} across {miners} miners in the payout \
+         window, with {found} blocks found. The figures on this page are updated by a \
+         script, which is not running.",
+        hashrate_text(rate)
+    )
+}
+
+/// A hashes-per-second figure with a unit that keeps it to a few digits, as the page's own
+/// `hashrate` in `page.js` formats it.
+fn hashrate_text(hs: f64) -> String {
+    const UNITS: [&str; 7] = ["H/s", "kH/s", "MH/s", "GH/s", "TH/s", "PH/s", "EH/s"];
+    let mut hs = hs;
+    let mut i = 0;
+    while hs >= 1000.0 && i < UNITS.len() - 1 {
+        hs /= 1000.0;
+        i += 1;
+    }
+    format!("{hs:.1} {}", UNITS[i])
+}
+
+/// Text written into an HTML attribute or element.
+fn attr(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
 /// The JSON snapshot. Every field is read from the shared state; no secret (the node
 /// credentials, the pool signing key) is included. `work` values are `u128`, which JSON
 /// numbers cannot hold in full, so they are strings.
-fn snapshot(server: &Server, history: &Mutex<VecDeque<(u64, f64)>>) -> String {
+fn snapshot(server: &Server, history: &Mutex<VecDeque<(u64, f64)>>) -> serde_json::Value {
     let tip = *lock(&server.node_view.tip);
     let coinbase_value = *lock(&server.node_view.coinbase_value);
     let operator_fee = coinbase_value.map_or(0, |v| server.payout.fee_on(v));
@@ -291,7 +430,7 @@ fn snapshot(server: &Server, history: &Mutex<VecDeque<(u64, f64)>>) -> String {
         }),
     };
 
-    let snapshot = serde_json::json!({
+    serde_json::json!({
         "pool": {
             "motd": server.motd,
             // The build this pool is running: the package version and the git commit.
@@ -353,13 +492,79 @@ fn snapshot(server: &Server, history: &Mutex<VecDeque<(u64, f64)>>) -> String {
             "recent": recent_blocks,
         },
         "generated_at": unix_now(),
-    });
-    snapshot.to_string()
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn demo_snapshot(tag: &str) -> serde_json::Value {
+        serde_json::json!({
+            "pool": { "coinbase_tag": tag },
+            "network": { "chain": "testnet4", "tip_height": 150_308 },
+            "hashrate": { "pool_hs": 12_500_000_000_000.0f64 },
+            "window": { "miners": [{ "identity": "alice" }, { "identity": "bob" }] },
+            "blocks": { "found": 3 },
+        })
+    }
+
+    /// The embedded snapshot carries text a miner chose, so a `</script>` in it would end
+    /// the element and put the rest of the snapshot into the page as markup.
+    #[test]
+    fn an_embedded_snapshot_cannot_end_the_script_element() {
+        let page = page(&demo_snapshot("</script><img src=x>"), None);
+        assert!(page.contains(r"<\/script><img src=x>"), "the sequence is escaped");
+        assert!(!page.contains("</script><img src=x>"), "and not written as it stands");
+        // The escape is a JSON one, so the tag reads back as the miner wrote it.
+        let embedded = page
+            .split_once("<script id=\"snapshot\" type=\"application/json\">")
+            .and_then(|(_, rest)| rest.split_once("</script>"))
+            .expect("the snapshot element");
+        let read: serde_json::Value = serde_json::from_str(embedded.0).expect("valid json");
+        assert_eq!(read["pool"]["coinbase_tag"], "</script><img src=x>");
+    }
+
+    /// The title leads with what the pool mines and names the chain when it is not mainnet.
+    #[test]
+    fn the_title_and_description_name_the_chain_and_the_fork() {
+        let page = page(&demo_snapshot(""), None);
+        assert!(
+            page.contains("<title>Bitcoin BLAKE2b testnet4 mining pool - RATUM Prime</title>"),
+            "{}",
+            &page[..400]
+        );
+        assert!(
+            page.contains("<meta name=\"description\" content=\"Non-custodial Bitcoin BLAKE2b")
+        );
+        assert!(page.contains("<meta property=\"og:title\""), "a link preview reads the OG tags");
+        // The figures, for a reader whose browser runs no script.
+        assert!(page.contains("at height 150308"));
+        assert!(page.contains("12.5 TH/s across 2 miners"));
+        assert!(page.contains("with 3 blocks found"));
+    }
+
+    /// A mainnet pool's title carries no chain name, and the canonical URL is written only
+    /// when the request named a host that can be written into the page.
+    #[test]
+    fn mainnet_has_no_chain_in_its_title_and_the_canonical_url_follows_the_host() {
+        let mut snapshot = demo_snapshot("");
+        snapshot["network"]["chain"] = serde_json::json!("main");
+        let page = page(&snapshot, Some("https://pool.example"));
+        assert!(page.contains("<title>Bitcoin BLAKE2b mining pool - RATUM Prime</title>"));
+        assert!(page.contains("<link rel=\"canonical\" href=\"https://pool.example/\">"));
+        assert!(!super::page(&snapshot, None).contains("rel=\"canonical\""));
+    }
+
+    #[test]
+    fn a_host_header_outside_what_a_host_is_written_with_is_not_used() {
+        assert!(usable_host("pool.iohzrd.tech"));
+        assert!(usable_host("127.0.0.1:38080"));
+        assert!(usable_host("[::1]:38080"));
+        assert!(!usable_host(""));
+        assert!(!usable_host("pool.example\" onload=alert(1) x=\""));
+        assert!(!usable_host(&"a".repeat(256)));
+    }
 
     fn block(n: u8, cumulative_work: u128, difficulty: f64) -> FoundBlock {
         FoundBlock {

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>RATUM Prime</title>
+<!--head-->
 <!--shared-css-->
 <style>
   th.key { width: 11rem; }
@@ -22,6 +22,7 @@
 <header>
   <div>
     <h1>RATUM Prime<span class="chain" id="chain"></span></h1>
+    <div class="motd">Bitcoin BLAKE2b mining pool - DATUM gateways, paid from the coinbase</div>
     <div class="motd" id="motd"></div>
   </div>
   <div class="motd right">
@@ -40,6 +41,8 @@
   they find the payouts this pool dictated beyond that are left out: their value goes to the
   pool's payout script and the operator settles it by hand.
 </div>
+
+<noscript><div class="notice"><!--summary--></div></noscript>
 
 <div class="hero" id="hero"></div>
 
@@ -176,6 +179,8 @@
     <a href="https://github.com/iohzrd/ratum" target="_blank" rel="noopener">iohzrd/ratum</a> ·
   </div>
 </footer>
+
+<script id="snapshot" type="application/json"><!--snapshot--></script>
 
 <!--shared-js-->
 <script>

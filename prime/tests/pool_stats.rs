@@ -113,6 +113,36 @@ fn the_stats_interface_serves_a_json_snapshot_and_a_page() {
     assert!(body.contains("Connect a gateway"), "the page shows how to connect");
     assert!(body.contains("github.com/iohzrd/ratum"), "the page links to the source repo");
 
+    // What a search engine and a link preview read: a title naming the chain the pool
+    // mines, a description, and the canonical URL built from the request's Host header.
+    assert!(body.contains("<title>Bitcoin BLAKE2b regtest mining pool - RATUM Prime</title>"));
+    assert!(body.contains("<meta name=\"description\""));
+    assert!(body.contains(&format!("<link rel=\"canonical\" href=\"http://{addr}/\">")));
+
+    // The snapshot the page was served with: the same figures, so the first paint needs no
+    // fetch, and a summary of them for a reader whose browser runs no script.
+    let embedded = body
+        .split_once("<script id=\"snapshot\" type=\"application/json\">")
+        .and_then(|(_, rest)| rest.split_once("</script>"))
+        .expect("the page carries the snapshot");
+    let served: serde_json::Value = serde_json::from_str(embedded.0).expect("valid json");
+    assert_eq!(served["pool"]["pubkey"], s["pool"]["pubkey"]);
+    assert_eq!(served["window"]["shares"], 2);
+    assert!(body.contains("<noscript>"), "and a summary for a browser that runs no script");
+
+    // Crawling is allowed, since a crawler that renders the page fetches the snapshot; the
+    // snapshot itself is not a result of its own.
+    let (code, robots) = get(&format!("http://{addr}/robots.txt"));
+    assert_eq!(code, 200);
+    assert!(robots.contains("User-agent: *"), "{robots}");
+    let response = minreq::get(format!("http://{addr}/stats.json")).send().expect("the snapshot");
+    let robots_tag = response
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("x-robots-tag"))
+        .map(|(_, value)| value.as_str());
+    assert_eq!(robots_tag, Some("noindex"));
+
     // An unknown path is a 404, not the page or the snapshot.
     let (code, _) = get(&format!("http://{addr}/nope"));
     assert_eq!(code, 404);

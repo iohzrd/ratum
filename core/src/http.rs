@@ -26,6 +26,12 @@ pub fn json(v: serde_json::Value) -> Reply {
     body(v.to_string(), "application/json")
 }
 
+/// The same response with `X-Robots-Tag: noindex`, so a crawler may fetch it (a page that
+/// renders from it needs that) without listing it as a result of its own.
+pub fn noindex(reply: Reply) -> Reply {
+    reply.with_header(header("X-Robots-Tag", "noindex"))
+}
+
 /// A plain-text response with a status code.
 pub fn text(code: u16, text: &str) -> Reply {
     Response::from_string(text).with_status_code(code)
@@ -37,6 +43,14 @@ pub fn not_found() -> Reply {
 
 pub fn method_not_allowed() -> Reply {
     text(405, "method not allowed")
+}
+
+/// The value of the request header named `name`, matched without case, or `None`.
+pub fn header_value(req: &Request, name: &str) -> Option<String> {
+    req.headers()
+        .iter()
+        .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case(name))
+        .map(|h| h.value.as_str().to_string())
 }
 
 /// The request's path and query string, split at the first `?`.

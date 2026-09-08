@@ -269,6 +269,15 @@ accepts miners who do not run their own (a value without a scheme is read as `ht
 unset, the page shows no such banner. It is unauthenticated: bind it to `127.0.0.1` unless it
 is behind a reverse proxy.
 
+The page is served with the snapshot it renders embedded in it, so the first paint needs no
+fetch, and with a one-paragraph summary of the same figures inside `<noscript>` for a reader
+or crawler that runs no script. Its head carries a
+title naming the chain, a description, the Open Graph and card tags a link preview reads, and
+the canonical URL built from the request's `Host` (and `X-Forwarded-Proto` when a reverse
+proxy sets it). `/robots.txt` allows crawling everywhere, since a crawler that renders the
+page fetches `/stats.json`; that response carries `X-Robots-Tag: noindex` so the JSON is not
+a search result of its own.
+
 ## References
 
 https://github.com/OCEAN-xyz/datum_gateway
