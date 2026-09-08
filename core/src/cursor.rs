@@ -25,7 +25,7 @@ impl<'a> Cursor<'a> {
         self.rest.is_empty()
     }
 
-    pub fn peek(&self) -> Option<u8> {
+    fn peek(&self) -> Option<u8> {
         self.rest.first().copied()
     }
 

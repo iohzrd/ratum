@@ -1,4 +1,4 @@
-use crate::cursor::Cursor;
+use crate::cursor::{Cursor, Truncated};
 
 pub use super::messages::DBF_MARKER;
 
@@ -29,6 +29,12 @@ pub enum Error {
     NotAtStart,
 }
 
+impl From<Truncated> for Error {
+    fn from(_: Truncated) -> Self {
+        Error::Truncated
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Fragment<'a> {
     pub id: u32,
@@ -50,12 +56,12 @@ impl<'a> Fragment<'a> {
 
     pub fn decode(data: &'a [u8]) -> Result<Self, Error> {
         let mut c = Cursor::new(data);
-        if c.arr::<{ DBF_MARKER.len() }>("marker").map_err(|_| Error::Truncated)? != DBF_MARKER {
+        if c.arr::<{ DBF_MARKER.len() }>("marker")? != DBF_MARKER {
             return Err(Error::BadMarker);
         }
-        let id = c.u32("transfer id").map_err(|_| Error::Truncated)?;
-        let total_size = c.u32("total size").map_err(|_| Error::Truncated)?;
-        let offset = c.u32("offset").map_err(|_| Error::Truncated)?;
+        let id = c.u32("transfer id")?;
+        let total_size = c.u32("total size")?;
+        let offset = c.u32("offset")?;
         let chunk = c.rest();
         if chunk.is_empty() || chunk.len() > FRAGMENT_DATA_SIZE {
             return Err(Error::BadChunk(chunk.len()));
@@ -88,13 +94,10 @@ impl Ack {
             return Err(Error::Truncated);
         }
         let mut c = Cursor::new(data);
-        if c.arr::<{ ACK_MARKER.len() }>("marker").map_err(|_| Error::Truncated)? != ACK_MARKER {
+        if c.arr::<{ ACK_MARKER.len() }>("marker")? != ACK_MARKER {
             return Err(Error::BadMarker);
         }
-        Ok(Ack {
-            id: c.u32("transfer id").map_err(|_| Error::Truncated)?,
-            next_offset: c.u32("next offset").map_err(|_| Error::Truncated)?,
-        })
+        Ok(Ack { id: c.u32("transfer id")?, next_offset: c.u32("next offset")? })
     }
 }
 

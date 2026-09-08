@@ -1,4 +1,18 @@
+use crate::address;
+
 pub type Modifiers = Vec<(String, Vec<(String, f64)>)>;
+
+/// The address a stratum username begins with: everything before the worker suffix
+/// ('.') and before the modifier name ('~').
+pub fn address_of(username: &str) -> &str {
+    let end = username.find(['.', '~']).unwrap_or(username.len());
+    &username[..end]
+}
+
+pub fn is_payable(username: &str) -> bool {
+    let a = address_of(username);
+    !a.is_empty() && a.len() < address::MAX_ADDRESS_CHARS && address::is_valid(a)
+}
 
 pub const SELECTOR_SPACE: f64 = 65536.0;
 pub const SELECTOR_MAX: i64 = u16::MAX as i64;

@@ -1,10 +1,10 @@
-use crate::address;
 use crate::coinbase::COINBASE_POOLED;
 use crate::config::Config;
 use crate::datum::{self, QueuedShare};
 use crate::dupes::Dupes;
 use crate::job::{
-    COINBASE_SUBSIDY_ONLY, JOB_ID_TIME_CHARS, Job, JobRef, MAX_JOBS, parse_sia_field,
+    COINBASE_SUBSIDY_ONLY, JOB_ID_TIME_CHARS, Job, JobRef, MAX_JOBS, SIA_FIELD_SIZE,
+    parse_sia_field,
 };
 use crate::tally::{FeeMeter, Tally};
 use crate::username;
@@ -325,9 +325,9 @@ struct SubmitRequest {
     job: Arc<Job>,
     job_diff: u64,
     job_ref: JobRef,
-    extranonce: [u8; 16],
-    ntime: [u8; 8],
-    nonce: [u8; 8],
+    extranonce: [u8; EXTRANONCE_SIZE_V2],
+    ntime: [u8; SIA_FIELD_SIZE],
+    nonce: [u8; SIA_FIELD_SIZE],
     miner_username: String,
 }
 
@@ -604,9 +604,7 @@ impl Connection {
         self.username = username.chars().take(MAX_USERNAME_CHARS).collect();
         let name = self.username.clone();
         self.with_stats(|st| st.username = name);
-        if self.server.config.stratum.require_address_username
-            && !address::username_is_payable(username)
-        {
+        if self.server.config.stratum.require_address_username && !username::is_payable(username) {
             let shown: String = username
                 .chars()
                 .map(|c| if c.is_ascii_graphic() || c == ' ' { c } else { '?' })
@@ -844,7 +842,7 @@ impl Connection {
         if !ratum::lock(&self.server.dupes).insert(*hash, job.created) {
             return Err(DUPLICATE);
         }
-        if cfg.stratum.require_address_username && !address::username_is_payable(username) {
+        if cfg.stratum.require_address_username && !username::is_payable(username) {
             return Err(UNAUTHORIZED_WORKER);
         }
         Ok(())

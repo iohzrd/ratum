@@ -463,10 +463,7 @@ impl Ledger {
         let (store, stamped) = Store::open(path, keep, chain)?;
         let (shares, mut read_back) = store.read_back(ledger.window)?;
         read_back.stamped = stamped;
-        for share in shares {
-            ledger.push(share);
-            ledger.trim();
-        }
+        ledger.fill(shares);
         ledger.owed = store.read_owed()?;
         ledger.blocks = store.read_blocks()?;
         ledger.cumulative_work = store.cumulative_work;
@@ -501,6 +498,12 @@ impl Ledger {
                  that is not credited (raise --ledger-keep to keep it)"
             );
         }
+        self.fill(shares);
+        self.shares.len().saturating_sub(before)
+    }
+
+    /// Replaces the in-memory window with `shares`, oldest first.
+    fn fill(&mut self, shares: Vec<Share>) {
         self.shares.clear();
         self.work_per_identity.clear();
         self.tag_per_identity.clear();
@@ -509,7 +512,6 @@ impl Ledger {
             self.push(share);
             self.trim();
         }
-        self.shares.len().saturating_sub(before)
     }
 
     pub fn dump(&self) -> io::Result<Vec<Share>> {

@@ -644,18 +644,16 @@ fn locate_pot_byte(tx: &CoinbaseTx, policy: &PoolPolicy) -> Result<(usize, Strin
     let tag_push = uid_push.checked_sub(1).map(|i| pushes[i].1);
     if !policy.coinbase_tag.is_empty() {
         let tag = policy.coinbase_tag.as_bytes();
-        let after_tag = tag_push
-            .filter(|data| data.len() > tag.len() && &data[..tag.len()] == tag)
-            .map(|data| (data, data[tag.len()]))
-            .filter(|(_, marker)| matches!(*marker, TAG_END | TAG_SEPARATOR))
+        let (marker, rest) = tag_push
+            .and_then(|data| data.strip_prefix(tag))
+            .and_then(|after| after.split_first())
+            .filter(|(marker, _)| matches!(**marker, TAG_END | TAG_SEPARATOR))
             .ok_or(RejectReason::MissingPoolTag)?;
-        if after_tag.1 == TAG_SEPARATOR {
-            tag_secondary = decode_tag(&after_tag.0[tag.len() + 1..]);
+        if *marker == TAG_SEPARATOR {
+            tag_secondary = decode_tag(rest);
         }
-    } else if let Some(data) = tag_push
-        && data.first() == Some(&TAG_SEPARATOR)
-    {
-        tag_secondary = decode_tag(&data[1..]);
+    } else if let Some(rest) = tag_push.and_then(|data| data.strip_prefix(&[TAG_SEPARATOR])) {
+        tag_secondary = decode_tag(rest);
     }
 
     Ok((tx.script_sig_offset + pushes[uid_push].0, tag_secondary))

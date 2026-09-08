@@ -3,6 +3,7 @@ use log::{info, warn};
 use ratum::http::{self, Reply};
 use serde_json::{Value, json};
 use std::io::Read as _;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, LazyLock, Mutex};
 use tiny_http::{Header, Method, Request, Response};
 
@@ -89,6 +90,11 @@ fn seconds_ago(t: Option<std::time::Instant>) -> f64 {
     t.map_or(-1.0, |t| t.elapsed().as_secs_f64())
 }
 
+/// An empty configuration string reaches the pages as null, not as "".
+fn or_null(text: &str) -> Value {
+    if text.is_empty() { Value::Null } else { json!(text) }
+}
+
 fn pool_host_json(cfg: &crate::config::Config) -> Value {
     if cfg.datum.pool_host.is_empty() {
         Value::Null
@@ -97,13 +103,10 @@ fn pool_host_json(cfg: &crate::config::Config) -> Value {
     }
 }
 
-fn pool_url_json(cfg: &crate::config::Config) -> Value {
-    if cfg.datum.pool_url.is_empty() { Value::Null } else { json!(cfg.datum.pool_url) }
-}
-
+/// The per-connection figures both pages show. `identity` adds the fields only the
+/// admin page is allowed to see, and selects the connection-age field it reads.
 fn client_json(cfg: &crate::config::Config, c: &ClientStats, identity: bool) -> Value {
     let mut v = json!({
-        "subscribed_seconds": seconds_ago(c.subscribed_at),
         "last_accepted_seconds": seconds_ago(c.last_accepted),
         "vardiff": c.current_diff,
         "accepted_diff": c.accepted.diff,
@@ -114,20 +117,23 @@ fn client_json(cfg: &crate::config::Config, c: &ClientStats, identity: bool) -> 
         "fee_count": c.fee.count,
         "hashrate_ths": c.hashrate_ths(),
     });
+    let o = v.as_object_mut().expect("an object");
     if identity {
-        let o = v.as_object_mut().expect("an object");
+        o.insert("subscribed_seconds".into(), json!(seconds_ago(c.subscribed_at)));
         o.insert("id".into(), json!(c.unique_id));
         o.insert("remote".into(), json!(c.remote));
         o.insert("username".into(), json!(c.username));
         o.insert(
             "unpayable".into(),
             json!(
-                cfg.stratum.require_address_username
-                    && !crate::address::username_is_payable(&c.username)
+                cfg.stratum.require_address_username && !crate::username::is_payable(&c.username)
             ),
         );
         o.insert("useragent".into(), json!(c.useragent));
         o.insert("subscribed".into(), json!(c.subscribed));
+    } else {
+        let connected = c.subscribed_at.map_or(0.0, |t| t.elapsed().as_secs_f64());
+        o.insert("connected_seconds".into(), json!(connected));
     }
     v
 }
@@ -215,7 +221,7 @@ fn status_json(ctx: &Context, with_clients: bool) -> Value {
         "shares_accepted": datum_stats.accepted.json(),
         "shares_rejected": datum_stats.rejected.json(),
         "pool_host": pool_host_json(cfg),
-        "pool_url": pool_url_json(cfg),
+        "pool_url": or_null(&cfg.datum.pool_url),
         "pool_pubkey": cfg.datum.pool_pubkey,
         "pool_tag": pool.as_ref().map_or(cfg.mining.coinbase_tag_primary.clone(), |p| p.coinbase_tag.clone()),
         "secondary_tag": cfg.mining.coinbase_tag_secondary,
@@ -225,7 +231,7 @@ fn status_json(ctx: &Context, with_clients: bool) -> Value {
         "gateway_fee_address": if cfg.datum.gateway_fee_bps > 0 { json!(cfg.fee_address()) } else { Value::Null },
         "gateway_fee_collected": ratum::lock(&server.fee).json(),
         "stratum": {
-            "listening": server.listening.load(std::sync::atomic::Ordering::Relaxed),
+            "listening": server.listening.load(Ordering::Relaxed),
             "connections": summary.connections,
             "subscriptions": summary.subscribed,
             "hashrate_ths": summary.hashrate_ths,
@@ -259,25 +265,15 @@ fn miner_lookup_json(ctx: &Context, addr: Option<&str>) -> Value {
     let valid =
         addr.filter(|a| a.len() < crate::address::MAX_ADDRESS_CHARS && crate::address::is_valid(a));
     let clients = valid.map_or_else(Vec::new, |a| {
-        ctx.server.client_stats_where(|c| {
-            c.subscribed && crate::address::username_address(&c.username) == a
-        })
+        ctx.server
+            .client_stats_where(|c| c.subscribed && crate::username::address_of(&c.username) == a)
     });
     let mut totals = Totals::default();
     let connections: Vec<Value> = clients
         .iter()
         .map(|c| {
             totals.add(c);
-            let mut v = client_json(cfg, c, false);
-            if let Some(o) = v.as_object_mut()
-                && let Some(s) = o.remove("subscribed_seconds")
-            {
-                o.insert(
-                    "connected_seconds".into(),
-                    if s.as_f64() == Some(-1.0) { json!(0.0) } else { s },
-                );
-            }
-            v
+            client_json(cfg, c, false)
         })
         .collect();
     json!({
@@ -297,7 +293,7 @@ fn miner_lookup_json(ctx: &Context, addr: Option<&str>) -> Value {
         "stratum_port": cfg.stratum.listen_port,
         "require_address_username": cfg.stratum.require_address_username,
         "pool_host": pool_host_json(cfg),
-        "pool_url": pool_url_json(cfg),
+        "pool_url": or_null(&cfg.datum.pool_url),
     })
 }
 

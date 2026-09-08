@@ -62,19 +62,18 @@ pub(crate) fn watch_node(
     loop {
         let height = match node.tip() {
             Ok(t) => {
-                match expected_chain {
-                    Some(expected) if t.chain != expected => {
-                        error!(
-                            "the node is on chain {} but this pool started on chain {} and \
-                             its ledger holds {} shares; exiting rather than credit shares \
-                             of one chain to the ledger of another",
-                            t.chain.name(),
-                            expected.name(),
-                            expected.name()
-                        );
-                        std::process::exit(1);
-                    }
-                    _ => {}
+                if let Some(expected) = expected_chain
+                    && t.chain != expected
+                {
+                    error!(
+                        "the node is on chain {} but this pool started on chain {} and its \
+                         ledger holds {} shares; exiting rather than credit shares of one \
+                         chain to the ledger of another",
+                        t.chain.name(),
+                        expected.name(),
+                        expected.name()
+                    );
+                    std::process::exit(1);
                 }
                 let tip_changed = last != Some(t.hash);
                 let previous_bits = *lock(&view.next_bits);
@@ -314,7 +313,7 @@ pub(crate) fn split_after_fee(l: &Ledger, payout: &PayoutPolicy, value: u64) -> 
 
 pub(crate) struct Resolver {
     scripts: HashMap<String, Result<Vec<u8>, Unpayable>>,
-    order: std::collections::VecDeque<String>,
+    order: VecDeque<String>,
 }
 
 const MAX_CACHED_ADDRESSES: usize = 1 << 16;
@@ -346,7 +345,7 @@ pub(crate) enum Payability {
 
 impl Resolver {
     pub(crate) fn new() -> Self {
-        Resolver { scripts: HashMap::new(), order: std::collections::VecDeque::new() }
+        Resolver { scripts: HashMap::new(), order: VecDeque::new() }
     }
 
     fn insert(&mut self, address: &str, script: Result<Vec<u8>, Unpayable>) {

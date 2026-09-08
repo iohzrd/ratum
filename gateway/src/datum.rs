@@ -761,7 +761,7 @@ impl<'a> Session<'a> {
     }
 
     fn on_share_response(&mut self, r: ShareResponse) {
-        let diff = if r.target_byte == 0xff {
+        let diff = if r.target_byte == ratum::datum::coinbase::POT_TARGET_PLACEHOLDER {
             self.shared.min_difficulty().max(1)
         } else {
             target::diff_for_pot(r.target_byte)
@@ -779,7 +779,7 @@ impl<'a> Session<'a> {
                 debug!("DATUM share accepted: {what} (tentatively)")
             }
             ShareVerdict::Rejected(reason) => {
-                warn!("DATUM share rejected: {what}: {reason:?} ({})", reason as u16)
+                warn!("DATUM share rejected: {what}: {reason:?} ({})", reason.code())
             }
             ShareVerdict::RejectedUnknown(code) => {
                 warn!("DATUM share rejected: {what}: reason code {code} (not one this build names)")

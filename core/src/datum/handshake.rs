@@ -1,4 +1,4 @@
-use super::framing::{self, Header, HeaderKeys, KeyRatchet, SessionNonces};
+use super::framing::{self, Header, HeaderKeys, KeyRatchet, STRUCT_END, SessionNonces};
 use dryoc::classic::crypto_box::{
     PublicKey as BoxPublicKey, SecretKey as BoxSecretKey, crypto_box_beforenm,
     crypto_box_easy_afternm, crypto_box_keypair, crypto_box_open_easy_afternm, crypto_box_seal,
@@ -22,13 +22,12 @@ pub(crate) const POOL_SIGN_KEY_INDEX: usize = HELLO_KEYS;
 pub(crate) const POOL_BOX_KEY_INDEX: usize = HELLO_KEYS + 1;
 pub(crate) const RESPONSE_KEYS_LEN: usize = (POOL_BOX_KEY_INDEX + 1) * PUBKEY_LEN;
 
+const MAX_USER_AGENT: usize = 256;
+pub const MAX_MOTD: usize = 511;
+
 pub(crate) fn key_at(block: &[u8], n: usize) -> Option<&[u8]> {
     block.get(n * PUBKEY_LEN..(n + 1) * PUBKEY_LEN)
 }
-
-const MAX_USER_AGENT: usize = 256;
-use super::framing::STRUCT_END;
-pub const MAX_MOTD: usize = 511;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

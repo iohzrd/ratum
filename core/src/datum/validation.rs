@@ -239,9 +239,7 @@ impl TxnBundle {
 
         let mut txns = Vec::with_capacity(stated.min(1024));
         for _ in 0..stated {
-            let size = c.take(3, "txn size")?;
-            let len = usize::from(u16::from_le_bytes(size[..2].try_into().unwrap()))
-                | (usize::from(size[2]) << 16);
+            let len = decode_txn_size(&mut c)?;
             let tx = c.take(len, "txn").map_err(|_| Error::BadTxnSize)?;
             txns.push(tx.to_vec());
         }
@@ -261,13 +259,25 @@ impl TxnBundle {
         }
         out.extend_from_slice(&(self.txns.len() as u16).to_le_bytes());
         for tx in &self.txns {
-            out.extend_from_slice(&(tx.len() as u16).to_le_bytes());
-            out.push((tx.len() >> 16) as u8);
+            encode_txn_size(&mut out, tx.len());
             out.extend_from_slice(tx);
         }
         out.push(STRUCT_END);
         out
     }
+}
+
+/// A transaction's length in a bundle: a little-endian u16 followed by its high byte.
+const TXN_SIZE_LEN: usize = 3;
+
+fn decode_txn_size(c: &mut Cursor<'_>) -> Result<usize, Error> {
+    let b: [u8; TXN_SIZE_LEN] = c.arr("txn size")?;
+    Ok(usize::from(u16::from_le_bytes([b[0], b[1]])) | (usize::from(b[2]) << 16))
+}
+
+fn encode_txn_size(out: &mut Vec<u8>, len: usize) {
+    out.extend_from_slice(&(len as u16).to_le_bytes());
+    out.push((len >> 16) as u8);
 }
 
 fn body_of(data: &[u8], want: u8) -> Result<Cursor<'_>, Error> {

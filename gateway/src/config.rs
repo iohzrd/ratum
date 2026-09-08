@@ -276,6 +276,7 @@ impl Config {
         self.validate_stratum()?;
         self.validate_mining()?;
         self.validate_api();
+        self.validate_logger();
         self.validate_datum()?;
         self.validate_username_modifiers()
     }
@@ -381,6 +382,9 @@ impl Config {
         if self.api.modify_conf && self.api.admin_password.is_empty() {
             self.warn("api.modify_conf is set but api.admin_password is empty, so the settings page cannot save");
         }
+    }
+
+    fn validate_logger(&mut self) {
         if self.logger.log_rotate_daily.is_some() {
             self.warn("logger.log_rotate_daily has no effect: the file is held open, so rotate it with logrotate's copytruncate");
         }

@@ -29,14 +29,7 @@ pub fn to_output_script(addr: &str) -> Option<Vec<u8>> {
         return None;
     }
     let lower = addr.to_ascii_lowercase();
-    if lower.starts_with("bc") || lower.starts_with("tb") {
-        let expected = if lower.starts_with("tb") {
-            "tb"
-        } else if lower.starts_with("bcrt1") {
-            "bcrt"
-        } else {
-            "bc"
-        };
+    if let Some(expected) = segwit_hrp(&lower) {
         let (found_hrp, version, program) = bech32::segwit::decode(addr).ok()?;
         if found_hrp != Hrp::parse(expected).ok()? {
             return None;
@@ -75,22 +68,26 @@ pub fn to_output_script(addr: &str) -> Option<Vec<u8>> {
     }
 }
 
+/// The human-readable part a segwit address must carry, or None when the address is
+/// not one this gateway pays.
+fn segwit_hrp(lower: &str) -> Option<&'static str> {
+    if lower.starts_with("bcrt1") {
+        Some("bcrt")
+    } else if lower.starts_with("tb1") {
+        Some("tb")
+    } else if lower.starts_with("bc1") {
+        Some("bc")
+    } else {
+        None
+    }
+}
+
 fn witness_version_opcode(version: u8) -> u8 {
     if version == 0 { OP_0 } else { OP_N_BASE + version }
 }
 
 pub fn is_valid(addr: &str) -> bool {
     to_output_script(addr).is_some()
-}
-
-pub fn username_address(username: &str) -> &str {
-    let end = username.find(['.', '~']).unwrap_or(username.len());
-    &username[..end]
-}
-
-pub fn username_is_payable(username: &str) -> bool {
-    let a = username_address(username);
-    !a.is_empty() && a.len() < MAX_ADDRESS_CHARS && is_valid(a)
 }
 
 pub fn output_script_to_display(script: &[u8]) -> String {

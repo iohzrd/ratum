@@ -453,6 +453,11 @@ pub mod share_status {
 
 pub const SHARE_RESPONSE_ABW_MARKER: u8 = 0x06;
 
+const SHARE_RESPONSE_LEN: usize = 1 + 1 + size_of::<u16>() + size_of::<u32>() + 1 + 1;
+/// The raw proof-of-work hash and the 0xFE that closes the reference.
+const ABW_REF_TAIL_LEN: usize = crate::bitcoin::HASH_SIZE + 1;
+const SHARE_RESPONSE_ABW_LEN: usize = SHARE_RESPONSE_LEN + 2 + ABW_REF_TAIL_LEN;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AbwShareRef {
     pub slot: u8,
@@ -476,7 +481,11 @@ impl ShareResponse {
             ShareVerdict::Rejected(r) => (share_status::REJECTED, r.code()),
             ShareVerdict::RejectedUnknown(code) => (share_status::REJECTED, code),
         };
-        let mut out = Vec::with_capacity(if self.abw_ref.is_some() { 45 } else { 10 });
+        let mut out = Vec::with_capacity(if self.abw_ref.is_some() {
+            SHARE_RESPONSE_ABW_LEN
+        } else {
+            SHARE_RESPONSE_LEN
+        });
         out.push(server_subcmd::SHARE_RESPONSE);
         out.push(status);
         out.extend_from_slice(&reason.to_le_bytes());
@@ -510,10 +519,13 @@ impl ShareResponse {
         let target_byte = c.u8("target byte").ok()?;
         let job_id = c.u8("job id").ok()?;
         let abw_ref = match c.rest() {
-            [SHARE_RESPONSE_ABW_MARKER, slot, hash @ ..] if hash.len() == 33 && *slot < 16 => {
-                (hash[32] == STRUCT_END).then(|| AbwShareRef {
+            [SHARE_RESPONSE_ABW_MARKER, slot, tail @ ..]
+                if tail.len() == ABW_REF_TAIL_LEN && *slot < super::abw::ASSIGNMENT_SLOTS =>
+            {
+                let (hash, end) = tail.split_at(crate::bitcoin::HASH_SIZE);
+                (end == [STRUCT_END]).then(|| AbwShareRef {
                     slot: *slot,
-                    raw_pow_hash: hash[..32].try_into().expect("32 bytes"),
+                    raw_pow_hash: hash.try_into().expect("HASH_SIZE bytes"),
                 })
             }
             _ => None,

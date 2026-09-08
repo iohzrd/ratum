@@ -38,6 +38,12 @@ pub const WITNESS_SCALE_FACTOR: u64 = 4;
 pub const NULL_OUTPOINT_INDEX: [u8; OUTPOINT_SIZE - HASH_SIZE] = [0xff; OUTPOINT_SIZE - HASH_SIZE];
 pub const SEQUENCE_FINAL: [u8; SEQUENCE_SIZE] = [0xff; SEQUENCE_SIZE];
 
+pub const MAX_OUTPUT_SCRIPT_SIZE: usize = 34;
+pub const MAX_OUTPUT_DATA_SIZE: usize = 83;
+pub const MAX_COMPACT_SIZE_LEN: usize = 1 + size_of::<u64>();
+
+pub use opcode::OP_RETURN;
+
 pub fn sha256d(data: &[u8]) -> [u8; 32] {
     let first = Sha256::digest(data);
     Sha256::digest(first).into()
@@ -174,6 +180,12 @@ pub enum TxError {
     NoInputs,
 }
 
+impl From<Truncated> for TxError {
+    fn from(t: Truncated) -> Self {
+        TxError::Truncated(t.0)
+    }
+}
+
 pub fn parse_coinbase(tx: &[u8]) -> Result<CoinbaseTx, TxError> {
     let mut c = Cursor::new(tx);
     let version = c.u32("version")?;
@@ -261,17 +273,6 @@ pub fn output_script_size_is_valid(script: &[u8]) -> bool {
     script.len() <= limit
 }
 
-pub const MAX_OUTPUT_SCRIPT_SIZE: usize = 34;
-pub const MAX_OUTPUT_DATA_SIZE: usize = 83;
-
-pub use opcode::OP_RETURN;
-
-impl From<Truncated> for TxError {
-    fn from(t: Truncated) -> Self {
-        TxError::Truncated(t.0)
-    }
-}
-
 const COMPACT_SIZE_U16_TAG: u8 = 0xfd;
 const COMPACT_SIZE_U32_TAG: u8 = 0xfe;
 const COMPACT_SIZE_U64_TAG: u8 = 0xff;
@@ -292,8 +293,6 @@ fn decode_compact_size(c: &mut Cursor<'_>) -> Result<u64, TxError> {
     }
     Ok(v)
 }
-
-pub const MAX_COMPACT_SIZE_LEN: usize = 1 + size_of::<u64>();
 
 pub fn encode_compact_size(n: u64) -> Vec<u8> {
     match n {

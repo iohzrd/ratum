@@ -401,9 +401,9 @@ impl JobRef {
             PREFIXED if s.starts_with(EMPTY_PREFIX) => (false, true, &s[1..]),
             _ => return None,
         };
-        let job_id = &rest[..JOB_ID_CHARS];
+        let job_id = rest.get(..JOB_ID_CHARS)?;
         let global_index = global_index_of(job_id)?;
-        let coinbase = u8::from_str_radix(&rest[JOB_ID_CHARS..NOTIFY_ID_CHARS], 16).ok()?;
+        let coinbase = u8::from_str_radix(rest.get(JOB_ID_CHARS..NOTIFY_ID_CHARS)?, 16).ok()?;
         if empty && coinbase != COINBASE_SUBSIDY_ONLY {
             return None;
         }

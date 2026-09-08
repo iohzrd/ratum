@@ -9,6 +9,13 @@ const COMPACT_SIGN_BIT: u32 = 0x0080_0000;
 const COMPACT_MANTISSA_BYTES: usize = 3;
 const MAX_COMPACT_SIZE: usize = 34;
 
+/// `target_for_difficulty` divides 2^QUOTIENT_BITS by the difficulty and writes the
+/// quotient into the top QUOTIENT_BYTES of the target.
+const QUOTIENT_BITS: i32 = 64;
+const QUOTIENT_BYTES: usize = 12;
+
+pub const MAX_TARGET_POT: u8 = (u64::BITS - 1) as u8;
+
 pub const DIFF1_TARGET: Target = target_for_pot(0);
 
 pub fn bits_to_target(bits: u32) -> Option<Target> {
@@ -64,9 +71,6 @@ pub fn target_for_difficulty(diff: f64) -> Target {
     t
 }
 
-const QUOTIENT_BITS: i32 = 64;
-const QUOTIENT_BYTES: usize = 12;
-
 pub fn difficulty_from_bits(bits: u32) -> Option<f64> {
     let target = bits_to_target(bits)?;
     let t = be_to_f64(&target);
@@ -103,8 +107,6 @@ pub fn share_nbits(exponent: u8) -> u32 {
 pub fn floor_pot(diff: u64) -> u8 {
     if diff == 0 { 0 } else { (u64::BITS - 1 - diff.leading_zeros()) as u8 }
 }
-
-pub const MAX_TARGET_POT: u8 = (u64::BITS - 1) as u8;
 
 pub fn diff_for_pot(exponent: u8) -> u64 {
     1u64 << (u32::from(exponent) & (u64::BITS - 1))

@@ -172,7 +172,13 @@ pub(crate) fn handle(mut stream: TcpStream, server: &Server) -> io::Result<()> {
 
 const MAX_CREDITED_NAMES: usize = 4096;
 
-type ShareOutcome = (ShareVerdict, Option<Vec<u8>>, Option<[u8; 32]>);
+/// What handling one share produced: the verdict to answer with, a follow-up request to
+/// send after the answer, and the raw proof-of-work hash when the pool rebuilt the header.
+struct ShareOutcome {
+    verdict: ShareVerdict,
+    pending: Option<Vec<u8>>,
+    raw_hash: Option<[u8; 32]>,
+}
 
 struct V3Session {
     token: ResumeToken,
@@ -599,58 +605,55 @@ impl Connection<'_> {
 
     fn on_share(&mut self, plain: &[u8]) -> io::Result<()> {
         let peer = self.peer;
-        let (verdict, nonce, target_byte, job_id, pending, raw_hash) =
-            match PowSubmit::decode(plain) {
-                Ok(s) => {
-                    debug!("[{peer}]   -> share {}", describe_share(&s));
-                    self.with_abw(AbwManager::note_share);
-                    let (verdict, pending, raw_hash) = self.check_share(&s, ratum::unix_now())?;
-                    (
-                        verdict,
-                        s.nonce,
-                        s.target_byte,
-                        s.job_id,
-                        pending,
-                        raw_hash.map(|h| (s.abw_slot, h)),
-                    )
-                }
-                Err(e) => {
-                    warn!("[{peer}]   !! could not decode share: {e}");
-                    if matches!(
-                        e,
-                        ratum::datum::share::Error::BadBlake2bSection
-                            | ratum::datum::share::Error::MissingBlake2bSection
-                            | ratum::datum::share::Error::BadExtranonceSize(_)
-                    ) {
-                        warn!(
-                            "[{peer}]      a share this pool cannot read indicates a gateway \
+        let (response, pending) = match PowSubmit::decode(plain) {
+            Ok(s) => {
+                debug!("[{peer}]   -> share {}", describe_share(&s));
+                self.with_abw(AbwManager::note_share);
+                let outcome = self.check_share(&s, ratum::unix_now())?;
+                let abw_ref = outcome
+                    .raw_hash
+                    .zip(s.abw_slot)
+                    .filter(|_| self.v3.is_some())
+                    .map(|(hash, slot)| AbwShareRef { slot, raw_pow_hash: raw_hash_le(&hash) });
+                let response = ShareResponse {
+                    verdict: outcome.verdict,
+                    nonce: s.nonce,
+                    target_byte: s.target_byte,
+                    job_id: s.job_id,
+                    abw_ref,
+                };
+                (response, outcome.pending)
+            }
+            Err(e) => {
+                warn!("[{peer}]   !! could not decode share: {e}");
+                if matches!(
+                    e,
+                    ratum::datum::share::Error::BadBlake2bSection
+                        | ratum::datum::share::Error::MissingBlake2bSection
+                        | ratum::datum::share::Error::BadExtranonceSize(_)
+                ) {
+                    warn!(
+                        "[{peer}]      a share this pool cannot read indicates a gateway \
                          built against a different revision of the protocol (an upstream \
                          DATUM gateway sends no BLAKE2b section); the pool and the gateway \
                          are released together"
-                        );
-                    }
-                    let (job_id, target_byte, nonce) = PowSubmit::prefix(plain).unwrap_or((
-                        0,
-                        ratum::datum::coinbase::POT_TARGET_PLACEHOLDER,
-                        0,
-                    ));
-                    (
-                        ShareVerdict::Rejected(Verifier::reason_for_decode_error(&e)),
-                        nonce,
-                        target_byte,
-                        job_id,
-                        None,
-                        None,
-                    )
+                    );
                 }
-            };
-        let abw_ref = match raw_hash {
-            Some((Some(slot), hash)) if self.v3.is_some() => {
-                Some(AbwShareRef { slot, raw_pow_hash: raw_hash_le(&hash) })
+                let (job_id, target_byte, nonce) = PowSubmit::prefix(plain).unwrap_or((
+                    0,
+                    ratum::datum::coinbase::POT_TARGET_PLACEHOLDER,
+                    0,
+                ));
+                let response = ShareResponse {
+                    verdict: ShareVerdict::Rejected(Verifier::reason_for_decode_error(&e)),
+                    nonce,
+                    target_byte,
+                    job_id,
+                    abw_ref: None,
+                };
+                (response, None)
             }
-            _ => None,
         };
-        let response = ShareResponse { verdict, nonce, target_byte, job_id, abw_ref };
         self.send_mining(&response.encode(), false)?;
         if let Some(request) = pending {
             self.send_mining(&request, false)?;
@@ -712,7 +715,8 @@ impl Connection<'_> {
             );
         }
         if self.is_unpayable(&s.username) {
-            return Ok((ShareVerdict::Rejected(RejectReason::BadUsername), pending, raw_hash));
+            let verdict = ShareVerdict::Rejected(RejectReason::BadUsername);
+            return Ok(ShareOutcome { verdict, pending, raw_hash });
         }
         if let Err(e) = self.record_and_credit(s, &a, now) {
             error!(
@@ -721,7 +725,7 @@ impl Connection<'_> {
                  resend can be credited"
             );
         }
-        Ok((ShareVerdict::Accepted, pending, raw_hash))
+        Ok(ShareOutcome { verdict: ShareVerdict::Accepted, pending, raw_hash })
     }
 
     fn on_refused(
@@ -754,7 +758,7 @@ impl Connection<'_> {
                 self.send_abw_receipt(s, &work)?;
             }
         }
-        Ok((ShareVerdict::Rejected(reason), None, raw_hash))
+        Ok(ShareOutcome { verdict: ShareVerdict::Rejected(reason), pending: None, raw_hash })
     }
 
     fn log_and_record_owed(&self, owed: ledger::OwedBlock) {
@@ -949,47 +953,42 @@ impl Connection<'_> {
 
     fn on_block_txns(&mut self, plain: &[u8]) {
         let peer = self.peer;
-        match plain.get(validation::SELECTOR_AT).copied() {
-            Some(validation::response::BLOCK_TXNS) => {
-                match TxnBundle::decode(plain, validation::response::BLOCK_TXNS) {
-                    Ok(bundle) => {
-                        info!(
-                            "[{peer}]   -> block transactions: job {} {} {} txns",
-                            bundle.job_index,
-                            bundle.status,
-                            bundle.txns.len()
-                        );
-                        match self.awaiting_txns.remove(&bundle.job_index) {
-                            Some(a) if bundle.status == validation::Status::Ok => {
-                                match block_matches_header(&a, &bundle.txns) {
-                                    Ok(()) => {
-                                        let block = ratum::bitcoin::serialize_block(
-                                            &a.work.header,
-                                            &a.work.coinbase_tx,
-                                            &bundle.txns,
-                                        );
-                                        submit(peer, &self.server.node, &block);
-                                    }
-                                    Err(why) => error!(
-                                        "[{peer}]      not relaying job {}: {why}",
-                                        bundle.job_index
-                                    ),
-                                }
-                            }
-                            Some(_) => {
-                                error!("[{peer}]      cannot assemble the block: {}", bundle.status)
-                            }
-                            None => warn!(
-                                "[{peer}]      transactions for job {} that nothing is waiting on",
-                                bundle.job_index
-                            ),
-                        }
-                    }
-                    Err(e) => error!("[{peer}]   !! bad block response: {e}"),
-                }
-            }
-            other => warn!("[{peer}]   !! unhandled 0x50 response {other:?}"),
+        let selector = plain.get(validation::SELECTOR_AT).copied();
+        if selector != Some(validation::response::BLOCK_TXNS) {
+            warn!("[{peer}]   !! unhandled 0x50 response {selector:?}");
+            return;
         }
+        let bundle = match TxnBundle::decode(plain, validation::response::BLOCK_TXNS) {
+            Ok(b) => b,
+            Err(e) => {
+                error!("[{peer}]   !! bad block response: {e}");
+                return;
+            }
+        };
+        info!(
+            "[{peer}]   -> block transactions: job {} {} {} txns",
+            bundle.job_index,
+            bundle.status,
+            bundle.txns.len()
+        );
+        let Some(a) = self.awaiting_txns.remove(&bundle.job_index) else {
+            warn!(
+                "[{peer}]      transactions for job {} that nothing is waiting on",
+                bundle.job_index
+            );
+            return;
+        };
+        if bundle.status != validation::Status::Ok {
+            error!("[{peer}]      cannot assemble the block: {}", bundle.status);
+            return;
+        }
+        if let Err(why) = block_matches_header(&a, &bundle.txns) {
+            error!("[{peer}]      not relaying job {}: {why}", bundle.job_index);
+            return;
+        }
+        let block =
+            ratum::bitcoin::serialize_block(&a.work.header, &a.work.coinbase_tx, &bundle.txns);
+        submit(peer, &self.server.node, &block);
     }
 }
 
