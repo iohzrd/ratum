@@ -369,7 +369,7 @@ impl Shared {
             .wait_timeout_while(guard, COINBASER_WAIT, |r| {
                 r.is_none() && !state.superseded.load(Ordering::SeqCst)
             })
-            .unwrap_or_else(|p| p.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let response = guard.clone();
         drop(guard);
         {

@@ -233,9 +233,7 @@ pub fn parse_coinbase(tx: &[u8]) -> Result<CoinbaseTx, TxError> {
     }
     // The null outpoint a coinbase spends: a zero txid and an all-ones index.
     let prevout = c.take(OUTPOINT_SIZE, "outpoint")?;
-    if prevout[..HASH_SIZE] != [0u8; HASH_SIZE]
-        || prevout[HASH_SIZE..] != [0xffu8; OUTPOINT_SIZE - HASH_SIZE]
-    {
+    if prevout[..HASH_SIZE] != [0u8; HASH_SIZE] || prevout[HASH_SIZE..] != NULL_OUTPOINT_INDEX {
         return Err(TxError::InputNotNull);
     }
     let script_len = decode_compact_size(&mut c)? as usize;

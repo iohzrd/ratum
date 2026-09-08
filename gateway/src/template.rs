@@ -278,7 +278,7 @@ impl Notify {
         let (mut g, _) = self
             .signal
             .wait_timeout_while(g, d, |p| p.block.is_none() && !p.rebuild)
-            .unwrap_or_else(|p| p.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(hash) = g.block.take() {
             g.rebuild = false;
             Wake::Block(hash)
@@ -362,6 +362,21 @@ struct Poller {
 }
 
 impl Poller {
+    fn new(config: Arc<Config>, status: Arc<Mutex<Status>>) -> Self {
+        Poller {
+            config,
+            status,
+            announced: Announced::default(),
+            last_prev: None,
+            no_v2_rule_reported: None,
+            was_notified: false,
+            notified_at: Instant::now(),
+            last_block_change: None,
+            force_clean: false,
+            last_refusal: None,
+        }
+    }
+
     /// Fetch and parse a template, or the reason there is none, which is reported and
     /// recorded in the status.
     fn poll(&mut self, node: &rpc::Client, payout_script: &[u8]) -> Option<Template> {
@@ -476,18 +491,7 @@ pub fn run(
     mut on_template: impl FnMut(Arc<Template>, bool),
 ) {
     let interval = Duration::from_secs(config.bitcoind.work_update_seconds);
-    let mut p = Poller {
-        config,
-        status,
-        announced: Announced::default(),
-        last_prev: None,
-        no_v2_rule_reported: None,
-        was_notified: false,
-        notified_at: Instant::now(),
-        last_block_change: None,
-        force_clean: false,
-        last_refusal: None,
-    };
+    let mut p = Poller::new(config, status);
     loop {
         let Some(template) = p.poll(&node, &payout_script()) else {
             std::thread::sleep(POLL_RETRY_DELAY);
@@ -641,18 +645,7 @@ pub(crate) mod tests {
     }
 
     fn poller() -> Poller {
-        Poller {
-            config: Arc::new(config()),
-            status: Arc::new(Mutex::new(Status::default())),
-            announced: Announced::default(),
-            last_prev: None,
-            no_v2_rule_reported: None,
-            was_notified: false,
-            notified_at: Instant::now(),
-            last_block_change: None,
-            force_clean: false,
-            last_refusal: None,
-        }
+        Poller::new(Arc::new(config()), Arc::new(Mutex::new(Status::default())))
     }
 
     #[test]

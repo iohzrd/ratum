@@ -8,10 +8,7 @@ use crate::bitcoin::{
     HASH_SIZE, LOCK_TIME_SIZE, NULL_OUTPOINT_INDEX, SEQUENCE_FINAL, WITNESS_COMMITMENT_HEADER,
     encode_compact_size, encode_output, encode_push,
 };
-use crate::datum::coinbase::{
-    ENPREFIX_SIZE, POT_TARGET_PLACEHOLDER, TAG_END, TAG_MARKER_BYTES, TAG_SEPARATOR,
-    UID_PUSH_SIZE_V1,
-};
+use crate::datum::coinbase::{ENPREFIX_SIZE, UID_PUSH_POT_AT, tag_push_data, uid_push};
 use crate::datum::messages::CoinbaseOutput;
 use crate::datum::share::{self, CoinbaseSection};
 
@@ -22,14 +19,6 @@ pub fn p2wpkh(b: u8) -> Vec<u8> {
     let mut s = vec![OP_0, HASH160_SIZE as u8];
     s.extend_from_slice(&[b; HASH160_SIZE]);
     s
-}
-
-pub fn push(data: &[u8]) -> Vec<u8> {
-    encode_push(data)
-}
-
-pub fn out(value: u64, script: &[u8]) -> Vec<u8> {
-    encode_output(value, script)
 }
 
 /// How the coinbase identifies the pool: the tag push the pool searches for, then the
@@ -66,33 +55,11 @@ pub fn coinbase(
     coinbase_value: u64,
 ) -> (CoinbaseSection, usize) {
     // The BIP34 height push: the low three bytes of the height, little-endian.
-    let mut script = push(&FIXTURE_HEIGHT.to_le_bytes()[..3]);
-    // The tag push, in the gateway's layout: the primary tag, then TAG_END when it is the
-    // only tag or TAG_SEPARATOR followed by the secondary tag and TAG_END when one follows.
-    let (tag0, tag1) = (tagging.tag.as_bytes(), tagging.tag_secondary.as_bytes());
-    let mut tag = Vec::with_capacity(tag0.len() + tag1.len() + TAG_MARKER_BYTES);
-    if !tag0.is_empty() {
-        tag.extend_from_slice(tag0);
-        tag.push(if tag1.is_empty() { TAG_END } else { TAG_SEPARATOR });
-    } else if !tag1.is_empty() {
-        tag.push(TAG_SEPARATOR);
-    }
-    if !tag1.is_empty() {
-        tag.extend_from_slice(tag1);
-        tag.push(TAG_END);
-    }
-    if tag.is_empty() {
-        tag.push(TAG_END);
-    }
-    script.extend_from_slice(&push(&tag));
-    // The uid push: the PoT placeholder, the 2-byte `coinbase_unique_id` little-endian,
-    // then the prime id.
-    let mut uid = vec![POT_TARGET_PLACEHOLDER];
-    uid.extend_from_slice(&FIXTURE_UNIQUE_ID.to_le_bytes());
-    uid.extend_from_slice(&tagging.prime_id.to_le_bytes());
-    debug_assert_eq!(uid.len(), UID_PUSH_SIZE_V1);
-    script.extend_from_slice(&push(&uid));
-    let pot_in_script = script.len() - UID_PUSH_SIZE_V1;
+    let mut script = encode_push(&FIXTURE_HEIGHT.to_le_bytes()[..3]);
+    let tag = tag_push_data(tagging.tag.as_bytes(), tagging.tag_secondary.as_bytes());
+    script.extend_from_slice(&encode_push(&tag));
+    let pot_in_script = script.len() + UID_PUSH_POT_AT;
+    script.extend_from_slice(&uid_push(FIXTURE_UNIQUE_ID, &tagging.prime_id.to_le_bytes()));
     // The extranonce push: the enprefix, then the 12-byte extranonce the assembler inserts.
     script.push((ENPREFIX_SIZE + share::EXTRANONCE_SIZE) as u8);
     script.extend_from_slice(&FIXTURE_ENPREFIX);
@@ -111,14 +78,14 @@ pub fn coinbase(
     let paid: u64 = outputs.iter().map(|o| o.value).sum();
     coinb2.extend_from_slice(&encode_compact_size((outputs.len() + FIXED_OUTPUTS) as u64));
     for o in outputs {
-        coinb2.extend_from_slice(&out(o.value, &o.script));
+        coinb2.extend_from_slice(&encode_output(o.value, &o.script));
     }
-    coinb2.extend_from_slice(&out(coinbase_value - paid, payout_script));
+    coinb2.extend_from_slice(&encode_output(coinbase_value - paid, payout_script));
     let mut commitment_data = WITNESS_COMMITMENT_HEADER.to_vec();
     commitment_data.extend_from_slice(&[0u8; HASH_SIZE]);
     let mut commitment = vec![OP_RETURN];
-    commitment.extend_from_slice(&push(&commitment_data));
-    coinb2.extend_from_slice(&out(0, &commitment));
+    commitment.extend_from_slice(&encode_push(&commitment_data));
+    coinb2.extend_from_slice(&encode_output(0, &commitment));
     coinb2.extend_from_slice(&[0u8; LOCK_TIME_SIZE]);
 
     (CoinbaseSection { coinbase_id: 0, coinb1, coinb2 }, pot_index)

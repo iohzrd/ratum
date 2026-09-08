@@ -10,15 +10,14 @@
 
 mod support;
 
-use ratum::bitcoin;
 use ratum::datum::messages::{RejectReason, ShareResponse, ShareVerdict, server_subcmd};
 use ratum::datum::share::PowSubmit;
 use ratum::datum::validation::{self, Status, TxnBundle};
 use ratum::target;
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use support::work::{self, Tagging, Work};
-use support::{FakeNode, Gateway, Pool, PoolArgs, TempDir, script_for_address};
+use support::work::{self, Tagging, Work, simple_tx};
+use support::{FakeNode, Gateway, Pool, PoolArgs, TempDir, pool_payout_script};
 
 /// The bytes of a serialized version 2 header.
 const HEADER: usize = ratum::header::HEADER_V2_SIZE;
@@ -26,52 +25,20 @@ const HEADER: usize = ratum::header::HEADER_V2_SIZE;
 const TARGET_BYTE: u8 = 0;
 const USERNAME: &str = "alice.rig1";
 
-fn pool_payout_script() -> Vec<u8> {
-    script_for_address("pool")
-}
-
-/// A transaction the pool's txid parser accepts: one input, one output, no witness.
-fn simple_tx(tag: u8) -> Vec<u8> {
-    let mut tx = vec![0x02, 0x00, 0x00, 0x00];
-    tx.push(0x01);
-    tx.extend_from_slice(&[tag; 32]);
-    tx.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
-    tx.push(0x01);
-    tx.push(0x51);
-    tx.extend_from_slice(&[0xff; 4]);
-    tx.push(0x01);
-    tx.extend_from_slice(&1_000u64.to_le_bytes());
-    tx.push(0x02);
-    tx.extend_from_slice(&[0x00, tag]);
-    tx.extend_from_slice(&[0x00; 4]);
-    tx
-}
-
-/// Work with two other transactions in the block, and the merkle branch that commits to
-/// them: for three leaves the branch is the second transaction, then the third paired with
-/// itself.
+/// Work with two other transactions in the block.
 fn work_with_transactions() -> (Work, Vec<Vec<u8>>) {
     tagged_work_with_transactions("")
 }
 
 /// `work_with_transactions` with the gateway's secondary coinbase tag.
 fn tagged_work_with_transactions(tag_secondary: &str) -> (Work, Vec<Vec<u8>>) {
-    let txns = vec![simple_tx(0xa1), simple_tx(0xb2)];
-    let a = bitcoin::txid(&txns[0]).expect("txid a");
-    let b = bitcoin::txid(&txns[1]).expect("txid b");
-    let mut paired = [0u8; 64];
-    paired[..32].copy_from_slice(&b);
-    paired[32..].copy_from_slice(&b);
-
-    let mut w = Work::build(
+    Work::build(
         &Tagging { tag: "RATUM", tag_secondary, prime_id: 1 },
         &pool_payout_script(),
         &[],
         work::COINBASE_VALUE,
-    );
-    w.job.merkle_branches = vec![a, bitcoin::sha256d(&paired)];
-    w.job.txn_count = txns.len() as u32;
-    (w, txns)
+    )
+    .with_transactions()
 }
 
 /// One found nonce, shared by every test in this file: the search takes most of the time,
@@ -135,12 +102,6 @@ fn ready(pool: &Pool) -> Gateway {
     gateway
 }
 
-fn submit(gateway: &mut Gateway, share: &PowSubmit) -> ShareResponse {
-    gateway.send_mining(&share.encode());
-    let (payload, _) = gateway.recv_until(server_subcmd::SHARE_RESPONSE);
-    ShareResponse::decode(&payload).expect("share response")
-}
-
 #[test]
 #[ignore = "searches ~2^32 hashes; run with --release -- --ignored"]
 fn a_solved_share_is_accepted_and_written_to_the_ledger() {
@@ -153,7 +114,7 @@ fn a_solved_share_is_accepted_and_written_to_the_ledger() {
     let ntime = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()) as u32;
     let (ntime, nonce) = find_nonce_with_retries(&w, ntime);
     let share = w.submit(USERNAME, ntime, nonce, TARGET_BYTE);
-    let response = submit(&mut gateway, &share);
+    let response = gateway.submit(&share);
     assert_eq!(response.verdict, ShareVerdict::Accepted, "{response:?}");
     assert_eq!(response.nonce, share.nonce);
     assert_eq!(response.target_byte, TARGET_BYTE);
@@ -183,9 +144,9 @@ fn the_same_work_is_never_credited_twice() {
     let share = solved_share(&w, false);
 
     let mut first = ready(&pool);
-    assert_eq!(submit(&mut first, &share).verdict, ShareVerdict::Accepted);
+    assert_eq!(first.submit(&share).verdict, ShareVerdict::Accepted);
     assert_eq!(
-        submit(&mut first, &share).verdict,
+        first.submit(&share).verdict,
         ShareVerdict::Rejected(RejectReason::DuplicateWork),
         "the same share twice on one connection"
     );
@@ -193,7 +154,7 @@ fn the_same_work_is_never_credited_twice() {
     // A second gateway cannot claim it either: the `ReplayGuard` is shared.
     let mut second = ready(&pool);
     assert_eq!(
-        submit(&mut second, &share).verdict,
+        second.submit(&share).verdict,
         ShareVerdict::Rejected(RejectReason::DuplicateWork),
         "the same share from another connection"
     );
@@ -215,7 +176,7 @@ fn a_block_with_no_other_transactions_is_relayed_at_once() {
     let mut share = w.submit(USERNAME, ntime, nonce, TARGET_BYTE);
     share.is_block = true;
 
-    assert_eq!(submit(&mut gateway, &share).verdict, ShareVerdict::Accepted);
+    assert_eq!(gateway.submit(&share).verdict, ShareVerdict::Accepted);
     let block = node.wait_for_submission(Duration::from_secs(10)).expect("the block was relayed");
     let raw = hex::decode(block).expect("block hex");
 
@@ -246,10 +207,7 @@ fn a_share_from_an_identity_that_cannot_be_paid_is_rejected_and_its_block_relaye
     let mut share = w.submit(USERNAME, ntime, nonce, TARGET_BYTE);
     share.is_block = true;
 
-    assert_eq!(
-        submit(&mut gateway, &share).verdict,
-        ShareVerdict::Rejected(RejectReason::BadUsername)
-    );
+    assert_eq!(gateway.submit(&share).verdict, ShareVerdict::Rejected(RejectReason::BadUsername));
     assert!(
         node.wait_for_submission(Duration::from_secs(10)).is_some(),
         "the block is relayed even though its submitter cannot be paid"
@@ -362,7 +320,7 @@ fn a_share_that_only_claims_to_be_a_block_is_still_only_a_share() {
     let mut share = w.submit(USERNAME, ntime, nonce, TARGET_BYTE);
     share.is_block = true;
 
-    assert_eq!(submit(&mut gateway, &share).verdict, ShareVerdict::Accepted);
+    assert_eq!(gateway.submit(&share).verdict, ShareVerdict::Accepted);
     pool.expect_line("gateway flagged a block");
     assert!(node.submitted().is_empty(), "and relays nothing");
     assert_eq!(pool.ledger_lines().len(), 1, "the share is still credited");
@@ -379,7 +337,7 @@ fn a_share_is_hashed_from_every_field_the_miner_sets() {
 
     let (w, _) = work_with_transactions();
     let share = solved_share(&w, false);
-    let response = submit(&mut gateway, &share);
+    let response = gateway.submit(&share);
     assert_eq!(response.verdict, ShareVerdict::Accepted, "{response:?}");
 
     let (ntime, nonce) = *solved();
@@ -396,7 +354,7 @@ fn a_share_is_hashed_from_every_field_the_miner_sets() {
     wrong_field.job_id = 1;
     wrong_field.blake2b.sia_nonce[4] = wrong_field.blake2b.sia_nonce[4].wrapping_add(1); // m_nonce2
     assert_eq!(
-        submit(&mut gateway, &wrong_field).verdict,
+        gateway.submit(&wrong_field).verdict,
         ShareVerdict::Rejected(RejectReason::HighHash),
         "changing a hashed field changes the hash"
     );
@@ -408,7 +366,7 @@ fn a_share_is_hashed_from_every_field_the_miner_sets() {
     offset.job_id = 2;
     offset.use_time_offset = true;
     assert_eq!(
-        submit(&mut gateway, &offset).verdict,
+        gateway.submit(&offset).verdict,
         ShareVerdict::Rejected(RejectReason::HighHash),
         "the time-offset selector is a hashed input"
     );

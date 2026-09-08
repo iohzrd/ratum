@@ -18,6 +18,23 @@ pub use ratum::fixtures::{Tagging, p2wpkh};
 
 pub const COINBASE_VALUE: u64 = 312_500_000;
 
+/// A transaction the pool's txid parser accepts: one input, one output, no witness.
+pub fn simple_tx(tag: u8) -> Vec<u8> {
+    let mut tx = vec![0x02, 0x00, 0x00, 0x00];
+    tx.push(0x01);
+    tx.extend_from_slice(&[tag; 32]);
+    tx.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+    tx.push(0x01);
+    tx.push(0x51);
+    tx.extend_from_slice(&[0xff; 4]);
+    tx.push(0x01);
+    tx.extend_from_slice(&1_000u64.to_le_bytes());
+    tx.push(0x02);
+    tx.extend_from_slice(&[0x00, tag]);
+    tx.extend_from_slice(&[0x00; 4]);
+    tx
+}
+
 /// The tip these jobs build on. A pool with a node treats a job on a different tip as stale,
 /// so the stand-in node reports this one.
 pub const PREV_HASH: [u8; 32] = [0x5a; 32];
@@ -73,6 +90,21 @@ impl Work {
             payout_script: payout_script.to_vec(),
             abw: None,
         }
+    }
+
+    /// Put two other transactions in the block and commit to them: for three leaves the
+    /// branch on the coinbase's path is the second transaction, then the third paired with
+    /// itself. Returns the transactions the block carries after the coinbase.
+    pub fn with_transactions(mut self) -> (Self, Vec<Vec<u8>>) {
+        let txns = vec![simple_tx(0xa1), simple_tx(0xb2)];
+        let a = bitcoin::txid(&txns[0]).expect("txid a");
+        let b = bitcoin::txid(&txns[1]).expect("txid b");
+        let mut paired = [0u8; 2 * ratum::bitcoin::HASH_SIZE];
+        paired[..32].copy_from_slice(&b);
+        paired[32..].copy_from_slice(&b);
+        self.job.merkle_branches = vec![a, bitcoin::sha256d(&paired)];
+        self.job.txn_count = txns.len() as u32;
+        (self, txns)
     }
 
     /// Turn this into version 3 work under an ABW assignment: the header commits to

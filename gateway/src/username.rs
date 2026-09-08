@@ -29,7 +29,7 @@ pub fn apply_modifier(
     let base = &username[..tilde];
     let ranges = &modifiers.iter().find(|(name, _)| name == modname)?.1;
     let rnd = u32::from(u16::from_le_bytes([hash[31], hash[30]]));
-    let worker = base.find('.').map(|d| &base[d..]).unwrap_or("");
+    let worker = base.find('.').map_or("", |d| &base[d..]);
     let mut sum = 0f64;
     for (addr, proportion) in ranges.iter() {
         sum += proportion.max(0.0);

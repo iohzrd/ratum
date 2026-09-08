@@ -108,29 +108,21 @@ fn open_ledger(location: &LedgerLocation, flag: &str) -> io::Result<Ledger> {
 /// The block hash a maintenance flag names: the 64 hex digits the pool logged. `also` names
 /// what else the flag takes, for the refusal.
 fn block_hash_arg(flag: &str, arg: &str, also: &str) -> [u8; 32] {
-    match hex::decode(arg).ok().and_then(|v| v.try_into().ok()) {
-        Some(hash) => hash,
-        None => {
-            eprintln!(
-                "{flag} takes the block hash the pool logged (64 hex digits){also}, got {arg:?}"
-            );
-            std::process::exit(2);
-        }
-    }
+    let Some(hash) = hex::decode(arg).ok().and_then(|v| v.try_into().ok()) else {
+        eprintln!("{flag} takes the block hash the pool logged (64 hex digits){also}, got {arg:?}");
+        std::process::exit(2);
+    };
+    hash
 }
 
 /// Print the record a settle or void returned, or report that `arg` names none.
 fn print_or_refuse(arg: &str, record: Option<ledger::OwedBlock>) -> io::Result<()> {
-    match record {
-        Some(o) => {
-            print_owed(&o);
-            Ok(())
-        }
-        None => {
-            eprintln!("no owed block under {arg}; --settle-block list prints them");
-            std::process::exit(2);
-        }
-    }
+    let Some(owed) = record else {
+        eprintln!("no owed block under {arg}; --settle-block list prints them");
+        std::process::exit(2);
+    };
+    print_owed(&owed);
+    Ok(())
 }
 
 /// Print the ledger as `<unix-seconds> <difficulty> <identity> <share-hash>` lines, oldest
@@ -350,185 +342,156 @@ struct Settings {
 }
 
 fn settings(c: &cli::Cli, f: ratum_prime::config::Config) -> Settings {
-    let listen = cli::resolve_str(c.listen.clone(), f.listen, "0.0.0.0:28915");
-    // The read-only stats interface. Unset by default; the interface starts only when this
-    // names an address. Bind it to 127.0.0.1 unless it is behind a reverse proxy, since the
-    // page is unauthenticated.
-    let stats_listen = c.stats_listen.clone().or(f.stats_listen);
-    // The host, or host:port, gateways should use to reach the pool, shown on the stats page.
-    // Unset falls back to the address the page was reached on, so set this when the public
-    // address differs from that (for example the pool is behind NAT or a port-mapping proxy).
-    let advertise_address = c.advertise_address.clone().or(f.advertise_address);
-    // A gateway miners may use instead of running their own, linked from the stats page. A
-    // value written without a scheme is read as an https:// URL, so "gateway.example" and
-    // "https://gateway.example" name the same page.
-    let public_gateway = c.public_gateway.clone().or(f.public_gateway).map(|u| {
-        if u.starts_with("http://") || u.starts_with("https://") {
-            u
-        } else {
-            format!("https://{u}")
-        }
-    });
-    let data_dir = c.data_dir.clone().or(f.data_dir);
-    let key_path = c.key.clone().or(f.key);
-    let motd = cli::resolve_str(c.motd.clone(), f.motd, "RATUM Prime");
-    let allowed_agents: Vec<String> = cli::resolve_str(c.allow_agent.clone(), f.allow_agent, "")
-        .split(',')
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .map(str::to_string)
-        .collect();
-    let require_v3 = cli::resolve::<bool>(
-        c.require_v3.as_deref(),
-        f.require_v3,
-        false,
-        "--require-v3",
-        "true or false",
-        |_| true,
-    );
     let reveal_range = abw::REVEAL_AFTER_SECS_RANGE;
     let reveal_must_be = format!("{} to {} (seconds)", reveal_range.start(), reveal_range.end());
-    let abw_reveal_after = cli::resolve::<u64>(
-        c.abw_reveal_after.as_deref(),
-        f.abw_reveal_after,
-        abw::DEFAULT_REVEAL_AFTER.as_secs(),
-        "--abw-reveal-after",
-        &reveal_must_be,
-        |n| reveal_range.contains(n),
-    );
-    let min_difficulty = cli::resolve::<u64>(
-        c.min_diff.as_deref(),
-        f.min_diff,
-        DEFAULT_MIN_DIFFICULTY,
-        "--min-diff",
-        "a power of two",
-        |n| n.is_power_of_two(),
-    );
-    let max_connections = cli::resolve::<usize>(
-        c.max_connections.as_deref(),
-        f.max_connections,
-        DEFAULT_MAX_CONNECTIONS,
-        "--max-connections",
-        "a positive number",
-        |n| *n > 0,
-    );
-    let payout_address = c.payout_address.clone().or(f.payout_address);
-    let payout_script_hex = c.payout_script.clone().or(f.payout_script);
-    let coinbase_tag = cli::resolve_str(c.coinbase_tag.clone(), f.coinbase_tag, "RATUM");
-    // Zero is refused: the C gateway keeps a resume token only under a nonzero prime id
-    // (`datum_has_resume_token = configured_prime_id != 0`), so with prime id 0 it would
-    // discard its queued and unanswered shares and its retained proofs on every reconnect.
-    let prime_id = cli::resolve::<u32>(
-        c.prime_id.as_deref(),
-        f.prime_id,
-        1,
-        "--prime-id",
-        "a positive number",
-        |n| *n > 0,
-    );
-    let ledger_path = c.ledger.clone().or(f.ledger);
-    // Each unit keeps SHARES_PER_KEEP_UNIT of the most recent shares; unset keeps every one.
-    let ledger_keep = cli::resolve_opt::<usize>(
-        c.ledger_keep.as_deref(),
-        f.ledger_keep,
-        "--ledger-keep",
-        "at least 1",
-        |n| *n >= 1,
-    );
-    let window_multiple = cli::resolve::<f64>(
-        c.window.as_deref(),
-        f.window,
-        8.0,
-        "--window",
-        "a positive number",
-        |n| n.is_finite() && *n > 0.0,
-    );
-    let window_floor = cli::resolve::<u128>(
-        c.window_floor.as_deref(),
-        f.window_floor,
-        1,
-        "--window-floor",
-        "a sum of share difficulty",
-        |_| true,
-    )
-    .max(1);
-    // What is withheld goes to the other miners, not to the pool: an identity under the
-    // minimum receives no output and its work leaves the denominator.
-    let min_payout = cli::resolve::<u64>(
-        c.min_payout.as_deref(),
-        f.min_payout,
-        DUST_THRESHOLD_P2PKH,
-        "--min-payout",
-        "a count of satoshis",
-        |_| true,
-    );
-    // The operator fee in basis points (hundredths of a percent). It is deducted from the
-    // coinbase value before the split; the gateway pays it to the pool's payout script as the
-    // remainder. The default 0 deducts nothing, so the whole value is split among miners.
-    let fee_bps = cli::resolve::<u16>(
-        c.fee_bps.as_deref(),
-        f.fee_bps,
-        0,
-        "--fee-bps",
-        &format!(
-            "basis points from 0 to {MAX_FEE_BPS} (a fee of at most {}%)",
-            f64::from(MAX_FEE_BPS) / 100.0
-        ),
-        |n| *n <= MAX_FEE_BPS,
-    );
-    let rpc_url = c.rpc.clone().or(f.rpc);
-    let rpc_user = cli::resolve_str(c.rpc_user.clone(), f.rpc_user, "");
-    let rpc_pass = cli::resolve_str(c.rpc_pass.clone(), f.rpc_pass, "");
-    let rpc_cookie = c.rpc_cookie.clone().or(f.rpc_cookie);
     // An hour: above the block interval, so a poll this slow already misses tips, and it
     // bounds the value a typo can set the interval to.
     let max_poll_secs = ratum::SECS_PER_HOUR as f64;
-    let poll = Duration::from_secs_f64(cli::resolve::<f64>(
-        c.poll.as_deref(),
-        f.poll,
-        DEFAULT_POLL_SECS,
-        "--poll",
-        &format!("a positive number of seconds up to {max_poll_secs:.0}"),
-        |n| n.is_finite() && *n > 0.0 && *n <= max_poll_secs,
-    ));
-    let require_split = cli::resolve::<bool>(
-        c.require_split.as_deref(),
-        f.require_split,
-        true,
-        "--require-split",
-        "true or false",
-        |_| true,
-    );
-
     Settings {
-        listen,
-        stats_listen,
-        advertise_address,
-        public_gateway,
-        data_dir,
-        key_path,
-        motd,
-        allowed_agents,
-        require_v3,
-        abw_reveal_after,
-        min_difficulty,
-        max_connections,
-        payout_address,
-        payout_script_hex,
-        coinbase_tag,
-        prime_id,
-        ledger_path,
-        ledger_keep,
-        window_multiple,
-        window_floor,
-        min_payout,
-        fee_bps,
-        rpc_url,
-        rpc_user,
-        rpc_pass,
-        rpc_cookie,
-        poll,
-        require_split,
+        listen: cli::resolve_str(c.listen.clone(), f.listen, "0.0.0.0:28915"),
+        // The read-only stats interface. Unset by default; the interface starts only when this
+        // names an address. Bind it to 127.0.0.1 unless it is behind a reverse proxy, since the
+        // page is unauthenticated.
+        stats_listen: c.stats_listen.clone().or(f.stats_listen),
+        // The host, or host:port, gateways should use to reach the pool, shown on the stats page.
+        // Unset falls back to the address the page was reached on, so set this when the public
+        // address differs from that (for example the pool is behind NAT or a port-mapping proxy).
+        advertise_address: c.advertise_address.clone().or(f.advertise_address),
+        // A gateway miners may use instead of running their own, linked from the stats page. A
+        // value written without a scheme is read as an https:// URL, so "gateway.example" and
+        // "https://gateway.example" name the same page.
+        public_gateway: c.public_gateway.clone().or(f.public_gateway).map(|u| {
+            if u.starts_with("http://") || u.starts_with("https://") {
+                u
+            } else {
+                format!("https://{u}")
+            }
+        }),
+        data_dir: c.data_dir.clone().or(f.data_dir),
+        key_path: c.key.clone().or(f.key),
+        motd: cli::resolve_str(c.motd.clone(), f.motd, "RATUM Prime"),
+        allowed_agents: cli::resolve_str(c.allow_agent.clone(), f.allow_agent, "")
+            .split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .collect(),
+        require_v3: cli::resolve::<bool>(
+            c.require_v3.as_deref(),
+            f.require_v3,
+            false,
+            "--require-v3",
+            "true or false",
+            |_| true,
+        ),
+        abw_reveal_after: cli::resolve::<u64>(
+            c.abw_reveal_after.as_deref(),
+            f.abw_reveal_after,
+            abw::DEFAULT_REVEAL_AFTER.as_secs(),
+            "--abw-reveal-after",
+            &reveal_must_be,
+            |n| reveal_range.contains(n),
+        ),
+        min_difficulty: cli::resolve::<u64>(
+            c.min_diff.as_deref(),
+            f.min_diff,
+            DEFAULT_MIN_DIFFICULTY,
+            "--min-diff",
+            "a power of two",
+            |n| n.is_power_of_two(),
+        ),
+        max_connections: cli::resolve::<usize>(
+            c.max_connections.as_deref(),
+            f.max_connections,
+            DEFAULT_MAX_CONNECTIONS,
+            "--max-connections",
+            "a positive number",
+            |n| *n > 0,
+        ),
+        payout_address: c.payout_address.clone().or(f.payout_address),
+        payout_script_hex: c.payout_script.clone().or(f.payout_script),
+        coinbase_tag: cli::resolve_str(c.coinbase_tag.clone(), f.coinbase_tag, "RATUM"),
+        // Zero is refused: the C gateway keeps a resume token only under a nonzero prime id
+        // (`datum_has_resume_token = configured_prime_id != 0`), so with prime id 0 it would
+        // discard its queued and unanswered shares and its retained proofs on every reconnect.
+        prime_id: cli::resolve::<u32>(
+            c.prime_id.as_deref(),
+            f.prime_id,
+            1,
+            "--prime-id",
+            "a positive number",
+            |n| *n > 0,
+        ),
+        ledger_path: c.ledger.clone().or(f.ledger),
+        // Each unit keeps SHARES_PER_KEEP_UNIT of the most recent shares; unset keeps every one.
+        ledger_keep: cli::resolve_opt::<usize>(
+            c.ledger_keep.as_deref(),
+            f.ledger_keep,
+            "--ledger-keep",
+            "at least 1",
+            |n| *n >= 1,
+        ),
+        window_multiple: cli::resolve::<f64>(
+            c.window.as_deref(),
+            f.window,
+            8.0,
+            "--window",
+            "a positive number",
+            |n| n.is_finite() && *n > 0.0,
+        ),
+        window_floor: cli::resolve::<u128>(
+            c.window_floor.as_deref(),
+            f.window_floor,
+            1,
+            "--window-floor",
+            "a sum of share difficulty",
+            |_| true,
+        )
+        .max(1),
+        // What is withheld goes to the other miners, not to the pool: an identity under the
+        // minimum receives no output and its work leaves the denominator.
+        min_payout: cli::resolve::<u64>(
+            c.min_payout.as_deref(),
+            f.min_payout,
+            DUST_THRESHOLD_P2PKH,
+            "--min-payout",
+            "a count of satoshis",
+            |_| true,
+        ),
+        // The operator fee in basis points (hundredths of a percent). It is deducted from the
+        // coinbase value before the split; the gateway pays it to the pool's payout script as the
+        // remainder. The default 0 deducts nothing, so the whole value is split among miners.
+        fee_bps: cli::resolve::<u16>(
+            c.fee_bps.as_deref(),
+            f.fee_bps,
+            0,
+            "--fee-bps",
+            &format!(
+                "basis points from 0 to {MAX_FEE_BPS} (a fee of at most {}%)",
+                f64::from(MAX_FEE_BPS) / 100.0
+            ),
+            |n| *n <= MAX_FEE_BPS,
+        ),
+        rpc_url: c.rpc.clone().or(f.rpc),
+        rpc_user: cli::resolve_str(c.rpc_user.clone(), f.rpc_user, ""),
+        rpc_pass: cli::resolve_str(c.rpc_pass.clone(), f.rpc_pass, ""),
+        rpc_cookie: c.rpc_cookie.clone().or(f.rpc_cookie),
+        poll: Duration::from_secs_f64(cli::resolve::<f64>(
+            c.poll.as_deref(),
+            f.poll,
+            DEFAULT_POLL_SECS,
+            "--poll",
+            &format!("a positive number of seconds up to {max_poll_secs:.0}"),
+            |n| n.is_finite() && *n > 0.0 && *n <= max_poll_secs,
+        )),
+        require_split: cli::resolve::<bool>(
+            c.require_split.as_deref(),
+            f.require_split,
+            true,
+            "--require-split",
+            "true or false",
+            |_| true,
+        ),
         rpc_pass_on_argv: c.rpc_pass.is_some(),
         payout_address_on_argv: c.payout_address.is_some(),
         payout_script_on_argv: c.payout_script.is_some(),

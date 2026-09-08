@@ -84,10 +84,7 @@ fn authorized(ctx: &Context, req: &Request) -> bool {
     if password.is_empty() {
         return false;
     }
-    let Some(h) = req.headers().iter().find(|h| h.field.equiv("Authorization")) else {
-        return false;
-    };
-    let value = h.value.as_str();
+    let Some(value) = http::header_value(req, "Authorization") else { return false };
     let Some(b64) = value.strip_prefix("Basic ") else { return false };
     use base64::Engine as _;
     let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(b64.trim()) else {

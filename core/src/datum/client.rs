@@ -263,16 +263,8 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::datum::handshake::{accept, open_hello};
-
-    fn server_read_hello(
-        wire: &[u8],
-        pool: &KeyPairs,
-    ) -> Result<crate::datum::handshake::Hello, Error> {
-        let mut rx = KeyRatchet::hello();
-        let header = rx.unmask(wire[..4].try_into().unwrap());
-        open_hello(header, &wire[4..4 + header.cmd_len as usize], pool)
-    }
+    use crate::datum::handshake::accept;
+    use crate::datum::handshake::tests::server_read_hello;
 
     #[test]
     fn client_and_server_complete_a_handshake_and_exchange_messages_both_ways() {

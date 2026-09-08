@@ -30,6 +30,24 @@ pub const TIMEOUT: Duration = Duration::from_secs(20);
 
 pub use ratum::lock;
 
+/// The script the stand-in node reports for the pool's own payout address, which is what
+/// `PoolArgs` starts the pool with.
+pub fn pool_payout_script() -> Vec<u8> {
+    script_for_address("pool")
+}
+
+/// Seed a data directory's ledger with alice (one share of difficulty 3) and bob (one share
+/// of difficulty 1), so the window is three parts to one and a split of it pays them in that
+/// proportion.
+pub fn seed_alice_and_bob(dir: &TempDir) {
+    let (mut l, _) =
+        ratum_prime::ledger::Ledger::open(&dir.join("regtest.redb"), u128::MAX, None, None)
+            .expect("open the seed ledger");
+    let now = ratum::unix_now();
+    l.record(now, "alice", 3, &[0x11; 32], "").expect("record alice");
+    l.record(now, "bob", 1, &[0x22; 32], "").expect("record bob");
+}
+
 /// A directory removed when this value is dropped, so a failed test leaves no state behind for
 /// the next.
 pub struct TempDir(PathBuf);

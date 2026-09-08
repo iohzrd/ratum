@@ -44,9 +44,10 @@ fn normalize(given: &str) -> String {
         Some(h) if count && parts.next().is_some() => h,
         _ => body,
     };
-    let body = match body.len() > 12 && body.bytes().all(|b| b.is_ascii_hexdigit()) {
-        true => &body[..12],
-        false => body,
+    let body = if body.len() > 12 && body.bytes().all(|b| b.is_ascii_hexdigit()) {
+        &body[..12]
+    } else {
+        body
     };
     format!("{body}{dirty}")
 }

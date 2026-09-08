@@ -136,13 +136,8 @@ fn handle(
         }
         // Crawlable, so a search engine that renders the page can fetch what it renders
         // from, but not a search result of its own.
-        "/stats.json" => request.respond(http::noindex(http::body(
-            snapshot(server, history).to_string(),
-            "application/json",
-        ))),
-        "/robots.txt" => {
-            request.respond(http::body(ROBOTS.to_string(), "text/plain; charset=utf-8"))
-        }
+        "/stats.json" => request.respond(http::noindex(http::json(snapshot(server, history)))),
+        "/robots.txt" => request.respond(http::plain(ROBOTS.to_string())),
         _ => request.respond(http::not_found()),
     }
 }

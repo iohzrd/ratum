@@ -4,6 +4,8 @@ use super::*;
 use ratum::datum::client::Client;
 use ratum::datum::framing::{self, Header};
 use ratum::datum::handshake::KeyPairs;
+use ratum::datum::messages::{ShareResponse, server_subcmd};
+use ratum::datum::share::PowSubmit;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
@@ -168,6 +170,13 @@ impl Gateway {
         self.send(framing::cmd::MINING, payload);
     }
 
+    /// Send a share and read the response the pool answers it with.
+    pub fn submit(&mut self, share: &PowSubmit) -> ShareResponse {
+        self.send_mining(&share.encode());
+        let (payload, _) = self.recv_until(server_subcmd::SHARE_RESPONSE);
+        ShareResponse::decode(&payload).expect("share response decodes")
+    }
+
     pub fn set_read_timeout(&self, d: Option<Duration>) {
         self.stream.set_read_timeout(d).expect("set read timeout");
     }
@@ -199,7 +208,7 @@ impl Gateway {
             let left = deadline.saturating_duration_since(Instant::now());
             match self.try_recv(left) {
                 Some((_, payload)) if payload.first() == Some(&marker) => return false,
-                Some(_) => continue,
+                Some(_) => {}
                 None => return true,
             }
         }

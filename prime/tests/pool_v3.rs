@@ -6,7 +6,6 @@
 
 mod support;
 
-use ratum::bitcoin;
 use ratum::datum::abw::{self, AssignmentNotice, Candidate, Reveal};
 use ratum::datum::bulk;
 use ratum::datum::framing;
@@ -16,9 +15,9 @@ use ratum::datum::messages::{
 };
 use ratum::datum::validation::{self, Status, TxnBundle};
 use ratum::target;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use support::work::{self, Tagging, Work};
-use support::{FakeNode, Gateway, Pool, PoolArgs, TIMEOUT, TempDir, script_for_address};
+use support::{FakeNode, Gateway, Pool, PoolArgs, TIMEOUT, TempDir, pool_payout_script};
 
 const PRIME_ID: u64 = 0x0102_0304;
 /// The bytes of a serialized version 2 header.
@@ -36,14 +35,6 @@ fn started(dir: &str, node: &FakeNode) -> Pool {
             ..Default::default()
         },
     )
-}
-
-fn pool_payout_script() -> Vec<u8> {
-    script_for_address("pool")
-}
-
-fn unix_now() -> u32 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as u32
 }
 
 /// The next assignment notice with the active flag. On a resume the retired slot's notice
@@ -76,12 +67,6 @@ fn v3_work(key_hash: [u8; 32], slot: u8) -> Work {
         work::COINBASE_VALUE,
     )
     .with_abw(key_hash, slot)
-}
-
-fn submit(gateway: &mut Gateway, s: &ratum::datum::share::PowSubmit) -> ShareResponse {
-    gateway.send_mining(&s.encode());
-    let (payload, _) = gateway.recv_until(server_subcmd::SHARE_RESPONSE);
-    ShareResponse::decode(&payload).expect("share response decodes")
 }
 
 /// Wait until the pool has logged `needle` at least `count` times.
@@ -200,8 +185,8 @@ fn a_share_naming_an_unseeded_slot_is_refused() {
     // Slot 5 was never seeded (only slot 0 is active), so the share is refused before its
     // proof of work is hashed.
     let w = v3_work(key_hash, 5);
-    let share = w.submit("alice.rig1", unix_now(), 0, 0);
-    let response = submit(&mut gateway, &share);
+    let share = w.submit("alice.rig1", ratum::unix_now() as u32, 0, 0);
+    let response = gateway.submit(&share);
     assert_eq!(response.verdict, ShareVerdict::Rejected(RejectReason::BadAbwSlot), "{response:?}");
     assert!(response.abw_ref.is_none(), "no work rebuilds without a seeded slot");
 }
@@ -215,7 +200,8 @@ fn a_share_that_does_not_decode_is_answered_with_its_prefix_fields() {
 
     // Cut inside the sections: the response names the job, target byte and nonce from the
     // prefix, by which the gateway retires its replay entry.
-    let share = v3_work(key_hash, slot).submit("alice.rig1", unix_now(), 0x0102_0304, 0);
+    let share =
+        v3_work(key_hash, slot).submit("alice.rig1", ratum::unix_now() as u32, 0x0102_0304, 0);
     let mut bytes = share.encode();
     bytes.truncate(60);
     gateway.send_mining(&bytes);
@@ -240,9 +226,9 @@ fn a_share_on_the_active_slot_is_hashed_and_a_below_target_one_is_high_hash() {
     // the difficulty-1 share target, so it is HighHash, not BadAbwSlot. This tests the
     // key-hash commitment computation without a 2^32 search.
     let w = v3_work(key_hash, slot);
-    let (ntime, nonce) = (unix_now(), 0);
+    let (ntime, nonce) = (ratum::unix_now() as u32, 0);
     let share = w.submit("alice.rig1", ntime, nonce, 0);
-    let response = submit(&mut gateway, &share);
+    let response = gateway.submit(&share);
     assert_eq!(
         response.verdict,
         ShareVerdict::Rejected(RejectReason::HighHash),
@@ -287,7 +273,7 @@ fn a_tip_change_rotates_the_assignment_and_the_retired_slot_is_revealed_after_th
     // A share on the retired slot is still hashed (and refused on its hash only).
     let mut w = v3_work(hash0, 0);
     w.job.prev_hash = [0x5b; 32];
-    let response = submit(&mut gateway, &w.submit("alice.rig1", unix_now(), 0, 0));
+    let response = gateway.submit(&w.submit("alice.rig1", ratum::unix_now() as u32, 0, 0));
     assert_eq!(response.verdict, ShareVerdict::Rejected(RejectReason::HighHash), "{response:?}");
 
     // Retired for the delay, slot 0 is revealed with the key its commitment names.
@@ -304,7 +290,7 @@ fn a_tip_change_rotates_the_assignment_and_the_retired_slot_is_revealed_after_th
     // that key for the exact reference.
     let mut w = v3_work(hash0, 0);
     w.job.prev_hash = [0x5b; 32];
-    let response = submit(&mut gateway, &w.submit("alice.rig1", unix_now(), 1, 0));
+    let response = gateway.submit(&w.submit("alice.rig1", ratum::unix_now() as u32, 1, 0));
     assert_eq!(response.verdict, ShareVerdict::Rejected(RejectReason::BadAbwSlot), "{response:?}");
     assert_eq!(response.abw_ref.map(|r| r.slot), Some(0), "rebuilt with the revealed key");
 
@@ -344,43 +330,15 @@ fn bulk_fragments_are_acknowledged_and_reassembled_and_a_stray_one_is_acknowledg
     gateway.recv_until(server_subcmd::COINBASER);
 }
 
-/// A transaction the pool's txid parser accepts: one input, one output, no witness.
-fn simple_tx(tag: u8) -> Vec<u8> {
-    let mut tx = vec![0x02, 0x00, 0x00, 0x00];
-    tx.push(0x01);
-    tx.extend_from_slice(&[tag; 32]);
-    tx.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
-    tx.push(0x01);
-    tx.push(0x51);
-    tx.extend_from_slice(&[0xff; 4]);
-    tx.push(0x01);
-    tx.extend_from_slice(&1_000u64.to_le_bytes());
-    tx.push(0x02);
-    tx.extend_from_slice(&[0x00, tag]);
-    tx.extend_from_slice(&[0x00; 4]);
-    tx
-}
-
-/// Version 3 work with two other transactions in the block, and the merkle branch that
-/// commits to them: for three leaves the branch is the second transaction, then the third
-/// paired with itself.
+/// Version 3 work with two other transactions in the block.
 fn work_with_transactions(key_hash: [u8; 32], slot: u8) -> (Work, Vec<Vec<u8>>) {
-    let txns = vec![simple_tx(0xa1), simple_tx(0xb2)];
-    let a = bitcoin::txid(&txns[0]).expect("txid a");
-    let b = bitcoin::txid(&txns[1]).expect("txid b");
-    let mut paired = [0u8; 64];
-    paired[..32].copy_from_slice(&b);
-    paired[32..].copy_from_slice(&b);
-    let mut w = v3_work(key_hash, slot);
-    w.job.merkle_branches = vec![a, bitcoin::sha256d(&paired)];
-    w.job.txn_count = txns.len() as u32;
-    (w, txns)
+    v3_work(key_hash, slot).with_transactions()
 }
 
 /// A nonce for `w` at difficulty 1, searching the ntime window from now.
 fn solve(w: &Work) -> (u32, u32) {
     let target = target::target_for_pot(0);
-    let now = unix_now();
+    let now = ratum::unix_now() as u32;
     (now..now + 600)
         .find_map(|t| w.find_nonce(t, 0, &target).map(|n| (t, n)))
         .expect("a difficulty-1 hash within the ntime window")
@@ -406,7 +364,7 @@ fn a_solved_v3_share_is_accepted_with_the_exact_abw_reference() {
     assert!(target::meets_target(&raw, &target::target_for_pot(0)));
 
     let share = w.submit("alice.rig1", ntime, nonce, 0);
-    let response = submit(&mut gateway, &share);
+    let response = gateway.submit(&share);
     assert_eq!(response.verdict, ShareVerdict::Accepted, "{response:?}");
     let abw_ref = response.abw_ref.expect("the response carries the exact ABW reference");
     assert_eq!(abw_ref.slot, slot);

@@ -12,23 +12,16 @@ use ratum::datum::messages::{
 };
 use ratum::datum::share::PowSubmit;
 use ratum::target;
-use ratum_prime::ledger::Ledger;
+
 use ratum_prime::verify::TIP_GRACE_SECS;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use support::work::{self, Tagging, Work};
-use support::{FakeNode, Pool, PoolArgs, TempDir, script_for_address};
+use support::{
+    FakeNode, Pool, PoolArgs, TempDir, pool_payout_script, script_for_address, seed_alice_and_bob,
+};
 
 fn now() -> u32 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()) as u32
-}
-
-/// Seed a data directory's ledger with alice (one share of difficulty 3) and bob (one share of
-/// difficulty 1), so a split of it pays them three to one.
-fn seed_alice_and_bob(dir: &TempDir) {
-    let (mut l, _) = Ledger::open(&dir.join("regtest.redb"), u128::MAX, None, None)
-        .expect("open the seed ledger");
-    l.record(now() as u64, "alice", 3, &[0x11; 32], "").unwrap();
-    l.record(now() as u64, "bob", 1, &[0x22; 32], "").unwrap();
+    ratum::unix_now() as u32
 }
 
 fn tagging() -> Tagging<'static> {
@@ -40,16 +33,6 @@ fn tagging() -> Tagging<'static> {
 /// script.
 fn work_for(pool_payout: &[u8]) -> Work {
     Work::build(&tagging(), pool_payout, &[], work::COINBASE_VALUE)
-}
-
-fn pool_payout_script() -> Vec<u8> {
-    script_for_address("pool")
-}
-
-fn submit_and_read(gateway: &mut support::Gateway, s: &PowSubmit) -> ShareResponse {
-    gateway.send_mining(&s.encode());
-    let (payload, _) = gateway.recv_until(server_subcmd::SHARE_RESPONSE);
-    ShareResponse::decode(&payload).expect("share response decodes")
 }
 
 fn reason(response: &ShareResponse) -> RejectReason {
@@ -341,7 +324,7 @@ fn the_network_target_is_set_again_when_the_template_arrives_after_its_tip() {
     work.job.prev_hash = node.tip_internal();
     work.job.nbits = work::EASY_NBITS;
     let share = work.submit("miner.rig", now(), 0, 0);
-    let response = submit_and_read(&mut gateway, &share);
+    let response = gateway.submit(&share);
     assert_eq!(
         reason(&response),
         RejectReason::BadTarget,
@@ -357,7 +340,7 @@ fn a_share_that_misses_the_target_is_rejected_as_a_high_hash() {
 
     let work = work_for(&pool_payout_script());
     let share = work.submit("miner.rig", now(), 0, 0);
-    let response = submit_and_read(&mut gateway, &share);
+    let response = gateway.submit(&share);
     assert_eq!(reason(&response), RejectReason::HighHash);
     assert_eq!(response.nonce, share.nonce);
     assert_eq!(response.job_id, share.job_id);
@@ -379,21 +362,21 @@ fn eight_reasons_a_share_is_rejected() {
 
     let mut under_minimum = work.submit("miner.rig", now(), 0, 0);
     under_minimum.target_byte = 0;
-    assert_eq!(reason(&submit_and_read(&mut gateway, &under_minimum)), RejectReason::BadTarget);
+    assert_eq!(reason(&gateway.submit(&under_minimum)), RejectReason::BadTarget);
 
     let mut bad_name = work.submit("has a space", now(), 0, target_byte);
     bad_name.job_id = 1;
-    assert_eq!(reason(&submit_and_read(&mut gateway, &bad_name)), RejectReason::BadUsername);
+    assert_eq!(reason(&gateway.submit(&bad_name)), RejectReason::BadUsername);
 
     let mut old = work.submit("miner.rig", now() - 3 * 60 * 60, 0, target_byte);
     old.job_id = 2;
-    assert_eq!(reason(&submit_and_read(&mut gateway, &old)), RejectReason::BadNtime);
+    assert_eq!(reason(&gateway.submit(&old)), RejectReason::BadNtime);
 
     let mut unknown_job = work.submit("miner.rig", now(), 0, target_byte);
     unknown_job.job_id = 9;
     unknown_job.job = None;
     unknown_job.coinbase = None;
-    assert_eq!(reason(&submit_and_read(&mut gateway, &unknown_job)), RejectReason::BadJobId);
+    assert_eq!(reason(&gateway.submit(&unknown_job)), RejectReason::BadJobId);
 
     let other_pool = Work::build(
         &Tagging { tag: "SOMEONE ELSE", tag_secondary: "", prime_id: 1 },
@@ -403,10 +386,7 @@ fn eight_reasons_a_share_is_rejected() {
     );
     let mut other_pools_tag = other_pool.submit("miner.rig", now(), 0, target_byte);
     other_pools_tag.job_id = 3;
-    assert_eq!(
-        reason(&submit_and_read(&mut gateway, &other_pools_tag)),
-        RejectReason::MissingPoolTag
-    );
+    assert_eq!(reason(&gateway.submit(&other_pools_tag)), RejectReason::MissingPoolTag);
 
     let elsewhere = Work::build(
         &tagging(),
@@ -417,7 +397,7 @@ fn eight_reasons_a_share_is_rejected() {
     let mut undictated_output = elsewhere.submit("miner.rig", now(), 0, target_byte);
     undictated_output.job_id = 4;
     assert_eq!(
-        reason(&submit_and_read(&mut gateway, &undictated_output)),
+        reason(&gateway.submit(&undictated_output)),
         RejectReason::BadCoinbaseOutputs,
         "the pool did not dictate that output"
     );
@@ -425,12 +405,12 @@ fn eight_reasons_a_share_is_rejected() {
     let mut no_coinbase = work.submit("miner.rig", now(), 0, target_byte);
     no_coinbase.job_id = 5;
     no_coinbase.coinbase = None;
-    assert_eq!(reason(&submit_and_read(&mut gateway, &no_coinbase)), RejectReason::CoinbaseMissing);
+    assert_eq!(reason(&gateway.submit(&no_coinbase)), RejectReason::CoinbaseMissing);
 
     let mut wrong_id = work.submit("miner.rig", now(), 0, target_byte);
     wrong_id.job_id = 6;
     wrong_id.coinbase_id = 3;
-    assert_eq!(reason(&submit_and_read(&mut gateway, &wrong_id)), RejectReason::CoinbaseIdMismatch);
+    assert_eq!(reason(&gateway.submit(&wrong_id)), RejectReason::CoinbaseIdMismatch);
 }
 
 #[test]
@@ -451,7 +431,7 @@ fn work_on_a_prev_hash_that_is_not_the_node_tip_is_stale() {
     let _config = gateway.recv();
     let work = work_for(&pool_payout_script()); // prev_hash is 0x5a…, not the node's tip
     let share = work.submit("miner.rig", now(), 0, 0);
-    assert_eq!(reason(&submit_and_read(&mut gateway, &share)), RejectReason::StaleBlock);
+    assert_eq!(reason(&gateway.submit(&share)), RejectReason::StaleBlock);
 }
 
 /// Sets the node's tip, then replaces it, and returns a gateway whose verifier has received
@@ -495,7 +475,7 @@ fn off_tip_share() -> PowSubmit {
 fn work_on_the_most_recently_replaced_tip_is_not_refused_as_stale() {
     // The miner was hashing this job when the tip changed and had no signal to stop.
     let (_node, _pool, mut gateway) = pool_past_the_tip("grace-fresh", &["77".repeat(32).as_str()]);
-    let reply = submit_and_read(&mut gateway, &off_tip_share());
+    let reply = gateway.submit(&off_tip_share());
     assert!(
         !matches!(reply.verdict, ShareVerdict::Rejected(RejectReason::StaleBlock)),
         "within the grace period the job is still checked, got {:?}",
@@ -508,7 +488,7 @@ fn work_on_a_replaced_tip_goes_stale_once_the_grace_period_ends() {
     let (_node, _pool, mut gateway) =
         pool_past_the_tip("grace-expired", &["77".repeat(32).as_str()]);
     std::thread::sleep(Duration::from_millis(TIP_GRACE_SECS * 1000 + 1500));
-    let reply = submit_and_read(&mut gateway, &off_tip_share());
+    let reply = gateway.submit(&off_tip_share());
     assert_eq!(
         reply.verdict,
         ShareVerdict::Rejected(RejectReason::StaleBlock),
@@ -524,7 +504,7 @@ fn the_grace_period_is_not_ended_by_further_tip_changes() {
         "grace-tip-changes",
         &["77".repeat(32).as_str(), "88".repeat(32).as_str(), "99".repeat(32).as_str()],
     );
-    let reply = submit_and_read(&mut gateway, &off_tip_share());
+    let reply = gateway.submit(&off_tip_share());
     assert!(
         !matches!(reply.verdict, ShareVerdict::Rejected(RejectReason::StaleBlock)),
         "the parent left the tip once, not three times, got {:?}",
@@ -564,7 +544,7 @@ fn work_on_an_off_tip_job_is_not_refused_as_stale_when_it_meets_the_network_targ
         .expect("a time whose share meets the network target within 64 tries");
 
     let share = work.submit("miner.rig", ntime, 0, 0);
-    let reply = submit_and_read(&mut gateway, &share);
+    let reply = gateway.submit(&share);
     assert!(
         !matches!(reply.verdict, ShareVerdict::Rejected(RejectReason::StaleBlock)),
         "a share meeting the network target is not rejected for the tip having changed, got {:?}",

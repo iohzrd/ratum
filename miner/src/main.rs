@@ -148,7 +148,7 @@ fn read_messages(
                     ntime,
                     ntime_hex,
                 };
-                let branches = p[4].as_array().map_or(0, |a| a.len());
+                let branches = p[4].as_array().map_or(0, Vec::len);
                 println!(
                     "job {} prev={} coinb1={}B coinb2={}B branches={branches}",
                     job.job_id,

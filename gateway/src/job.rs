@@ -530,6 +530,18 @@ pub fn parse_sia_field(s: &str) -> Option<[u8; SIA_FIELD_SIZE]> {
 mod tests {
     use super::*;
 
+    /// A connected pool's configuration, as the tests below build jobs against.
+    fn pool_config(coinbase_tag: String, protocol_v3: bool) -> PoolConfig {
+        PoolConfig {
+            payout_script: ratum::fixtures::p2wpkh(0xee),
+            prime_id: 7,
+            coinbase_tag,
+            min_difficulty: 1024,
+            protocol_v3,
+            abw_disabled: false,
+        }
+    }
+
     #[test]
     fn branches_reproduce_the_tree_root() {
         let cb = [0x11u8; 32];
@@ -577,14 +589,7 @@ mod tests {
     #[test]
     fn the_pooled_coinbase_includes_every_dictated_output_the_block_has_room_for() {
         use crate::template::tests::{config, template};
-        let pool = PoolConfig {
-            payout_script: ratum::fixtures::p2wpkh(0xee),
-            prime_id: 7,
-            coinbase_tag: "RATUM".into(),
-            min_difficulty: 1024,
-            protocol_v3: false,
-            abw_disabled: false,
-        };
+        let pool = pool_config("RATUM".into(), false);
         let outputs: Vec<CoinbaseOutput> = (0..120u8)
             .map(|i| CoinbaseOutput { value: 100_000, script: ratum::fixtures::p2wpkh(i) })
             .collect();
@@ -649,14 +654,7 @@ mod tests {
     fn the_pooled_coinbase_stays_under_the_pools_section_limit() {
         use crate::template::tests::{config, template};
         use ratum::datum::share::MAX_COINBASE_SECTION_BYTES;
-        let pool = PoolConfig {
-            payout_script: ratum::fixtures::p2wpkh(0xee),
-            prime_id: 7,
-            coinbase_tag: "a".repeat(80),
-            min_difficulty: 1024,
-            protocol_v3: true,
-            abw_disabled: false,
-        };
+        let pool = pool_config("a".repeat(80), true);
         let mut roomy = template();
         roomy.sizelimit = 4_000_000;
         roomy.weightlimit = 4_000_000;
@@ -705,14 +703,7 @@ mod tests {
     #[test]
     fn a_coinbase_built_to_the_room_keeps_the_block_under_the_weight_limit() {
         use crate::template::tests::{config, template};
-        let pool = PoolConfig {
-            payout_script: ratum::fixtures::p2wpkh(0xee),
-            prime_id: 7,
-            coinbase_tag: "RATUM".into(),
-            min_difficulty: 1024,
-            protocol_v3: false,
-            abw_disabled: false,
-        };
+        let pool = pool_config("RATUM".into(), false);
         let mut builder = Builder::new(Arc::new(config()));
         for (script_len, op) in [(34usize, 0x51u8), (22, 0x00)] {
             let outputs: Vec<CoinbaseOutput> = (0..512u16)

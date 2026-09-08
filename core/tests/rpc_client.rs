@@ -1,14 +1,12 @@
 //! `ratum::rpc::Client` against a server that returns exactly what a test specifies,
 //! including the responses a real node gives on an error.
 
-mod support;
-
+use ratum::lock;
 use ratum::rpc::{Chain, Client, Error};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use support::lock;
 
 /// One request as the server received it.
 #[derive(Clone, Debug)]

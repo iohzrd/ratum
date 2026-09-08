@@ -323,7 +323,7 @@ impl Channel {
             proto_cmd,
             ..Default::default()
         };
-        let mut out = Vec::with_capacity(4 + ct.len());
+        let mut out = Vec::with_capacity(framing::HEADER_LEN + ct.len());
         out.extend_from_slice(&self.tx_headers.mask(header));
         out.extend_from_slice(&ct);
         Ok(out)
@@ -429,7 +429,7 @@ pub fn accept(hello: Hello, pool: &KeyPairs, motd: &str) -> Result<(Vec<u8>, Ses
         proto_cmd: framing::cmd::HANDSHAKE_RESPONSE,
         ..Default::default()
     };
-    let mut out = Vec::with_capacity(4 + sealed.len());
+    let mut out = Vec::with_capacity(framing::HEADER_LEN + sealed.len());
     out.extend_from_slice(&tx_headers.mask(header));
     out.extend_from_slice(&sealed);
 
@@ -454,14 +454,19 @@ pub fn accept(hello: Hello, pool: &KeyPairs, motd: &str) -> Result<(Vec<u8>, Ses
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::datum::client::Client;
 
-    fn server_read_hello(wire: &[u8], pool: &KeyPairs) -> Result<Hello, Error> {
+    /// Open a hello frame as the pool's connection loop does: unmask the header with the
+    /// initial hello key, then open the payload its length names. Shared with the
+    /// `client` tests, which drive `Client::hello` against it.
+    pub(crate) fn server_read_hello(wire: &[u8], pool: &KeyPairs) -> Result<Hello, Error> {
         let mut rx = KeyRatchet::hello();
-        let header = rx.unmask(wire[..4].try_into().unwrap());
-        open_hello(header, &wire[4..4 + header.cmd_len as usize], pool)
+        let head = wire[..framing::HEADER_LEN].try_into().expect("HEADER_LEN bytes");
+        let header = rx.unmask(head);
+        let body = &wire[framing::HEADER_LEN..framing::HEADER_LEN + header.cmd_len as usize];
+        open_hello(header, body, pool)
     }
 
     /// A hello whose 17 pad bytes are nonzero. The gateway pads a hello with 1 to 200 bytes

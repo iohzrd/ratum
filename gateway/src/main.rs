@@ -312,7 +312,7 @@ fn main() {
         started: Instant::now(),
         csrf: api::csrf_token(),
         config_path: cli.config.clone(),
-        history: Mutex::new(Default::default()),
+        history: Mutex::default(),
     }));
     start_template_thread(&rt, Arc::clone(&server), template_status);
     watch_loop(&rt, &server)

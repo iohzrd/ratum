@@ -26,6 +26,10 @@ pub fn json(v: serde_json::Value) -> Reply {
     body(v.to_string(), "application/json")
 }
 
+pub fn plain(text: String) -> Reply {
+    body(text, "text/plain; charset=utf-8")
+}
+
 /// The same response with `X-Robots-Tag: noindex`, so a crawler may fetch it (a page that
 /// renders from it needs that) without listing it as a result of its own.
 pub fn noindex(reply: Reply) -> Reply {

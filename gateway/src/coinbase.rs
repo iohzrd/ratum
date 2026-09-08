@@ -25,10 +25,7 @@ use ratum::bitcoin::{
     SEQUENCE_SIZE, TX_VERSION_SIZE, WITNESS_SCALE_FACTOR, encode_compact_size, encode_output,
     encode_push,
 };
-use ratum::datum::coinbase::{
-    EXTRANONCE_PUSH_SIZE, POT_TARGET_PLACEHOLDER, TAG_END, TAG_MARKER_BYTES, TAG_SEPARATOR,
-    UID_PUSH_SIZE_NO_PRIME, UID_PUSH_SIZE_V1, UID_PUSH_SIZE_V3,
-};
+use ratum::datum::coinbase::{EXTRANONCE_PUSH_SIZE, UID_PUSH_POT_AT, tag_push_data, uid_push};
 use ratum::datum::messages::CoinbaseOutput;
 use ratum::datum::share::{EXTRANONCE_SIZE, MAX_COINBASE_SECTION_BYTES};
 
@@ -163,66 +160,40 @@ pub fn height_push(height: u32) -> Vec<u8> {
 /// The scriptSig without the extranonce push, and the offset of the PoT placeholder in it.
 pub fn script_sig(t: &Tagging<'_>) -> Result<(Vec<u8>, usize), String> {
     let mut script = height_push(t.height);
-    {
-        let tag0 = t.tag_primary.as_bytes();
-        let mut tag1 = t.tag_secondary.as_bytes();
-        // The version 3 prime push is 11 bytes rather than 7, so the tags have 4 fewer bytes
-        // of the scriptSig to fit in (the C gateway's MAX_COINBASE_TAG_SPACE went 86 to 82).
-        let tag_space = crate::config::MAX_COINBASE_TAG_SPACE
-            - if t.wide_prime { crate::config::WIDE_PRIME_PUSH_EXTRA_BYTES } else { 0 };
-        let mut k = tag0.len() + tag1.len() + TAG_MARKER_BYTES;
-        if tag1.is_empty() {
-            k -= 1;
-            if tag0.is_empty() {
-                k -= 1;
-            }
-        }
-        if k > tag_space {
-            let excess = k - tag_space;
-            if tag1.len() > excess {
-                tag1 = &tag1[..tag1.len() - excess];
-                k = tag_space;
-            } else if !tag1.is_empty() {
-                k -= tag1.len() + 1;
-                tag1 = &[];
-            }
-            if k > tag_space {
-                return Err("the coinbase tags do not fit".into());
-            }
-        }
-        if k > 0 {
-            let mut data = Vec::with_capacity(k);
-            if !tag0.is_empty() {
-                data.extend_from_slice(tag0);
-                data.push(if tag1.is_empty() { TAG_END } else { TAG_SEPARATOR });
-            } else if !tag1.is_empty() {
-                data.push(TAG_SEPARATOR);
-            }
-            if !tag1.is_empty() {
-                data.extend_from_slice(tag1);
-                data.push(TAG_END);
-            }
-            script.extend_from_slice(&encode_push(&data));
-        } else {
-            // A one-byte push of TAG_END, so the uid push that follows is not read as a tag.
-            script.extend_from_slice(&encode_push(&[TAG_END]));
-        }
-    }
+    script.extend_from_slice(&encode_push(&tag_push_data_that_fits(t)?));
     // The uid push: its size names which prime id form follows the placeholder and unique id.
-    let (push_size, prime_id) = if t.prime_id == 0 && !t.datum_active {
-        (UID_PUSH_SIZE_NO_PRIME, &[][..])
+    let prime_id = if t.prime_id == 0 && !t.datum_active {
+        &[][..]
     } else if t.wide_prime {
-        (UID_PUSH_SIZE_V3, &t.prime_id.to_le_bytes()[..])
+        &t.prime_id.to_le_bytes()[..]
     } else {
-        (UID_PUSH_SIZE_V1, &(t.prime_id as u32).to_le_bytes()[..])
+        &(t.prime_id as u32).to_le_bytes()[..]
     };
-    script.push(push_size as u8);
-    let pot_index = script.len();
-    script.push(POT_TARGET_PLACEHOLDER);
-    script.extend_from_slice(&t.unique_id.to_le_bytes());
-    script.extend_from_slice(prime_id);
-    debug_assert_eq!(script.len(), pot_index + push_size);
+    let pot_index = script.len() + UID_PUSH_POT_AT;
+    script.extend_from_slice(&uid_push(t.unique_id, prime_id));
     Ok((script, pot_index))
+}
+
+/// The tag push's data, with the secondary tag shortened (and then dropped) to keep the push
+/// within the scriptSig's room for it. `Err` when the primary tag alone does not fit.
+fn tag_push_data_that_fits(t: &Tagging<'_>) -> Result<Vec<u8>, String> {
+    let tag0 = t.tag_primary.as_bytes();
+    let tag1 = t.tag_secondary.as_bytes();
+    // The version 3 prime push is 11 bytes rather than 7, so the tags have 4 fewer bytes
+    // of the scriptSig to fit in (the C gateway's MAX_COINBASE_TAG_SPACE went 86 to 82).
+    let tag_space = crate::config::MAX_COINBASE_TAG_SPACE
+        - if t.wide_prime { crate::config::WIDE_PRIME_PUSH_EXTRA_BYTES } else { 0 };
+    let mut data = tag_push_data(tag0, tag1);
+    if data.len() > tag_space {
+        // Shorten the secondary tag by what does not fit, or drop it when that is all of it.
+        let excess = data.len() - tag_space;
+        let kept = if tag1.len() > excess { &tag1[..tag1.len() - excess] } else { &[][..] };
+        data = tag_push_data(tag0, kept);
+    }
+    if data.len() > tag_space {
+        return Err("the coinbase tags do not fit".into());
+    }
+    Ok(data)
 }
 
 pub struct Params<'a> {
@@ -468,6 +439,56 @@ mod tests {
         t.tag_secondary = "";
         let (s, _) = script_sig(&t).unwrap();
         assert_eq!(ratum::bitcoin::script_pushes(&s)[1].1, b"RATUM\x00");
+    }
+
+    /// The tags are shortened to the room the scriptSig has, and the primary tag alone must
+    /// fit: the secondary tag loses only what does not fit, then is dropped whole, and a
+    /// primary tag that still does not fit refuses the job.
+    #[test]
+    fn the_secondary_tag_is_shortened_then_dropped_to_fit_the_script_sig() {
+        use crate::config::{MAX_COINBASE_TAG_SPACE, WIDE_PRIME_PUSH_EXTRA_BYTES};
+        let space = MAX_COINBASE_TAG_SPACE;
+        let primary = "p".repeat(40);
+        let secondary = "s".repeat(space - 40 - 2);
+        let mut t = tagging(21);
+        t.tag_primary = &primary;
+        t.tag_secondary = &secondary;
+        // The two tags and their two markers are exactly the room a version 1 uid push leaves.
+        let (s, _) = script_sig(&t).unwrap();
+        let push = ratum::bitcoin::script_pushes(&s)[1].1.to_vec();
+        assert_eq!(push.len(), space);
+        assert_eq!(push, format!("{primary}\x0f{secondary}\x00").as_bytes());
+
+        // The version 3 uid push takes four of those bytes, so the secondary tag loses four.
+        t.wide_prime = true;
+        let (s, _) = script_sig(&t).unwrap();
+        let push = ratum::bitcoin::script_pushes(&s)[1].1.to_vec();
+        assert_eq!(push.len(), space - WIDE_PRIME_PUSH_EXTRA_BYTES);
+        let shortened = &secondary[..secondary.len() - WIDE_PRIME_PUSH_EXTRA_BYTES];
+        assert_eq!(push, format!("{primary}\x0f{shortened}\x00").as_bytes());
+
+        // A primary tag that leaves the secondary no room at all drops it whole.
+        let long_primary = "p".repeat(space - 1);
+        t.wide_prime = false;
+        t.tag_primary = &long_primary;
+        let (s, _) = script_sig(&t).unwrap();
+        assert_eq!(
+            ratum::bitcoin::script_pushes(&s)[1].1,
+            format!("{long_primary}\x00").as_bytes()
+        );
+
+        // A primary tag over the room refuses the job, whatever the secondary is.
+        let too_long = "p".repeat(space);
+        t.tag_primary = &too_long;
+        assert!(script_sig(&t).is_err());
+
+        // Neither tag: a lone TAG_END, so the uid push is not read as a tag.
+        t.tag_primary = "";
+        t.tag_secondary = "";
+        let (s, pot) = script_sig(&t).unwrap();
+        let pushes = ratum::bitcoin::script_pushes(&s);
+        assert_eq!(pushes[1].1, &[ratum::datum::coinbase::TAG_END][..]);
+        assert_eq!(pushes[2].0, pot);
     }
 
     #[test]

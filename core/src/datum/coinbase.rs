@@ -42,3 +42,46 @@ pub const EXTRANONCE_PUSH_SIZE: usize = 1 + ENPREFIX_SIZE + super::share::EXTRAN
 /// The marker bytes a tag push carries besides the tags: `TAG_SEPARATOR` between them and
 /// `TAG_END` after the last.
 pub const TAG_MARKER_BYTES: usize = 2;
+
+/// The data of the tag push: the primary tag, then `TAG_END` when it is the only tag, or
+/// `TAG_SEPARATOR`, the secondary tag and `TAG_END` when one follows. With neither tag the
+/// push carries a lone `TAG_END`, so the uid push after it is not read as a tag.
+///
+/// The gateway writes this and the pool's `locate_pot_byte` reads it back, so the layout is
+/// here rather than at either end.
+pub fn tag_push_data(primary: &[u8], secondary: &[u8]) -> Vec<u8> {
+    let mut data = Vec::with_capacity(primary.len() + secondary.len() + TAG_MARKER_BYTES);
+    if !primary.is_empty() {
+        data.extend_from_slice(primary);
+        data.push(if secondary.is_empty() { TAG_END } else { TAG_SEPARATOR });
+    } else if !secondary.is_empty() {
+        data.push(TAG_SEPARATOR);
+    }
+    if !secondary.is_empty() {
+        data.extend_from_slice(secondary);
+        data.push(TAG_END);
+    }
+    if data.is_empty() {
+        data.push(TAG_END);
+    }
+    data
+}
+
+/// Where the PoT placeholder sits inside the push [`uid_push`] returns: after the push
+/// opcode. A caller records `script.len() + UID_PUSH_POT_AT` before appending it, which is
+/// the offset the share's `target_byte_index` names.
+pub const UID_PUSH_POT_AT: usize = 1;
+
+/// The uid push: a direct push of the PoT placeholder, the two-byte
+/// `mining.coinbase_unique_id` little-endian, and `prime_id` (empty, four bytes for the
+/// version 1 protocol, or eight for version 3, which is what its length names).
+pub fn uid_push(unique_id: u16, prime_id: &[u8]) -> Vec<u8> {
+    let len = UID_PUSH_PREFIX_SIZE + prime_id.len();
+    debug_assert!(matches!(len, UID_PUSH_SIZE_NO_PRIME | UID_PUSH_SIZE_V1 | UID_PUSH_SIZE_V3));
+    let mut push = Vec::with_capacity(UID_PUSH_POT_AT + len);
+    push.push(len as u8);
+    push.push(POT_TARGET_PLACEHOLDER);
+    push.extend_from_slice(&unique_id.to_le_bytes());
+    push.extend_from_slice(prime_id);
+    push
+}

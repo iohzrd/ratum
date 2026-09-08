@@ -5,22 +5,8 @@
 mod support;
 
 use ratum::datum::messages::{CoinbaserRequest, server_subcmd};
-use ratum_prime::ledger::Ledger;
-use std::time::{SystemTime, UNIX_EPOCH};
 use support::work;
-use support::{FakeNode, Pool, PoolArgs, TempDir};
-
-fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
-}
-
-/// Seed the ledger with alice (work 3) and bob (work 1), so the window is three parts to one.
-fn seed_alice_and_bob(dir: &TempDir) {
-    let (mut l, _) = Ledger::open(&dir.join("regtest.redb"), u128::MAX, None, None)
-        .expect("open the seed ledger");
-    l.record(now(), "alice", 3, &[0x11; 32], "").unwrap();
-    l.record(now(), "bob", 1, &[0x22; 32], "").unwrap();
-}
+use support::{FakeNode, Pool, PoolArgs, TempDir, seed_alice_and_bob};
 
 /// The address the pool logs the interface as listening on, e.g. `127.0.0.1:41007`.
 fn stats_addr(pool: &Pool) -> String {

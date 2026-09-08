@@ -308,7 +308,7 @@ mod tests {
         assert_eq!(&pool_hc.result[..cleared_bytes], &pool_hc.hash2[..cleared_bytes]);
         // Below the cleared prefix the mask is nonzero, so a block is indistinguishable from a
         // share without the key.
-        assert!(pool_hc.result[cleared_bytes..] != pool_hc.hash2[cleared_bytes..]);
+        assert_ne!(pool_hc.result[cleared_bytes..], pool_hc.hash2[cleared_bytes..]);
     }
 
     #[test]

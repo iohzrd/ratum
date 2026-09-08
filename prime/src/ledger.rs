@@ -384,7 +384,7 @@ impl Store {
         let next_seq = {
             let r = db.begin_read().map_err(to_io)?;
             let shares = r.open_table(SHARES).map_err(to_io)?;
-            shares.last().map_err(to_io)?.map(|(k, _)| k.value() + 1).unwrap_or(0)
+            shares.last().map_err(to_io)?.map_or(0, |(k, _)| k.value() + 1)
         };
         let retain = keep.map(|k| (k.max(1) as u64).saturating_mul(SHARES_PER_KEEP_UNIT));
         Ok((Store { db, next_seq, retain_bound: retain, cumulative_work }, stamped))

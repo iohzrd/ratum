@@ -619,6 +619,7 @@ pub(crate) fn owed_for_block(
 mod tests {
     use super::*;
     use ratum::datum::messages::ClientConfig;
+    use ratum::fixtures::p2wpkh;
 
     /// `payability` returns from its cache before calling the node, so the node client, which
     /// cannot connect, is never called for an address `resolved` names.
@@ -676,11 +677,6 @@ mod tests {
     }
 
     const POOL: [u8; 4] = [0x00, 0x14, 0xee, 0xee];
-    fn p2wpkh(fill: u8) -> Vec<u8> {
-        let mut v = vec![0x00, 0x14];
-        v.extend_from_slice(&[fill; 20]);
-        v
-    }
 
     #[test]
     fn a_saved_session_is_resumed_once_by_its_token() {
