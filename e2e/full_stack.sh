@@ -9,7 +9,7 @@
 # block the node accepts. The node itself mines through the activation height first, as
 # happened on mainnet; the stack serves only version 2 work.
 #
-# usage: tests/e2e/full_stack.sh [--keep]
+# usage: e2e/full_stack.sh [--keep]
 #
 # Needs a Bitcoin Knots build with the BLAKE2b change; the gateway is this workspace's
 # ratum-gateway crate unless DATUM_GATEWAY names another build (the C gateway, say):
@@ -51,36 +51,10 @@ POOL_ADDRESS=bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080
 MINER_ADDRESS=bcrt1qzyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3lgth6c
 GATEWAY_POOL_ADDRESS=${GATEWAY_POOL_ADDRESS:-$MINER_ADDRESS}
 
-ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+. "$(dirname "$0")/lib.sh"
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/ratum-e2e-XXXXXX")
-
-# A port nothing else is holding. Picking one at random collides with whatever else is on
-# the machine, and a collision is reported as a program that exits during startup rather than
-# as a message naming the port, so bind the port first to check that it is free.
-free_port() {
-    local port
-    port=$(python3 - "$1" "$2" <<'PORTPY'
-import random, socket, sys
-
-base, span = int(sys.argv[1]), int(sys.argv[2])
-for _ in range(200):
-    port = base + random.randrange(span)
-    probe = socket.socket()
-    try:
-        probe.bind(("127.0.0.1", port))
-    except OSError:
-        continue
-    finally:
-        probe.close()
-    print(port)
-    break
-else:
-    sys.exit(1)
-PORTPY
-    )
-    [ -n "$port" ] || { printf 'no free port in %s..%s\n' "$1" "$(($1 + $2))" >&2; exit 1; }
-    printf '%s\n' "$port"
-}
 
 RPC_PORT=$(free_port 18400 150)
 POOL_PORT=$(free_port 28900 90)
@@ -88,65 +62,19 @@ STRATUM_PORT=$(free_port 23300 90)
 API_PORT=$(free_port 7100 90)
 PIDS=()
 
-step() { printf '\n=== %s\n' "$*"; }
-fail() { printf '\nFAILED: %s\n' "$*" >&2; exit 1; }
-
-cleanup() {
-    local status=$?
-    for pid in "${PIDS[@]:-}"; do
-        [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
-    done
-    "$BITCOIN_CLI" -datadir="$WORK/node" stop >/dev/null 2>&1 || true
-    sleep 1
-    if [ "$KEEP" = 1 ]; then
-        printf '\nlogs kept in %s\n' "$WORK"
-    else
-        rm -rf "$WORK"
-    fi
-    exit $status
-}
 trap cleanup EXIT
 
-for tool in "$BITCOIND" "$BITCOIN_CLI" ${DATUM_GATEWAY:+"$DATUM_GATEWAY"}; do
-    [ -x "$tool" ] || fail "$tool is not executable; set BITCOIND, BITCOIN_CLI or DATUM_GATEWAY"
-done
-command -v python3 >/dev/null || fail "python3 is not on PATH"
+require_tools python3
 
 DATUM_GATEWAY=${DATUM_GATEWAY:-$ROOT/target/release/ratum-gateway}
-step "building the pool, the gateway and the test miner"
-(cd "$ROOT" && cargo build --workspace --release --bin ratum-prime --bin sia-test-miner --bin ratum-gateway) \
-    || fail "cargo build"
+build_release
 
-step "starting a regtest node with BLAKE2b active at height $ACTIVATION_HEIGHT"
-mkdir -p "$WORK/node"
-cat > "$WORK/node/bitcoin.conf" <<EOF
-regtest=1
-server=1
-# No peers, so no P2P listener. It also prevents the node from binding ports 18444 and 18445,
-# either of which the randomly chosen RPC port below could otherwise collide with.
-listen=0
-rpcuser=ratum
-rpcpassword=ratumtest
-[regtest]
-rpcbind=127.0.0.1
-rpcport=$RPC_PORT
-testactivationheight=blake2b@$ACTIVATION_HEIGHT
-blake2b_headline=RATUM e2e headline
-EOF
-"$BITCOIND" -datadir="$WORK/node" > "$WORK/bitcoind.log" 2>&1 &
-PIDS+=($!)
-
-for _ in $(seq 1 60); do
-    "$BITCOIN_CLI" -datadir="$WORK/node" getblockchaininfo >/dev/null 2>&1 && break
-    sleep 0.5
-done
-"$BITCOIN_CLI" -datadir="$WORK/node" getblockchaininfo >/dev/null \
-    || fail "the node never responded on port $RPC_PORT"
+start_node
 
 step "mining $ACTIVATION_HEIGHT blocks with the node, through the activation"
-"$BITCOIN_CLI" -datadir="$WORK/node" generatetoaddress "$ACTIVATION_HEIGHT" "$POOL_ADDRESS" \
+cli generatetoaddress "$ACTIVATION_HEIGHT" "$POOL_ADDRESS" \
     >/dev/null
-height=$("$BITCOIN_CLI" -datadir="$WORK/node" getblockcount)
+height=$(cli getblockcount)
 [ "$height" = "$ACTIVATION_HEIGHT" ] || fail "expected height $ACTIVATION_HEIGHT, got $height"
 TARGET_HEIGHT=$((ACTIVATION_HEIGHT + BLOCKS))
 
@@ -227,7 +155,7 @@ deadline=$((SECONDS + TIMEOUT))
 started=$SECONDS
 last_report=$SECONDS
 while [ "$SECONDS" -lt "$deadline" ]; do
-    height=$("$BITCOIN_CLI" -datadir="$WORK/node" getblockcount 2>/dev/null || echo 0)
+    height=$(cli getblockcount 2>/dev/null || echo 0)
     [ "$height" -ge "$TARGET_HEIGHT" ] && break
     if [ $((SECONDS - last_report)) -ge 30 ]; then
         last_report=$SECONDS
@@ -239,8 +167,8 @@ done
     || fail "no block at height $TARGET_HEIGHT within ${TIMEOUT}s; see $WORK/pool.log and $WORK/miner.log"
 
 step "checking the last pooled block"
-HASH=$("$BITCOIN_CLI" -datadir="$WORK/node" getblockhash "$TARGET_HEIGHT")
-HEADER=$("$BITCOIN_CLI" -datadir="$WORK/node" getblockheader "$HASH" false)
+HASH=$(cli getblockhash "$TARGET_HEIGHT")
+HEADER=$(cli getblockheader "$HASH" false)
 [ "${#HEADER}" = 328 ] || fail "the header is ${#HEADER} hex characters, not 328 (164 bytes)"
 
 grep -q "BLOCK at height $TARGET_HEIGHT" "$WORK/pool.log" \

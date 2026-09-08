@@ -9,7 +9,7 @@
 #                       ^ RPC  datum_gateway B (no fee) - DATUM +-> ratum-prime -> RPC
 #                                     ^ bob
 #
-# usage: tests/e2e/gateway_fee.sh [--keep]
+# usage: e2e/gateway_fee.sh [--keep]
 #
 # Needs a Bitcoin Knots build with the BLAKE2b change; the gateway is this workspace's
 # ratum-gateway crate unless DATUM_GATEWAY names another build (the C gateway, say):
@@ -60,33 +60,10 @@ ALICE_CPUS=0-$(( CORES / 2 - 1 ))
 BOB_CPUS=$(( CORES / 2 ))-$(( CORES * 3 / 4 - 1 ))
 LAZY_CPUS=$(( CORES * 3 / 4 ))-$(( CORES - 1 ))
 
-ROOT=${ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}
+. "$(dirname "$0")/lib.sh"
+
+ROOT=${ROOT:-$(cd "$(dirname "$0")/.." && pwd)}
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/ratum-fee-XXXXXX")
-
-free_port() {
-    local port
-    port=$(python3 - "$1" "$2" <<'PORTPY'
-import random, socket, sys
-
-base, span = int(sys.argv[1]), int(sys.argv[2])
-for _ in range(200):
-    port = base + random.randrange(span)
-    probe = socket.socket()
-    try:
-        probe.bind(("127.0.0.1", port))
-    except OSError:
-        continue
-    finally:
-        probe.close()
-    print(port)
-    break
-else:
-    sys.exit(1)
-PORTPY
-    )
-    [ -n "$port" ] || { printf 'no free port in %s..%s\n' "$1" "$(($1 + $2))" >&2; exit 1; }
-    printf '%s\n' "$port"
-}
 
 RPC_PORT=$(free_port 18400 150)
 POOL_PORT=$(free_port 28900 90)
@@ -96,62 +73,17 @@ API_PORT_A=$(free_port 7100 90)
 API_PORT_B=$(free_port 7200 90)
 PIDS=()
 
-step() { printf '\n=== %s\n' "$*"; }
-fail() { printf '\nFAILED: %s\n' "$*" >&2; exit 1; }
-
-cleanup() {
-    local status=$?
-    for pid in "${PIDS[@]:-}"; do
-        [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
-    done
-    "$BITCOIN_CLI" -datadir="$WORK/node" stop >/dev/null 2>&1 || true
-    sleep 1
-    if [ "$KEEP" = 1 ]; then
-        printf '\nlogs kept in %s\n' "$WORK"
-    else
-        rm -rf "$WORK"
-    fi
-    exit $status
-}
 trap cleanup EXIT
 
-for tool in "$BITCOIND" "$BITCOIN_CLI" ${DATUM_GATEWAY:+"$DATUM_GATEWAY"}; do
-    [ -x "$tool" ] || fail "$tool is not executable; set BITCOIND, BITCOIN_CLI or DATUM_GATEWAY"
-done
-for tool in jq taskset python3; do
-    command -v "$tool" >/dev/null || fail "$tool is not on PATH"
-done
+require_tools jq taskset python3
 
 DATUM_GATEWAY=${DATUM_GATEWAY:-$ROOT/target/release/ratum-gateway}
-step "building the pool, the gateway and the test miner"
-(cd "$ROOT" && cargo build --workspace --release --bin ratum-prime --bin sia-test-miner --bin ratum-gateway) || fail "cargo build"
+build_release
 
-step "starting a regtest node with BLAKE2b active at height $ACTIVATION_HEIGHT"
-mkdir -p "$WORK/node"
-cat > "$WORK/node/bitcoin.conf" <<EOF
-regtest=1
-server=1
-listen=0
-rpcuser=ratum
-rpcpassword=ratumtest
-[regtest]
-rpcbind=127.0.0.1
-rpcport=$RPC_PORT
-testactivationheight=blake2b@$ACTIVATION_HEIGHT
-blake2b_headline=RATUM e2e headline
-EOF
-"$BITCOIND" -datadir="$WORK/node" > "$WORK/bitcoind.log" 2>&1 &
-PIDS+=($!)
-
-for _ in $(seq 1 60); do
-    "$BITCOIN_CLI" -datadir="$WORK/node" getblockchaininfo >/dev/null 2>&1 && break
-    sleep 0.5
-done
-"$BITCOIN_CLI" -datadir="$WORK/node" getblockchaininfo >/dev/null \
-    || fail "the node never responded on port $RPC_PORT"
+start_node
 
 step "mining $ACTIVATION_HEIGHT blocks with the node, through the activation"
-"$BITCOIN_CLI" -datadir="$WORK/node" generatetoaddress "$ACTIVATION_HEIGHT" "$POOL_ADDRESS" >/dev/null
+cli generatetoaddress "$ACTIVATION_HEIGHT" "$POOL_ADDRESS" >/dev/null
 
 step "starting ratum-prime on port $POOL_PORT"
 mkdir -p "$WORK/pool"
@@ -263,7 +195,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
         last_report=$SECONDS
         printf '  %4ds: alice %s/%s, fee %s, bob %s/%s, %s refused at height %s\n' \
             $((SECONDS - started)) "${alice_n:-0}" "$ALICE_SHARES" "${fee_n:-0}" "${bob_n:-0}" "$BOB_SHARES" "$LAZY_USER" \
-            "$("$BITCOIN_CLI" -datadir="$WORK/node" getblockcount 2>/dev/null || echo '?')"
+            "$(cli getblockcount 2>/dev/null || echo '?')"
     fi
     alice_n=$(grep -c "<- accepted .*; $ALICE" "$WORK/pool.log" 2>/dev/null || true)
     bob_n=$(grep -c "<- accepted .*; $BOB" "$WORK/pool.log" 2>/dev/null || true)

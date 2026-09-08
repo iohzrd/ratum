@@ -21,7 +21,7 @@
 # the tip for the other's session, so work that was current when it was issued goes stale
 # through no act of the miner doing it.
 #
-# usage: tests/e2e/multi_miner.sh [--keep]
+# usage: e2e/multi_miner.sh [--keep]
 #
 # Needs a Bitcoin Knots build with the BLAKE2b change; the gateway is this workspace's
 # ratum-gateway crate unless DATUM_GATEWAY names another build (the C gateway, say):
@@ -67,36 +67,10 @@ ALICE_CPUS=0-$(( CORES / 2 - 1 ))
 BOB_CPUS=$(( CORES / 2 ))-$(( CORES * 5 / 6 - 1 ))
 CAROL_CPUS=$(( CORES * 5 / 6 ))-$(( CORES - 1 ))
 
-ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+. "$(dirname "$0")/lib.sh"
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/ratum-multi-XXXXXX")
-
-# A port nothing else is holding. Picking one at random collides with whatever else is on
-# the machine, and a collision is reported as a program that exits during startup rather than
-# as a message naming the port, so bind the port first to check that it is free.
-free_port() {
-    local port
-    port=$(python3 - "$1" "$2" <<'PORTPY'
-import random, socket, sys
-
-base, span = int(sys.argv[1]), int(sys.argv[2])
-for _ in range(200):
-    port = base + random.randrange(span)
-    probe = socket.socket()
-    try:
-        probe.bind(("127.0.0.1", port))
-    except OSError:
-        continue
-    finally:
-        probe.close()
-    print(port)
-    break
-else:
-    sys.exit(1)
-PORTPY
-    )
-    [ -n "$port" ] || { printf 'no free port in %s..%s\n' "$1" "$(($1 + $2))" >&2; exit 1; }
-    printf '%s\n' "$port"
-}
 
 RPC_PORT=$(free_port 18400 150)
 POOL_PORT=$(free_port 28900 90)
@@ -106,31 +80,9 @@ API_PORT_A=$(free_port 7100 90)
 API_PORT_B=$(free_port 7200 90)
 PIDS=()
 
-step() { printf '\n=== %s\n' "$*"; }
-fail() { printf '\nFAILED: %s\n' "$*" >&2; exit 1; }
-
-cleanup() {
-    local status=$?
-    for pid in "${PIDS[@]:-}"; do
-        [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
-    done
-    "$BITCOIN_CLI" -datadir="$WORK/node" stop >/dev/null 2>&1 || true
-    sleep 1
-    if [ "$KEEP" = 1 ]; then
-        printf '\nlogs kept in %s\n' "$WORK"
-    else
-        rm -rf "$WORK"
-    fi
-    exit $status
-}
 trap cleanup EXIT
 
-for tool in "$BITCOIND" "$BITCOIN_CLI" ${DATUM_GATEWAY:+"$DATUM_GATEWAY"}; do
-    [ -x "$tool" ] || fail "$tool is not executable; set BITCOIND, BITCOIN_CLI or DATUM_GATEWAY"
-done
-for tool in jq taskset python3; do
-    command -v "$tool" >/dev/null || fail "$tool is not on PATH"
-done
+require_tools jq taskset python3
 
 # ledger::split in Python, to check the coinbase against. Which prefix of shares.log the
 # window was is not fixed: a gateway requests a coinbaser only for the jobs whose state sets
@@ -148,7 +100,6 @@ for line in sys.stdin:
     if line.split():
         identity, amount = line.split()
         paid[identity] = int(amount)
-
 
 def split(work, total):
     out = {}
@@ -170,7 +121,6 @@ def split(work, total):
             out[identity] = amount
     return out
 
-
 with open(ledger) as f:
     shares = [line.split() for line in f]
 
@@ -190,43 +140,18 @@ else:
 MATCHPY
 
 DATUM_GATEWAY=${DATUM_GATEWAY:-$ROOT/target/release/ratum-gateway}
-step "building the pool, the gateway and the test miner"
-(cd "$ROOT" && cargo build --workspace --release --bin ratum-prime --bin sia-test-miner --bin ratum-gateway) || fail "cargo build"
+build_release
 
-step "starting a regtest node with BLAKE2b active at height $ACTIVATION_HEIGHT"
-mkdir -p "$WORK/node"
-cat > "$WORK/node/bitcoin.conf" <<EOF
-regtest=1
-server=1
-# No peers, so no P2P listener. It also prevents the node from binding ports 18444 and 18445,
-# either of which the randomly chosen RPC port below could otherwise collide with.
-listen=0
-rpcuser=ratum
-rpcpassword=ratumtest
-[regtest]
-rpcbind=127.0.0.1
-rpcport=$RPC_PORT
-testactivationheight=blake2b@$ACTIVATION_HEIGHT
-blake2b_headline=RATUM e2e headline
-EOF
-"$BITCOIND" -datadir="$WORK/node" > "$WORK/bitcoind.log" 2>&1 &
-PIDS+=($!)
-
-for _ in $(seq 1 60); do
-    "$BITCOIN_CLI" -datadir="$WORK/node" getblockchaininfo >/dev/null 2>&1 && break
-    sleep 0.5
-done
-"$BITCOIN_CLI" -datadir="$WORK/node" getblockchaininfo >/dev/null \
-    || fail "the node never responded on port $RPC_PORT"
+start_node
 
 for address in "$ALICE" "$BOB" "$CAROL" "$GATEWAY_ADDRESS" "$POOL_ADDRESS"; do
-    valid=$("$BITCOIN_CLI" -datadir="$WORK/node" validateaddress "$address" | jq -r .isvalid)
+    valid=$(cli validateaddress "$address" | jq -r .isvalid)
     [ "$valid" = "true" ] || fail "$address is not an address this node accepts"
 done
 
 step "mining $ACTIVATION_HEIGHT blocks with the node, through the activation"
-"$BITCOIN_CLI" -datadir="$WORK/node" generatetoaddress "$ACTIVATION_HEIGHT" "$POOL_ADDRESS" >/dev/null
-height=$("$BITCOIN_CLI" -datadir="$WORK/node" getblockcount)
+cli generatetoaddress "$ACTIVATION_HEIGHT" "$POOL_ADDRESS" >/dev/null
+height=$(cli getblockcount)
 [ "$height" = "$ACTIVATION_HEIGHT" ] || fail "expected height $ACTIVATION_HEIGHT, got $height"
 
 step "starting ratum-prime on port $POOL_PORT, window floor $WINDOW_FLOOR"
@@ -342,7 +267,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
     if [ $((SECONDS - last_report)) -ge 30 ]; then
         last_report=$SECONDS
         printf '  %4ds: %s/%s shares accepted at height %s\n' $((SECONDS - started)) "$recorded" "$SHARE_COUNT" \
-            "$("$BITCOIN_CLI" -datadir="$WORK/node" getblockcount 2>/dev/null || echo '?')"
+            "$(cli getblockcount 2>/dev/null || echo '?')"
     fi
     # grep -c prints the count even when it is 0 and exits nonzero, so an || fallback
     # would append a second line; default only a truly empty result.
@@ -409,9 +334,11 @@ printf '  %s sessions contributed credited shares\n' "$contributing"
 step "each block pays out what the pool recorded for it"
 checked=0
 proportional=0
-for h in $(seq "$ACTIVATION_HEIGHT" "$("$BITCOIN_CLI" -datadir="$WORK/node" getblockcount)"); do
-    hash=$("$BITCOIN_CLI" -datadir="$WORK/node" getblockhash "$h")
-    block=$("$BITCOIN_CLI" -datadir="$WORK/node" getblock "$hash" 2)
+# The node mined heights 1 to $ACTIVATION_HEIGHT itself, so the blocks the pool found, and
+# the only ones it holds an acceptance line for, start one above that.
+for h in $(seq "$((ACTIVATION_HEIGHT + 1))" "$(cli getblockcount)"); do
+    hash=$(cli getblockhash "$h")
+    block=$(cli getblock "$hash" 2)
 
     # What the pool recorded when it accepted the share that solved this block.
     line=$(grep "<- accepted .*hash=$hash" "$WORK/pool.log" || true)
