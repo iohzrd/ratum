@@ -117,6 +117,18 @@ fn start_datum(rt: &Runtime) {
     }
 }
 
+fn spawn_stratum_listener(server: Arc<stratum::Server>) {
+    std::thread::Builder::new()
+        .name("stratum-listener".into())
+        .spawn(move || {
+            if let Err(e) = stratum::listen(server) {
+                error!("stratum listener: {e}");
+                std::process::exit(1);
+            }
+        })
+        .expect("stratum listener thread");
+}
+
 fn start_template_thread(
     rt: &Runtime,
     server: Arc<stratum::Server>,
@@ -150,16 +162,7 @@ fn start_template_thread(
                     publisher.on_template(t, new_block);
                     if !listener_started {
                         listener_started = true;
-                        let server = Arc::clone(&server);
-                        std::thread::Builder::new()
-                            .name("stratum-listener".into())
-                            .spawn(move || {
-                                if let Err(e) = stratum::listen(server) {
-                                    error!("stratum listener: {e}");
-                                    std::process::exit(1);
-                                }
-                            })
-                            .expect("stratum listener thread");
+                        spawn_stratum_listener(Arc::clone(&server));
                     }
                 },
             );

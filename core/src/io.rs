@@ -1,4 +1,3 @@
-use crate::datum::framing::{self, Header};
 use std::io::{self, Read};
 use std::time::{Duration, Instant};
 
@@ -23,19 +22,4 @@ pub fn read_exact_deadline(
         }
     }
     Ok(buf)
-}
-
-pub fn read_frame(
-    s: &mut impl Read,
-    unmask: impl FnOnce([u8; framing::HEADER_LEN]) -> Header,
-    started: Instant,
-    deadline: Duration,
-) -> io::Result<(Header, Vec<u8>)> {
-    let head = read_exact_deadline(s, framing::HEADER_LEN, started, deadline)?;
-    let header = unmask(head.try_into().expect("four bytes"));
-    if header.cmd_len > framing::MAX_CMD_DATA_SIZE {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame exceeds the protocol limit"));
-    }
-    let body = read_exact_deadline(s, header.cmd_len as usize, started, deadline)?;
-    Ok((header, body))
 }

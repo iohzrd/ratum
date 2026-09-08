@@ -558,10 +558,10 @@ impl Ledger {
             hash: Some(*hash),
             tag: tag.to_string(),
         };
-        if let Some(store) = &mut self.store {
-            if !store.insert(&share)? {
-                return Ok(());
-            }
+        if let Some(store) = &mut self.store
+            && !store.insert(&share)?
+        {
+            return Ok(());
         }
         self.cumulative_work += u128::from(difficulty);
         self.push(share);

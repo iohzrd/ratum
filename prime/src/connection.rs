@@ -146,7 +146,7 @@ pub(crate) fn handle(mut stream: TcpStream, server: &Server) -> io::Result<()> {
         socket,
         waker,
         session,
-        verifier: Verifier::with_replay_guard(server.policy.clone(), Arc::clone(&server.replay)),
+        verifier: Verifier::new(server.policy.clone(), Arc::clone(&server.replay)),
         credited: HashMap::new(),
         reported_unpayable: HashSet::new(),
         coinbaser_id: 0,
@@ -273,39 +273,7 @@ impl Connection<'_> {
 
     fn read_body(&mut self, n: usize) -> io::Result<Vec<u8>> {
         let mut buf = vec![0u8; n];
-        let mut got = 0usize;
-        let mut idle_since = Instant::now();
-        let started = Instant::now();
-        while got < n {
-            if started.elapsed() > BODY_DEADLINE {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "frame body exceeded its deadline",
-                ));
-            }
-            if !self.socket.readable() {
-                let left = BODY_TIMEOUT.checked_sub(idle_since.elapsed()).filter(|d| !d.is_zero());
-                let Some(left) = left else {
-                    return Err(io::Error::new(io::ErrorKind::TimedOut, "frame body stalled"));
-                };
-                let cap = BODY_DEADLINE.saturating_sub(started.elapsed());
-                self.socket.wait(Some(left.min(cap)))?;
-                continue;
-            }
-            match self.socket.read(&mut buf[got..])? {
-                Some(0) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "connection closed mid-frame",
-                    ));
-                }
-                Some(k) => {
-                    got += k;
-                    idle_since = Instant::now();
-                }
-                None => {}
-            }
-        }
+        self.socket.read_exact(&mut buf, BODY_TIMEOUT, BODY_DEADLINE)?;
         Ok(buf)
     }
 

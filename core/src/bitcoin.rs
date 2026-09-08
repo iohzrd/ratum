@@ -37,7 +37,6 @@ pub const WITNESS_SCALE_FACTOR: u64 = 4;
 
 pub const NULL_OUTPOINT_INDEX: [u8; OUTPOINT_SIZE - HASH_SIZE] = [0xff; OUTPOINT_SIZE - HASH_SIZE];
 pub const SEQUENCE_FINAL: [u8; SEQUENCE_SIZE] = [0xff; SEQUENCE_SIZE];
-pub const WITNESS_COMMITMENT_HEADER: [u8; 4] = [0xaa, 0x21, 0xa9, 0xed];
 
 pub fn sha256d(data: &[u8]) -> [u8; 32] {
     let first = Sha256::digest(data);
@@ -173,12 +172,6 @@ pub enum TxError {
     TrailingBytes(usize),
     #[error("input count is zero")]
     NoInputs,
-}
-
-impl CoinbaseTx {
-    pub fn total_output_value(&self) -> u64 {
-        self.outputs.iter().fold(0u64, |a, o| a.saturating_add(o.value))
-    }
 }
 
 pub fn parse_coinbase(tx: &[u8]) -> Result<CoinbaseTx, TxError> {

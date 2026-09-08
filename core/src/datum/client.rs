@@ -100,8 +100,7 @@ impl Client {
                 None => body.push(0),
             }
         }
-        let mut r = [0u8; 2];
-        dryoc::rng::copy_randombytes(&mut r);
+        let r = crate::rand::bytes::<2>();
         let pad_len = 1 + usize::from(r[0]) % HELLO_PAD_MAX;
         body.resize(body.len() + pad_len, r[1]);
 

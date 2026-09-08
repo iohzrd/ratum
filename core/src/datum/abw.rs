@@ -27,9 +27,7 @@ pub fn key_matches_hash(xor_key: &[u8; 16], hash: &[u8; 32]) -> bool {
 }
 
 pub fn random_key() -> [u8; 16] {
-    let mut key = [0u8; 16];
-    dryoc::rng::copy_randombytes(&mut key);
-    key
+    crate::rand::bytes()
 }
 
 pub fn raw_hash_le(hash2: &[u8; 32]) -> [u8; 32] {

@@ -173,8 +173,4 @@ impl Reassembler {
     pub fn reset(&mut self) {
         self.transfer = None;
     }
-
-    pub fn in_progress(&self) -> bool {
-        self.transfer.is_some()
-    }
 }

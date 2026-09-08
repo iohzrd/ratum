@@ -6,6 +6,7 @@ pub mod http;
 pub mod io;
 pub mod nonce;
 pub mod poll;
+pub mod rand;
 pub mod rpc;
 pub mod target;
 pub mod web;

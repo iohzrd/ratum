@@ -30,9 +30,7 @@ fn sample_hashrate(ctx: &Context) {
 const CSRF_TOKEN_BYTES: usize = 16;
 
 pub fn csrf_token() -> String {
-    let mut b = [0u8; CSRF_TOKEN_BYTES];
-    dryoc::rng::copy_randombytes(&mut b);
-    hex::encode(b)
+    hex::encode(ratum::rand::bytes::<CSRF_TOKEN_BYTES>())
 }
 
 fn secure_eq(a: &str, b: &str) -> bool {
@@ -367,6 +365,39 @@ fn save_settings(ctx: &Context, body: &str) -> (Reply, bool) {
     }
 }
 
+/// Saves the settings form. The bool is whether the process must restart to pick them up.
+fn post_settings(ctx: &Context, req: &mut Request) -> (Reply, bool) {
+    if !ctx.server.config.api.modify_conf {
+        return (forbidden("Saving settings requires api.modify_conf to be set."), false);
+    }
+    if let Err(reply) = settings_access(ctx, req) {
+        return (reply, false);
+    }
+    let body = read_body(req);
+    save_settings(ctx, &body)
+}
+
+fn post_command(ctx: &Context, req: &mut Request) -> Reply {
+    if ctx.server.config.api.admin_password.is_empty() {
+        return forbidden("Commands require api.admin_password to be set.");
+    }
+    if !authorized(ctx, req) {
+        return unauthorized();
+    }
+    let body = read_body(req);
+    if !http::param(&body, "csrf").is_some_and(|t| secure_eq(&t, &ctx.csrf)) {
+        return forbidden("Missing or stale form token.");
+    }
+    if let Some(id) = http::param(&body, "kill_client").and_then(|v| v.parse::<u64>().ok()) {
+        if ctx.server.kill_client(id) {
+            info!("API kill request for client {id}");
+        }
+    } else if http::param(&body, "empty_thread").is_some() {
+        ctx.server.shutdown_all();
+    }
+    redirect("/")
+}
+
 fn serve_admin(ctx: &Context, mut req: Request) {
     let (path, query) = http::path_and_query(&req);
     let method = req.method().clone();
@@ -400,43 +431,11 @@ fn serve_admin(ctx: &Context, mut req: Request) {
             Err(reply) => reply,
         },
         (Method::Post, "/config") => {
-            if !ctx.server.config.api.modify_conf {
-                forbidden("Saving settings requires api.modify_conf to be set.")
-            } else {
-                match settings_access(ctx, &req) {
-                    Ok(()) => {
-                        let body = read_body(&mut req);
-                        let (reply, r) = save_settings(ctx, &body);
-                        restart = r;
-                        reply
-                    }
-                    Err(reply) => reply,
-                }
-            }
+            let (reply, r) = post_settings(ctx, &mut req);
+            restart = r;
+            reply
         }
-        (Method::Post, "/cmd") => {
-            if ctx.server.config.api.admin_password.is_empty() {
-                forbidden("Commands require api.admin_password to be set.")
-            } else if !authorized(ctx, &req) {
-                unauthorized()
-            } else {
-                let body = read_body(&mut req);
-                if !http::param(&body, "csrf").is_some_and(|t| secure_eq(&t, &ctx.csrf)) {
-                    forbidden("Missing or stale form token.")
-                } else {
-                    if let Some(id) =
-                        http::param(&body, "kill_client").and_then(|v| v.parse::<u64>().ok())
-                    {
-                        if ctx.server.kill_client(id) {
-                            info!("API kill request for client {id}");
-                        }
-                    } else if http::param(&body, "empty_thread").is_some() {
-                        ctx.server.shutdown_all();
-                    }
-                    redirect("/")
-                }
-            }
-        }
+        (Method::Post, "/cmd") => post_command(ctx, &mut req),
         (Method::Get | Method::Post, _) => http::not_found(),
         _ => http::method_not_allowed(),
     };

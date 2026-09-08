@@ -237,16 +237,6 @@ impl HeaderV2 {
             result,
         }
     }
-
-    pub fn pow_hash(&self) -> U256 {
-        let mut r = self.hash_components().result;
-        r.reverse();
-        r
-    }
-
-    pub fn pow_hash_hex(&self) -> String {
-        hex::encode(self.hash_components().result)
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -286,18 +276,6 @@ pub fn u256_from_display_hex(s: &str) -> Option<U256> {
     let mut v: U256 = hex::decode(s).ok()?.try_into().ok()?;
     v.reverse();
     Some(v)
-}
-
-pub fn u128_from_display_hex(s: &str) -> Option<U128> {
-    let mut v: U128 = hex::decode(s).ok()?.try_into().ok()?;
-    v.reverse();
-    Some(v)
-}
-
-pub fn display_hex(le: &[u8]) -> String {
-    let mut v = le.to_vec();
-    v.reverse();
-    hex::encode(v)
 }
 
 struct Writer<'a> {

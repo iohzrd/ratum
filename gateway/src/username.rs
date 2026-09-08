@@ -35,28 +35,3 @@ pub fn apply_modifier(
     }
     Some(pool_address.to_string())
 }
-
-#[derive(Default)]
-pub struct FeeMeter {
-    owed: u64,
-    started: bool,
-}
-
-impl FeeMeter {
-    pub fn charge(&mut self, diff: u64, bps: u64, seed: impl FnOnce() -> u64) -> bool {
-        if bps == 0 {
-            return false;
-        }
-        let share_work = diff.saturating_mul(ratum::BASIS_POINTS_PER_UNIT);
-        if !self.started {
-            self.started = true;
-            self.owed = seed() % share_work.max(1);
-        }
-        self.owed = self.owed.saturating_add(diff.saturating_mul(bps));
-        if self.owed >= share_work {
-            self.owed -= share_work;
-            return true;
-        }
-        false
-    }
-}

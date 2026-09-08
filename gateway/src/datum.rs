@@ -461,7 +461,8 @@ impl<'a> Session<'a> {
         let mut stream = connect(settings)?;
         stream.set_read_timeout(Some(HANDSHAKE_READ_POLL))?;
         stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
-        let mut client = Client::with_key_pairs(identity.clone(), KeyPairs::generate(), rand_u32());
+        let mut client =
+            Client::with_key_pairs(identity.clone(), KeyPairs::generate(), ratum::rand::u32());
         let hello = if settings.protocol_v3 {
             let token = shared.resume_token();
             client.hello_resumable(&settings.pool_box_pk, &settings.user_agent, token.as_ref())
@@ -513,8 +514,7 @@ impl<'a> Session<'a> {
     }
 
     fn send_mining(&mut self, payload: &[u8]) -> Result<(), SessionError> {
-        let mut pad = [0u8; MINING_PAD_MAX];
-        dryoc::rng::copy_randombytes(&mut pad);
+        let pad = ratum::rand::bytes::<MINING_PAD_MAX>();
         let pad_len = 1 + usize::from(pad[0]) % MINING_PAD_MAX;
         let mut padded = Vec::with_capacity(payload.len() + pad_len);
         padded.extend_from_slice(payload);
@@ -531,36 +531,12 @@ impl<'a> Session<'a> {
         Ok(())
     }
 
-    fn read_exact(
-        &mut self,
-        n: usize,
-        started: Instant,
-        deadline: Duration,
-    ) -> io::Result<Vec<u8>> {
+    /// Reads one frame body, sharing the session's global timeout with every other read
+    /// since the last message from the pool.
+    fn read_body(&mut self, n: usize) -> io::Result<Vec<u8>> {
+        let left = self.settings.global_timeout.saturating_sub(self.last_server_msg.elapsed());
         let mut buf = vec![0u8; n];
-        let mut got = 0usize;
-        while got < n {
-            let left = match deadline.checked_sub(started.elapsed()) {
-                Some(left) if !left.is_zero() => left,
-                _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "read exceeded its deadline",
-                    ));
-                }
-            };
-            if !self.socket.readable() {
-                self.socket.wait(Some(left))?;
-                continue;
-            }
-            match self.socket.read(&mut buf[got..])? {
-                Some(0) => {
-                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed"));
-                }
-                Some(k) => got += k,
-                None => {}
-            }
-        }
+        self.socket.read_exact(&mut buf, left, left)?;
         Ok(buf)
     }
 
@@ -607,11 +583,7 @@ impl<'a> Session<'a> {
                 continue;
             }
             let Some(header) = self.poll_header()? else { continue };
-            let body = self.read_exact(
-                header.cmd_len as usize,
-                self.last_server_msg,
-                self.settings.global_timeout,
-            )?;
+            let body = self.read_body(header.cmd_len as usize)?;
             let plain = self.client.decrypt(header, &body).map_err(|e| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -1082,12 +1054,6 @@ fn requested_ids(plain: &[u8], txn_count: usize) -> Option<Vec<usize>> {
     ids.iter().all(|&i| i < txn_count).then_some(ids)
 }
 
-fn rand_u32() -> u32 {
-    let mut b = [0u8; size_of::<u32>()];
-    dryoc::rng::copy_randombytes(&mut b);
-    u32::from_le_bytes(b)
-}
-
 const RECONNECT_DELAY_MIN: Duration = Duration::from_secs(5);
 const RECONNECT_DELAY_SPREAD: Duration = Duration::from_secs(15);
 
@@ -1110,7 +1076,7 @@ pub fn run_forever(settings: Settings, shared: Arc<Shared>, identity: KeyPairs) 
         }
         let delay = RECONNECT_DELAY_MIN
             + Duration::from_millis(u64::from(
-                rand_u32() % (RECONNECT_DELAY_SPREAD.as_millis() as u32 + 1),
+                ratum::rand::u32() % (RECONNECT_DELAY_SPREAD.as_millis() as u32 + 1),
             ));
         info!("reconnecting to the pool in {:.1}s", delay.as_secs_f64());
         std::thread::sleep(delay);

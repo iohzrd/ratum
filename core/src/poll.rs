@@ -63,6 +63,47 @@ impl PolledSocket {
         }
     }
 
+    /// Fills `buf`, waiting for readability between reads. `idle` bounds the span between
+    /// two reads that make progress, `total` bounds the whole call; either expiring returns
+    /// `ErrorKind::TimedOut`.
+    pub fn read_exact(
+        &mut self,
+        buf: &mut [u8],
+        idle: Duration,
+        total: Duration,
+    ) -> io::Result<()> {
+        let started = Instant::now();
+        let mut idle_since = started;
+        let mut got = 0usize;
+        while got < buf.len() {
+            if started.elapsed() >= total {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "read exceeded its deadline"));
+            }
+            if !self.readable {
+                let left = idle.checked_sub(idle_since.elapsed()).filter(|d| !d.is_zero());
+                let Some(left) = left else {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "read stalled"));
+                };
+                self.wait(Some(left.min(total.saturating_sub(started.elapsed()))))?;
+                continue;
+            }
+            match self.read(&mut buf[got..])? {
+                Some(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "connection closed mid-read",
+                    ));
+                }
+                Some(n) => {
+                    got += n;
+                    idle_since = Instant::now();
+                }
+                None => {}
+            }
+        }
+        Ok(())
+    }
+
     pub fn write_all(&mut self, data: &[u8], timeout: Duration) -> io::Result<()> {
         let deadline = Instant::now() + timeout;
         let mut rest = data;

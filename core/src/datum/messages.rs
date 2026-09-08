@@ -108,16 +108,12 @@ pub type ResumeToken = [u8; RESUME_TOKEN_LEN];
 pub const DBF_MARKER: [u8; 4] = *b"DBF\x01";
 pub const CONFIG_FLAG_ABW_DISABLED: u8 = 0x01;
 
-pub fn token_matches_prime_id(token: &ResumeToken, prime_id: u64) -> bool {
-    u64::from_le_bytes(token[..TOKEN_PRIME_ID_LEN].try_into().expect("eight bytes")) == prime_id
-}
-
 const TOKEN_PRIME_ID_LEN: usize = size_of::<u64>();
 
 pub fn new_resume_token(prime_id: u64) -> ResumeToken {
     let mut t = [0u8; RESUME_TOKEN_LEN];
     t[..TOKEN_PRIME_ID_LEN].copy_from_slice(&prime_id.to_le_bytes());
-    dryoc::rng::copy_randombytes(&mut t[TOKEN_PRIME_ID_LEN..]);
+    crate::rand::fill(&mut t[TOKEN_PRIME_ID_LEN..]);
     t
 }
 
@@ -375,10 +371,6 @@ impl CoinbaserResponse {
     }
 
     pub fn decode(data: &[u8]) -> Option<Self> {
-        Self::decode_with(data, &|_| false)
-    }
-
-    pub fn decode_with(data: &[u8], skip: &dyn Fn(&[u8]) -> bool) -> Option<Self> {
         let mut c = Cursor::new(data);
         c.skip_if(server_subcmd::COINBASER);
         let value = c.u64("value").ok()?;
@@ -403,9 +395,6 @@ impl CoinbaserResponse {
                 return None;
             }
             let script = b.take(slen, "output script").ok()?.to_vec();
-            if skip(&script) {
-                continue;
-            }
             total += v;
             outputs.push(CoinbaseOutput { value: v, script });
             if outputs.len() >= MAX_COINBASER_OUTPUTS {

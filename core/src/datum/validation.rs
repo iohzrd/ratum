@@ -73,33 +73,8 @@ pub const JOB_INDEX_AT: usize = 2;
 pub const REQUEST_HEADER_LEN: usize = JOB_INDEX_AT + 1;
 pub const PARENT_FETCH_REQUEST_LEN: usize = REQUEST_HEADER_LEN + crate::bitcoin::HASH_SIZE;
 
-pub fn request_short_txn_list(job_index: u8) -> Vec<u8> {
-    vec![VALIDATION, request::SHORT_TXN_LIST, job_index]
-}
-
-pub fn request_txns(job_index: u8, indices: &[u16]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(REQUEST_HEADER_LEN + size_of::<u16>() + size_of_val(indices));
-    out.push(VALIDATION);
-    out.push(request::TXNS);
-    out.push(job_index);
-    out.extend_from_slice(&(indices.len() as u16).to_le_bytes());
-    for i in indices {
-        out.extend_from_slice(&i.to_le_bytes());
-    }
-    out
-}
-
 pub fn request_block_txns(job_index: u8) -> Vec<u8> {
     vec![VALIDATION, request::BLOCK_TXNS, job_index]
-}
-
-pub fn request_parent_fetch(job_index: u8, parent_hash: &[u8; 32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(PARENT_FETCH_REQUEST_LEN);
-    out.push(VALIDATION);
-    out.push(request::PARENT_FETCH);
-    out.push(job_index);
-    out.extend_from_slice(parent_hash);
-    out
 }
 
 wire_codes! {

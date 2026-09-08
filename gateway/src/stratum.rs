@@ -6,8 +6,8 @@ use crate::dupes::Dupes;
 use crate::job::{
     COINBASE_SUBSIDY_ONLY, JOB_ID_TIME_CHARS, Job, JobRef, MAX_JOBS, parse_sia_field,
 };
-use crate::tally::Tally;
-use crate::username::{self, FeeMeter};
+use crate::tally::{FeeMeter, Tally};
+use crate::username;
 use crate::vardiff::{self, Vardiff};
 use log::{debug, error, info, warn};
 use mio::Waker;
@@ -884,11 +884,7 @@ impl Connection {
 
     fn fee_charged(&mut self, diff: u64) -> bool {
         let bps = u64::from(self.server.config.datum.gateway_fee_bps);
-        let charged = self.fee.charge(diff, bps, || {
-            let mut b = [0u8; size_of::<u64>()];
-            dryoc::rng::copy_randombytes(&mut b);
-            u64::from_le_bytes(b)
-        });
+        let charged = self.fee.charge(diff, bps, ratum::rand::u64);
         if charged {
             self.with_stats(|st| st.fee.add(diff));
             ratum::lock(&self.server.fee).add(diff);

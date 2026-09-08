@@ -51,14 +51,6 @@ impl ReplayGuard {
         }
         true
     }
-
-    pub fn len(&self) -> usize {
-        self.seen.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.seen.is_empty()
-    }
 }
 
 impl Default for ReplayGuard {
@@ -164,16 +156,11 @@ pub struct Verifier {
     tip_next_target: Option<target::Target>,
     recent_tips: VecDeque<([u8; 32], u64)>,
     installed_coinbase_bytes: usize,
-    cap: usize,
     abw_keys: Option<AbwKeys>,
 }
 
 impl Verifier {
-    pub fn new(policy: PoolPolicy) -> Self {
-        Verifier::with_replay_guard(policy, Arc::new(Mutex::new(ReplayGuard::default())))
-    }
-
-    pub fn with_replay_guard(policy: PoolPolicy, replay: Arc<Mutex<ReplayGuard>>) -> Self {
+    pub fn new(policy: PoolPolicy, replay: Arc<Mutex<ReplayGuard>>) -> Self {
         Verifier {
             policy,
             jobs: vec![None; MAX_JOBS],
@@ -183,7 +170,6 @@ impl Verifier {
             tip_next_target: None,
             recent_tips: VecDeque::new(),
             installed_coinbase_bytes: 0,
-            cap: MAX_INSTALLED_COINBASE_BYTES,
             abw_keys: None,
         }
     }
@@ -194,18 +180,6 @@ impl Verifier {
 
     pub fn set_abw_keys(&mut self, keys: Option<AbwKeys>) {
         self.abw_keys = keys;
-    }
-
-    pub fn replay_guard(&self) -> Arc<Mutex<ReplayGuard>> {
-        Arc::clone(&self.replay)
-    }
-
-    pub fn policy(&self) -> &PoolPolicy {
-        &self.policy
-    }
-
-    pub fn record_split(&mut self, response: &CoinbaserResponse, now: u64) {
-        self.record_dictated(response, Vec::new(), now);
     }
 
     pub fn record_dictated(
@@ -493,7 +467,7 @@ impl Verifier {
             };
             let projected = self.installed_coinbase_bytes.saturating_sub(released + replaced)
                 + coinbase_bytes(cb);
-            if projected > self.cap {
+            if projected > MAX_INSTALLED_COINBASE_BYTES {
                 return Err(RejectReason::CoinbaseTooLarge);
             }
         }

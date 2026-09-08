@@ -30,15 +30,15 @@ pub fn to_output_script(addr: &str) -> Option<Vec<u8>> {
     }
     let lower = addr.to_ascii_lowercase();
     if lower.starts_with("bc") || lower.starts_with("tb") {
-        let hrp = if lower.starts_with('t') {
-            Hrp::parse("tb").ok()?
+        let expected = if lower.starts_with("tb") {
+            "tb"
         } else if lower.starts_with("bcrt1") {
-            Hrp::parse("bcrt").ok()?
+            "bcrt"
         } else {
-            Hrp::parse("bc").ok()?
+            "bc"
         };
         let (found_hrp, version, program) = bech32::segwit::decode(addr).ok()?;
-        if found_hrp != hrp {
+        if found_hrp != Hrp::parse(expected).ok()? {
             return None;
         }
         let v = version.to_u8();
