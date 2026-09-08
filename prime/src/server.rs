@@ -535,11 +535,39 @@ pub(crate) fn resolve_address(node: &rpc::Client, address: &str) -> Result<Resol
     })
 }
 
+/// The entries of `split` a coinbase output can pay, with the script each pays to, in the
+/// split's order. Anything but a script (the node is unreachable, or the identity was
+/// credited before this check existed and is not payable) leaves the identity out and its
+/// amount with the pool, which `left_out` names for the log.
+///
+/// An identity is resolved on the share that first credits it, so all of these are cached
+/// and this makes no RPC call in the ordinary case.
+fn payable_entries(
+    server: &Server,
+    split: Vec<(String, u64)>,
+    left_out: &str,
+) -> Vec<(String, u64, Vec<u8>)> {
+    let mut kept = Vec::with_capacity(split.len());
+    for (identity, sats) in split {
+        match Resolver::payability(&server.resolver, &server.node, &identity) {
+            Payability::Script(script) => kept.push((identity, sats, script)),
+            Payability::Unpayable(why) => warn!(
+                "      {identity} cannot be paid ({why}); its {sats} sats are left out of \
+                 {left_out} and stay with the pool"
+            ),
+            Payability::Unknown => warn!(
+                "      {identity} could not be resolved; its {sats} sats are left out of \
+                 {left_out} and stay with the pool"
+            ),
+        }
+    }
+    kept
+}
+
 pub(crate) fn dictated_outputs(
     server: &Server,
     value: u64,
 ) -> (Vec<(String, CoinbaseOutput)>, usize, u128) {
-    let node = &server.node;
     // The pool receives the operator fee; what remains is split among the miners. The gateway
     // pays the fee to the pool's payout script as the coinbase remainder (the value minus these
     // dictated outputs), so no output is dictated for it here.
@@ -547,27 +575,10 @@ pub(crate) fn dictated_outputs(
         let l = lock(&server.ledger);
         (split_after_fee(&l, &server.payout, value), l.len(), l.total_work())
     };
-    let mut outputs = Vec::with_capacity(split.len());
-    for (identity, amount) in split {
-        // An identity is resolved on the share that first credits it, so all of these are
-        // cached and this loop makes no RPC call in the ordinary case. Anything but a script
-        // (the node is unreachable, or the identity was credited before this check existed
-        // and is not payable) leaves its amount out of the dictated outputs, and the gateway
-        // pays that amount to the pool's payout script as part of the remainder.
-        match Resolver::payability(&server.resolver, node, &identity) {
-            Payability::Script(script) => {
-                outputs.push((identity, CoinbaseOutput { value: amount, script }))
-            }
-            Payability::Unpayable(why) => warn!(
-                "      {identity} cannot be paid ({why}); paying the other outputs and \
-                 leaving this identity's amount to the pool"
-            ),
-            Payability::Unknown => warn!(
-                "      {identity} could not be resolved; paying the other outputs and \
-                 leaving this identity's amount to the pool"
-            ),
-        }
-    }
+    let outputs = payable_entries(server, split, "the dictated outputs")
+        .into_iter()
+        .map(|(identity, value, script)| (identity, CoinbaseOutput { value, script }))
+        .collect();
     (outputs, shares, work)
 }
 
@@ -593,22 +604,10 @@ pub(crate) fn owed_for_block(
     at: u64,
 ) -> Option<OwedBlock> {
     let split = split_after_fee(&lock(&server.ledger), &server.payout, value);
-    let mut entries = Vec::with_capacity(split.len());
-    for (identity, sats) in split {
-        // Cached from the share that first credited the identity, so no RPC call in the
-        // ordinary case; see the matching rule in `coinbaser_outputs`.
-        match Resolver::payability(&server.resolver, &server.node, &identity) {
-            Payability::Script(_) => entries.push((identity, sats)),
-            Payability::Unpayable(why) => warn!(
-                "      {identity} cannot be paid ({why}); its {sats} sats are left out of \
-                 the owed record and stay with the pool"
-            ),
-            Payability::Unknown => warn!(
-                "      {identity} could not be resolved; its {sats} sats are left out of \
-                 the owed record and stay with the pool"
-            ),
-        }
-    }
+    let entries: Vec<(String, u64)> = payable_entries(server, split, "the owed record")
+        .into_iter()
+        .map(|(identity, sats, _)| (identity, sats))
+        .collect();
     let total: u64 = entries.iter().map(|(_, sats)| *sats).sum();
     if total == 0 {
         return None;

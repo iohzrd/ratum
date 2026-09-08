@@ -17,8 +17,8 @@
 
 use crate::template::Template;
 use ratum::bitcoin::opcode::{
-    OP_0, OP_16, OP_CHECKMULTISIG, OP_CHECKMULTISIGVERIFY, OP_CHECKSIG, OP_CHECKSIGVERIFY,
-    OP_N_BASE, OP_PUSHDATA1, OP_PUSHDATA2, OP_PUSHDATA4, OP_RETURN,
+    MAX_DIRECT_PUSH_OPCODE, OP_0, OP_16, OP_CHECKMULTISIG, OP_CHECKMULTISIGVERIFY, OP_CHECKSIG,
+    OP_CHECKSIGVERIFY, OP_N_BASE, OP_PUSHDATA1, OP_PUSHDATA2, OP_PUSHDATA4, OP_RETURN,
 };
 use ratum::bitcoin::{
     HASH_SIZE, LOCK_TIME_SIZE, MIN_OUTPUT_SIZE, NULL_OUTPOINT_INDEX, OUTPOINT_SIZE, SEQUENCE_FINAL,
@@ -383,7 +383,6 @@ const COINBASE_WITNESS_BYTES: u64 = 36;
 pub fn output_sigop_cost(script: &[u8]) -> u64 {
     /// What `GetSigOpCount(false)` charges a CHECKMULTISIG whose key count it does not read.
     const MAX_PUBKEYS_PER_MULTISIG: u64 = 20;
-    const MAX_DIRECT_PUSH_OPCODE: u8 = ratum::bitcoin::opcode::MAX_DIRECT_PUSH as u8;
 
     let mut cost = 0u64;
     let mut i = 0usize;

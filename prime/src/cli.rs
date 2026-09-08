@@ -203,17 +203,7 @@ pub(crate) fn resolve<T: FromStr>(
     must_be: &str,
     ok: impl Fn(&T) -> bool,
 ) -> T {
-    match cli {
-        Some(s) => {
-            let value = s.parse::<T>().unwrap_or_else(|_| refuse(flag, must_be, &format!("{s:?}")));
-            if ok(&value) { value } else { refuse(flag, must_be, &format!("{s:?}")) }
-        }
-        None => match file {
-            Some(value) if ok(&value) => value,
-            Some(_) => refuse(flag, must_be, "the configured value"),
-            None => default,
-        },
-    }
+    resolve_opt(cli, file, flag, must_be, ok).unwrap_or(default)
 }
 
 /// Resolve an optional setting the same way, returning `None` when it is given nowhere.

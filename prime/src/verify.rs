@@ -375,7 +375,7 @@ impl Verifier {
     }
 
     fn parent_kept(&self, prev_hash: [u8; 32]) -> bool {
-        self.tip == Some(prev_hash) || self.recent_tips.iter().any(|(h, _)| *h == prev_hash)
+        parent_is_kept(self.tip, &self.recent_tips, prev_hash)
     }
 
     /// Mark the jobs whose parent was a kept tip and no longer is. Their sections stay, and
@@ -384,13 +384,12 @@ impl Verifier {
     /// and, when it is a block by its own bits, its receipt, which the version 3 gateway's
     /// reveal audit requires for every proof it retained.
     fn evict_jobs_off_recent_tips(&mut self) {
-        for slot in self.jobs.iter_mut().flatten() {
+        let Verifier { jobs, tip, recent_tips, .. } = self;
+        for slot in jobs.iter_mut().flatten() {
             if slot.evicted {
                 continue;
             }
-            let kept = self.tip == Some(slot.job.prev_hash)
-                || self.recent_tips.iter().any(|(h, _)| *h == slot.job.prev_hash);
-            if kept {
+            if parent_is_kept(*tip, recent_tips, slot.job.prev_hash) {
                 slot.parent_seen = true;
             } else if slot.parent_seen {
                 slot.evicted = true;
@@ -698,6 +697,15 @@ impl Verifier {
         }
         Ok(())
     }
+}
+
+/// Whether a job's parent is the tip or one of the replaced tips still kept.
+fn parent_is_kept(
+    tip: Option<[u8; 32]>,
+    recent_tips: &VecDeque<([u8; 32], u64)>,
+    prev_hash: [u8; 32],
+) -> bool {
+    tip == Some(prev_hash) || recent_tips.iter().any(|(h, _)| *h == prev_hash)
 }
 
 /// The bytes a username may hold: printable ASCII other than the space, so an identity is

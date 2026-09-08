@@ -243,6 +243,11 @@ impl Client {
         }
     }
 
+    /// The node's URL, as configured. For a log line naming what this client talks to.
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
     pub fn tip(&self) -> Result<Tip, Error> {
         let info = self.call("getblockchaininfo", serde_json::json!([]))?;
         let display = info["bestblockhash"]

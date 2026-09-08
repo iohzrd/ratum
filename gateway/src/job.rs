@@ -104,8 +104,8 @@ impl Job {
     /// The coinbase an id names: the subsidy-only one for `COINBASE_SUBSIDY_ONLY`, the pooled
     /// one for any other. The id carries no size class (see `coinbase::COINBASE_POOLED`);
     /// the stratum layer accepts only the pooled id on a share.
-    pub fn coinbase(&self, id: u8) -> Option<&Coinbase> {
-        if id == COINBASE_SUBSIDY_ONLY { Some(&self.subsidy_only) } else { Some(&self.pooled) }
+    pub fn coinbase(&self, id: u8) -> &Coinbase {
+        if id == COINBASE_SUBSIDY_ONLY { &self.subsidy_only } else { &self.pooled }
     }
 
     pub fn is_stale_prevblock(&self) -> bool {
@@ -114,7 +114,7 @@ impl Job {
 
     /// The transaction a share commits to: the coinbase with the PoT byte written in.
     pub fn full_coinbase(&self, id: u8, pot: u8) -> Option<Vec<u8>> {
-        let mut tx = self.coinbase(id)?.assemble(&[0u8; EXTRANONCE_SIZE]);
+        let mut tx = self.coinbase(id).assemble(&[0u8; EXTRANONCE_SIZE]);
         *tx.get_mut(self.target_pot_index)? = pot;
         Some(tx)
     }
@@ -610,7 +610,8 @@ mod tests {
         let parsed = ratum::bitcoin::parse_coinbase(&tx).unwrap();
         // The 120 dictated outputs, the remainder to the pool script, the witness commitment.
         assert_eq!(parsed.outputs.len(), 122);
-        assert!(job.coinbase(coinbase::COINBASE_POOLED).is_some());
+        assert_eq!(job.coinbase(coinbase::COINBASE_POOLED), &job.pooled);
+        assert_eq!(job.coinbase(COINBASE_SUBSIDY_ONLY), &job.subsidy_only);
 
         // A block its transactions nearly fill: the coinbase shrinks to the weight left, four
         // units a byte, and the split's last outputs are left out.

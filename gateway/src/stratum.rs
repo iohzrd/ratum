@@ -18,14 +18,14 @@ use crate::tally::Tally;
 use crate::username::{self, FeeMeter};
 use crate::vardiff::{self, Vardiff};
 use log::{debug, error, info, warn};
-use mio::net::TcpStream as PolledStream;
-use mio::{Events, Interest, Poll, Token, Waker};
+use mio::Waker;
 use ratum::datum::share::{
     EXTRANONCE_SIZE_V2, EXTRANONCE_V2_PAD, EXTRANONCE1_SIZE, EXTRANONCE2_SIZE,
 };
+use ratum::poll::PolledSocket;
 use ratum::target;
 use serde_json::{Value, json};
-use std::io::{self, Read, Write};
+use std::io;
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -47,10 +47,6 @@ const IDLE_CHECK_INTERVAL: Duration = Duration::from_millis(11150);
 /// How long a write waits for the socket to take the rest of the line before it fails with
 /// `TimedOut`.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
-/// The connection's socket in its `Poll`.
-const SOCKET: Token = Token(0);
-/// The `Waker` a new job or a kill request calls.
-const WAKE: Token = Token(1);
 const STAT_CYCLE: Duration = Duration::from_secs(60);
 /// How long after a hashrate window closes the estimate from it is still reported; past it
 /// the connection has stopped submitting and `hashrate_ths` returns `None`.
@@ -404,13 +400,8 @@ struct SubmitRequest {
 struct Connection {
     server: Arc<Server>,
     entry: Arc<ClientEntry>,
-    stream: PolledStream,
-    /// Readiness for the socket and the waker; the thread blocks here between reads.
-    poll: Poll,
-    events: Events,
-    /// Set when the poll reports the socket readable, cleared when a read returns
-    /// `WouldBlock`: the registration is edge triggered, so readiness holds until then.
-    readable: bool,
+    /// The socket and its readiness; the thread blocks here between reads.
+    socket: PolledSocket,
     remote: String,
     sid: u32,
     subscribed: bool,
@@ -435,11 +426,8 @@ impl Connection {
         stream.set_nodelay(true)?;
         // The poll reports readiness; the socket itself never blocks, and both directions
         // return `WouldBlock` instead.
-        stream.set_nonblocking(true)?;
-        let mut stream = PolledStream::from_std(stream);
-        let poll = Poll::new()?;
-        poll.registry().register(&mut stream, SOCKET, Interest::READABLE | Interest::WRITABLE)?;
-        let waker = Arc::new(Waker::new(poll.registry(), WAKE)?);
+        let socket = PolledSocket::new(stream)?;
+        let waker = Arc::new(socket.waker()?);
         let unique_id = server.next_unique_id.fetch_add(1, Ordering::Relaxed);
         // The C gateway packs a 22-bit client index and a thread id; here the connection
         // counter is the whole 32 bits, so two live connections never share extranonce1.
@@ -460,10 +448,7 @@ impl Connection {
         let s = &server.config.stratum;
         let mut c = Connection {
             entry: Arc::clone(&entry),
-            stream,
-            poll,
-            events: Events::with_capacity(8),
-            readable: false,
+            socket,
             remote,
             sid,
             subscribed: false,
@@ -509,16 +494,16 @@ impl Connection {
             self.idle_checks()?;
             self.roll_window();
 
-            if !self.readable {
+            if !self.socket.readable() {
                 // Nothing left to read: block until the socket is readable, the waker is
                 // called for a new job or a kill request, or a timed check is due.
                 let timeout = self.until_next_check();
-                self.wait(Some(timeout))?;
+                self.socket.wait(Some(timeout))?;
                 continue;
             }
-            match self.stream.read(&mut chunk) {
-                Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into()),
-                Ok(n) => {
+            match self.socket.read(&mut chunk)? {
+                Some(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into()),
+                Some(n) => {
                     buf.extend_from_slice(&chunk[..n]);
                     if buf.len() >= CLIENT_BUFFER {
                         return Err(Disconnect::Protocol(
@@ -531,9 +516,7 @@ impl Connection {
                         self.handle_line(line.trim_end_matches('\r'))?;
                     }
                 }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => self.readable = false,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e.into()),
+                None => {}
             }
         }
     }
@@ -543,24 +526,6 @@ impl Connection {
     fn until_next_check(&self) -> Duration {
         let due = self.next_idle_check.min(self.window_started + STAT_CYCLE);
         due.saturating_duration_since(Instant::now())
-    }
-
-    /// Block until an event or `timeout`, recording read readiness. A waker event needs no
-    /// record: `serve` reads `kill` and the generation counter each time around the loop.
-    /// `Interrupted` returns with no event, as a timeout does.
-    fn wait(&mut self, timeout: Option<Duration>) -> io::Result<()> {
-        match self.poll.poll(&mut self.events, timeout) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(()),
-            Err(e) => return Err(e),
-        }
-        for ev in self.events.iter() {
-            // A closed or errored socket is read so that `read` reports it.
-            if ev.token() == SOCKET && (ev.is_readable() || ev.is_read_closed() || ev.is_error()) {
-                self.readable = true;
-            }
-        }
-        Ok(())
     }
 
     fn with_stats(&self, f: impl FnOnce(&mut ClientStats)) {
@@ -615,32 +580,8 @@ impl Connection {
     }
 
     fn send_line(&mut self, line: &str) -> io::Result<()> {
-        self.write_all(line.as_bytes())?;
-        self.write_all(b"\n")
-    }
-
-    /// Write every byte, waiting for write readiness while the socket buffer is full.
-    /// Fails with `TimedOut` once `WRITE_TIMEOUT` has passed, as the socket write timeout
-    /// did. Read readiness seen while waiting is kept for `serve`.
-    fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
-        let deadline = Instant::now() + WRITE_TIMEOUT;
-        let mut rest = data;
-        while !rest.is_empty() {
-            match self.stream.write(rest) {
-                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-                Ok(n) => rest = &rest[n..],
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    let left = deadline.saturating_duration_since(Instant::now());
-                    if left.is_zero() {
-                        return Err(io::ErrorKind::TimedOut.into());
-                    }
-                    self.wait(Some(left))?;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(())
+        self.socket.write_all(line.as_bytes(), WRITE_TIMEOUT)?;
+        self.socket.write_all(b"\n", WRITE_TIMEOUT)
     }
 
     /// A response to request `id`: `error` is the stratum error array or null.
@@ -1084,7 +1025,7 @@ mod tests {
     use super::*;
     use crate::job::Builder;
     use crate::template::tests::{config, template};
-    use std::io::{BufRead, BufReader};
+    use std::io::{BufRead, BufReader, Write as _};
     use std::thread::JoinHandle;
 
     /// How long a test waits for a line or a thread to end. The events under test are

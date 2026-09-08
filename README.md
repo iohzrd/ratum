@@ -128,9 +128,9 @@ format are byte-coupled between the pool and the gateway, so they are one releas
 cargo build --workspace --release        # target/release/ratum-prime, ratum-gateway, sia-test-miner
 cargo test --workspace
 cargo test --workspace --release -- --ignored  # shares and blocks, ~2^32 hashes each
-tests/e2e/full_stack.sh                  # the activation block
-tests/e2e/multi_miner.sh                 # three miners, two gateways: credit and payout split
-tests/e2e/gateway_fee.sh                 # a gateway charging a fee beside one charging none
+e2e/full_stack.sh                  # the activation block
+e2e/multi_miner.sh                 # three miners, two gateways: credit and payout split
+e2e/gateway_fee.sh                 # a gateway charging a fee beside one charging none
 ```
 
 The scripts need a Knots build with the BLAKE2b change (`BITCOIND`, `BITCOIN_CLI`);

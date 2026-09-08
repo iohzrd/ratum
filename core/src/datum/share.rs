@@ -202,6 +202,68 @@ fn le32(b: &[u8]) -> u32 {
     u32::from_le_bytes(b.try_into().expect("four bytes"))
 }
 
+/// The 0x01 section, after its marker: the template the job was built from and the merkle
+/// path from the coinbase.
+fn decode_job_section(r: &mut Cursor<'_>) -> Result<JobSection, Error> {
+    let prev_hash: [u8; 32] = r.arr("prev hash")?;
+    let target_byte_index = r.u16("target byte index")?;
+    let nbits: [u8; 4] = r.arr("nbits")?;
+    let coinbaser_id = r.u8("coinbaser id")?;
+    let height = r.u32("height")?;
+    let coinbase_value = r.u64("coinbase value")?;
+    let txn_count = r.u32("txn count")?;
+    let txn_total_weight = r.u32("txn weight")?;
+    let txn_total_size = r.u32("txn size")?;
+    let txn_total_sigops = r.u32("txn sigops")?;
+    let n = r.u8("merkle count")?;
+    if n as usize > MAX_MERKLE_BRANCHES {
+        return Err(Error::BadMerkleCount(n));
+    }
+    let mut merkle_branches = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        merkle_branches.push(r.arr("merkle branch")?);
+    }
+    Ok(JobSection {
+        prev_hash,
+        target_byte_index,
+        nbits,
+        coinbaser_id,
+        height,
+        coinbase_value,
+        txn_count,
+        txn_total_weight,
+        txn_total_size,
+        txn_total_sigops,
+        merkle_branches,
+    })
+}
+
+/// The 0x02 section, after its marker: the coinbase's two halves, which the extranonce goes
+/// between.
+fn decode_coinbase_section(r: &mut Cursor<'_>) -> Result<CoinbaseSection, Error> {
+    let coinbase_id = r.u8("coinbase section id")?;
+    let len1 = r.u16("coinb1 len")? as usize;
+    let len2 = r.u16("coinb2 len")? as usize;
+    let coinb1 = r.take(len1, "coinb1")?.to_vec();
+    let coinb2 = r.take(len2, "coinb2")?.to_vec();
+    Ok(CoinbaseSection { coinbase_id, coinb1, coinb2 })
+}
+
+/// The 0x03 section, after its marker: the algorithm byte, the two eight-byte Sia fields,
+/// the time marker and the job's time.
+fn decode_blake2b_section(r: &mut Cursor<'_>) -> Result<Blake2bSection, Error> {
+    if r.u8("algorithm")? != BLAKE2B_ALGORITHM {
+        return Err(Error::BadBlake2bSection);
+    }
+    let sia_ntime: [u8; SIA_FIELD_SIZE] = r.arr("sia ntime")?;
+    let sia_nonce: [u8; SIA_FIELD_SIZE] = r.arr("sia nonce")?;
+    if r.u8("time marker")? != BLAKE2B_TIME {
+        return Err(Error::BadBlake2bSection);
+    }
+    let time_on_wire = r.u32("time on wire")?;
+    Ok(Blake2bSection { sia_ntime, sia_nonce, time_on_wire })
+}
+
 /// A share as the gateway submits it (0x27). The fixed fields are the upstream DATUM
 /// layout; `ntime`, `nonce` and `version` are carried in it but the header the pool builds
 /// takes its time and nonces from `blake2b` (the 0x03 section, which every share must carry)
@@ -290,6 +352,8 @@ impl PowSubmit {
         let reserved = r.take(RESERVED_SIZE, "reserved")?;
         let use_time_offset = reserved[0] & RESERVED_USE_TIME_OFFSET != 0;
 
+        // The sections, in any order, until the terminator. A repeated section replaces the
+        // one before it, as the C parser's assignment does.
         let mut job = None;
         let mut coinbase = None;
         let mut blake2b = None;
@@ -297,62 +361,10 @@ impl PowSubmit {
         loop {
             match r.u8("section marker")? {
                 STRUCT_END => break,
-                SECTION_JOB => {
-                    let prev_hash: [u8; 32] = r.arr("prev hash")?;
-                    let target_byte_index = r.u16("target byte index")?;
-                    let nbits: [u8; 4] = r.arr("nbits")?;
-                    let coinbaser_id = r.u8("coinbaser id")?;
-                    let height = r.u32("height")?;
-                    let coinbase_value = r.u64("coinbase value")?;
-                    let txn_count = r.u32("txn count")?;
-                    let txn_total_weight = r.u32("txn weight")?;
-                    let txn_total_size = r.u32("txn size")?;
-                    let txn_total_sigops = r.u32("txn sigops")?;
-                    let n = r.u8("merkle count")?;
-                    if n as usize > MAX_MERKLE_BRANCHES {
-                        return Err(Error::BadMerkleCount(n));
-                    }
-                    let mut merkle_branches = Vec::with_capacity(n as usize);
-                    for _ in 0..n {
-                        merkle_branches.push(r.arr("merkle branch")?);
-                    }
-                    job = Some(JobSection {
-                        prev_hash,
-                        target_byte_index,
-                        nbits,
-                        coinbaser_id,
-                        height,
-                        coinbase_value,
-                        txn_count,
-                        txn_total_weight,
-                        txn_total_size,
-                        txn_total_sigops,
-                        merkle_branches,
-                    });
-                }
-                SECTION_COINBASE => {
-                    let coinbase_id = r.u8("coinbase section id")?;
-                    let len1 = r.u16("coinb1 len")? as usize;
-                    let len2 = r.u16("coinb2 len")? as usize;
-                    let coinb1 = r.take(len1, "coinb1")?.to_vec();
-                    let coinb2 = r.take(len2, "coinb2")?.to_vec();
-                    coinbase = Some(CoinbaseSection { coinbase_id, coinb1, coinb2 });
-                }
-                SECTION_ABW_SLOT => {
-                    abw_slot = Some(r.u8("abw slot")?);
-                }
-                SECTION_BLAKE2B => {
-                    if r.u8("algorithm")? != BLAKE2B_ALGORITHM {
-                        return Err(Error::BadBlake2bSection);
-                    }
-                    let sia_ntime: [u8; SIA_FIELD_SIZE] = r.arr("sia ntime")?;
-                    let sia_nonce: [u8; SIA_FIELD_SIZE] = r.arr("sia nonce")?;
-                    if r.u8("time marker")? != BLAKE2B_TIME {
-                        return Err(Error::BadBlake2bSection);
-                    }
-                    let time_on_wire = r.u32("time on wire")?;
-                    blake2b = Some(Blake2bSection { sia_ntime, sia_nonce, time_on_wire });
-                }
+                SECTION_JOB => job = Some(decode_job_section(&mut r)?),
+                SECTION_COINBASE => coinbase = Some(decode_coinbase_section(&mut r)?),
+                SECTION_ABW_SLOT => abw_slot = Some(r.u8("abw slot")?),
+                SECTION_BLAKE2B => blake2b = Some(decode_blake2b_section(&mut r)?),
                 other => return Err(Error::UnknownSection(other)),
             }
         }

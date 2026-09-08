@@ -15,8 +15,7 @@ use crate::job::{Abw, Job, PoolConfig};
 use crate::tally::Tally;
 use crate::template::Notify;
 use log::{debug, error, info, warn};
-use mio::net::TcpStream as PolledStream;
-use mio::{Events, Interest, Poll, Token, Waker};
+use mio::Waker;
 use ratum::datum::abw::{self, Activation, AssignmentNotice, Candidate, Reveal};
 use ratum::datum::client::Client;
 use ratum::datum::framing::{self, Header};
@@ -31,9 +30,10 @@ use ratum::datum::validation::{
 };
 use ratum::header::HeaderV2;
 use ratum::io::read_exact_deadline;
+use ratum::poll::PolledSocket;
 use ratum::target;
 use std::collections::VecDeque;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -55,10 +55,6 @@ const HANDSHAKE_READ_POLL: Duration = Duration::from_millis(5);
 /// How long a write waits for the socket to take the rest of a frame before it fails with
 /// `TimedOut`.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
-/// The session's socket in its `Poll`.
-const SOCKET: Token = Token(0);
-/// The `Waker` a queued share or a coinbaser request calls.
-const WAKE: Token = Token(1);
 /// Every mining message ends with this many random bytes at most (the C gateway pads each
 /// with 1 to 80 or 1 to 100), so a message's length does not identify its contents.
 const MINING_PAD_MAX: usize = 100;
@@ -504,13 +500,8 @@ struct Session<'a> {
     settings: &'a Settings,
     shared: &'a Shared,
     identity: &'a KeyPairs,
-    stream: PolledStream,
-    /// Readiness for the socket and the waker; the thread blocks here between frames.
-    poll: Poll,
-    events: Events,
-    /// Set when the poll reports the socket readable, cleared when a read returns
-    /// `WouldBlock`: the registration is edge triggered, so readiness holds until then.
-    readable: bool,
+    /// The socket and its readiness; the thread blocks here between frames.
+    socket: PolledSocket,
     client: Client,
     last_server_msg: Instant,
     last_share_sent: Option<Instant>,
@@ -626,21 +617,15 @@ impl<'a> Session<'a> {
 
         // The handshake is done; from here the poll reports readiness, the socket itself
         // never blocks, and both directions return `WouldBlock` instead.
-        stream.set_nonblocking(true)?;
-        let mut stream = PolledStream::from_std(stream);
-        let poll = Poll::new()?;
-        poll.registry().register(&mut stream, SOCKET, Interest::READABLE | Interest::WRITABLE)?;
-        *ratum::lock(&shared.waker) = Some(Arc::new(Waker::new(poll.registry(), WAKE)?));
+        let socket = PolledSocket::new(stream)?;
+        *ratum::lock(&shared.waker) = Some(Arc::new(socket.waker()?));
 
         let slots = ratum::lock(&shared.slots).len();
         Ok(Session {
             settings,
             shared,
             identity,
-            stream,
-            poll,
-            events: Events::with_capacity(8),
-            readable: false,
+            socket,
             client,
             last_server_msg: Instant::now(),
             last_share_sent: None,
@@ -668,49 +653,7 @@ impl<'a> Session<'a> {
             }
             Err(e) => return Err(io::Error::other(e.to_string()).into()),
         };
-        self.write_all(&wire)?;
-        Ok(())
-    }
-
-    /// Write every byte, waiting for write readiness while the socket buffer is full.
-    /// Fails with `TimedOut` once `WRITE_TIMEOUT` has passed, as the socket write timeout
-    /// did. Read readiness seen while waiting is kept for the next read.
-    fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
-        let deadline = Instant::now() + WRITE_TIMEOUT;
-        let mut rest = data;
-        while !rest.is_empty() {
-            match self.stream.write(rest) {
-                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-                Ok(n) => rest = &rest[n..],
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    let left = deadline.saturating_duration_since(Instant::now());
-                    if left.is_zero() {
-                        return Err(io::ErrorKind::TimedOut.into());
-                    }
-                    self.wait(Some(left))?;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(())
-    }
-
-    /// Block until an event or `timeout`, recording read readiness. A waker event needs no
-    /// record: `run` calls `send_pending` each time around the loop. `Interrupted` returns
-    /// with no event, as a timeout does.
-    fn wait(&mut self, timeout: Option<Duration>) -> io::Result<()> {
-        match self.poll.poll(&mut self.events, timeout) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(()),
-            Err(e) => return Err(e),
-        }
-        for ev in self.events.iter() {
-            // A closed or errored socket is read so that `read` reports it.
-            if ev.token() == SOCKET && (ev.is_readable() || ev.is_read_closed() || ev.is_error()) {
-                self.readable = true;
-            }
-        }
+        self.socket.write_all(&wire, WRITE_TIMEOUT)?;
         Ok(())
     }
 
@@ -734,18 +677,16 @@ impl<'a> Session<'a> {
                     ));
                 }
             };
-            if !self.readable {
-                self.wait(Some(left))?;
+            if !self.socket.readable() {
+                self.socket.wait(Some(left))?;
                 continue;
             }
-            match self.stream.read(&mut buf[got..]) {
-                Ok(0) => {
+            match self.socket.read(&mut buf[got..])? {
+                Some(0) => {
                     return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed"));
                 }
-                Ok(k) => got += k,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => self.readable = false,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e),
+                Some(k) => got += k,
+                None => {}
             }
         }
         Ok(buf)
@@ -755,12 +696,10 @@ impl<'a> Session<'a> {
     /// them; `None` until the whole header has arrived.
     fn poll_header(&mut self) -> Result<Option<Header>, SessionError> {
         let mut byte = [0u8; framing::HEADER_LEN];
-        match self.stream.read(&mut byte[..framing::HEADER_LEN - self.pending_header.len()]) {
-            Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into()),
-            Ok(n) => self.pending_header.extend_from_slice(&byte[..n]),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => self.readable = false,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e.into()),
+        match self.socket.read(&mut byte[..framing::HEADER_LEN - self.pending_header.len()])? {
+            Some(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into()),
+            Some(n) => self.pending_header.extend_from_slice(&byte[..n]),
+            None => {}
         }
         if self.pending_header.len() < framing::HEADER_LEN {
             return Ok(None);
@@ -791,12 +730,12 @@ impl<'a> Session<'a> {
 
             self.send_pending()?;
 
-            if !self.readable {
+            if !self.socket.readable() {
                 // Nothing to read: block until the socket is readable, the waker is called
                 // for a queued share or a coinbaser request, or the global timeout is due.
                 let timeout =
                     self.settings.global_timeout.saturating_sub(self.last_server_msg.elapsed());
-                self.wait(Some(timeout))?;
+                self.socket.wait(Some(timeout))?;
                 continue;
             }
             let Some(header) = self.poll_header()? else { continue };
@@ -833,55 +772,14 @@ impl<'a> Session<'a> {
                     error!("pool configuration was not signed; ignored");
                     return Ok(());
                 }
-                if self.settings.protocol_v3 {
-                    // A version 3 hello was sent. A version 3 pool responds with version 3; a
-                    // version 1 pool responds with version 1 and the session runs version 1.
-                    match ClientConfigV3::decode(plain) {
-                        Some(c) => {
-                            *ratum::lock(&self.shared.resume_token) = Some(c.resume_token);
-                            self.on_config(PoolConfig::from_message_v3(c));
-                        }
-                        None => match ClientConfig::decode(plain) {
-                            Some(c) => {
-                                warn!(
-                                    "pool responded to the version 3 hello with a version 1 \
-                                     configuration; this session runs version 1 (no \
-                                     anti-block-withholding)"
-                                );
-                                self.on_config(PoolConfig::from_message(c));
-                            }
-                            None => error!("malformed pool configuration; ignored"),
-                        },
-                    }
-                } else {
-                    match ClientConfig::decode(plain) {
-                        Some(c) => self.on_config(PoolConfig::from_message(c)),
-                        None => error!("malformed pool configuration; ignored"),
-                    }
-                }
+                self.on_config_message(plain);
             }
             Some(server_subcmd::MIGRATION) => {
-                // The C gateway disconnects and reconnects to the target; this gateway stays
-                // on its configured pool, so the request is logged and not followed.
                 if !header.is_signed {
                     error!("migration request was not signed; ignored");
                     return Ok(());
                 }
-                match MigrationRequest::decode(plain) {
-                    Some(MigrationRequest { target: Some(t) }) => warn!(
-                        "pool requested migration to {:?} port {} (pool key {}); not \
-                         supported, staying on the configured pool",
-                        t.host,
-                        t.port,
-                        &hex::encode(t.pubkey)[..16]
-                    ),
-                    Some(MigrationRequest { target: None }) => {
-                        warn!(
-                            "pool requested a return to the configured pool; this gateway is on it"
-                        )
-                    }
-                    None => error!("malformed migration request; ignored"),
-                }
+                log_migration_request(plain);
             }
             Some(abw::subcmd::ASSIGNMENT_NOTICE) => self.on_abw_notice(plain),
             Some(abw::subcmd::ACTIVATION) => self.on_abw_activation(plain),
@@ -894,35 +792,7 @@ impl<'a> Session<'a> {
                 }
             }
             Some(abw::subcmd::CANDIDATE_RELEASE) => {}
-            Some(server_subcmd::COINBASER) => {
-                let Some(state) = ratum::lock(&self.shared.coinbaser).clone() else {
-                    warn!("coinbaser response with no request waiting");
-                    return Ok(());
-                };
-                let r = match CoinbaserResponse::decode(plain) {
-                    Some(r) => {
-                        debug!(
-                            "coinbaser response: {} sats, id {}, {} outputs",
-                            r.value,
-                            r.coinbaser_id,
-                            r.outputs.len()
-                        );
-                        r
-                    }
-                    // The C gateway builds the job with no split rather than waiting out
-                    // the request.
-                    None => {
-                        error!("malformed coinbaser response; the job pays the pool script alone");
-                        CoinbaserResponse {
-                            value: state.value,
-                            coinbaser_id: 0,
-                            outputs: Vec::new(),
-                        }
-                    }
-                };
-                *ratum::lock(&state.response) = Some(r);
-                state.done.notify_all();
-            }
+            Some(server_subcmd::COINBASER) => self.on_coinbaser_response(plain),
             Some(server_subcmd::SHARE_RESPONSE) => match ShareResponse::decode(plain) {
                 Some(r) => self.on_share_response(r),
                 None => warn!("malformed share response"),
@@ -935,6 +805,57 @@ impl<'a> Session<'a> {
             other => warn!("unknown DATUM mining sub-command {other:?}"),
         }
         Ok(())
+    }
+
+    /// The pool's split for the job whose coinbaser request is waiting, handed to the
+    /// thread that made it. A response that does not decode leaves the job with no split, as
+    /// the C gateway does rather than waiting the request out.
+    fn on_coinbaser_response(&mut self, plain: &[u8]) {
+        let Some(state) = ratum::lock(&self.shared.coinbaser).clone() else {
+            warn!("coinbaser response with no request waiting");
+            return;
+        };
+        let r = match CoinbaserResponse::decode(plain) {
+            Some(r) => {
+                debug!(
+                    "coinbaser response: {} sats, id {}, {} outputs",
+                    r.value,
+                    r.coinbaser_id,
+                    r.outputs.len()
+                );
+                r
+            }
+            None => {
+                error!("malformed coinbaser response; the job pays the pool script alone");
+                CoinbaserResponse { value: state.value, coinbaser_id: 0, outputs: Vec::new() }
+            }
+        };
+        *ratum::lock(&state.response) = Some(r);
+        state.done.notify_all();
+    }
+
+    /// The pool's 0x99 configuration. After a version 3 hello a version 3 pool responds with
+    /// a version 3 configuration; a version 1 pool responds with a version 1 one, and the
+    /// session then runs the version 1 protocol.
+    fn on_config_message(&mut self, plain: &[u8]) {
+        if self.settings.protocol_v3
+            && let Some(c) = ClientConfigV3::decode(plain)
+        {
+            *ratum::lock(&self.shared.resume_token) = Some(c.resume_token);
+            self.on_config(PoolConfig::from_message_v3(c));
+            return;
+        }
+        let Some(c) = ClientConfig::decode(plain) else {
+            error!("malformed pool configuration; ignored");
+            return;
+        };
+        if self.settings.protocol_v3 {
+            warn!(
+                "pool responded to the version 3 hello with a version 1 configuration; this \
+                 session runs version 1 (no anti-block-withholding)"
+            );
+        }
+        self.on_config(PoolConfig::from_message(c));
     }
 
     fn on_config(&mut self, config: PoolConfig) {
@@ -1063,47 +984,13 @@ impl<'a> Session<'a> {
                 info!("pool requested the short transaction list of job {job_index:?}");
                 match lookup {
                     Ok(job) => self.short_txn_list(&job),
-                    Err((idx, status)) => ShortTxnList {
-                        job_index: idx,
-                        status,
-                        txn_count: 0,
-                        short_ids: vec![],
-                        crosscheck: None,
-                    },
+                    Err((idx, status)) => ShortTxnList::empty(idx, status),
                 }
                 .encode()
             }
             validation::request::TXNS | validation::request::BLOCK_TXNS => {
                 let all = sub == validation::request::BLOCK_TXNS;
-                let selector =
-                    if all { validation::response::BLOCK_TXNS } else { validation::response::TXNS };
-                let bundle = match lookup {
-                    Ok(job) => {
-                        let txns = &job.template.txns;
-                        let ids = if all {
-                            Some((0..txns.len()).collect())
-                        } else {
-                            requested_ids(plain, txns.len())
-                        };
-                        match ids {
-                            Some(ids) => TxnBundle {
-                                selector,
-                                job_index: job.datum_slot,
-                                status: Status::Ok,
-                                txns: ids.iter().map(|&i| txns[i].raw.clone()).collect(),
-                            },
-                            None => TxnBundle {
-                                selector,
-                                job_index: job.datum_slot,
-                                status: Status::BadRequest,
-                                txns: vec![],
-                            },
-                        }
-                    }
-                    Err((idx, status)) => {
-                        TxnBundle { selector, job_index: idx, status, txns: vec![] }
-                    }
-                };
+                let bundle = txn_bundle(lookup, plain, all);
                 info!(
                     "pool requested {} of job {job_index:?}: sending {}",
                     if all { "the block transactions" } else { "transactions" },
@@ -1168,13 +1055,7 @@ impl<'a> Session<'a> {
     fn short_txn_list(&self, job: &Job) -> ShortTxnList {
         let hashes = job.template.witness_hashes();
         if hashes.len() > validation::MAX_SHORT_LIST_TXNS as usize {
-            return ShortTxnList {
-                job_index: job.datum_slot,
-                status: Status::TooManyTxns,
-                txn_count: 0,
-                short_ids: vec![],
-                crosscheck: None,
-            };
+            return ShortTxnList::empty(job.datum_slot, Status::TooManyTxns);
         }
         let key = validation::short_id_key(&self.identity.sign_pk, &self.settings.pool_sign_pk);
         ShortTxnList {
@@ -1244,7 +1125,7 @@ impl<'a> Session<'a> {
             merkle_branches: job.merkle_branches.clone(),
         });
         let coinbase_section = (!sent.coinbase_known(share.coinbase_id)).then(|| {
-            let c = job.coinbase(share.coinbase_id).expect("every id names a coinbase");
+            let c = job.coinbase(share.coinbase_id);
             CoinbaseSection {
                 coinbase_id: share.coinbase_id,
                 coinb1: c.coinb1.clone(),
@@ -1326,6 +1207,47 @@ impl<'a> Session<'a> {
         }
         self.last_share_sent = Some(now);
         Ok(())
+    }
+}
+
+/// Report a migration request (0xA4). The C gateway disconnects and reconnects to the
+/// target; this gateway stays on its configured pool, so the request is logged and not
+/// followed.
+fn log_migration_request(plain: &[u8]) {
+    match MigrationRequest::decode(plain) {
+        Some(MigrationRequest { target: Some(t) }) => warn!(
+            "pool requested migration to {:?} port {} (pool key {}); not supported, staying \
+             on the configured pool",
+            t.host,
+            t.port,
+            &hex::encode(t.pubkey)[..16]
+        ),
+        Some(MigrationRequest { target: None }) => {
+            warn!("pool requested a return to the configured pool; this gateway is on it")
+        }
+        None => error!("malformed migration request; ignored"),
+    }
+}
+
+/// The transactions a `TXNS` (`all` false) or `BLOCK_TXNS` (`all` true) request asks for:
+/// the ones its indexes name, or every one of the job's. A request naming no job, an index
+/// the job does not have, or no index at all is answered with the status alone.
+fn txn_bundle(lookup: Result<Arc<Job>, (u8, Status)>, plain: &[u8], all: bool) -> TxnBundle {
+    let selector = if all { validation::response::BLOCK_TXNS } else { validation::response::TXNS };
+    let job = match lookup {
+        Ok(job) => job,
+        Err((idx, status)) => return TxnBundle::empty(selector, idx, status),
+    };
+    let txns = &job.template.txns;
+    let ids = if all { Some((0..txns.len()).collect()) } else { requested_ids(plain, txns.len()) };
+    match ids {
+        Some(ids) => TxnBundle {
+            selector,
+            job_index: job.datum_slot,
+            status: Status::Ok,
+            txns: ids.iter().map(|&i| txns[i].raw.clone()).collect(),
+        },
+        None => TxnBundle::empty(selector, job.datum_slot, Status::BadRequest),
     }
 }
 

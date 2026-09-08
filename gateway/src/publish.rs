@@ -57,8 +57,9 @@ impl Publisher {
         // with its configuration.
         // With no ABW requirement (a v1 pool, or a v3 pool that disabled it) the work commits
         // to the null key and the gateway classifies blocks itself.
-        let abw = if self.shared.require_abw() { self.shared.abw_assignment() } else { None };
-        if pool.is_some() && self.shared.require_abw() && abw.is_none() {
+        let require_abw = self.shared.require_abw();
+        let abw = if require_abw { self.shared.abw_assignment() } else { None };
+        if pool.is_some() && require_abw && abw.is_none() {
             debug!(
                 "waiting for the pool's anti-withholding assignment before building {what} work"
             );

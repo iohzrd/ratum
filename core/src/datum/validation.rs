@@ -1,4 +1,5 @@
 use crate::cursor::{Cursor, Truncated};
+use crate::datum::codes::wire_codes;
 
 pub use super::messages::client_subcmd::VALIDATION;
 
@@ -21,43 +22,19 @@ pub mod response {
 pub use super::framing::STRUCT_END;
 pub const JOB_INDEX_INVALID: u8 = 0xFF;
 pub const MAX_SHORT_LIST_TXNS: u16 = 16383;
-pub const MAX_TXN_SIZE: usize = 0xff_ffff;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Status {
-    Ok,
-    JobEmpty,
-    NoTemplate,
-    TooManyTxns,
-    BadJobIndex,
-    BadRequest,
-    Unknown(u8),
-}
-
-impl Status {
-    pub fn from_byte(b: u8) -> Self {
-        match b {
-            0x01 => Status::Ok,
-            0xF0 => Status::JobEmpty,
-            0xF1 => Status::NoTemplate,
-            0xF2 => Status::TooManyTxns,
-            0xF3 => Status::BadJobIndex,
-            0xF4 => Status::BadRequest,
-            other => Status::Unknown(other),
-        }
+wire_codes! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Status: u8 {
+        Ok = 0x01,
+        JobEmpty = 0xF0,
+        NoTemplate = 0xF1,
+        TooManyTxns = 0xF2,
+        BadJobIndex = 0xF3,
+        BadRequest = 0xF4,
     }
-
-    pub fn to_byte(self) -> u8 {
-        match self {
-            Status::Ok => 0x01,
-            Status::JobEmpty => 0xF0,
-            Status::NoTemplate => 0xF1,
-            Status::TooManyTxns => 0xF2,
-            Status::BadJobIndex => 0xF3,
-            Status::BadRequest => 0xF4,
-            Status::Unknown(b) => b,
-        }
-    }
+    /// A status byte this build does not name.
+    unknown Unknown;
 }
 
 impl std::fmt::Display for Status {
@@ -135,39 +112,18 @@ pub fn request_parent_fetch(job_index: u8, parent_hash: &[u8; 32]) -> Vec<u8> {
     out
 }
 
-/// `DATUM_PARENT_FETCH_STATUS_*`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ParentStatus {
-    Success,
-    JobMismatch,
-    Busy,
-    Unavailable,
-    RpcFailed,
-    Unknown(u8),
-}
-
-impl ParentStatus {
-    pub fn from_byte(b: u8) -> Self {
-        match b {
-            0x01 => ParentStatus::Success,
-            0xF0 => ParentStatus::JobMismatch,
-            0xF6 => ParentStatus::Busy,
-            0xF7 => ParentStatus::Unavailable,
-            0xF8 => ParentStatus::RpcFailed,
-            other => ParentStatus::Unknown(other),
-        }
+wire_codes! {
+    /// `DATUM_PARENT_FETCH_STATUS_*`.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum ParentStatus: u8 {
+        Success = 0x01,
+        JobMismatch = 0xF0,
+        Busy = 0xF6,
+        Unavailable = 0xF7,
+        RpcFailed = 0xF8,
     }
-
-    pub fn to_byte(self) -> u8 {
-        match self {
-            ParentStatus::Success => 0x01,
-            ParentStatus::JobMismatch => 0xF0,
-            ParentStatus::Busy => 0xF6,
-            ParentStatus::Unavailable => 0xF7,
-            ParentStatus::RpcFailed => 0xF8,
-            ParentStatus::Unknown(b) => b,
-        }
-    }
+    /// A status byte this build does not name.
+    unknown Unknown;
 }
 
 /// The `0x50 0x94` reply: the raw serialized parent block, or an error status with an
@@ -198,7 +154,7 @@ impl ParentFetchReply {
         out.push(VALIDATION);
         out.push(response::PARENT_FETCH);
         out.push(self.job_index);
-        out.push(self.status.to_byte());
+        out.push(self.status.code());
         out.extend_from_slice(&self.parent_hash);
         out.extend_from_slice(&(self.block.len() as u32).to_le_bytes());
         out.extend_from_slice(&self.block);
@@ -209,7 +165,7 @@ impl ParentFetchReply {
     pub fn decode(data: &[u8]) -> Result<Self, Error> {
         let mut c = body_of(data, response::PARENT_FETCH)?;
         let job_index = c.u8("job index")?;
-        let status = ParentStatus::from_byte(c.u8("status")?);
+        let status = ParentStatus::from_code(c.u8("status")?);
         let parent_hash: [u8; 32] = c.arr("parent hash")?;
         let size = c.u32("block size")? as usize;
         let block = c.take(size, "block").map_err(|_| Error::BadTxnSize)?.to_vec();
@@ -240,28 +196,21 @@ pub const CROSSCHECK_SEED: [u8; 32] = [
 ];
 
 impl ShortTxnList {
+    /// A list with no ids: a refusal, or an `Ok` reply for a job with no transactions.
+    pub fn empty(job_index: u8, status: Status) -> Self {
+        ShortTxnList { job_index, status, txn_count: 0, short_ids: Vec::new(), crosscheck: None }
+    }
+
     pub fn decode(data: &[u8]) -> Result<Self, Error> {
         let mut c = body_of(data, response::SHORT_TXN_LIST)?;
         let job_index = c.u8("job index")?;
-        let status = Status::from_byte(c.u8("status")?);
+        let status = Status::from_code(c.u8("status")?);
         if status != Status::Ok {
-            return Ok(ShortTxnList {
-                job_index,
-                status,
-                txn_count: 0,
-                short_ids: Vec::new(),
-                crosscheck: None,
-            });
+            return Ok(ShortTxnList::empty(job_index, status));
         }
         let txn_count = c.u16("txn count")?;
         if txn_count == 0 {
-            return Ok(ShortTxnList {
-                job_index,
-                status,
-                txn_count: 0,
-                short_ids: Vec::new(),
-                crosscheck: None,
-            });
+            return Ok(ShortTxnList::empty(job_index, status));
         }
         let ids = c.take(txn_count as usize * SHORT_ID_SIZE, "short ids")?;
         let short_ids = ids
@@ -283,7 +232,7 @@ impl ShortTxnList {
 
     pub fn encode(&self) -> Vec<u8> {
         let mut out =
-            vec![VALIDATION, response::SHORT_TXN_LIST, self.job_index, self.status.to_byte()];
+            vec![VALIDATION, response::SHORT_TXN_LIST, self.job_index, self.status.code()];
         if self.status != Status::Ok {
             return out;
         }
@@ -326,12 +275,17 @@ pub struct TxnBundle {
 }
 
 impl TxnBundle {
+    /// A bundle carrying no transactions: what a refusal replies with.
+    pub fn empty(selector: u8, job_index: u8, status: Status) -> Self {
+        TxnBundle { selector, job_index, status, txns: Vec::new() }
+    }
+
     pub fn decode(data: &[u8], selector: u8) -> Result<Self, Error> {
         let mut c = body_of(data, selector)?;
         let job_index = c.u8("job index")?;
-        let status = Status::from_byte(c.u8("status")?);
+        let status = Status::from_code(c.u8("status")?);
         if status != Status::Ok {
-            return Ok(TxnBundle { selector, job_index, status, txns: Vec::new() });
+            return Ok(TxnBundle::empty(selector, job_index, status));
         }
         let stated = usize::from(c.u16("txn count")?);
 
@@ -353,7 +307,7 @@ impl TxnBundle {
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = vec![VALIDATION, self.selector, self.job_index, self.status.to_byte()];
+        let mut out = vec![VALIDATION, self.selector, self.job_index, self.status.code()];
         if self.status != Status::Ok {
             return out;
         }

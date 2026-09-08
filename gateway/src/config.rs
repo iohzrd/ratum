@@ -870,21 +870,20 @@ fn render(doc: &Value) -> String {
 /// The file's text with `form`'s edits, validated: `Ok(None)` when no value differs from
 /// the running configuration, `Ok(Some(text))` to write, or the errors, in which case
 /// nothing is to be written.
-pub fn apply(
-    cfg: &Config,
-    file_text: &str,
-    form: &[(String, String)],
-) -> Result<Option<String>, Vec<String>> {
-    let mut doc: Value = serde_json::from_str(file_text)
-        .map_err(|e| vec![format!("the configuration file is not valid JSON: {e}")])?;
-    let mut edit = Edit { doc: &mut doc, changed: false, errors: Vec::new() };
-    let field = |name: &str| form.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str());
+/// The value the form submitted under `name`, or `None` when the form does not carry it.
+fn submitted<'a>(form: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    form.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+}
 
+/// Apply the reward-sharing choice and the pool host whose destination it decides. Turning
+/// sharing off parks the configured `pool_host` as `pool_host(old)` and turning it on takes
+/// that value back, which is the C page's convention.
+fn apply_reward_sharing(edit: &mut Edit<'_>, cfg: &Config, form: &[(String, String)]) {
     // The reward-sharing choice first: it decides whether the pool host field sets
     // `pool_host` or the parked `pool_host(old)`.
     let mut pool_host = cfg.datum.pool_host.clone();
     let default_host = Datum::default().pool_host;
-    match field("reward_sharing") {
+    match submitted(form, "reward_sharing") {
         None => {}
         Some(choice @ ("require" | "prefer")) => {
             let only = choice == "require";
@@ -930,7 +929,7 @@ pub fn apply(
         Some(_) => edit.errors.push("Reward sharing must be require, prefer or never".into()),
     }
 
-    if let Some(host) = field("datum_pool_host") {
+    if let Some(host) = submitted(form, "datum_pool_host") {
         let host = host.trim();
         if !pool_host.is_empty() {
             edit.set_if_changed("datum", "pool_host", json!(host), json!(pool_host));
@@ -941,8 +940,13 @@ pub fn apply(
             edit.set_if_changed("datum", "pool_host(old)", json!(host), old);
         }
     }
+}
 
-    match field("username_behaviour") {
+/// Apply the username choice: `full_users` passes the miner's own username to the pool,
+/// `workers` appends its worker name to the gateway's address, and `private` sends the
+/// address alone.
+fn apply_username_behaviour(edit: &mut Edit<'_>, cfg: &Config, form: &[(String, String)]) {
+    match submitted(form, "username_behaviour") {
         None => {}
         Some("full_users") => edit.set_if_changed(
             "datum",
@@ -969,9 +973,22 @@ pub fn apply(
             edit.errors.push("Miner usernames must be full_users, workers or private".into())
         }
     }
+}
+
+pub fn apply(
+    cfg: &Config,
+    file_text: &str,
+    form: &[(String, String)],
+) -> Result<Option<String>, Vec<String>> {
+    let mut doc: Value = serde_json::from_str(file_text)
+        .map_err(|e| vec![format!("the configuration file is not valid JSON: {e}")])?;
+    let mut edit = Edit { doc: &mut doc, changed: false, errors: Vec::new() };
+
+    apply_reward_sharing(&mut edit, cfg, form);
+    apply_username_behaviour(&mut edit, cfg, form);
 
     for f in FIELDS {
-        let Some(text) = field(f.name) else { continue };
+        let Some(text) = submitted(form, f.name) else { continue };
         let current = (f.current)(cfg);
         match f.kind {
             Kind::Text => edit.set_if_changed(f.section, f.key, json!(text.trim()), current),
@@ -994,10 +1011,10 @@ pub fn apply(
     // A longer job interval raises the pool timeout with it, as the C gateway does, instead
     // of refusing the interval for the timeout the file does not name.
     if let Some(seconds) =
-        field("bitcoind_work_update_seconds").and_then(|t| t.trim().parse::<u64>().ok())
-        && cfg.datum.protocol_global_timeout < seconds + 5
+        submitted(form, "bitcoind_work_update_seconds").and_then(|t| t.trim().parse::<u64>().ok())
+        && cfg.datum.protocol_global_timeout < seconds + GLOBAL_TIMEOUT_MARGIN_SECS
     {
-        edit.set("datum", "protocol_global_timeout", json!(seconds + 5));
+        edit.set("datum", "protocol_global_timeout", json!(seconds + GLOBAL_TIMEOUT_MARGIN_SECS));
     }
 
     let Edit { changed, errors, .. } = edit;

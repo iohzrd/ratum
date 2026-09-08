@@ -24,6 +24,9 @@ pub mod opcode {
     /// `OP_PUSHDATA1`. `GetScriptOp` reads `opcode < OP_PUSHDATA1` as a direct push of that
     /// many bytes, so the range is `0x01..=0x4b`.
     pub const MAX_DIRECT_PUSH: usize = OP_PUSHDATA1 as usize - 1;
+    /// The same value as the opcode it is, so a script scanner can name it in a match
+    /// pattern (`0x01..=MAX_DIRECT_PUSH_OPCODE`).
+    pub const MAX_DIRECT_PUSH_OPCODE: u8 = MAX_DIRECT_PUSH as u8;
 
     /// What `OP_1`..`OP_16` encode a small integer against: Core's `CScript::EncodeOP_N` is
     /// `OP_1 + n - 1` and its `DecodeOP_N` is `opcode - (OP_1 - 1)`. `OP_0` encodes zero and
@@ -61,9 +64,6 @@ pub const SEQUENCE_FINAL: [u8; SEQUENCE_SIZE] = [0xff; SEQUENCE_SIZE];
 /// The four bytes that begin the witness commitment's data push, BIP141's
 /// `WITNESS_COMMITMENT_HEADER` (`validation.cpp`).
 pub const WITNESS_COMMITMENT_HEADER: [u8; 4] = [0xaa, 0x21, 0xa9, 0xed];
-/// The witness commitment output's script: `OP_RETURN`, a push of the header and the
-/// 32-byte commitment. This is what a node's `default_witness_commitment` always is.
-pub const WITNESS_COMMITMENT_SCRIPT_SIZE: usize = 2 + WITNESS_COMMITMENT_HEADER.len() + HASH_SIZE;
 
 pub fn sha256d(data: &[u8]) -> [u8; 32] {
     let first = Sha256::digest(data);
@@ -286,7 +286,7 @@ pub fn script_pushes(script: &[u8]) -> Vec<(usize, &[u8])> {
     while i < script.len() {
         let op = script[i];
         let (data_at, len) = match op {
-            0x01..=MAX_DIRECT_PUSH_OPCODE => (i + 1, op as usize),
+            0x01..=opcode::MAX_DIRECT_PUSH_OPCODE => (i + 1, op as usize),
             opcode::OP_PUSHDATA1 => {
                 let Some(&n) = script.get(i + 1) else { break };
                 (i + 2, n as usize)
@@ -338,9 +338,6 @@ pub const MAX_OUTPUT_SCRIPT_SIZE: usize = 34;
 pub const MAX_OUTPUT_DATA_SIZE: usize = 83;
 
 pub use opcode::OP_RETURN;
-
-/// The largest opcode that is itself a direct push, for use in a match pattern.
-const MAX_DIRECT_PUSH_OPCODE: u8 = opcode::MAX_DIRECT_PUSH as u8;
 
 impl From<Truncated> for TxError {
     fn from(t: Truncated) -> Self {

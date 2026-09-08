@@ -1,4 +1,5 @@
 use crate::cursor::Cursor;
+use crate::datum::codes::wire_codes;
 
 /// The first payload byte of a `cmd::MINING` frame sent by the pool: the mining sub-command.
 pub mod server_subcmd {
@@ -48,6 +49,26 @@ pub enum Error {
     SplitExceedsValue { total: u64, value: u64 },
 }
 
+/// The limits both configuration versions encode under: the pool's payout script, its
+/// coinbase tag, and a minimum difficulty the gateway can express as a power-of-two share
+/// target.
+fn check_config_fields(
+    payout_script: &[u8],
+    coinbase_tag: &str,
+    min_difficulty: u64,
+) -> Result<(), Error> {
+    if payout_script.len() > MAX_PAYOUT_SCRIPT {
+        return Err(Error::TooLong { field: "payout script", len: payout_script.len() });
+    }
+    if coinbase_tag.len() > MAX_COINBASE_TAG {
+        return Err(Error::TooLong { field: "coinbase tag", len: coinbase_tag.len() });
+    }
+    if !min_difficulty.is_power_of_two() {
+        return Err(Error::MinDiffNotPowerOfTwo(min_difficulty));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClientConfig {
     pub payout_script: Vec<u8>,
@@ -58,16 +79,7 @@ pub struct ClientConfig {
 
 impl ClientConfig {
     pub fn encode(&self) -> Result<Vec<u8>, Error> {
-        if self.payout_script.len() > MAX_PAYOUT_SCRIPT {
-            return Err(Error::TooLong { field: "payout script", len: self.payout_script.len() });
-        }
-        if self.coinbase_tag.len() > MAX_COINBASE_TAG {
-            return Err(Error::TooLong { field: "coinbase tag", len: self.coinbase_tag.len() });
-        }
-        if !self.min_difficulty.is_power_of_two() {
-            return Err(Error::MinDiffNotPowerOfTwo(self.min_difficulty));
-        }
-
+        check_config_fields(&self.payout_script, &self.coinbase_tag, self.min_difficulty)?;
         let tag = self.coinbase_tag.as_bytes();
         let mut out = Vec::with_capacity(CONFIG_FIXED_LEN + self.payout_script.len() + tag.len());
         out.push(server_subcmd::CONFIG);
@@ -164,16 +176,7 @@ pub struct ClientConfigV3 {
 
 impl ClientConfigV3 {
     pub fn encode(&self) -> Result<Vec<u8>, Error> {
-        if self.payout_script.len() > MAX_PAYOUT_SCRIPT {
-            return Err(Error::TooLong { field: "payout script", len: self.payout_script.len() });
-        }
-        if self.coinbase_tag.len() > MAX_COINBASE_TAG {
-            return Err(Error::TooLong { field: "coinbase tag", len: self.coinbase_tag.len() });
-        }
-        if !self.min_difficulty.is_power_of_two() {
-            return Err(Error::MinDiffNotPowerOfTwo(self.min_difficulty));
-        }
-
+        check_config_fields(&self.payout_script, &self.coinbase_tag, self.min_difficulty)?;
         let tag = self.coinbase_tag.as_bytes();
         let mut out = Vec::with_capacity(
             CONFIG_V3_FIXED_LEN + self.payout_script.len() + tag.len() + DBF_MARKER.len(),
@@ -497,78 +500,45 @@ pub enum ShareVerdict {
     RejectedUnknown(u16),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u16)]
-pub enum RejectReason {
-    BadJobId = 10,
-    BadCoinbaseId = 11,
-    BadExtranonceSize = 12,
-    BadTarget = 13,
-    BadUsername = 14,
-    BadCoinbaserId = 15,
-    BadMerkleCount = 16,
-    CoinbaseTooLarge = 17,
-    CoinbaseMissing = 18,
-    TargetMismatch = 19,
-    HashNotZero = 20,
-    HighHash = 21,
-    CoinbaseIdMismatch = 22,
-    BadNtime = 23,
-    BadVersion = 24,
-    StaleBlock = 25,
-    BadCoinbase = 26,
-    BadCoinbaseOutputs = 27,
-    MissingPoolTag = 28,
-    DuplicateWork = 29,
-    Other = 30,
-    // 40..43 are RATUM's own codes for the header v2 checks and the split rule; the gateway
-    // defines only 10..30 and logs an unknown code as an integer.
-    /// The 0x03 section is absent (the upstream SHA256d share format, which this pool does
-    /// not verify), its algorithm byte is not 0x01, or its time marker is not 0x04.
-    BadBlake2bSection = 40,
-    /// Reserved; not returned by this version.
-    HeaderFieldMismatch = 41,
-    /// Reserved; not returned by this version.
-    HeaderMerkleMismatch = 42,
-    /// The share's coinbase paid none of the outputs the pool's coinbaser dictated for its
-    /// job, past the pool's `SPLIT_GRACE_SECS`: the gateway is not mining the split.
-    NoSplit = 43,
-    /// RATUM's own code: a version 3 session share names no ABW slot, an unseeded one, or one out
-    /// of range.
-    BadAbwSlot = 44,
-}
-
-impl RejectReason {
-    pub fn from_code(code: u16) -> Option<Self> {
-        Some(match code {
-            10 => RejectReason::BadJobId,
-            11 => RejectReason::BadCoinbaseId,
-            12 => RejectReason::BadExtranonceSize,
-            13 => RejectReason::BadTarget,
-            14 => RejectReason::BadUsername,
-            15 => RejectReason::BadCoinbaserId,
-            16 => RejectReason::BadMerkleCount,
-            17 => RejectReason::CoinbaseTooLarge,
-            18 => RejectReason::CoinbaseMissing,
-            19 => RejectReason::TargetMismatch,
-            20 => RejectReason::HashNotZero,
-            21 => RejectReason::HighHash,
-            22 => RejectReason::CoinbaseIdMismatch,
-            23 => RejectReason::BadNtime,
-            24 => RejectReason::BadVersion,
-            25 => RejectReason::StaleBlock,
-            26 => RejectReason::BadCoinbase,
-            27 => RejectReason::BadCoinbaseOutputs,
-            28 => RejectReason::MissingPoolTag,
-            29 => RejectReason::DuplicateWork,
-            30 => RejectReason::Other,
-            40 => RejectReason::BadBlake2bSection,
-            41 => RejectReason::HeaderFieldMismatch,
-            42 => RejectReason::HeaderMerkleMismatch,
-            43 => RejectReason::NoSplit,
-            44 => RejectReason::BadAbwSlot,
-            _ => return None,
-        })
+wire_codes! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum RejectReason: u16 {
+        BadJobId = 10,
+        BadCoinbaseId = 11,
+        BadExtranonceSize = 12,
+        BadTarget = 13,
+        BadUsername = 14,
+        BadCoinbaserId = 15,
+        BadMerkleCount = 16,
+        CoinbaseTooLarge = 17,
+        CoinbaseMissing = 18,
+        TargetMismatch = 19,
+        HashNotZero = 20,
+        HighHash = 21,
+        CoinbaseIdMismatch = 22,
+        BadNtime = 23,
+        BadVersion = 24,
+        StaleBlock = 25,
+        BadCoinbase = 26,
+        BadCoinbaseOutputs = 27,
+        MissingPoolTag = 28,
+        DuplicateWork = 29,
+        Other = 30,
+        // 40..43 are RATUM's own codes for the header v2 checks and the split rule; the gateway
+        // defines only 10..30 and logs an unknown code as an integer.
+        /// The 0x03 section is absent (the upstream SHA256d share format, which this pool does
+        /// not verify), its algorithm byte is not 0x01, or its time marker is not 0x04.
+        BadBlake2bSection = 40,
+        /// Reserved; not returned by this version.
+        HeaderFieldMismatch = 41,
+        /// Reserved; not returned by this version.
+        HeaderMerkleMismatch = 42,
+        /// The share's coinbase paid none of the outputs the pool's coinbaser dictated for its
+        /// job, past the pool's `SPLIT_GRACE_SECS`: the gateway is not mining the split.
+        NoSplit = 43,
+        /// RATUM's own code: a version 3 session share names no ABW slot, an unseeded one, or one out
+        /// of range.
+        BadAbwSlot = 44,
     }
 }
 
@@ -607,7 +577,7 @@ impl ShareResponse {
         let (status, reason) = match self.verdict {
             ShareVerdict::Accepted => (share_status::ACCEPTED, 0u16),
             ShareVerdict::AcceptedTentatively => (share_status::ACCEPTED_TENTATIVELY, 0),
-            ShareVerdict::Rejected(r) => (share_status::REJECTED, r as u16),
+            ShareVerdict::Rejected(r) => (share_status::REJECTED, r.code()),
             ShareVerdict::RejectedUnknown(code) => (share_status::REJECTED, code),
         };
         let mut out = Vec::with_capacity(if self.abw_ref.is_some() { 45 } else { 10 });

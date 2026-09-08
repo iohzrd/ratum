@@ -290,6 +290,42 @@ struct Store {
 }
 
 impl Store {
+    /// Run `f` in a write transaction and commit it. Durability is `Immediate`, so what `f`
+    /// wrote is fsynced before this returns: a share the pool has answered is on disk.
+    fn write<T>(&self, f: impl FnOnce(&redb::WriteTransaction) -> io::Result<T>) -> io::Result<T> {
+        let mut w = self.db.begin_write().map_err(to_io)?;
+        w.set_durability(Durability::Immediate).map_err(to_io)?;
+        let out = f(&w)?;
+        w.commit().map_err(to_io)?;
+        Ok(out)
+    }
+
+    /// Every row of `table`, in key order, unpacked from its key and value. A row that does
+    /// not unpack, which an uncorrupted database never produces, is logged as `what` and left
+    /// out; the share reader surfaces the same condition through `ReadBack::skipped`.
+    fn read_packed<T>(
+        &self,
+        table: TableDefinition<'static, &'static [u8], &'static [u8]>,
+        what: &str,
+        unpack: impl Fn(&[u8], &[u8]) -> Option<T>,
+    ) -> io::Result<Vec<T>> {
+        let r = self.db.begin_read().map_err(to_io)?;
+        let table = r.open_table(table).map_err(to_io)?;
+        let mut out = Vec::new();
+        for entry in table.iter().map_err(to_io)? {
+            let (key, value) = entry.map_err(to_io)?;
+            match unpack(key.value(), value.value()) {
+                Some(row) => out.push(row),
+                None => log::warn!(
+                    "skipping {what} row ({}) that did not unpack, which an uncorrupted \
+                     database never produces",
+                    hex::encode(key.value())
+                ),
+            }
+        }
+        Ok(out)
+    }
+
     /// Open the ledger at `path`, creating it if absent. With `chain`, the ledger's chain
     /// stamp must match it: a ledger stamped for another chain is refused with
     /// `InvalidData`, and one with no stamp (written before stamps existed) is stamped now.
@@ -368,29 +404,25 @@ impl Store {
     fn insert(&mut self, share: &Share) -> io::Result<bool> {
         let hash = share.hash.expect("a recorded share has a hash");
         let cumulative = self.cumulative_work + u128::from(share.difficulty);
-        let mut w = self.db.begin_write().map_err(to_io)?;
-        w.set_durability(Durability::Immediate).map_err(to_io)?;
-        let inserted = {
+        let inserted = self.write(|w| {
             let mut by_hash = w.open_table(BY_HASH).map_err(to_io)?;
             if by_hash.get(hash.as_slice()).map_err(to_io)?.is_some() {
-                false
-            } else {
-                let seq = self.next_seq;
-                w.open_table(SHARES)
-                    .map_err(to_io)?
-                    .insert(seq, pack(share).as_slice())
-                    .map_err(to_io)?;
-                by_hash.insert(hash.as_slice(), seq).map_err(to_io)?;
-                // In the same transaction as the share, so the counter and the stored
-                // shares cannot diverge.
-                w.open_table(META)
-                    .map_err(to_io)?
-                    .insert(META_CUMULATIVE_WORK, cumulative.to_string().as_str())
-                    .map_err(to_io)?;
-                true
+                return Ok(false);
             }
-        };
-        w.commit().map_err(to_io)?;
+            let seq = self.next_seq;
+            w.open_table(SHARES)
+                .map_err(to_io)?
+                .insert(seq, pack(share).as_slice())
+                .map_err(to_io)?;
+            by_hash.insert(hash.as_slice(), seq).map_err(to_io)?;
+            // In the same transaction as the share, so the counter and the stored shares
+            // cannot diverge.
+            w.open_table(META)
+                .map_err(to_io)?
+                .insert(META_CUMULATIVE_WORK, cumulative.to_string().as_str())
+                .map_err(to_io)?;
+            Ok(true)
+        })?;
         if inserted {
             self.next_seq += 1;
             self.cumulative_work = cumulative;
@@ -444,10 +476,7 @@ impl Store {
         if surplus == 0 {
             return Ok(0);
         }
-        let mut w = self.db.begin_write().map_err(to_io)?;
-        w.set_durability(Durability::Immediate).map_err(to_io)?;
-        let mut removed = 0usize;
-        {
+        self.write(|w| {
             let mut shares = w.open_table(SHARES).map_err(to_io)?;
             let mut by_hash = w.open_table(BY_HASH).map_err(to_io)?;
             // The oldest `surplus` rows, with the hash to remove from the index.
@@ -461,52 +490,34 @@ impl Store {
                     Some((seq.value(), hash))
                 })
                 .collect();
+            let mut removed = 0usize;
             for (seq, hash) in oldest {
                 shares.remove(seq).map_err(to_io)?;
                 by_hash.remove(hash.as_slice()).map_err(to_io)?;
                 removed += 1;
             }
-        }
-        w.commit().map_err(to_io)?;
-        Ok(removed)
+            Ok(removed)
+        })
     }
 
     /// Write the row for `block.block_hash`, if absent. Returns whether it was written: a
     /// resent block share finds its row present and cannot duplicate the record.
     fn insert_block(&mut self, block: &FoundBlock) -> io::Result<bool> {
-        let mut w = self.db.begin_write().map_err(to_io)?;
-        w.set_durability(Durability::Immediate).map_err(to_io)?;
-        let inserted = {
+        self.write(|w| {
             let mut table = w.open_table(BLOCKS).map_err(to_io)?;
             if table.get(block.block_hash.as_slice()).map_err(to_io)?.is_some() {
-                false
-            } else {
-                table
-                    .insert(block.block_hash.as_slice(), pack_block(block).as_slice())
-                    .map_err(to_io)?;
-                true
+                return Ok(false);
             }
-        };
-        w.commit().map_err(to_io)?;
-        Ok(inserted)
+            table
+                .insert(block.block_hash.as_slice(), pack_block(block).as_slice())
+                .map_err(to_io)?;
+            Ok(true)
+        })
     }
 
     /// Every found block, oldest first.
     fn read_blocks(&self) -> io::Result<Vec<FoundBlock>> {
-        let r = self.db.begin_read().map_err(to_io)?;
-        let table = r.open_table(BLOCKS).map_err(to_io)?;
-        let mut out = Vec::new();
-        for entry in table.iter().map_err(to_io)? {
-            let (hash, value) = entry.map_err(to_io)?;
-            match unpack_block(hash.value(), value.value()) {
-                Some(block) => out.push(block),
-                None => log::warn!(
-                    "skipping a block row ({}) that did not unpack, which an uncorrupted \
-                     database never produces",
-                    hex::encode(hash.value())
-                ),
-            }
-        }
+        let mut out = self.read_packed(BLOCKS, "a block", unpack_block)?;
         out.sort_by_key(|b| (b.at, b.height));
         Ok(out)
     }
@@ -514,43 +525,26 @@ impl Store {
     /// Write the row for `owed.block_hash`, overwriting one already there. `Ledger` decides
     /// what the row holds (deduplication, the settle rule); this only stores it.
     fn write_owed(&mut self, owed: &OwedBlock) -> io::Result<()> {
-        let mut w = self.db.begin_write().map_err(to_io)?;
-        w.set_durability(Durability::Immediate).map_err(to_io)?;
-        w.open_table(OWED)
-            .map_err(to_io)?
-            .insert(owed.block_hash.as_slice(), pack_owed(owed).as_slice())
-            .map_err(to_io)?;
-        w.commit().map_err(to_io)?;
-        Ok(())
+        self.write(|w| {
+            w.open_table(OWED)
+                .map_err(to_io)?
+                .insert(owed.block_hash.as_slice(), pack_owed(owed).as_slice())
+                .map_err(to_io)?;
+            Ok(())
+        })
     }
 
     /// Delete the row under `hash`, if present.
     fn remove_owed(&mut self, hash: &[u8; 32]) -> io::Result<()> {
-        let mut w = self.db.begin_write().map_err(to_io)?;
-        w.set_durability(Durability::Immediate).map_err(to_io)?;
-        w.open_table(OWED).map_err(to_io)?.remove(hash.as_slice()).map_err(to_io)?;
-        w.commit().map_err(to_io)?;
-        Ok(())
+        self.write(|w| {
+            w.open_table(OWED).map_err(to_io)?.remove(hash.as_slice()).map_err(to_io)?;
+            Ok(())
+        })
     }
 
     /// Every owed block, oldest first.
     fn read_owed(&self) -> io::Result<Vec<OwedBlock>> {
-        let r = self.db.begin_read().map_err(to_io)?;
-        let table = r.open_table(OWED).map_err(to_io)?;
-        let mut out = Vec::new();
-        for entry in table.iter().map_err(to_io)? {
-            let (hash, value) = entry.map_err(to_io)?;
-            match unpack_owed(hash.value(), value.value()) {
-                Some(owed) => out.push(owed),
-                // The share reader surfaces its corrupt rows through `ReadBack::skipped`;
-                // this is the owed table's equivalent trace.
-                None => log::warn!(
-                    "skipping an owed row ({}) that did not unpack, which an uncorrupted \
-                     database never produces",
-                    hex::encode(hash.value())
-                ),
-            }
-        }
+        let mut out = self.read_packed(OWED, "an owed", unpack_owed)?;
         out.sort_by_key(|o| (o.at, o.height));
         Ok(out)
     }

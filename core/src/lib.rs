@@ -7,6 +7,7 @@ pub mod header;
 pub mod http;
 pub mod io;
 pub mod nonce;
+pub mod poll;
 pub mod rpc;
 pub mod target;
 pub mod web;

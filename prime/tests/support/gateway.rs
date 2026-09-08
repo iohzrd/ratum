@@ -115,8 +115,7 @@ impl Gateway {
         // `read_handshake_response` unmasks that header itself.
         let mut head = [0u8; 4];
         gateway.stream.read_exact(&mut head).expect("handshake frame header");
-        let key = framing::HeaderKeys::from_nk(nk).server_to_client;
-        let peeked = Header::from_bytes((u32::from_le_bytes(head) ^ key).to_le_bytes());
+        let peeked = gateway.client.peek_handshake_header(head);
         let mut body = vec![0u8; peeked.cmd_len as usize];
         gateway.stream.read_exact(&mut body).expect("handshake frame body");
 

@@ -12,6 +12,7 @@ use crate::stratum::{ClientStats, Server};
 use log::{info, warn};
 use ratum::http::{self, Reply};
 use serde_json::{Value, json};
+use std::io::Read as _;
 use std::sync::{Arc, LazyLock, Mutex};
 use tiny_http::{Header, Method, Request, Response};
 
@@ -162,6 +163,49 @@ fn client_json(cfg: &crate::config::Config, c: &ClientStats, identity: bool) -> 
     v
 }
 
+/// The job the stratum server is serving, with the template it was built from.
+fn job_json(j: &crate::job::Job) -> Value {
+    json!({
+        "job_id": j.job_id,
+        "global_index": j.global_index,
+        "created_seconds_ago": j.created.elapsed().as_secs_f64(),
+        "height": j.template.height,
+        "value_btc": j.template.coinbase_value as f64 / ratum::SATS_PER_BTC,
+        "previous_block": j.template.prev_hash_hex,
+        "target": j.template.target_hex,
+        "witness_commitment": hex::encode(&j.template.witness_commitment),
+        "difficulty": ratum::target::difficulty_from_bits(j.template.nbits),
+        "version": format!("{:08x}", j.template.version),
+        "bits": j.template.bits,
+        "curtime": j.template.curtime,
+        "mintime": j.template.mintime,
+        "sizelimit": j.template.sizelimit,
+        "weightlimit": j.template.weightlimit,
+        "sigoplimit": j.template.sigoplimit,
+        "txn_count": j.template.txns.len(),
+        "txn_total_size": j.template.totals.size,
+        "txn_total_weight": j.template.totals.weight,
+        "txn_total_sigops": j.template.totals.sigops,
+        "is_datum_job": j.is_datum_job,
+        "coinbaser_outputs": j.coinbaser_outputs.len(),
+    })
+}
+
+/// What the job's generation transaction pays: the pool's split, then the remainder to the
+/// pool script.
+fn coinbaser_json(j: &crate::job::Job) -> Vec<Value> {
+    j.payout_rows()
+        .iter()
+        .map(|r| {
+            json!({
+                "value_btc": r.value as f64 / ratum::SATS_PER_BTC,
+                "address": crate::address::output_script_to_display(&r.script),
+                "remainder": r.remainder,
+            })
+        })
+        .collect()
+}
+
 /// The status snapshot. `with_clients` adds the per-connection rows, which need the admin
 /// password when one is set.
 fn status_json(ctx: &Context, with_clients: bool) -> Value {
@@ -186,44 +230,8 @@ fn status_json(ctx: &Context, with_clients: bool) -> Value {
         // gateway serves work that pays mining.pool_address, as the C gateway does.
         "Non-Pooled Mode (pool unreachable)".to_string()
     };
-    let job = current.as_ref().map(|j| {
-        json!({
-            "job_id": j.job_id,
-            "global_index": j.global_index,
-            "created_seconds_ago": j.created.elapsed().as_secs_f64(),
-            "height": j.template.height,
-            "value_btc": j.template.coinbase_value as f64 / ratum::SATS_PER_BTC,
-            "previous_block": j.template.prev_hash_hex,
-            "target": j.template.target_hex,
-            "witness_commitment": hex::encode(&j.template.witness_commitment),
-            "difficulty": ratum::target::difficulty_from_bits(j.template.nbits),
-            "version": format!("{:08x}", j.template.version),
-            "bits": j.template.bits,
-            "curtime": j.template.curtime,
-            "mintime": j.template.mintime,
-            "sizelimit": j.template.sizelimit,
-            "weightlimit": j.template.weightlimit,
-            "sigoplimit": j.template.sigoplimit,
-            "txn_count": j.template.txns.len(),
-            "txn_total_size": j.template.totals.size,
-            "txn_total_weight": j.template.totals.weight,
-            "txn_total_sigops": j.template.totals.sigops,
-            "is_datum_job": j.is_datum_job,
-            "coinbaser_outputs": j.coinbaser_outputs.len(),
-        })
-    });
-    let coinbaser = current.as_ref().map(|j| {
-        j.payout_rows()
-            .iter()
-            .map(|r| {
-                json!({
-                    "value_btc": r.value as f64 / ratum::SATS_PER_BTC,
-                    "address": crate::address::output_script_to_display(&r.script),
-                    "remainder": r.remainder,
-                })
-            })
-            .collect::<Vec<_>>()
-    });
+    let job = current.as_deref().map(job_json);
+    let coinbaser = current.as_deref().map(coinbaser_json);
     let clients = with_clients.then(|| {
         server.client_stats().iter().map(|c| client_json(cfg, c, true)).collect::<Vec<_>>()
     });
@@ -278,12 +286,9 @@ struct Totals {
 
 impl Totals {
     fn add(&mut self, c: &ClientStats) {
-        self.accepted.count += c.accepted.count;
-        self.accepted.diff += c.accepted.diff;
-        self.rejected.count += c.rejected.count;
-        self.rejected.diff += c.rejected.diff;
-        self.fee.count += c.fee.count;
-        self.fee.diff += c.fee.diff;
+        self.accepted.merge(&c.accepted);
+        self.rejected.merge(&c.rejected);
+        self.fee.merge(&c.fee);
         self.hashrate_ths += c.hashrate_ths().unwrap_or(0.0);
     }
 }
@@ -487,8 +492,6 @@ fn serve_admin(ctx: &Context, mut req: Request) {
         crate::config::restart();
     }
 }
-
-use std::io::Read as _;
 
 fn serve_miner(ctx: &Context, req: Request) {
     let (path, query) = http::path_and_query(&req);

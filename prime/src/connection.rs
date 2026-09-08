@@ -12,8 +12,7 @@ use crate::server::{
     Payability, Resolver, SavedSession, Server, SessionState, dictated_outputs, owed_for_block,
 };
 use log::{debug, error, info, warn};
-use mio::net::TcpStream as PolledStream;
-use mio::{Events, Interest, Poll, Token, Waker};
+use mio::Waker;
 use ratum::datum::abw::raw_hash_le;
 use ratum::datum::bulk::{self, Reassembler};
 use ratum::datum::framing::{self, Header, KeyRatchet};
@@ -25,11 +24,12 @@ use ratum::datum::messages::{
 use ratum::datum::share::PowSubmit;
 use ratum::datum::validation::{self, TxnBundle};
 use ratum::io::read_exact_deadline;
+use ratum::poll::PolledSocket;
 use ratum::{lock, rpc};
 use ratum_prime::ledger;
 use ratum_prime::verify::{Accepted, Rebuilt, Verifier};
 use std::collections::{HashMap, HashSet};
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -76,10 +76,6 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 const BODY_TIMEOUT: Duration = Duration::from_secs(30);
 const BODY_DEADLINE: Duration = Duration::from_secs(120);
-/// The connection's socket in its `Poll`.
-const SOCKET: Token = Token(0);
-/// The `Waker` the node watcher calls on a new tip or target.
-const WAKE: Token = Token(1);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
 /// The largest hello frame the pool will read from an unauthenticated peer. A hello carries
 /// four 32-byte keys, a short user agent, up to 200 padding bytes, a signature and a
@@ -90,21 +86,19 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
 /// version field to negotiate.
 const MAX_HELLO_FRAME: usize = 4 * 1024;
 
-pub(crate) fn handle(mut stream: TcpStream, server: &Server) -> io::Result<()> {
-    let peer = stream.peer_addr()?;
-    debug!("[{peer}] connected");
-
-    stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
-    stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
-
-    let handshake_started = Instant::now();
+/// Read and open the hello frame: the masked header, then the sealed payload the header's
+/// length names, both bounded by `HANDSHAKE_DEADLINE` from `started`. `Ok(None)` is a hello
+/// that does not open (sealed to another pool, altered, or not a hello), which closes the
+/// connection without an error.
+fn read_hello(
+    stream: &mut TcpStream,
+    server: &Server,
+    peer: std::net::SocketAddr,
+    started: Instant,
+) -> io::Result<Option<ratum::datum::handshake::Hello>> {
     let mut rx = KeyRatchet::hello();
-    let header_bytes = read_exact_deadline(
-        &mut stream,
-        framing::HEADER_LEN,
-        handshake_started,
-        HANDSHAKE_DEADLINE,
-    )?;
+    let header_bytes =
+        read_exact_deadline(stream, framing::HEADER_LEN, started, HANDSHAKE_DEADLINE)?;
     let header = rx.unmask(header_bytes.try_into().unwrap());
     debug!(
         "[{peer}] hello header: cmd={} len={} signed={} encrypted_pubkey={}",
@@ -113,19 +107,27 @@ pub(crate) fn handle(mut stream: TcpStream, server: &Server) -> io::Result<()> {
     if header.cmd_len as usize > MAX_HELLO_FRAME {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "hello frame too large"));
     }
-    let payload = read_exact_deadline(
-        &mut stream,
-        header.cmd_len as usize,
-        handshake_started,
-        HANDSHAKE_DEADLINE,
-    )?;
-
-    let hello = match open_hello(header, &payload, &server.pool_keys) {
-        Ok(h) => h,
+    let payload =
+        read_exact_deadline(stream, header.cmd_len as usize, started, HANDSHAKE_DEADLINE)?;
+    match open_hello(header, &payload, &server.pool_keys) {
+        Ok(hello) => Ok(Some(hello)),
         Err(e) => {
             warn!("[{peer}] hello rejected: {e}");
-            return Ok(());
+            Ok(None)
         }
+    }
+}
+
+pub(crate) fn handle(mut stream: TcpStream, server: &Server) -> io::Result<()> {
+    let peer = stream.peer_addr()?;
+    debug!("[{peer}] connected");
+
+    stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+    stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
+
+    let handshake_started = Instant::now();
+    let Some(hello) = read_hello(&mut stream, server, peer, handshake_started)? else {
+        return Ok(());
     };
     if !agent_allowed(&server.allowed_agents, &hello.user_agent) {
         warn!(
@@ -175,21 +177,15 @@ pub(crate) fn handle(mut stream: TcpStream, server: &Server) -> io::Result<()> {
     // The handshake is done; from here the poll reports readiness, the socket itself never
     // blocks, and both directions return `WouldBlock` instead. The watcher's waker is
     // registered before the first send, so a tip observed during it is not missed.
-    stream.set_nonblocking(true)?;
-    let mut stream = PolledStream::from_std(stream);
-    let poll = Poll::new()?;
-    poll.registry().register(&mut stream, SOCKET, Interest::READABLE | Interest::WRITABLE)?;
-    let waker = Arc::new(Waker::new(poll.registry(), WAKE)?);
+    let socket = PolledSocket::new(stream)?;
+    let waker = Arc::new(socket.waker()?);
     server.node_view.add_waker(&waker);
 
     let mut conn = Connection {
         server,
         peer,
         opened: handshake_started,
-        stream,
-        poll,
-        events: Events::with_capacity(8),
-        readable: false,
+        socket,
         waker,
         session,
         verifier: Verifier::with_replay_guard(server.policy.clone(), Arc::clone(&server.replay)),
@@ -210,41 +206,7 @@ pub(crate) fn handle(mut stream: TcpStream, server: &Server) -> io::Result<()> {
             conn.send_mining(&server.config_payload, true)?;
             debug!("[{peer}] sent v1 0x99 config ({} bytes, signed)", server.config_payload.len());
         }
-        Generation::V3 { resume } => {
-            // The connection holds the session before the config is sent, so a failed send
-            // still saves it for a resume.
-            let (state, resumed) =
-                server.resume_or_start(client_key, resume.as_ref(), Instant::now());
-            // The splits the resumed session dictated: the gateway's replayed shares and its
-            // shares on the jobs it still holds pay them, and its next split must not take
-            // an id one of those jobs names.
-            conn.verifier.restore_splits(state.splits);
-            conn.coinbaser_id = state.coinbaser_id;
-            let payload = server.config_payload_v3(&state.token);
-            conn.v3 = Some(V3Session { token: state.token, abw: state.abw });
-            let notices = conn.with_abw(|m| m.notices()).expect("a version 3 session");
-            conn.send_mining(&payload, true)?;
-            debug!("[{peer}] sent v3 0x99 config ({} bytes, signed)", payload.len());
-            match (resume.is_some(), resumed) {
-                (true, true) => info!(
-                    "[{peer}] resume accepted: the session's ABW assignments continue and \
-                     its replayed shares verify"
-                ),
-                (true, false) => info!(
-                    "[{peer}] resume declined: no saved session under this gateway's key \
-                     with the token it presented; new session"
-                ),
-                (false, _) => debug!("[{peer}] new version 3 session"),
-            }
-            // The gateway builds no work until it holds an active assignment. A resumed
-            // gateway cleared its active slot on reconnect and is sent every seeded slot
-            // again; the reveals it may not have received follow once its replayed shares
-            // are answered (`AbwManager::resumed`).
-            for notice in &notices {
-                conn.send_mining(notice, false)?;
-            }
-            debug!("[{peer}] sent {} ABW assignment notice(s)", notices.len());
-        }
+        Generation::V3 { resume } => conn.start_v3_session(client_key, resume.as_ref())?,
     }
 
     conn.run()
@@ -272,13 +234,8 @@ struct Connection<'a> {
     peer: std::net::SocketAddr,
     /// When the connection was accepted; a saved session records it as `held_since`.
     opened: Instant,
-    stream: PolledStream,
-    /// Readiness for the socket and the waker; the thread blocks here between frames.
-    poll: Poll,
-    events: Events,
-    /// Set when the poll reports the socket readable, cleared when a read returns
-    /// `WouldBlock`: the registration is edge triggered, so readiness holds until then.
-    readable: bool,
+    /// The socket and its readiness; the thread blocks here between frames.
+    socket: PolledSocket,
     /// This connection's entry in `NodeView`, removed when the connection closes.
     waker: Arc<Waker>,
     session: Session,
@@ -344,50 +301,8 @@ impl Connection<'_> {
             .session
             .encrypt(cmd, payload, sign)
             .map_err(|e| io::Error::other(e.to_string()))?;
-        self.write_all(&wire)?;
+        self.socket.write_all(&wire, WRITE_TIMEOUT)?;
         self.last_send = Instant::now();
-        Ok(())
-    }
-
-    /// Write every byte, waiting for write readiness while the socket buffer is full.
-    /// Fails with `TimedOut` once `WRITE_TIMEOUT` has passed, as the socket write timeout
-    /// did. Read readiness seen while waiting is kept for the next read.
-    fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
-        let deadline = Instant::now() + WRITE_TIMEOUT;
-        let mut rest = data;
-        while !rest.is_empty() {
-            match self.stream.write(rest) {
-                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-                Ok(n) => rest = &rest[n..],
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    let left = deadline.saturating_duration_since(Instant::now());
-                    if left.is_zero() {
-                        return Err(io::ErrorKind::TimedOut.into());
-                    }
-                    self.wait(Some(left))?;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(())
-    }
-
-    /// Block until an event or `timeout`, recording read readiness. A waker event needs no
-    /// record: `run` reads the node view each time around the loop. `Interrupted` returns
-    /// with no event, as a timeout does.
-    fn wait(&mut self, timeout: Option<Duration>) -> io::Result<()> {
-        match self.poll.poll(&mut self.events, timeout) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(()),
-            Err(e) => return Err(e),
-        }
-        for ev in self.events.iter() {
-            // A closed or errored socket is read so that `read` reports it.
-            if ev.token() == SOCKET && (ev.is_readable() || ev.is_read_closed() || ev.is_error()) {
-                self.readable = true;
-            }
-        }
         Ok(())
     }
 
@@ -408,7 +323,7 @@ impl Connection<'_> {
         let mut got = 0usize;
         let mut partial_since: Option<Instant> = None;
         while got < hdr.len() {
-            if !self.readable {
+            if !self.socket.readable() {
                 // Nothing has arrived at all: the caller waits on the poll. Part of a header
                 // has: wait for the rest, up to `HEADER_TIMEOUT` from the first byte.
                 let Some(since) = partial_since else { return Ok(Framing::Idle) };
@@ -419,18 +334,16 @@ impl Connection<'_> {
                         "frame header partially received",
                     ));
                 };
-                self.wait(Some(left))?;
+                self.socket.wait(Some(left))?;
                 continue;
             }
-            match self.stream.read(&mut hdr[got..]) {
-                Ok(0) => return Ok(Framing::Closed),
-                Ok(n) => {
+            match self.socket.read(&mut hdr[got..])? {
+                Some(0) => return Ok(Framing::Closed),
+                Some(n) => {
                     got += n;
                     partial_since.get_or_insert_with(Instant::now);
                 }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => self.readable = false,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e),
+                None => {}
             }
         }
         Ok(Framing::HeaderRead)
@@ -453,29 +366,27 @@ impl Connection<'_> {
                     "frame body exceeded its deadline",
                 ));
             }
-            if !self.readable {
+            if !self.socket.readable() {
                 let left = BODY_TIMEOUT.checked_sub(idle_since.elapsed()).filter(|d| !d.is_zero());
                 let Some(left) = left else {
                     return Err(io::Error::new(io::ErrorKind::TimedOut, "frame body stalled"));
                 };
                 let cap = BODY_DEADLINE.saturating_sub(started.elapsed());
-                self.wait(Some(left.min(cap)))?;
+                self.socket.wait(Some(left.min(cap)))?;
                 continue;
             }
-            match self.stream.read(&mut buf[got..]) {
-                Ok(0) => {
+            match self.socket.read(&mut buf[got..])? {
+                Some(0) => {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "connection closed mid-frame",
                     ));
                 }
-                Ok(k) => {
+                Some(k) => {
                     got += k;
                     idle_since = Instant::now();
                 }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => self.readable = false,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e),
+                None => {}
             }
         }
         Ok(buf)
@@ -483,6 +394,49 @@ impl Connection<'_> {
 
     fn send_mining(&mut self, payload: &[u8], sign: bool) -> io::Result<()> {
         self.send_frame(framing::cmd::MINING, payload, sign)
+    }
+
+    /// Continue the saved session `resume` names, or start one, then send the version 3
+    /// configuration and the assignment notices the gateway needs before it builds work.
+    fn start_v3_session(
+        &mut self,
+        client_key: [u8; 32],
+        resume: Option<&ResumeToken>,
+    ) -> io::Result<()> {
+        let peer = self.peer;
+        // The connection holds the session before the config is sent, so a failed send
+        // still saves it for a resume.
+        let (state, resumed) = self.server.resume_or_start(client_key, resume, Instant::now());
+        // The splits the resumed session dictated: the gateway's replayed shares and its
+        // shares on the jobs it still holds pay them, and its next split must not take an id
+        // one of those jobs names.
+        self.verifier.restore_splits(state.splits);
+        self.coinbaser_id = state.coinbaser_id;
+        let payload = self.server.config_payload_v3(&state.token);
+        self.v3 = Some(V3Session { token: state.token, abw: state.abw });
+        let notices = self.with_abw(|m| m.notices()).expect("a version 3 session");
+        self.send_mining(&payload, true)?;
+        debug!("[{peer}] sent v3 0x99 config ({} bytes, signed)", payload.len());
+        match (resume.is_some(), resumed) {
+            (true, true) => info!(
+                "[{peer}] resume accepted: the session's ABW assignments continue and its \
+                 replayed shares verify"
+            ),
+            (true, false) => info!(
+                "[{peer}] resume declined: no saved session under this gateway's key with \
+                 the token it presented; new session"
+            ),
+            (false, _) => debug!("[{peer}] new version 3 session"),
+        }
+        // The gateway builds no work until it holds an active assignment. A resumed gateway
+        // cleared its active slot on reconnect and is sent every seeded slot again; the
+        // reveals it may not have received follow once its replayed shares are answered
+        // (`AbwManager::resumed`).
+        for notice in &notices {
+            self.send_mining(notice, false)?;
+        }
+        debug!("[{peer}] sent {} ABW assignment notice(s)", notices.len());
+        Ok(())
     }
 
     /// The anti-block-withholding slots of a version 3 session; `None` on a v1 session.
@@ -627,8 +581,8 @@ impl Connection<'_> {
     /// bytes waiting, so a due reveal waits one more pass around the loop; a closed peer
     /// reads as readable and is handled as `Framing::Closed`.
     fn socket_drained(&mut self) -> io::Result<bool> {
-        self.wait(Some(Duration::ZERO))?;
-        Ok(!self.readable)
+        self.socket.wait(Some(Duration::ZERO))?;
+        Ok(!self.socket.readable())
     }
 
     /// The 0xA5 receipt for `work` on a version 3 session, when the share named a slot.
@@ -651,11 +605,11 @@ impl Connection<'_> {
                 self.send_keepalive()?;
             }
 
-            if !self.readable {
+            if !self.socket.readable() {
                 // Nothing to read: block until the socket is readable, the watcher calls
                 // this connection's waker for a new tip, or a timed action is due.
                 let timeout = self.until_next_action();
-                self.wait(Some(timeout))?;
+                self.socket.wait(Some(timeout))?;
                 continue;
             }
             let mut hdr = [0u8; framing::HEADER_LEN];
@@ -900,130 +854,158 @@ impl Connection<'_> {
     /// and the raw PoW hash when the share verified far enough to have one (for the exact
     /// ABW reference).
     fn check_share(&mut self, s: &PowSubmit, now: u64) -> io::Result<ShareOutcome> {
-        let peer = self.peer;
         match self.verifier.verify(s, now) {
-            Ok(a) => {
-                let raw_hash = Some(a.work.raw_hash);
-                let mut pending = None;
-                let candidate = self.verifier.block_candidate(&a.work);
-                if a.is_block {
-                    warn!(
-                        "[{peer}]   ** BLOCK at height {}: {}",
-                        a.work.height,
-                        hex::encode(a.work.block_hash)
-                    );
-                } else if candidate {
-                    info!(
-                        "[{peer}]      share meets its job's bits {:#010x} but not the node's \
-                         next target; not relayed",
-                        a.work.job_bits
-                    );
-                }
-                // Mark a block handled to the gateway's disclosure audit: without a receipt
-                // for a block it retained, its reveal-time check sets a permanent CRITICAL
-                // failure and closes the connection. The audit classifies by the job's own
-                // bits, so the receipt also covers a share the pool does not relay.
-                if candidate {
-                    self.send_abw_receipt(s, &a.work)?;
-                }
-                if a.is_block {
-                    if relay_or_request_txns(peer, &self.server.node, &a, s.subsidy_only) {
-                        if let Some(prev) = self.awaiting_txns.insert(s.job_id, a.clone()) {
-                            error!(
-                                "[{peer}]   !! a block on job {} was still awaiting its \
-                                 transactions and is abandoned: {}",
-                                s.job_id,
-                                hex::encode(prev.work.block_hash)
-                            );
-                        }
-                        pending = Some(validation::request_block_txns(s.job_id));
-                    }
-                } else if s.is_block {
-                    warn!(
-                        "[{peer}]   !! gateway flagged a block but the hash does not meet the \
-                         network target"
-                    );
-                }
-                // Every accepted block enters the ledger's block history, whoever found it
-                // and however its coinbase paid: the stats interface renders the list and
-                // derives the luck figure from it.
-                if a.is_block {
-                    self.record_found_block(&a, s, now);
-                }
-                // What the pool's payout script received on a block that is owed to the
-                // window is recorded as owed by the pool. A coinbase that left dictated
-                // outputs out (they did not fit the miner's coinbase) names them exactly, from
-                // the split the pool dictated for the job. A coinbase that paid the window
-                // nothing on a job with no recorded split (a subsidy-only job, or a coinbase
-                // built with no split) is recorded from the split a coinbaser would dictate
-                // now. Taken before `record_and_credit` adds the block's own share; the window
-                // is read at acceptance, so it also holds shares credited after this job was
-                // served, an approximation of the split a coinbaser serving the job would have
-                // fixed.
-                if a.is_block {
-                    if !a.work.unpaid.is_empty() {
-                        self.record_unpaid_outputs(&a, now);
-                    } else if a.work.paid_to_split == 0 {
-                        self.record_owed_block(&a, now);
-                    }
-                }
-                // A share is credited to an identity only if the coinbase can pay it. The
-                // check is here, after the relay above, so a block is still submitted, and
-                // before the credit, so work is never counted for an identity whose amount
-                // would be paid to the pool as the coinbase remainder instead. The share's
-                // hash stays in the `ReplayGuard`: the verdict depends on the username, which
-                // a resend of the same share would carry again.
-                if self.is_unpayable(&s.username) {
-                    return Ok((
-                        ShareVerdict::Rejected(RejectReason::BadUsername),
-                        pending,
-                        raw_hash,
-                    ));
-                }
-                // Credit after arranging relay, and never let a ledger write error close the
-                // connection: the block relay above and any pending transaction fetch must
-                // outlive it. On failure the share is not credited and `record_and_credit`
-                // removed its hash from the `ReplayGuard`, so a resend can be credited once
-                // the store recovers.
-                if let Err(e) = self.record_and_credit(s, &a, now) {
+            Ok(a) => self.on_accepted(s, a, now),
+            Err(reason) => self.on_refused(s, reason, now),
+        }
+    }
+
+    /// A share the verifier accepted: relay it if it is a block, record what the block owes
+    /// the window, and credit the work.
+    fn on_accepted(&mut self, s: &PowSubmit, a: Accepted, now: u64) -> io::Result<ShareOutcome> {
+        let peer = self.peer;
+        let raw_hash = Some(a.work.raw_hash);
+        let mut pending = None;
+        let candidate = self.verifier.block_candidate(&a.work);
+        if a.is_block {
+            warn!(
+                "[{peer}]   ** BLOCK at height {}: {}",
+                a.work.height,
+                hex::encode(a.work.block_hash)
+            );
+        } else if candidate {
+            info!(
+                "[{peer}]      share meets its job's bits {:#010x} but not the node's \
+                 next target; not relayed",
+                a.work.job_bits
+            );
+        }
+        // Mark a block handled to the gateway's disclosure audit: without a receipt
+        // for a block it retained, its reveal-time check sets a permanent CRITICAL
+        // failure and closes the connection. The audit classifies by the job's own
+        // bits, so the receipt also covers a share the pool does not relay.
+        if candidate {
+            self.send_abw_receipt(s, &a.work)?;
+        }
+        if a.is_block {
+            if relay_or_request_txns(peer, &self.server.node, &a, s.subsidy_only) {
+                if let Some(prev) = self.awaiting_txns.insert(s.job_id, a.clone()) {
                     error!(
-                        "[{peer}]   !! could not record the share to the ledger ({e}); it is \
-                         not credited and its hash was removed from the ReplayGuard so a \
-                         resend can be credited"
+                        "[{peer}]   !! a block on job {} was still awaiting its \
+                         transactions and is abandoned: {}",
+                        s.job_id,
+                        hex::encode(prev.work.block_hash)
                     );
                 }
-                Ok((ShareVerdict::Accepted, pending, raw_hash))
+                pending = Some(validation::request_block_txns(s.job_id));
             }
-            Err(reason) => {
-                debug!("[{peer}]   <- rejected: {reason:?}");
-                if s.is_block
-                    && let Ok(w) = self.verifier.reconstruct(s, now)
-                {
-                    warn!(
-                        "[{peer}]   !! pool built header {} coinbase {}",
-                        hex::encode(w.header),
-                        hex::encode(&w.coinbase_tx)
-                    );
-                }
-                // A version 3 gateway retains a proof for this share too: the exact
-                // reference retires its replay entry, and a block it refused for (a
-                // duplicate, say) needs the receipt, or the reveal audit finds an unhandled
-                // block, sets the permanent CRITICAL failure and closes the connection.
-                let mut raw_hash = None;
-                if self.v3.is_some()
-                    && let Some(work) = self.verifier.rebuild_refused(s)
-                {
-                    raw_hash = Some(work.raw_hash);
-                    if self.verifier.block_candidate(&work) {
-                        warn!(
-                            "[{peer}]   ** the refused share ({reason:?}) meets a block \
-                             target: sending the ABW receipt so the gateway counts it handled"
-                        );
-                        self.send_abw_receipt(s, &work)?;
-                    }
-                }
-                Ok((ShareVerdict::Rejected(reason), None, raw_hash))
+            // Every accepted block enters the ledger's block history, whoever found it
+            // and however its coinbase paid: the stats interface renders the list and
+            // derives the luck figure from it.
+            self.record_found_block(&a, s, now);
+            // What the pool's payout script received on a block that is owed to the
+            // window is recorded as owed by the pool. A coinbase that left dictated
+            // outputs out (they did not fit the miner's coinbase) names them exactly,
+            // from the split the pool dictated for the job. A coinbase that paid the
+            // window nothing on a job with no recorded split (a subsidy-only job, or a
+            // coinbase built with no split) is recorded from the split a coinbaser
+            // would dictate now. Taken before `record_and_credit` adds the block's own
+            // share; the window is read at acceptance, so it also holds shares credited
+            // after this job was served, an approximation of the split a coinbaser serving
+            // the job would have fixed.
+            if !a.work.unpaid.is_empty() {
+                self.record_unpaid_outputs(&a, now);
+            } else if a.work.paid_to_split == 0 {
+                self.record_owed_block(&a, now);
             }
+        } else if s.is_block {
+            warn!(
+                "[{peer}]   !! gateway flagged a block but the hash does not meet the \
+                 network target"
+            );
+        }
+        // A share is credited to an identity only if the coinbase can pay it. The
+        // check is here, after the relay above, so a block is still submitted, and
+        // before the credit, so work is never counted for an identity whose amount
+        // would be paid to the pool as the coinbase remainder instead. The share's
+        // hash stays in the `ReplayGuard`: the verdict depends on the username, which
+        // a resend of the same share would carry again.
+        if self.is_unpayable(&s.username) {
+            return Ok((ShareVerdict::Rejected(RejectReason::BadUsername), pending, raw_hash));
+        }
+        // Credit after arranging relay, and never let a ledger write error close the
+        // connection: the block relay above and any pending transaction fetch must
+        // outlive it. On failure the share is not credited and `record_and_credit`
+        // removed its hash from the `ReplayGuard`, so a resend can be credited once
+        // the store recovers.
+        if let Err(e) = self.record_and_credit(s, &a, now) {
+            error!(
+                "[{peer}]   !! could not record the share to the ledger ({e}); it is \
+                 not credited and its hash was removed from the ReplayGuard so a \
+                 resend can be credited"
+            );
+        }
+        Ok((ShareVerdict::Accepted, pending, raw_hash))
+    }
+
+    /// A share the verifier refused: log why, and on a version 3 session rebuild it for its
+    /// exact reference and, when it is a block by the gateway's measure, its receipt.
+    fn on_refused(
+        &mut self,
+        s: &PowSubmit,
+        reason: RejectReason,
+        now: u64,
+    ) -> io::Result<ShareOutcome> {
+        let peer = self.peer;
+        debug!("[{peer}]   <- rejected: {reason:?}");
+        if s.is_block
+            && let Ok(w) = self.verifier.reconstruct(s, now)
+        {
+            warn!(
+                "[{peer}]   !! pool built header {} coinbase {}",
+                hex::encode(w.header),
+                hex::encode(&w.coinbase_tx)
+            );
+        }
+        // A version 3 gateway retains a proof for this share too: the exact
+        // reference retires its replay entry, and a block it refused for (a
+        // duplicate, say) needs the receipt, or the reveal audit finds an unhandled
+        // block, sets the permanent CRITICAL failure and closes the connection.
+        let mut raw_hash = None;
+        if self.v3.is_some()
+            && let Some(work) = self.verifier.rebuild_refused(s)
+        {
+            raw_hash = Some(work.raw_hash);
+            if self.verifier.block_candidate(&work) {
+                warn!(
+                    "[{peer}]   ** the refused share ({reason:?}) meets a block \
+                     target: sending the ABW receipt so the gateway counts it handled"
+                );
+                self.send_abw_receipt(s, &work)?;
+            }
+        }
+        Ok((ShareVerdict::Rejected(reason), None, raw_hash))
+    }
+
+    /// Log an owed record's entries and the command that settles it, then store it. The
+    /// amounts are logged first, so a ledger write failure loses the record's durability but
+    /// never the numbers.
+    fn log_and_record_owed(&self, owed: ledger::OwedBlock) {
+        let peer = self.peer;
+        for (identity, sats) in &owed.entries {
+            warn!("[{peer}]   **   {identity} {sats} sats");
+        }
+        let hash = hex::encode(owed.block_hash);
+        warn!(
+            "[{peer}]   ** recorded as owed by block hash {hash}; after paying it from the \
+             pool's wallet, run: ratum-prime --settle-block {hash} (with --ledger or \
+             --data-dir, pool stopped)"
+        );
+        if let Err(e) = lock(&self.server.ledger).record_owed(owed) {
+            error!(
+                "[{peer}]   !! could not record the owed amounts to the ledger ({e}); they \
+                 are in this log only"
+            );
         }
     }
 
@@ -1055,8 +1037,7 @@ impl Connection<'_> {
     }
 
     /// Compute and record what the pool owes the window for a block whose coinbase paid it
-    /// nothing; see `ledger::OwedBlock`. The amounts are logged either way, so a ledger
-    /// write failure loses the record's durability but never the numbers.
+    /// nothing; see `ledger::OwedBlock`.
     fn record_owed_block(&self, a: &Accepted, now: u64) {
         let peer = self.peer;
         let value = a.work.paid_to_pool;
@@ -1075,22 +1056,7 @@ impl Connection<'_> {
             owed.entries.len(),
             if owed.entries.len() == 1 { "y" } else { "ies" },
         );
-        for (identity, sats) in &owed.entries {
-            warn!("[{peer}]   **   {identity} {sats} sats");
-        }
-        warn!(
-            "[{peer}]   ** recorded as owed by block hash {}; after paying it from the pool's \
-             wallet, run: ratum-prime --settle-block {} (with --ledger or --data-dir, pool \
-             stopped)",
-            hex::encode(a.work.block_hash),
-            hex::encode(a.work.block_hash),
-        );
-        if let Err(e) = lock(&self.server.ledger).record_owed(owed) {
-            error!(
-                "[{peer}]   !! could not record the owed split to the ledger ({e}); the \
-                 amounts above are in this log only"
-            );
-        }
+        self.log_and_record_owed(owed);
     }
 
     /// Record what the pool owes the window for a block whose coinbase left dictated outputs
@@ -1131,30 +1097,14 @@ impl Connection<'_> {
             entries.len(),
             if entries.len() == 1 { "y" } else { "ies" },
         );
-        for (identity, sats) in &entries {
-            warn!("[{peer}]   **   {identity} {sats} sats");
-        }
-        warn!(
-            "[{peer}]   ** recorded as owed by block hash {}; after paying it from the pool's \
-             wallet, run: ratum-prime --settle-block {} (with --ledger or --data-dir, pool \
-             stopped)",
-            hex::encode(a.work.block_hash),
-            hex::encode(a.work.block_hash),
-        );
-        let owed = ledger::OwedBlock {
+        self.log_and_record_owed(ledger::OwedBlock {
             at: now,
             height: a.work.height,
             block_hash: a.work.block_hash,
             total,
             settled_at: None,
             entries,
-        };
-        if let Err(e) = lock(&self.server.ledger).record_owed(owed) {
-            error!(
-                "[{peer}]   !! could not record the owed outputs to the ledger ({e}); the \
-                 amounts above are in this log only"
-            );
-        }
+        });
     }
 
     /// Whether the identity that `username` credits to cannot be paid a coinbase output. When

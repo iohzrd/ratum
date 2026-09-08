@@ -13,7 +13,7 @@ use crate::server::{Resolver, Server, split_after_fee};
 use log::warn;
 use ratum::http;
 use ratum::lock;
-use ratum_prime::ledger::FoundBlock;
+use ratum_prime::ledger::{self, FoundBlock};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
@@ -268,6 +268,125 @@ fn attr(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
+/// The chain and the block it is on, with the retarget estimate the observed block spacing
+/// gives. Without a tip (the node has not answered yet) only the template's coinbase value
+/// is known.
+fn network_json(
+    tip: Option<ratum::rpc::Tip>,
+    coinbase_value: Option<u64>,
+    observed_block_secs: Option<f64>,
+) -> serde_json::Value {
+    let Some(t) = tip else {
+        return serde_json::json!({
+            "chain": serde_json::Value::Null,
+            "tip_height": serde_json::Value::Null,
+            "tip_hash": serde_json::Value::Null,
+            "difficulty": serde_json::Value::Null,
+            "coinbase_value": coinbase_value,
+        });
+    };
+    serde_json::json!({
+        "chain": t.chain.name(),
+        "tip_height": t.height,
+        "tip_hash": hex::encode(ratum::bitcoin::reversed(&t.hash)),
+        "difficulty": t.difficulty,
+        "coinbase_value": coinbase_value,
+        "observed_block_seconds": observed_block_secs,
+        "retarget": {
+            "height": (t.height / RETARGET_INTERVAL + 1) * RETARGET_INTERVAL,
+            "blocks_remaining": RETARGET_INTERVAL - t.height % RETARGET_INTERVAL,
+            "estimated_factor": observed_block_secs.map(|s| {
+                (TARGET_BLOCK_SECS / s).clamp(1.0 / MAX_RETARGET_FACTOR, MAX_RETARGET_FACTOR)
+            }),
+        },
+    })
+}
+
+/// What the pool's payout script received on each block the window is owed (outputs the
+/// coinbase left out, or a coinbase that paid the window nothing): the unsettled total, the
+/// sum per identity while unsettled (largest first), and every block's record. Settlement is
+/// a wallet transaction the operator records with `--settle-block`.
+fn owed_json(owed: &[ledger::OwedBlock]) -> (u64, Vec<serde_json::Value>, Vec<serde_json::Value>) {
+    let mut unsettled: u64 = 0;
+    let mut by_identity: HashMap<String, u64> = HashMap::new();
+    let blocks: Vec<serde_json::Value> = owed
+        .iter()
+        .map(|o| {
+            if o.settled_at.is_none() {
+                unsettled += o.total;
+                for (identity, sats) in &o.entries {
+                    *by_identity.entry(identity.clone()).or_insert(0) += sats;
+                }
+            }
+            serde_json::json!({
+                "height": o.height,
+                "block_hash": hex::encode(o.block_hash),
+                "found_at": o.at,
+                "total_sats": o.total,
+                "settled_at": o.settled_at,
+                "miners": o.entries.iter().map(|(identity, sats)| {
+                    serde_json::json!({ "identity": identity, "sats": sats })
+                }).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    let mut by_identity: Vec<(String, u64)> = by_identity.into_iter().collect();
+    by_identity.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let by_identity = by_identity
+        .into_iter()
+        .map(|(identity, sats)| serde_json::json!({ "identity": identity, "sats": sats }))
+        .collect();
+    (unsettled, by_identity, blocks)
+}
+
+/// One row per identity in the payout window: its share of the work, what the split
+/// allocates it, whether a coinbase output can pay it, and the gateway tag its newest share
+/// came through.
+fn miners_json(
+    server: &Server,
+    work_by_identity: &[(String, u128)],
+    total_work: u128,
+    payout_sats: &HashMap<String, u64>,
+    recent_by_identity: &HashMap<String, u128>,
+    tags: &HashMap<String, String>,
+) -> Vec<serde_json::Value> {
+    work_by_identity
+        .iter()
+        .map(|(identity, work)| {
+            let share_percent =
+                if total_work > 0 { *work as f64 / total_work as f64 * 100.0 } else { 0.0 };
+            // Read-through of the resolver cache only: an unauthenticated request must not
+            // make the pool call the node. Every identity credited since the pool started was
+            // resolved on its first share, so `null` is an identity read back from the ledger
+            // at startup that has not submitted since.
+            let (payable, unpayable_reason) = match Resolver::cached(&server.resolver, identity) {
+                Some(Ok(_)) => (Some(true), None),
+                Some(Err(why)) => (Some(false), Some(why.to_string())),
+                None => (None, None),
+            };
+            serde_json::json!({
+                "identity": identity,
+                "work": work.to_string(),
+                "share_percent": share_percent,
+                // Approximate, from the shares accepted from this identity in the last
+                // `hashrate.span_seconds`: zero for one idle that long.
+                "hashrate_hs": hashes_per_second(
+                    recent_by_identity.get(identity).copied().unwrap_or(0),
+                    HASHRATE_SPAN_SECS,
+                ),
+                // What the split allocates. An identity that is not payable is not paid it:
+                // the amount is left in the coinbase remainder, which the gateway pays to the
+                // pool's payout script.
+                "payout_sats": payout_sats.get(identity).copied().unwrap_or(0),
+                "payable": payable,
+                "unpayable_reason": unpayable_reason,
+                // The gateway tag the identity's newest share in the window came through.
+                "tag": tags.get(identity).map_or("", String::as_str),
+            })
+        })
+        .collect()
+}
+
 /// The JSON snapshot. Every field is read from the shared state; no secret (the node
 /// credentials, the pool signing key) is included. `work` values are `u128`, which JSON
 /// numbers cannot hold in full, so they are strings.
@@ -327,102 +446,16 @@ fn snapshot(server: &Server, history: &Mutex<ratum::web::History>) -> serde_json
         }
     };
 
-    // What the pool's payout script received on each block that the window is owed (outputs
-    // the coinbase left out, or a coinbase that paid the window nothing), per block and
-    // summed per identity while unsettled. Settlement is a wallet transaction the operator
-    // records with --settle-block.
-    let mut owed_unsettled: u64 = 0;
-    let mut owed_by_identity: HashMap<String, u64> = HashMap::new();
-    let owed_blocks: Vec<serde_json::Value> = owed
-        .iter()
-        .map(|o| {
-            if o.settled_at.is_none() {
-                owed_unsettled += o.total;
-                for (identity, sats) in &o.entries {
-                    *owed_by_identity.entry(identity.clone()).or_insert(0) += sats;
-                }
-            }
-            serde_json::json!({
-                "height": o.height,
-                "block_hash": hex::encode(o.block_hash),
-                "found_at": o.at,
-                "total_sats": o.total,
-                "settled_at": o.settled_at,
-                "miners": o.entries.iter().map(|(identity, sats)| {
-                    serde_json::json!({ "identity": identity, "sats": sats })
-                }).collect::<Vec<_>>(),
-            })
-        })
-        .collect();
-    let mut owed_by_identity: Vec<(String, u64)> = owed_by_identity.into_iter().collect();
-    owed_by_identity.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    let owed_by_identity: Vec<serde_json::Value> = owed_by_identity
-        .into_iter()
-        .map(|(identity, sats)| serde_json::json!({ "identity": identity, "sats": sats }))
-        .collect();
-
-    let miners: Vec<serde_json::Value> = work_by_identity
-        .iter()
-        .map(|(identity, work)| {
-            let share_percent =
-                if total_work > 0 { *work as f64 / total_work as f64 * 100.0 } else { 0.0 };
-            // Read-through of the resolver cache only: an unauthenticated request must not
-            // make the pool call the node. Every identity credited since the pool started was
-            // resolved on its first share, so `null` is an identity read back from the ledger
-            // at startup that has not submitted since.
-            let (payable, unpayable_reason) = match Resolver::cached(&server.resolver, identity) {
-                Some(Ok(_)) => (Some(true), None),
-                Some(Err(why)) => (Some(false), Some(why.to_string())),
-                None => (None, None),
-            };
-            serde_json::json!({
-                "identity": identity,
-                "work": work.to_string(),
-                "share_percent": share_percent,
-                // Approximate, from the shares accepted from this identity in the last
-                // `hashrate.span_seconds`: zero for one idle that long.
-                "hashrate_hs": hashes_per_second(
-                    recent_by_identity.get(identity).copied().unwrap_or(0),
-                    HASHRATE_SPAN_SECS,
-                ),
-                // What the split allocates. An identity that is not payable is not paid it:
-                // the amount is left in the coinbase remainder, which the gateway pays to the
-                // pool's payout script.
-                "payout_sats": payout_sats.get(identity).copied().unwrap_or(0),
-                "payable": payable,
-                "unpayable_reason": unpayable_reason,
-                // The gateway tag the identity's newest share in the window came through.
-                "tag": tags.get(identity).map_or("", String::as_str),
-            })
-        })
-        .collect();
-
-    let network = match &tip {
-        Some(t) => serde_json::json!({
-            "chain": t.chain.name(),
-            "tip_height": t.height,
-            "tip_hash": hex::encode(ratum::bitcoin::reversed(&t.hash)),
-            "difficulty": t.difficulty,
-            "coinbase_value": coinbase_value,
-            "observed_block_seconds": observed_block_secs,
-            "retarget": {
-                "height": (t.height / RETARGET_INTERVAL + 1) * RETARGET_INTERVAL,
-                "blocks_remaining": RETARGET_INTERVAL - t.height % RETARGET_INTERVAL,
-                "estimated_factor": observed_block_secs
-                    .map(|s| {
-                        (TARGET_BLOCK_SECS / s)
-                            .clamp(1.0 / MAX_RETARGET_FACTOR, MAX_RETARGET_FACTOR)
-                    }),
-            },
-        }),
-        None => serde_json::json!({
-            "chain": serde_json::Value::Null,
-            "tip_height": serde_json::Value::Null,
-            "tip_hash": serde_json::Value::Null,
-            "difficulty": serde_json::Value::Null,
-            "coinbase_value": coinbase_value,
-        }),
-    };
+    let (owed_unsettled, owed_by_identity, owed_blocks) = owed_json(&owed);
+    let miners = miners_json(
+        server,
+        &work_by_identity,
+        total_work,
+        &payout_sats,
+        &recent_by_identity,
+        &tags,
+    );
+    let network = network_json(tip, coinbase_value, observed_block_secs);
 
     serde_json::json!({
         "pool": {
