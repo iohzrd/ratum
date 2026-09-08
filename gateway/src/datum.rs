@@ -28,10 +28,10 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-pub const COINBASER_WAIT: Duration = Duration::from_secs(5);
-pub const COINBASER_MIN_VALUE: u64 = 31_250_000;
-pub const SHARE_ACK_TIMEOUT: Duration = Duration::from_secs(30);
-pub const SHARE_ACK_GRACE: Duration = Duration::from_secs(25);
+const COINBASER_WAIT: Duration = Duration::from_secs(5);
+const COINBASER_MIN_VALUE: u64 = 31_250_000;
+const SHARE_ACK_TIMEOUT: Duration = Duration::from_secs(30);
+const SHARE_ACK_GRACE: Duration = Duration::from_secs(25);
 const HANDSHAKE_READ_POLL: Duration = Duration::from_millis(5);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const MINING_PAD_MAX: usize = 100;
@@ -312,8 +312,6 @@ pub struct Settings {
     pub pool_sign_pk: [u8; 32],
     pub pool_box_pk: [u8; 32],
     pub global_timeout: Duration,
-    pub share_ack_timeout: Duration,
-    pub share_ack_grace: Duration,
     pub user_agent: String,
     pub pass_full_users: bool,
     pub pass_workers: bool,
@@ -331,8 +329,6 @@ impl Settings {
             pool_sign_pk,
             pool_box_pk,
             global_timeout: Duration::from_secs(config.datum.protocol_global_timeout),
-            share_ack_timeout: SHARE_ACK_TIMEOUT,
-            share_ack_grace: SHARE_ACK_GRACE,
             user_agent: user_agent(),
             pass_full_users: config.datum.pool_pass_full_users,
             pass_workers: config.datum.pool_pass_workers,
@@ -569,9 +565,9 @@ impl<'a> Session<'a> {
             }
             if let (Some(sent), Some(acked)) = (self.last_share_sent, self.last_share_accepted)
                 && sent > acked
-                && sent.duration_since(acked) >= self.settings.share_ack_timeout
+                && sent.duration_since(acked) >= SHARE_ACK_TIMEOUT
             {
-                return Err(SessionError::ShareAckTimeout(self.settings.share_ack_timeout));
+                return Err(SessionError::ShareAckTimeout(SHARE_ACK_TIMEOUT));
             }
 
             self.send_pending()?;
@@ -991,10 +987,7 @@ impl<'a> Session<'a> {
         );
         self.send_mining(&submit.encode())?;
         let now = Instant::now();
-        if self
-            .last_share_sent
-            .is_none_or(|t| now.duration_since(t) > self.settings.share_ack_grace)
-        {
+        if self.last_share_sent.is_none_or(|t| now.duration_since(t) > SHARE_ACK_GRACE) {
             self.last_share_accepted = Some(now);
         }
         self.last_share_sent = Some(now);

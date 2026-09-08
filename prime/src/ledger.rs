@@ -7,7 +7,7 @@ use redb::{
     Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
 };
 
-pub const MAX_SHARES: usize = 1 << 20;
+const MAX_SHARES: usize = 1 << 20;
 
 pub const SHARES_PER_KEEP_UNIT: u64 = MAX_SHARES as u64;
 

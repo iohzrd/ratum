@@ -90,10 +90,6 @@ impl KeyRatchet {
         KeyRatchet::new(INITIAL_HELLO_KEY)
     }
 
-    pub fn key(self) -> u32 {
-        self.key
-    }
-
     pub fn mask(&mut self, h: Header) -> [u8; HEADER_LEN] {
         let v = u32::from_le_bytes(h.to_bytes()) ^ self.key;
         self.key = feedback(self.key);

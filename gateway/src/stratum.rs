@@ -783,15 +783,6 @@ impl Connection {
             .header(r.coinbase, pot, req.extranonce, req.nonce, req.ntime)
             .ok_or(UNKNOWN_WORK)?;
         let hash = job.share_pow_hash(&header);
-
-        let username = username::apply_modifier(
-            &self.server.config.stratum.username_modifiers,
-            &self.server.config.mining.pool_address,
-            &req.miner_username,
-            &hash,
-        )
-        .unwrap_or_else(|| req.miner_username.clone());
-
         let is_block = job.abw.is_none() && target::meets_target(&hash, &job.block_target);
         if is_block {
             let display = hex::encode(hash);
@@ -806,7 +797,14 @@ impl Connection {
             let wire_username = if checked.is_ok() && self.fee_charged(req.job_diff) {
                 self.server.config.fee_address().to_string()
             } else {
-                username
+                let cfg = &self.server.config;
+                username::apply_modifier(
+                    &cfg.stratum.username_modifiers,
+                    &cfg.mining.pool_address,
+                    &req.miner_username,
+                    &hash,
+                )
+                .unwrap_or_else(|| req.miner_username.clone())
             };
             self.server.datum.submit(QueuedShare {
                 job: Arc::clone(job),

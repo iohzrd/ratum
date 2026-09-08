@@ -29,11 +29,13 @@ impl Publisher {
         })
     }
 
+    /// A new tip publishes the subsidy-only job, which needs no coinbaser and so is ready
+    /// at once; every other job carries the pooled coinbase. `new_block` therefore selects
+    /// both the empty coinbase and the clean-jobs flag the miners are notified with.
     fn build_and_publish(
         &self,
         t: &Arc<Template>,
         new_block: bool,
-        empty: bool,
         pool: Option<&PoolConfig>,
         coinbaser: Option<CoinbaserResponse>,
         what: &str,
@@ -53,8 +55,8 @@ impl Publisher {
             Ok(job) => {
                 *last = None;
                 let job = Arc::new(job);
-                self.server.publish(Arc::clone(&job), empty);
-                if !empty {
+                self.server.publish(Arc::clone(&job), new_block);
+                if !new_block {
                     info!(
                         "Stratum job {} ready ({what}): height {}, {} coinbaser outputs, {}pooled (sent to {} subscribers)",
                         job.job_id,
@@ -78,14 +80,14 @@ impl Publisher {
         let serial = self.template_serial.fetch_add(1, Ordering::SeqCst) + 1;
         let pool = self.shared.pool_config();
         if new_block {
-            self.build_and_publish(&t, true, true, pool.as_ref(), None, "new-block");
+            self.build_and_publish(&t, true, pool.as_ref(), None, "new-block");
             std::thread::sleep(EMPTY_JOB_HOLD);
             if pool.is_some() {
-                self.build_and_publish(&t, false, false, pool.as_ref(), None, "priority");
+                self.build_and_publish(&t, false, pool.as_ref(), None, "priority");
             }
         }
         if pool.is_none() {
-            self.build_and_publish(&t, false, false, None, None, "full");
+            self.build_and_publish(&t, false, None, None, "full");
         } else {
             self.spawn_coinbaser(t, new_block, serial);
         }
@@ -103,7 +105,7 @@ impl Publisher {
             if new_block && pool.is_some() && coinbaser.is_none() {
                 return;
             }
-            this.build_and_publish(&t, false, false, pool.as_ref(), coinbaser, "full");
+            this.build_and_publish(&t, false, pool.as_ref(), coinbaser, "full");
         });
         if let Err(e) = spawned {
             error!("could not start the coinbaser thread: {e}");

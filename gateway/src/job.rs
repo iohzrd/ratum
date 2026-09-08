@@ -3,7 +3,7 @@ use crate::config::Config;
 use crate::template::Template;
 use ratum::bitcoin::HASH_SIZE;
 use ratum::datum::messages::{CoinbaseOutput, CoinbaserResponse};
-use ratum::datum::share::{EXTRANONCE_SIZE, EXTRANONCE_SIZE_V2, SIA_FIELD_HALF};
+use ratum::datum::share::{self, EXTRANONCE_SIZE, EXTRANONCE_SIZE_V2, SIA_FIELD_HALF};
 use ratum::header::{self, HeaderV2};
 use ratum::target::{self, Target};
 use std::collections::HashMap;
@@ -99,22 +99,22 @@ impl Job {
         }
     }
 
-    fn header_h2(&self, h: &HeaderV2) -> [u8; 32] {
+    /// Under an anti-block-withholding assignment the gateway holds the pool's key hash
+    /// but not the key itself, so it commits to the assignment's hash in place of the
+    /// one the header's own (always zero) XOR key would give.
+    fn precompute(&self, h: &HeaderV2) -> header::Precomputed {
         match self.abw {
-            Some(a) => h.precompute_with_key_hash(a.key_hash).h2,
-            None => h.precompute().h2,
+            Some(a) => h.precompute_with_key_hash(a.key_hash),
+            None => h.precompute(),
         }
     }
 
+    /// The hash the mining machine produces. The gateway builds every header with a zero
+    /// XOR key, whose mask is all zeroes, so this is the block hash as well whenever the
+    /// job carries no assignment.
     pub fn share_pow_hash(&self, h: &HeaderV2) -> [u8; 32] {
-        match self.abw {
-            Some(a) => {
-                let pre = h.precompute_with_key_hash(a.key_hash);
-                let input = h.asic_input_with(&pre.hash1, &pre.h2);
-                ratum::header::blake2b_256(&input)
-            }
-            None => h.hash_components().result,
-        }
+        let pre = self.precompute(h);
+        header::blake2b_256(&h.asic_input_with(&pre.hash1, &pre.h2))
     }
 
     pub fn commitment(&self, id: u8, pot: u8) -> Option<Commitment> {
@@ -128,8 +128,7 @@ impl Job {
         let merkle_root = ratum::bitcoin::merkle_root(&cb_hash, branches);
         let txcount = if subsidy_only { 1 } else { self.template.txns.len() as u16 + 1 };
         let base = self.header_base(merkle_root, txcount, pot);
-        let h2 = self.header_h2(&base);
-        let c = Commitment { merkle_root, h2, txcount };
+        let c = Commitment { merkle_root, h2: self.precompute(&base).h2, txcount };
         ratum::lock(&self.commitments).insert((id, pot), c.clone());
         Some(c)
     }
@@ -142,15 +141,11 @@ impl Job {
         sia_nonce: [u8; SIA_FIELD_SIZE],
         sia_ntime: [u8; SIA_FIELD_SIZE],
     ) -> Option<HeaderV2> {
-        let halves = |f: [u8; SIA_FIELD_SIZE]| {
-            let (lo, hi) = f.split_at(SIA_FIELD_HALF);
-            (u32::from_le_bytes(lo.try_into().unwrap()), u32::from_le_bytes(hi.try_into().unwrap()))
-        };
         let c = self.commitment(id, pot)?;
         let mut h = self.header_base(c.merkle_root, c.txcount, pot);
         h.extranonce = extranonce;
-        (h.nonce, h.nonce2) = halves(sia_nonce);
-        (h.time_offset, h.nonce3) = halves(sia_ntime);
+        (h.nonce, h.nonce2) = share::sia_halves(&sia_nonce);
+        (h.time_offset, h.nonce3) = share::sia_halves(&sia_ntime);
         Some(h)
     }
 
@@ -350,7 +345,6 @@ fn coinbase_set(
         outputs: outs,
         output_budget: budget,
         sigop_budget: sigops,
-        force_op_return_extranonce: false,
     };
     let (subsidy_only, target_pot_index, _) = coinbase::build(&params(&[], 0, 0, true));
     let fixed =
@@ -422,12 +416,7 @@ pub fn parse_sia_field(s: &str) -> Option<[u8; SIA_FIELD_SIZE]> {
     const NARROW_HEX_CHARS: usize = 2 * SIA_FIELD_HALF;
     match s.len() {
         HEX_CHARS => hex::decode(s).ok()?.try_into().ok(),
-        NARROW_HEX_CHARS => {
-            let v = u32::from_str_radix(s, 16).ok()?;
-            let mut out = [0u8; SIA_FIELD_SIZE];
-            out[..SIA_FIELD_HALF].copy_from_slice(&v.to_le_bytes());
-            Some(out)
-        }
+        NARROW_HEX_CHARS => Some(share::sia_field(u32::from_str_radix(s, 16).ok()?, 0)),
         _ => None,
     }
 }

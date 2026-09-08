@@ -12,10 +12,10 @@ use ratum::target;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
-pub const MAX_COINBASE_TYPES: u8 = 6;
-pub const MAX_SEEN: usize = 1 << 20;
+const MAX_COINBASE_TYPES: u8 = 6;
+const MAX_SEEN: usize = 1 << 20;
 
-pub const MAX_INSTALLED_COINBASE_BYTES: usize = 16 << 20;
+const MAX_INSTALLED_COINBASE_BYTES: usize = 16 << 20;
 
 #[derive(Debug)]
 pub struct ReplayGuard {
@@ -59,11 +59,11 @@ impl Default for ReplayGuard {
     }
 }
 
-pub const DEFAULT_NTIME_WINDOW_SECS: u64 = 2 * 60 * 60;
+const DEFAULT_NTIME_WINDOW_SECS: u64 = 2 * 60 * 60;
 
-pub const TIP_GRACE_SECS: u64 = 1;
+const TIP_GRACE_SECS: u64 = 1;
 
-pub const SPLIT_GRACE_SECS: u64 = 10;
+const SPLIT_GRACE_SECS: u64 = 10;
 
 const MAX_RECENT_TIPS: usize = 3;
 
@@ -303,12 +303,6 @@ impl Verifier {
         self.meets_network_target(work) || meets_own_bits(work)
     }
 
-    pub fn reconstruct(&self, s: &PowSubmit, now: u64) -> Result<Rebuilt, RejectReason> {
-        let (work, prev_hash) = self.build(s)?;
-        self.check_share(s, &work, prev_hash, now)?;
-        Ok(work)
-    }
-
     fn build(&self, s: &PowSubmit) -> Result<(Rebuilt, [u8; 32]), RejectReason> {
         let (work, prev_hash, seeded) = self.build_unchecked(s, false)?;
         if !seeded {
@@ -388,7 +382,7 @@ impl Verifier {
         }
     }
 
-    pub fn rebuild(&mut self, s: &PowSubmit, now: u64) -> Result<Rebuilt, RejectReason> {
+    fn rebuild(&mut self, s: &PowSubmit, now: u64) -> Result<Rebuilt, RejectReason> {
         let (work, prev_hash) = self.build(s)?;
         let meets = target::meets_target(&work.raw_hash, &target::target_for_pot(s.target_byte));
         if meets || self.meets_network_target(&work) {
@@ -527,7 +521,7 @@ fn check_username_and_time(
     Ok(())
 }
 
-pub fn meets_own_bits(work: &Rebuilt) -> bool {
+fn meets_own_bits(work: &Rebuilt) -> bool {
     target::bits_to_target(work.job_bits)
         .is_some_and(|t| target::meets_target(&work.block_hash, &t))
 }

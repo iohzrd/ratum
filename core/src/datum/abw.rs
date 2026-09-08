@@ -1,6 +1,5 @@
 use super::framing::STRUCT_END;
 use crate::cursor::Cursor;
-use crate::header::tagged_sha256;
 
 pub const DRAFT_REVISION: u8 = 0;
 pub const ASSIGNMENT_SLOTS: u8 = 16;
@@ -18,9 +17,7 @@ pub fn clear_bits(target_pot: u8) -> u8 {
     (u32::from(SHARE_TARGET_BASE_BITS) + u32::from(target_pot)).min(u32::from(u8::MAX)) as u8
 }
 
-pub fn xor_key_hash(xor_key: &[u8; 16]) -> [u8; 32] {
-    tagged_sha256("Bitcoin block hash PoW XOR key", xor_key)
-}
+pub use crate::header::xor_key_hash;
 
 pub fn key_matches_hash(xor_key: &[u8; 16], hash: &[u8; 32]) -> bool {
     xor_key_hash(xor_key) == *hash

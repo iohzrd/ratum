@@ -3,7 +3,6 @@ use crate::cursor::{Cursor, Truncated};
 pub use super::messages::DBF_MARKER;
 
 pub const ACK_MARKER: [u8; 4] = *b"DBA\x01";
-pub const FRAGMENT_HEADER_SIZE: usize = DBF_MARKER.len() + 3 * size_of::<u32>();
 pub const FRAGMENT_DATA_SIZE: usize = 16 * 1024;
 pub const MAX_TRANSFER_SIZE: usize = super::framing::MAX_CMD_DATA_SIZE as usize;
 
@@ -44,16 +43,6 @@ pub struct Fragment<'a> {
 }
 
 impl<'a> Fragment<'a> {
-    pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(FRAGMENT_HEADER_SIZE + self.data.len());
-        out.extend_from_slice(&DBF_MARKER);
-        out.extend_from_slice(&self.id.to_le_bytes());
-        out.extend_from_slice(&self.total_size.to_le_bytes());
-        out.extend_from_slice(&self.offset.to_le_bytes());
-        out.extend_from_slice(self.data);
-        out
-    }
-
     pub fn decode(data: &'a [u8]) -> Result<Self, Error> {
         let mut c = Cursor::new(data);
         if c.arr::<{ DBF_MARKER.len() }>("marker")? != DBF_MARKER {
@@ -88,30 +77,6 @@ impl Ack {
         next_offset.copy_from_slice(&self.next_offset.to_le_bytes());
         out
     }
-
-    pub fn decode(data: &[u8]) -> Result<Self, Error> {
-        if data.len() != ACK_LEN {
-            return Err(Error::Truncated);
-        }
-        let mut c = Cursor::new(data);
-        if c.arr::<{ ACK_MARKER.len() }>("marker")? != ACK_MARKER {
-            return Err(Error::BadMarker);
-        }
-        Ok(Ack { id: c.u32("transfer id")?, next_offset: c.u32("next offset")? })
-    }
-}
-
-pub fn split(id: u32, payload: &[u8]) -> Vec<Fragment<'_>> {
-    payload
-        .chunks(FRAGMENT_DATA_SIZE)
-        .enumerate()
-        .map(|(i, chunk)| Fragment {
-            id,
-            total_size: payload.len() as u32,
-            offset: (i * FRAGMENT_DATA_SIZE) as u32,
-            data: chunk,
-        })
-        .collect()
 }
 
 #[derive(Debug, Default)]

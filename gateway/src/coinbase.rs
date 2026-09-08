@@ -141,7 +141,6 @@ pub struct Params<'a> {
     pub outputs: &'a [CoinbaseOutput],
     pub output_budget: usize,
     pub sigop_budget: u64,
-    pub force_op_return_extranonce: bool,
 }
 
 const COINBASE_TX_VERSION: u32 = 1;
@@ -150,8 +149,7 @@ const PRUNABLE_OP_RETURN: [u8; 3] = [OP_RETURN, 0x01, 0x00];
 const MIN_USEFUL_OUTPUT_ROOM: usize = 30;
 
 pub fn build(p: &Params<'_>) -> (Coinbase, usize, Vec<CoinbaseOutput>) {
-    let in_script =
-        p.script_sig.len() <= SCRIPT_SIG_ROOM_FOR_EXTRANONCE && !p.force_op_return_extranonce;
+    let in_script = p.script_sig.len() <= SCRIPT_SIG_ROOM_FOR_EXTRANONCE;
 
     let mut included = Vec::new();
     let mut paid = 0u64;

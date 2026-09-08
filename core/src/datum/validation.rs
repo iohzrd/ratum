@@ -116,19 +116,6 @@ impl ParentFetchReply {
         out.push(STRUCT_END);
         out
     }
-
-    pub fn decode(data: &[u8]) -> Result<Self, Error> {
-        let mut c = body_of(data, response::PARENT_FETCH)?;
-        let job_index = c.u8("job index")?;
-        let status = ParentStatus::from_code(c.u8("status")?);
-        let parent_hash: [u8; 32] = c.arr("parent hash")?;
-        let size = c.u32("block size")? as usize;
-        let block = c.take(size, "block").map_err(|_| Error::BadTxnSize)?.to_vec();
-        if c.u8("terminator")? != STRUCT_END {
-            return Err(Error::MissingTerminator);
-        }
-        Ok(ParentFetchReply { job_index, status, parent_hash, block })
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -153,35 +140,6 @@ impl ShortTxnList {
         ShortTxnList { job_index, status, txn_count: 0, short_ids: Vec::new(), crosscheck: None }
     }
 
-    pub fn decode(data: &[u8]) -> Result<Self, Error> {
-        let mut c = body_of(data, response::SHORT_TXN_LIST)?;
-        let job_index = c.u8("job index")?;
-        let status = Status::from_code(c.u8("status")?);
-        if status != Status::Ok {
-            return Ok(ShortTxnList::empty(job_index, status));
-        }
-        let txn_count = c.u16("txn count")?;
-        if txn_count == 0 {
-            return Ok(ShortTxnList::empty(job_index, status));
-        }
-        let ids = c.take(txn_count as usize * SHORT_ID_SIZE, "short ids")?;
-        let short_ids = ids
-            .as_chunks::<SHORT_ID_SIZE>()
-            .0
-            .iter()
-            .map(|c| {
-                let low = u32::from_le_bytes(c[..4].try_into().unwrap());
-                let high = u16::from_le_bytes(c[4..].try_into().unwrap());
-                u64::from(low) | (u64::from(high) << 32)
-            })
-            .collect();
-        let crosscheck: [u8; 32] = c.arr("crosscheck")?;
-        if c.u8("terminator")? != STRUCT_END {
-            return Err(Error::MissingTerminator);
-        }
-        Ok(ShortTxnList { job_index, status, txn_count, short_ids, crosscheck: Some(crosscheck) })
-    }
-
     pub fn encode(&self) -> Vec<u8> {
         let mut out =
             vec![VALIDATION, response::SHORT_TXN_LIST, self.job_index, self.status.code()];
@@ -201,17 +159,6 @@ impl ShortTxnList {
         }
         out.push(STRUCT_END);
         out
-    }
-
-    pub fn matches(&self, hashes: &[[u8; 32]], key: &[u8; 16]) -> bool {
-        if self.status != Status::Ok || self.txn_count as usize != hashes.len() {
-            return false;
-        }
-        if hashes.is_empty() {
-            return self.short_ids.is_empty() && self.crosscheck.is_none();
-        }
-        let expected: Vec<u64> = hashes.iter().map(|h| short_id(h, key)).collect();
-        self.short_ids == expected && self.crosscheck == Some(crosscheck(hashes))
     }
 }
 

@@ -178,8 +178,7 @@ impl HeaderV2 {
     }
 
     pub fn precompute(&self) -> Precomputed {
-        let xor_key_hash = tagged_sha256("Bitcoin block hash PoW XOR key", &self.xor_key);
-        self.precompute_with_key_hash(xor_key_hash)
+        self.precompute_with_key_hash(xor_key_hash(&self.xor_key))
     }
 
     pub fn precompute_with_key_hash(&self, xor_key_hash: [u8; 32]) -> Precomputed {
@@ -246,6 +245,12 @@ pub struct Precomputed {
     pub h2: [u8; 32],
     pub hash1: [u8; 32],
     pub mask: [u8; 32],
+}
+
+/// The commitment a header carries to its proof-of-work XOR key, and the value an
+/// anti-block-withholding assignment names in place of a key the gateway does not hold.
+pub fn xor_key_hash(xor_key: &U128) -> [u8; 32] {
+    tagged_sha256("Bitcoin block hash PoW XOR key", xor_key)
 }
 
 pub fn prevblock_hidden(prev_block: &U256) -> [u8; 32] {

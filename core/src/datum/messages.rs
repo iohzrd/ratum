@@ -205,39 +205,8 @@ pub const MIGRATION_ACTION_REDIRECT: u8 = 0;
 pub const MIGRATION_ACTION_RETURN_HOME: u8 = 1;
 pub const MAX_MIGRATION_HOST: usize = 1024;
 pub const MIGRATION_PUBKEY_LEN: usize = 2 * 32;
-const MIGRATION_REDIRECT_FIXED_LEN: usize =
-    3 + size_of::<u16>() + size_of::<u16>() + MIGRATION_PUBKEY_LEN + 1;
 
 impl MigrationRequest {
-    pub fn encode(&self) -> Result<Vec<u8>, Error> {
-        let mut out = Vec::with_capacity(
-            MIGRATION_REDIRECT_FIXED_LEN + self.target.as_ref().map_or(0, |t| t.host.len()),
-        );
-        out.push(server_subcmd::MIGRATION);
-        out.push(MIGRATION_REVISION);
-        match &self.target {
-            None => {
-                out.push(MIGRATION_ACTION_RETURN_HOME);
-            }
-            Some(t) => {
-                let host = t.host.as_bytes();
-                if host.is_empty() || host.len() >= MAX_MIGRATION_HOST || host.contains(&0) {
-                    return Err(Error::OutOfRange { field: "migration host", len: host.len() });
-                }
-                if t.port == 0 {
-                    return Err(Error::OutOfRange { field: "migration port", len: 0 });
-                }
-                out.push(MIGRATION_ACTION_REDIRECT);
-                out.extend_from_slice(&(host.len() as u16).to_le_bytes());
-                out.extend_from_slice(host);
-                out.extend_from_slice(&t.port.to_le_bytes());
-                out.extend_from_slice(&t.pubkey);
-            }
-        }
-        out.push(STRUCT_END);
-        Ok(out)
-    }
-
     pub fn decode(data: &[u8]) -> Option<Self> {
         let mut c = Cursor::new(data);
         c.skip_if(server_subcmd::MIGRATION);

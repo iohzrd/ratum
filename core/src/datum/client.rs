@@ -31,10 +31,6 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn new(nk: u32) -> Self {
-        Client::with_key_pairs(KeyPairs::generate(), KeyPairs::generate(), nk)
-    }
-
     pub fn with_key_pairs(long_term_keys: KeyPairs, session_keys: KeyPairs, nk: u32) -> Self {
         Client {
             long_term_keys,
@@ -44,18 +40,6 @@ impl Client {
             pool_session_sign_pk: None,
             motd: String::new(),
         }
-    }
-
-    pub fn nk(&self) -> u32 {
-        self.nk
-    }
-
-    pub fn long_term_keys(&self) -> &KeyPairs {
-        &self.long_term_keys
-    }
-
-    pub fn session_keys(&self) -> &KeyPairs {
-        &self.session_keys
     }
 
     pub fn motd(&self) -> &str {

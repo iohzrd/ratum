@@ -107,28 +107,37 @@ pub fn share_extranonce(field: &[u8; EXTRANONCE_SIZE_V2]) -> Option<Vec<u8>> {
     Some(field[EXTRANONCE_V2_PAD..].to_vec())
 }
 
+/// A Sia stratum field is two little-endian u32 halves: `nonce` carries the header's
+/// nonce then nonce2, `ntime` carries its time offset then nonce3.
+pub fn sia_field(low: u32, high: u32) -> [u8; SIA_FIELD_SIZE] {
+    let mut f = [0u8; SIA_FIELD_SIZE];
+    f[..SIA_FIELD_HALF].copy_from_slice(&low.to_le_bytes());
+    f[SIA_FIELD_HALF..].copy_from_slice(&high.to_le_bytes());
+    f
+}
+
+pub fn sia_halves(field: &[u8; SIA_FIELD_SIZE]) -> (u32, u32) {
+    let (low, high) = field.split_at(SIA_FIELD_HALF);
+    let le32 = |b: &[u8]| u32::from_le_bytes(b.try_into().expect("four bytes"));
+    (le32(low), le32(high))
+}
+
 impl Blake2bSection {
     pub fn from_header(h: &HeaderV2) -> Self {
-        let mut sia_nonce = [0u8; SIA_FIELD_SIZE];
-        sia_nonce[..SIA_FIELD_HALF].copy_from_slice(&h.nonce.to_le_bytes());
-        sia_nonce[SIA_FIELD_HALF..].copy_from_slice(&h.nonce2.to_le_bytes());
-        let mut sia_ntime = [0u8; SIA_FIELD_SIZE];
-        sia_ntime[..SIA_FIELD_HALF].copy_from_slice(&h.time_offset.to_le_bytes());
-        sia_ntime[SIA_FIELD_HALF..].copy_from_slice(&h.nonce3.to_le_bytes());
-        Blake2bSection { sia_ntime, sia_nonce, time_on_wire: h.time_on_wire() }
+        Blake2bSection {
+            sia_ntime: sia_field(h.time_offset, h.nonce3),
+            sia_nonce: sia_field(h.nonce, h.nonce2),
+            time_on_wire: h.time_on_wire(),
+        }
     }
 
     pub fn nonce_fields(&self) -> (u32, u32) {
-        (le32(&self.sia_nonce[..SIA_FIELD_HALF]), le32(&self.sia_nonce[SIA_FIELD_HALF..]))
+        sia_halves(&self.sia_nonce)
     }
 
     pub fn time_fields(&self) -> (u32, u32) {
-        (le32(&self.sia_ntime[..SIA_FIELD_HALF]), le32(&self.sia_ntime[SIA_FIELD_HALF..]))
+        sia_halves(&self.sia_ntime)
     }
-}
-
-fn le32(b: &[u8]) -> u32 {
-    u32::from_le_bytes(b.try_into().expect("four bytes"))
 }
 
 fn decode_job_section(r: &mut Cursor<'_>) -> Result<JobSection, Error> {

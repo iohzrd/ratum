@@ -267,8 +267,7 @@ struct Settings {
     abw_reveal_after: u64,
     min_difficulty: u64,
     max_connections: usize,
-    payout_address: Option<String>,
-    payout_script_hex: Option<String>,
+    payout: Option<(Payout, String)>,
     coinbase_tag: String,
     prime_id: u32,
     ledger_path: Option<String>,
@@ -284,14 +283,13 @@ struct Settings {
     poll: Duration,
     require_split: bool,
     rpc_pass_on_argv: bool,
-    payout_address_on_argv: bool,
-    payout_script_on_argv: bool,
 }
 
 fn settings(c: &cli::Cli, f: ratum_prime::config::Config) -> Settings {
     let reveal_range = abw::REVEAL_AFTER_SECS_RANGE;
     let reveal_must_be = format!("{} to {} (seconds)", reveal_range.start(), reveal_range.end());
     let max_poll_secs = ratum::SECS_PER_HOUR as f64;
+    let payout = payout_choice(c, &f);
     Settings {
         listen: cli::resolve_str(c.listen.clone(), f.listen, "0.0.0.0:28915"),
         stats_listen: c.stats_listen.clone().or(f.stats_listen),
@@ -344,8 +342,7 @@ fn settings(c: &cli::Cli, f: ratum_prime::config::Config) -> Settings {
             "a positive number",
             |n| *n > 0,
         ),
-        payout_address: c.payout_address.clone().or(f.payout_address),
-        payout_script_hex: c.payout_script.clone().or(f.payout_script),
+        payout,
         coinbase_tag: cli::resolve_str(c.coinbase_tag.clone(), f.coinbase_tag, "RATUM"),
         prime_id: cli::resolve::<u32>(
             c.prime_id.as_deref(),
@@ -420,8 +417,6 @@ fn settings(c: &cli::Cli, f: ratum_prime::config::Config) -> Settings {
             |_| true,
         ),
         rpc_pass_on_argv: c.rpc_pass.is_some(),
-        payout_address_on_argv: c.payout_address.is_some(),
-        payout_script_on_argv: c.payout_script.is_some(),
     }
 }
 
@@ -468,36 +463,55 @@ fn connect_node(
     .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))
 }
 
-fn payout_script(
-    node: &rpc::Client,
-    mut payout_address: Option<String>,
-    mut payout_script_hex: Option<String>,
-    payout_address_on_argv: bool,
-    payout_script_on_argv: bool,
-) -> Vec<u8> {
-    if payout_address.is_some() && payout_script_hex.is_some() {
-        match (payout_address_on_argv, payout_script_on_argv) {
-            (true, false) => payout_script_hex = None,
-            (false, true) => payout_address = None,
-            _ => {}
+#[derive(Clone, Copy)]
+enum Payout {
+    Address,
+    Script,
+}
+
+impl Payout {
+    fn flag(self) -> &'static str {
+        match self {
+            Payout::Address => "--payout-address",
+            Payout::Script => "--payout-script",
         }
     }
+}
 
-    let script = match (&payout_address, &payout_script_hex) {
-        (Some(_), Some(_)) => {
-            eprintln!("give --payout-address or --payout-script, not both");
-            std::process::exit(2);
+/// `--payout-address` and `--payout-script` name the pool's payout output two ways. A flag
+/// on the command line overrides whichever the configuration file set; naming both from the
+/// same source is refused, since neither is the obvious winner.
+fn payout_choice(c: &cli::Cli, f: &ratum_prime::config::Config) -> Option<(Payout, String)> {
+    let sources = [
+        (c.payout_address.as_ref(), c.payout_script.as_ref()),
+        (f.payout_address.as_ref(), f.payout_script.as_ref()),
+    ];
+    for (address, script) in sources {
+        match (address, script) {
+            (Some(a), None) => return Some((Payout::Address, a.clone())),
+            (None, Some(s)) => return Some((Payout::Script, s.clone())),
+            (Some(_), Some(_)) => {
+                eprintln!("give --payout-address or --payout-script, not both");
+                std::process::exit(2);
+            }
+            (None, None) => {}
         }
-        (None, None) => {
-            eprintln!(
-                "--payout-address (or --payout-script) is required: the gateway reserves a \
-                 coinbase output for it on every job, and it receives the value of every \
-                 fallback case (an address that does not resolve, a script too long to pay, an \
-                 empty window, a split that could not be encoded)"
-            );
-            std::process::exit(2);
-        }
-        (None, Some(hex_script)) => match hex::decode(hex_script) {
+    }
+    None
+}
+
+fn payout_script(node: &rpc::Client, payout: Option<(Payout, String)>) -> Vec<u8> {
+    let Some((kind, value)) = payout else {
+        eprintln!(
+            "--payout-address (or --payout-script) is required: the gateway reserves a \
+             coinbase output for it on every job, and it receives the value of every \
+             fallback case (an address that does not resolve, a script too long to pay, an \
+             empty window, a split that could not be encoded)"
+        );
+        std::process::exit(2);
+    };
+    let script = match kind {
+        Payout::Script => match hex::decode(&value) {
             Ok(b) if b.first() == Some(&OP_RETURN) => {
                 eprintln!(
                     "--payout-script starts with OP_RETURN, which would burn every fallback \
@@ -507,31 +521,31 @@ fn payout_script(
             }
             Ok(b) if !b.is_empty() => b,
             _ => {
-                eprintln!("--payout-script must be a non-empty hex script, got {hex_script:?}");
+                eprintln!("--payout-script must be a non-empty hex script, got {value:?}");
                 std::process::exit(2);
             }
         },
-        (Some(addr), None) => match resolve_address(node, addr) {
+        Payout::Address => match resolve_address(node, &value) {
             Ok(Resolved::Script(b)) => b,
             Ok(Resolved::NoScript) => {
-                eprintln!("the node gave no scriptPubKey for {addr:?}");
+                eprintln!("the node gave no scriptPubKey for {value:?}");
                 std::process::exit(2);
             }
             Ok(Resolved::Invalid) => {
-                eprintln!("--payout-address {addr:?} is not an address this node accepts");
+                eprintln!("--payout-address {value:?} is not an address this node accepts");
                 std::process::exit(2);
             }
             Err(e) => {
-                eprintln!("could not resolve --payout-address {addr:?}: {e}");
+                eprintln!("could not resolve --payout-address {value:?}: {e}");
                 std::process::exit(2);
             }
         },
     };
     if !output_script_size_is_valid(&script) {
-        let flag = if payout_address.is_some() { "--payout-address" } else { "--payout-script" };
         eprintln!(
-            "{flag} gives a {}-byte script, which a block carrying it would be rejected for: \
+            "{} gives a {}-byte script, which a block carrying it would be rejected for: \
              a coinbase output script may be at most {} bytes",
+            kind.flag(),
             script.len(),
             ratum::bitcoin::MAX_OUTPUT_SCRIPT_SIZE
         );
@@ -694,8 +708,7 @@ fn main() -> io::Result<()> {
         abw_reveal_after,
         min_difficulty,
         max_connections,
-        payout_address,
-        payout_script_hex,
+        payout,
         coinbase_tag,
         prime_id,
         ledger_path,
@@ -711,8 +724,6 @@ fn main() -> io::Result<()> {
         poll,
         require_split,
         rpc_pass_on_argv,
-        payout_address_on_argv,
-        payout_script_on_argv,
     } = settings(&loaded.cli, loaded.file);
 
     let data_dir = data_dir.map(PathBuf::from);
@@ -747,13 +758,7 @@ fn main() -> io::Result<()> {
     info!("pool_pubkey: {}", pool_keys.pubkey_hex());
 
     let node = connect_node(&rpc_url, &rpc_user, &rpc_pass, &rpc_cookie, rpc_pass_on_argv)?;
-    let payout_script = payout_script(
-        &node,
-        payout_address,
-        payout_script_hex,
-        payout_address_on_argv,
-        payout_script_on_argv,
-    );
+    let payout_script = payout_script(&node, payout);
     info!("pool payout script: {}", hex::encode(&payout_script));
 
     let (chain, startup_window) =

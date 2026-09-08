@@ -665,7 +665,7 @@ impl Connection<'_> {
     fn check_share(&mut self, s: &PowSubmit, now: u64) -> io::Result<ShareOutcome> {
         match self.verifier.verify(s, now) {
             Ok(a) => self.on_accepted(s, a, now),
-            Err(reason) => self.on_refused(s, reason, now),
+            Err(reason) => self.on_refused(s, reason),
         }
     }
 
@@ -728,16 +728,12 @@ impl Connection<'_> {
         Ok(ShareOutcome { verdict: ShareVerdict::Accepted, pending, raw_hash })
     }
 
-    fn on_refused(
-        &mut self,
-        s: &PowSubmit,
-        reason: RejectReason,
-        now: u64,
-    ) -> io::Result<ShareOutcome> {
+    fn on_refused(&mut self, s: &PowSubmit, reason: RejectReason) -> io::Result<ShareOutcome> {
         let peer = self.peer;
         debug!("[{peer}]   <- rejected: {reason:?}");
-        if s.is_block
-            && let Ok(w) = self.verifier.reconstruct(s, now)
+        let work = self.verifier.rebuild_refused(s);
+        if let Some(w) = &work
+            && s.is_block
         {
             warn!(
                 "[{peer}]   !! pool built header {} coinbase {}",
@@ -745,20 +741,21 @@ impl Connection<'_> {
                 hex::encode(&w.coinbase_tx)
             );
         }
-        let mut raw_hash = None;
-        if self.v3.is_some()
-            && let Some(work) = self.verifier.rebuild_refused(s)
+        let work = work.filter(|_| self.v3.is_some());
+        if let Some(w) = &work
+            && self.verifier.block_candidate(w)
         {
-            raw_hash = Some(work.raw_hash);
-            if self.verifier.block_candidate(&work) {
-                warn!(
-                    "[{peer}]   ** the refused share ({reason:?}) meets a block \
-                     target: sending the ABW receipt so the gateway counts it handled"
-                );
-                self.send_abw_receipt(s, &work)?;
-            }
+            warn!(
+                "[{peer}]   ** the refused share ({reason:?}) meets a block \
+                 target: sending the ABW receipt so the gateway counts it handled"
+            );
+            self.send_abw_receipt(s, w)?;
         }
-        Ok(ShareOutcome { verdict: ShareVerdict::Rejected(reason), pending: None, raw_hash })
+        Ok(ShareOutcome {
+            verdict: ShareVerdict::Rejected(reason),
+            pending: None,
+            raw_hash: work.map(|w| w.raw_hash),
+        })
     }
 
     fn log_and_record_owed(&self, owed: ledger::OwedBlock) {
