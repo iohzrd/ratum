@@ -123,7 +123,7 @@ fn unpack_block(hash: &[u8], bytes: &[u8]) -> Option<FoundBlock> {
     let height = c.u32("height").ok()?;
     let paid_to_split = c.u64("paid_to_split").ok()?;
     let paid_to_pool = c.u64("paid_to_pool").ok()?;
-    let difficulty = f64::from_bits(c.u64("difficulty").ok()?);
+    let difficulty = f64::from_le_bytes(c.arr("difficulty").ok()?);
     let cumulative_work = u128::from_le_bytes(c.arr("cumulative work").ok()?);
     let (finder, tag) = split_at_separator(c.rest());
     Some(FoundBlock {

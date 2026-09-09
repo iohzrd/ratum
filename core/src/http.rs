@@ -3,7 +3,7 @@ use tiny_http::{Header, Request, Response, Server};
 
 pub type Reply = Response<Cursor<Vec<u8>>>;
 
-fn header(name: &str, value: &str) -> Header {
+pub fn header(name: &str, value: &str) -> Header {
     Header::from_bytes(name.as_bytes(), value.as_bytes()).expect("static header is valid")
 }
 

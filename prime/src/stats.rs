@@ -1,5 +1,6 @@
 use crate::server::{Resolver, Server, split_after_fee};
 use log::warn;
+use ratum::hashrate::{self, History};
 use ratum::http;
 use ratum::lock;
 use ratum_prime::ledger::{self, FoundBlock};
@@ -26,12 +27,10 @@ const MAX_RETARGET_FACTOR: f64 = 4.0;
 
 const RECENT_BLOCKS: usize = 50;
 
-type HashrateHistory = Arc<Mutex<ratum::web::History>>;
-
-fn sample_hashrate(server: &Server, history: &Mutex<ratum::web::History>) {
+fn sample_hashrate(server: &Server, history: &Mutex<History>) {
     let now = ratum::unix_now();
     let (work, _) = lock(&server.ledger).work_since(now.saturating_sub(HASHRATE_SPAN_SECS));
-    ratum::web::push_sample(&mut lock(history), now, hashes_per_second(work, HASHRATE_SPAN_SECS));
+    hashrate::push_sample(&mut lock(history), now, hashes_per_second(work, HASHRATE_SPAN_SECS));
 }
 
 fn luck_percent(blocks: &[FoundBlock]) -> (Option<f64>, u32) {
@@ -53,9 +52,9 @@ fn luck_percent(blocks: &[FoundBlock]) -> (Option<f64>, u32) {
 pub(crate) fn spawn(server: Arc<Server>, listen: &str) -> Result<SocketAddr, String> {
     let http = HttpServer::http(listen).map_err(|e| e.to_string())?;
     let addr = http.server_addr().to_ip().ok_or("no socket address")?;
-    let history: HashrateHistory = Arc::new(Mutex::new(ratum::web::History::new()));
+    let history = Arc::new(Mutex::new(History::new()));
     let (sampler, sampler_history) = (Arc::clone(&server), Arc::clone(&history));
-    ratum::web::sample_periodically("stats-sampler", move || {
+    hashrate::sample_periodically("stats-sampler", move || {
         sample_hashrate(&sampler, &sampler_history);
     });
     http::serve("stats", http, move |request| {
@@ -66,11 +65,7 @@ pub(crate) fn spawn(server: Arc<Server>, listen: &str) -> Result<SocketAddr, Str
     Ok(addr)
 }
 
-fn handle(
-    server: &Server,
-    history: &Mutex<ratum::web::History>,
-    request: Request,
-) -> std::io::Result<()> {
+fn handle(server: &Server, history: &Mutex<History>, request: Request) -> std::io::Result<()> {
     if *request.method() != Method::Get {
         return request.respond(http::method_not_allowed());
     }
@@ -244,7 +239,7 @@ fn observed_block_seconds(server: &Server) -> Option<f64> {
     }
 }
 
-fn snapshot(server: &Server, history: &Mutex<ratum::web::History>) -> Value {
+fn snapshot(server: &Server, history: &Mutex<History>) -> Value {
     let tip = *lock(&server.node_view.tip);
     let coinbase_value = *lock(&server.node_view.coinbase_value);
     let operator_fee = coinbase_value.map_or(0, |v| server.payout.fee_on(v));
@@ -286,7 +281,7 @@ fn snapshot(server: &Server, history: &Mutex<ratum::web::History>) -> Value {
         "hashrate": {
             "span_seconds": HASHRATE_SPAN_SECS,
             "pool_hs": hashes_per_second(l.recent_work, HASHRATE_SPAN_SECS),
-            "interval_seconds": ratum::web::HISTORY_INTERVAL_SECS,
+            "interval_seconds": hashrate::INTERVAL_SECS,
             "history": lock(history)
                 .iter()
                 .map(|&(t, hs)| json!([t, hs as u64]))

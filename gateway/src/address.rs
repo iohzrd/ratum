@@ -21,11 +21,12 @@ const WITNESS_V0_PROGRAM_SIZES: [usize; 2] = [HASH160_SIZE, WITNESS_V1_PROGRAM_S
 const WITNESS_PROGRAM_SIZES: std::ops::RangeInclusive<usize> = 2..=40;
 const WITNESS_SCRIPT_PREFIX_SIZE: usize = 2;
 
-const MIN_ADDRESS_CHARS: usize = 16;
-pub const MAX_ADDRESS_CHARS: usize = 128;
+/// The lengths an address may have. The longest an encoding produces is 62 characters (a
+/// bech32m witness v1 program), so the upper bound only keeps decoding off long strings.
+const ADDRESS_CHARS: std::ops::Range<usize> = 16..128;
 
 pub fn to_output_script(addr: &str) -> Option<Vec<u8>> {
-    if addr.len() < MIN_ADDRESS_CHARS {
+    if !ADDRESS_CHARS.contains(&addr.len()) {
         return None;
     }
     let lower = addr.to_ascii_lowercase();

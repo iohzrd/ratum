@@ -1,6 +1,7 @@
 pub mod bitcoin;
 pub mod cursor;
 pub mod datum;
+pub mod hashrate;
 pub mod header;
 pub mod http;
 pub mod io;
@@ -10,7 +11,6 @@ pub mod rand;
 pub mod rpc;
 pub mod target;
 pub mod thread;
-pub mod web;
 
 pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("RATUM_GIT_COMMIT"), ")");
 pub const GIT_COMMIT: &str = env!("RATUM_GIT_COMMIT");

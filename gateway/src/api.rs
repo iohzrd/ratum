@@ -7,12 +7,19 @@ use ratum::http::{self, Reply};
 use serde_json::{Value, json};
 use std::io::Read as _;
 use std::sync::{Arc, LazyLock, Mutex};
-use tiny_http::{Header, Method, Request, Response};
+use tiny_http::{Method, Request};
 
-static INDEX_HTML: LazyLock<String> =
-    LazyLock::new(|| ratum::web::assemble(include_str!("status.html")));
-static CONFIG_HTML: LazyLock<String> =
-    LazyLock::new(|| ratum::web::assemble(include_str!("config.html")));
+const CSS: &str = include_str!("page.css");
+const JS: &str = include_str!("page.js");
+
+/// Replaces a page's placeholder comments with the stylesheet and script both pages share.
+fn assemble(page: &str) -> String {
+    page.replace("<!--shared-css-->", &format!("<style>\n{CSS}</style>"))
+        .replace("<!--shared-js-->", &format!("<script>\n{JS}</script>"))
+}
+
+static INDEX_HTML: LazyLock<String> = LazyLock::new(|| assemble(include_str!("status.html")));
+static CONFIG_HTML: LazyLock<String> = LazyLock::new(|| assemble(include_str!("config.html")));
 
 pub struct Context {
     pub server: Arc<Server>,
@@ -20,12 +27,12 @@ pub struct Context {
     pub started: std::time::Instant,
     pub csrf: String,
     pub config_path: String,
-    pub history: Mutex<ratum::web::History>,
+    pub history: Mutex<ratum::hashrate::History>,
 }
 
 fn sample_hashrate(ctx: &Context) {
     let hs = ctx.server.summary().hashrate_ths * ratum::HASHES_PER_TERAHASH;
-    ratum::web::push_sample(&mut ratum::lock(&ctx.history), ratum::unix_now(), hs);
+    ratum::hashrate::push_sample(&mut ratum::lock(&ctx.history), ratum::unix_now(), hs);
 }
 
 const CSRF_TOKEN_BYTES: usize = 16;
@@ -62,15 +69,12 @@ fn forbidden(why: &str) -> Reply {
 }
 
 fn unauthorized() -> Reply {
-    Response::from_string("This action requires admin access.").with_status_code(401).with_header(
-        Header::from_bytes("WWW-Authenticate", "Basic realm=\"DATUM Gateway\"").unwrap(),
-    )
+    http::text(401, "This action requires admin access.")
+        .with_header(http::header("WWW-Authenticate", "Basic realm=\"DATUM Gateway\""))
 }
 
 fn redirect(to: &str) -> Reply {
-    Response::from_string("")
-        .with_status_code(302)
-        .with_header(Header::from_bytes("Location", to).unwrap())
+    http::text(302, "").with_header(http::header("Location", to))
 }
 
 const MAX_BODY_BYTES: u64 = 1 << 20;
@@ -257,7 +261,7 @@ pub fn start(ctx: Arc<Context>) {
     } else if let Some(server) = bind("API", &cfg.api.listen_addr, cfg.api.listen_port) {
         info!("API listening on port {}", cfg.api.listen_port);
         let sampler = Arc::clone(&ctx);
-        ratum::web::sample_periodically("api-sampler", move || sample_hashrate(&sampler));
+        ratum::hashrate::sample_periodically("api-sampler", move || sample_hashrate(&sampler));
         let ctx = Arc::clone(&ctx);
         http::serve("api", server, move |req| serve_admin(&ctx, req));
     }

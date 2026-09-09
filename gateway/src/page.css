@@ -33,6 +33,7 @@
         padding: .8rem; overflow-x: auto; margin: .5rem 0 0; color: var(--fg); }
   code { color: var(--accent); }
   a { color: var(--accent); }
+  .nav a { margin-left: .75rem; }
   footer { color: var(--muted); margin-top: 1rem; font-size: .8rem; }
   .stale { color: var(--warn); }
   .good { color: var(--good); }

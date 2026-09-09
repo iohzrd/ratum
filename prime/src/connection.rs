@@ -61,7 +61,7 @@ fn read_hello(
     let mut rx = KeyRatchet::hello();
     let header_bytes =
         read_exact_deadline(stream, framing::HEADER_LEN, started, HANDSHAKE_DEADLINE)?;
-    let header = rx.unmask(header_bytes.try_into().unwrap());
+    let header = rx.unmask(header_bytes.try_into().expect("HEADER_LEN bytes"));
     debug!(
         "[{peer}] hello header: cmd={} len={} signed={} encrypted_pubkey={}",
         header.proto_cmd, header.cmd_len, header.is_signed, header.is_encrypted_pubkey
@@ -605,7 +605,6 @@ impl Connection<'_> {
     ) -> io::Result<ShareOutcome> {
         let peer = self.peer;
         let raw_hash = Some(a.work.raw_hash);
-        let mut pending = None;
         let candidate = self.verifier.block_candidate(&a.work);
         if a.is_block {
             warn!(
@@ -623,30 +622,17 @@ impl Connection<'_> {
         if candidate {
             self.send_abw_receipt(s, &a.work)?;
         }
-        if a.is_block {
-            if relay::submit_or_request_txns(peer, &self.server.node, a, s.subsidy_only) {
-                if let Some(prev) = self.awaiting_txns.insert(s.job_id, a.clone()) {
-                    error!(
-                        "[{peer}]   !! a block on job {} was still awaiting its \
-                         transactions and is abandoned: {}",
-                        s.job_id,
-                        hex::encode(prev.work.block_hash)
-                    );
-                }
-                pending = Some(validation::request_block_txns(s.job_id));
+        let pending = if a.is_block {
+            self.relay_and_record(s, a, now)
+        } else {
+            if s.is_block {
+                warn!(
+                    "[{peer}]   !! gateway flagged a block but the hash does not meet the \
+                     network target"
+                );
             }
-            self.credit.record_found_block(self.server, a, s, now);
-            if !a.work.unpaid.is_empty() {
-                self.credit.record_unpaid_outputs(self.server, &self.verifier, a, now);
-            } else if a.work.paid_to_split == 0 {
-                self.credit.record_owed_block(self.server, a, now);
-            }
-        } else if s.is_block {
-            warn!(
-                "[{peer}]   !! gateway flagged a block but the hash does not meet the \
-                 network target"
-            );
-        }
+            None
+        };
         if self.credit.is_unpayable(self.server, &s.username) {
             let verdict = ShareVerdict::Rejected(RejectReason::BadUsername);
             return Ok(ShareOutcome { verdict, pending, raw_hash });
@@ -659,6 +645,31 @@ impl Connection<'_> {
             );
         }
         Ok(ShareOutcome { verdict: ShareVerdict::Accepted, pending, raw_hash })
+    }
+
+    /// Relays the block, or holds it until the gateway sends the transactions it needs and
+    /// returns the request for them, and records the block and whatever it owes the window.
+    fn relay_and_record(&mut self, s: &PowSubmit, a: &AcceptedShare, now: u64) -> Option<Vec<u8>> {
+        let peer = self.peer;
+        let mut pending = None;
+        if relay::submit_or_request_txns(peer, &self.server.node, a, s.subsidy_only) {
+            if let Some(prev) = self.awaiting_txns.insert(s.job_id, a.clone()) {
+                error!(
+                    "[{peer}]   !! a block on job {} was still awaiting its transactions \
+                     and is abandoned: {}",
+                    s.job_id,
+                    hex::encode(prev.work.block_hash)
+                );
+            }
+            pending = Some(validation::request_block_txns(s.job_id));
+        }
+        self.credit.record_found_block(self.server, a, s, now);
+        if !a.work.unpaid.is_empty() {
+            self.credit.record_unpaid_outputs(self.server, &self.verifier, a, now);
+        } else if a.work.paid_to_split == 0 {
+            self.credit.record_owed_block(self.server, a, now);
+        }
+        pending
     }
 
     fn on_refused(&mut self, s: &PowSubmit, reason: RejectReason) -> io::Result<ShareOutcome> {

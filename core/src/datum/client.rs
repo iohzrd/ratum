@@ -124,8 +124,11 @@ impl Client {
         wire: &[u8],
         pool_sign_pk: &SignPublicKey,
     ) -> Result<(), Error> {
-        let head: [u8; framing::HEADER_LEN] =
-            wire.get(..framing::HEADER_LEN).ok_or(Error::Truncated)?.try_into().unwrap();
+        let head: [u8; framing::HEADER_LEN] = wire
+            .get(..framing::HEADER_LEN)
+            .ok_or(Error::Truncated)?
+            .try_into()
+            .expect("HEADER_LEN bytes");
         let header = self.channel.unmask_header(head);
         if header.proto_cmd != framing::cmd::HANDSHAKE_RESPONSE
             || !header.is_signed

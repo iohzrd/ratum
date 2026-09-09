@@ -8,8 +8,7 @@ pub fn address_of(username: &str) -> &str {
 }
 
 pub fn is_payable(username: &str) -> bool {
-    let a = address_of(username);
-    !a.is_empty() && a.len() < address::MAX_ADDRESS_CHARS && address::is_valid(a)
+    address::is_valid(address_of(username))
 }
 
 pub const SELECTOR_SPACE: f64 = 65536.0;

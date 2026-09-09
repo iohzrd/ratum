@@ -66,8 +66,7 @@ fn admin_client_json(cfg: &Config, c: &ClientStats) -> Value {
 }
 
 fn miner_client_json(c: &ClientStats) -> Value {
-    let connected = c.subscribed_at.map_or(0.0, |t| t.elapsed().as_secs_f64());
-    super::with_fields(client_json(c), [("connected_seconds", json!(connected))])
+    super::with_fields(client_json(c), [("connected_seconds", json!(seconds_ago(c.subscribed_at)))])
 }
 
 fn job_json(j: &Job) -> Value {
@@ -144,7 +143,7 @@ pub(super) fn status_json(ctx: &Context, with_clients: bool) -> Value {
         "work_update_seconds": cfg.bitcoind.work_update_seconds,
         "stale_window_seconds": cfg.stale_window().as_secs(),
         "hashrate": {
-            "interval_seconds": ratum::web::HISTORY_INTERVAL_SECS,
+            "interval_seconds": ratum::hashrate::INTERVAL_SECS,
             "history": ratum::lock(&ctx.history)
                 .iter()
                 .map(|(at, hs)| json!([at, hs.round()]))
@@ -194,7 +193,7 @@ impl MinerTotals {
 
 pub(super) fn miner_lookup_json(ctx: &Context, addr: Option<&str>) -> Value {
     let cfg = &ctx.server.config;
-    let valid = addr.filter(|a| a.len() < address::MAX_ADDRESS_CHARS && address::is_valid(a));
+    let valid = addr.filter(|a| address::is_valid(a));
     let clients = valid.map_or_else(Vec::new, |a| {
         ctx.server.client_stats_where(|c| c.subscribed && username::address_of(&c.username) == a)
     });

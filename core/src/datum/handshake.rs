@@ -174,7 +174,7 @@ pub fn open_hello(header: Header, payload: &[u8], pool: &KeyPairs) -> Result<Hel
     if after[0] != STRUCT_END {
         return Err(Error::Malformed("no 0xFE after user agent"));
     }
-    let nk = u32::from_le_bytes(after[1..AFTER_UA_LEN].try_into().unwrap());
+    let nk = u32::from_le_bytes(after[1..AFTER_UA_LEN].try_into().expect("AFTER_UA_LEN - 1 bytes"));
 
     let tail = &after[AFTER_UA_LEN..];
     let generation = if tail.len() > DRS_FLAG_AT && tail[..DRS_FLAG_AT] == DRS_MARKER {
