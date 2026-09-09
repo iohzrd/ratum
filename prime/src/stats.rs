@@ -7,15 +7,8 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 use tiny_http::{Method, Request, Server as HttpServer};
-
-static PAGE_TEMPLATE: LazyLock<String> =
-    LazyLock::new(|| ratum::web::assemble(include_str!("stats.html")));
-
-const DESCRIPTION: &str = "Non-custodial Bitcoin BLAKE2b mining pool on the Bitcoin Knots \
-                           hardfork chain: miners run a DATUM gateway, build their own \
-                           blocks and are paid from the coinbase.";
 
 const HASHRATE_SPAN_SECS: u64 = 10 * ratum::SECS_PER_MINUTE;
 
@@ -83,110 +76,9 @@ fn handle(
     }
     let (path, _) = http::path_and_query(&request);
     match path.as_str() {
-        "/" | "/index.html" => {
-            let origin = request_origin(&request);
-            let page = page(&snapshot(server, history), origin.as_deref());
-            request.respond(http::html(page))
-        }
         "/stats.json" => request.respond(http::noindex(http::json(snapshot(server, history)))),
-        "/robots.txt" => request.respond(http::plain(ROBOTS.to_string())),
         _ => request.respond(http::not_found()),
     }
-}
-
-const ROBOTS: &str = "User-agent: *\nAllow: /\n";
-
-fn request_origin(request: &Request) -> Option<String> {
-    let host = http::header_value(request, "Host")?;
-    if !usable_host(&host) {
-        return None;
-    }
-    let proto = match http::header_value(request, "X-Forwarded-Proto").as_deref() {
-        Some("https") => "https",
-        _ => "http",
-    };
-    Some(format!("{proto}://{host}"))
-}
-
-const MAX_HOST_CHARS: usize = 255;
-
-fn usable_host(host: &str) -> bool {
-    !host.is_empty()
-        && host.len() <= MAX_HOST_CHARS
-        && host.chars().all(|c| c.is_ascii_alphanumeric() || "-.:[]".contains(c))
-}
-
-fn page(snapshot: &Value, origin: Option<&str>) -> String {
-    let chain = snapshot["network"]["chain"].as_str();
-    PAGE_TEMPLATE
-        .replace("<!--head-->", &head(chain, origin))
-        .replace("<!--summary-->", &summary(snapshot))
-        .replace("<!--snapshot-->", &snapshot.to_string().replace("</", "<\\/"))
-}
-
-fn head(chain: Option<&str>, origin: Option<&str>) -> String {
-    let network = match chain {
-        Some(c) if c != "main" && !c.is_empty() => format!(" {c}"),
-        _ => String::new(),
-    };
-    let title = attr(&format!("Bitcoin BLAKE2b{network} mining pool - RATUM Prime"));
-    let description = attr(DESCRIPTION);
-    let icon = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'\
-                %3E%3Crect width='16' height='16' rx='3' fill='%230f1115'/%3E%3Ctext x='8' \
-                y='12' font-size='11' font-family='monospace' font-weight='bold' \
-                text-anchor='middle' fill='%236ea8fe'%3ER%3C/text%3E%3C/svg%3E";
-    let canonical = origin.map_or(String::new(), |o| {
-        let url = attr(&format!("{o}/"));
-        format!(
-            "<link rel=\"canonical\" href=\"{url}\">\n<meta property=\"og:url\" content=\"{url}\">\n"
-        )
-    });
-    format!(
-        "<title>{title}</title>\n\
-         <meta name=\"description\" content=\"{description}\">\n\
-         <link rel=\"icon\" href=\"{icon}\">\n\
-         {canonical}\
-         <meta property=\"og:type\" content=\"website\">\n\
-         <meta property=\"og:site_name\" content=\"RATUM Prime\">\n\
-         <meta property=\"og:title\" content=\"{title}\">\n\
-         <meta property=\"og:description\" content=\"{description}\">\n\
-         <meta name=\"twitter:card\" content=\"summary\">\n"
-    )
-}
-
-fn summary(snapshot: &Value) -> String {
-    let chain = snapshot["network"]["chain"].as_str().unwrap_or("");
-    let height = snapshot["network"]["tip_height"].as_u64();
-    let rate = snapshot["hashrate"]["pool_hs"].as_f64().unwrap_or(0.0);
-    let miners = snapshot["window"]["miners"].as_array().map_or(0, Vec::len);
-    let found = snapshot["blocks"]["found"].as_u64().unwrap_or(0);
-    let at = match (chain.is_empty(), height) {
-        (false, Some(h)) => format!(" on {} at height {h}", attr(chain)),
-        (false, None) => format!(" on {}", attr(chain)),
-        (true, _) => String::new(),
-    };
-    format!(
-        "{DESCRIPTION} It is mining{at}, at about {} across {miners} miners in the payout \
-         window, with {found} blocks found. The figures on this page are updated by a \
-         script, which is not running.",
-        hashrate_text(rate)
-    )
-}
-
-fn hashrate_text(hs: f64) -> String {
-    const UNITS: [&str; 7] = ["H/s", "kH/s", "MH/s", "GH/s", "TH/s", "PH/s", "EH/s"];
-    const SI_STEP: f64 = 1000.0;
-    let mut hs = hs;
-    let mut i = 0;
-    while hs >= SI_STEP && i < UNITS.len() - 1 {
-        hs /= SI_STEP;
-        i += 1;
-    }
-    format!("{hs:.1} {}", UNITS[i])
-}
-
-fn attr(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
 fn network_json(

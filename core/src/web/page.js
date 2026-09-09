@@ -1,26 +1,13 @@
 function num(n) { return n == null ? "-" : Number(n).toLocaleString(); }
 function esc(s) { return String(s == null ? "" : s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
-function ths(t) { return t == null ? "-" : Number(t).toFixed(3) + " TH/s"; }
-function card(label, value) {
-  return `<div class="card"><div class="label">${label}</div><div class="value">${value}</div></div>`;
-}
 function unreachable() {
   document.getElementById("updated").innerHTML = '<span class="stale">unreachable</span>';
 }
 function updated(when) {
   document.getElementById("updated").textContent = "updated " + (when || new Date()).toLocaleTimeString();
 }
-// The snapshot the server embedded in the page, or null when it embedded none. The pool
-// page carries one so the first paint, and a crawler that renders the page without
-// fetching, have the figures.
-function embedded() {
-  const el = document.getElementById("snapshot");
-  if (!el || !el.textContent.trim()) return null;
-  try { return JSON.parse(el.textContent); } catch (e) { return null; }
-}
-
 // Fetch `url` as JSON every 5 s and pass it to `render`; the header shows when the page
-// last succeeded or that the server is unreachable. An embedded snapshot renders first.
+// last succeeded or that the server is unreachable.
 function poll(url, render) {
   async function tick() {
     let s;
@@ -33,8 +20,6 @@ function poll(url, render) {
     }
     render(s);
   }
-  const seed = embedded();
-  if (seed) render(seed);
   tick();
   setInterval(tick, 5000);
 }

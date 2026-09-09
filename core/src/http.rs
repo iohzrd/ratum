@@ -21,10 +21,6 @@ pub fn json(v: serde_json::Value) -> Reply {
     body(v.to_string(), "application/json")
 }
 
-pub fn plain(text: String) -> Reply {
-    body(text, "text/plain; charset=utf-8")
-}
-
 pub fn noindex(reply: Reply) -> Reply {
     reply.with_header(header("X-Robots-Tag", "noindex"))
 }

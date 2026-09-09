@@ -11,8 +11,6 @@ use tiny_http::{Header, Method, Request, Response};
 
 static INDEX_HTML: LazyLock<String> =
     LazyLock::new(|| ratum::web::assemble(include_str!("status.html")));
-static MINER_HTML: LazyLock<String> =
-    LazyLock::new(|| ratum::web::assemble(include_str!("miner.html")));
 static CONFIG_HTML: LazyLock<String> =
     LazyLock::new(|| ratum::web::assemble(include_str!("config.html")));
 
@@ -235,11 +233,9 @@ fn serve_miner(ctx: &Context, req: Request) {
         http::method_not_allowed()
     } else if path != "/" {
         http::not_found()
-    } else if http::param(&query, "format").as_deref() == Some("json") {
+    } else {
         let addr = http::param(&query, "addr");
         http::json(snapshot::miner_lookup_json(ctx, addr.as_deref()))
-    } else {
-        http::html(MINER_HTML.clone())
     };
     let _ = req.respond(response);
 }
