@@ -174,6 +174,24 @@ fn decode_job_section(r: &mut Cursor<'_>) -> Result<JobSection, Error> {
     })
 }
 
+fn encode_job_section(out: &mut Vec<u8>, j: &JobSection) {
+    out.push(SECTION_JOB);
+    out.extend_from_slice(&j.prev_hash);
+    out.extend_from_slice(&j.target_byte_index.to_le_bytes());
+    out.extend_from_slice(&j.nbits);
+    out.push(j.coinbaser_id);
+    out.extend_from_slice(&j.height.to_le_bytes());
+    out.extend_from_slice(&j.coinbase_value.to_le_bytes());
+    out.extend_from_slice(&j.txn_count.to_le_bytes());
+    out.extend_from_slice(&j.txn_total_weight.to_le_bytes());
+    out.extend_from_slice(&j.txn_total_size.to_le_bytes());
+    out.extend_from_slice(&j.txn_total_sigops.to_le_bytes());
+    out.push(j.merkle_branches.len() as u8);
+    for b in &j.merkle_branches {
+        out.extend_from_slice(b);
+    }
+}
+
 fn decode_coinbase_section(r: &mut Cursor<'_>) -> Result<CoinbaseSection, Error> {
     let coinbase_id = r.u8("coinbase section id")?;
     let len1 = r.u16("coinb1 len")? as usize;
@@ -181,6 +199,15 @@ fn decode_coinbase_section(r: &mut Cursor<'_>) -> Result<CoinbaseSection, Error>
     let coinb1 = r.take(len1, "coinb1")?.to_vec();
     let coinb2 = r.take(len2, "coinb2")?.to_vec();
     Ok(CoinbaseSection { coinbase_id, coinb1, coinb2 })
+}
+
+fn encode_coinbase_section(out: &mut Vec<u8>, c: &CoinbaseSection) {
+    out.push(SECTION_COINBASE);
+    out.push(c.coinbase_id);
+    out.extend_from_slice(&(c.coinb1.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(c.coinb2.len() as u16).to_le_bytes());
+    out.extend_from_slice(&c.coinb1);
+    out.extend_from_slice(&c.coinb2);
 }
 
 fn decode_blake2b_section(r: &mut Cursor<'_>) -> Result<Blake2bSection, Error> {
@@ -194,6 +221,15 @@ fn decode_blake2b_section(r: &mut Cursor<'_>) -> Result<Blake2bSection, Error> {
     }
     let time_on_wire = r.u32("time on wire")?;
     Ok(Blake2bSection { sia_ntime, sia_nonce, time_on_wire })
+}
+
+fn encode_blake2b_section(out: &mut Vec<u8>, b: &Blake2bSection) {
+    out.push(SECTION_BLAKE2B);
+    out.push(BLAKE2B_ALGORITHM);
+    out.extend_from_slice(&b.sia_ntime);
+    out.extend_from_slice(&b.sia_nonce);
+    out.push(BLAKE2B_TIME);
+    out.extend_from_slice(&b.time_on_wire.to_le_bytes());
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -323,37 +359,12 @@ impl PowSubmit {
         }
         out.extend_from_slice(&reserved);
         if let Some(j) = &self.job {
-            out.push(SECTION_JOB);
-            out.extend_from_slice(&j.prev_hash);
-            out.extend_from_slice(&j.target_byte_index.to_le_bytes());
-            out.extend_from_slice(&j.nbits);
-            out.push(j.coinbaser_id);
-            out.extend_from_slice(&j.height.to_le_bytes());
-            out.extend_from_slice(&j.coinbase_value.to_le_bytes());
-            out.extend_from_slice(&j.txn_count.to_le_bytes());
-            out.extend_from_slice(&j.txn_total_weight.to_le_bytes());
-            out.extend_from_slice(&j.txn_total_size.to_le_bytes());
-            out.extend_from_slice(&j.txn_total_sigops.to_le_bytes());
-            out.push(j.merkle_branches.len() as u8);
-            for b in &j.merkle_branches {
-                out.extend_from_slice(b);
-            }
+            encode_job_section(&mut out, j);
         }
         if let Some(c) = &self.coinbase {
-            out.push(SECTION_COINBASE);
-            out.push(c.coinbase_id);
-            out.extend_from_slice(&(c.coinb1.len() as u16).to_le_bytes());
-            out.extend_from_slice(&(c.coinb2.len() as u16).to_le_bytes());
-            out.extend_from_slice(&c.coinb1);
-            out.extend_from_slice(&c.coinb2);
+            encode_coinbase_section(&mut out, c);
         }
-        let b = &self.blake2b;
-        out.push(SECTION_BLAKE2B);
-        out.push(BLAKE2B_ALGORITHM);
-        out.extend_from_slice(&b.sia_ntime);
-        out.extend_from_slice(&b.sia_nonce);
-        out.push(BLAKE2B_TIME);
-        out.extend_from_slice(&b.time_on_wire.to_le_bytes());
+        encode_blake2b_section(&mut out, &self.blake2b);
         if let Some(slot) = self.abw_slot {
             out.push(SECTION_ABW_SLOT);
             out.push(slot);

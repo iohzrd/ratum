@@ -27,20 +27,22 @@ struct Sink {
 }
 
 impl Sink {
-    fn write(&self, line: &[u8]) {
+    /// Runs `f` on whichever stream this sink writes to. Both callers ignore the result:
+    /// a logger that cannot report a failure has nowhere to report it.
+    fn on_stream(&self, f: impl FnOnce(&mut dyn Write) -> std::io::Result<()>) {
         let _ = match &self.output {
-            Output::Stdout => std::io::stdout().write_all(line),
-            Output::Stderr => std::io::stderr().write_all(line),
-            Output::File(f) => (&*f).write_all(line),
+            Output::Stdout => f(&mut std::io::stdout().lock()),
+            Output::Stderr => f(&mut std::io::stderr().lock()),
+            Output::File(file) => f(&mut &*file),
         };
     }
 
+    fn write(&self, line: &[u8]) {
+        self.on_stream(|w| w.write_all(line));
+    }
+
     fn flush(&self) {
-        let _ = match &self.output {
-            Output::Stdout => std::io::stdout().flush(),
-            Output::Stderr => std::io::stderr().flush(),
-            Output::File(f) => (&*f).flush(),
-        };
+        self.on_stream(|w| w.flush());
     }
 }
 

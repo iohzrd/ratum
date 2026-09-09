@@ -108,18 +108,27 @@ fn settings_access(ctx: &Context, req: &Request) -> Result<(), Reply> {
     admin_access(ctx, req, "The settings page requires api.admin_password to be set.")
 }
 
+/// `base`, which must be a JSON object, with `fields` added to it.
+fn with_fields(mut base: Value, fields: impl IntoIterator<Item = (&'static str, Value)>) -> Value {
+    let o = base.as_object_mut().expect("a JSON object");
+    o.extend(fields.into_iter().map(|(k, v)| (k.to_string(), v)));
+    base
+}
+
 fn settings_json(ctx: &Context) -> Value {
     let cfg = &ctx.server.config;
     let doc = std::fs::read_to_string(&ctx.config_path)
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
         .unwrap_or(Value::Null);
-    let mut v = crate::settings::form_values(cfg, &doc);
-    let o = v.as_object_mut().expect("an object");
-    o.insert("editable".into(), json!(cfg.api.modify_conf));
-    o.insert("config_path".into(), json!(ctx.config_path));
-    o.insert("csrf".into(), json!(ctx.csrf));
-    v
+    with_fields(
+        crate::settings::form_values(cfg, &doc),
+        [
+            ("editable", json!(cfg.api.modify_conf)),
+            ("config_path", json!(ctx.config_path)),
+            ("csrf", json!(ctx.csrf)),
+        ],
+    )
 }
 
 fn save_settings(ctx: &Context, body: &str) -> (Reply, bool) {

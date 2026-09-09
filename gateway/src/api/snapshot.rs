@@ -56,26 +56,26 @@ fn client_json(c: &ClientStats) -> Value {
 
 /// `client_json` plus the fields only an authorized admin page sees.
 fn admin_client_json(cfg: &Config, c: &ClientStats) -> Value {
-    let mut v = client_json(c);
     let unpayable = cfg.stratum.require_address_username && !username::is_payable(&c.username);
-    let o = v.as_object_mut().expect("an object");
-    o.insert("subscribed_seconds".into(), json!(seconds_ago(c.subscribed_at)));
-    o.insert("id".into(), json!(c.unique_id));
-    o.insert("remote".into(), json!(c.remote));
-    o.insert("username".into(), json!(c.username));
-    o.insert("unpayable".into(), json!(unpayable));
-    o.insert("useragent".into(), json!(c.useragent));
-    o.insert("subscribed".into(), json!(c.subscribed));
-    v
+    super::with_fields(
+        client_json(c),
+        [
+            ("subscribed_seconds", json!(seconds_ago(c.subscribed_at))),
+            ("id", json!(c.unique_id)),
+            ("remote", json!(c.remote)),
+            ("username", json!(c.username)),
+            ("unpayable", json!(unpayable)),
+            ("useragent", json!(c.useragent)),
+            ("subscribed", json!(c.subscribed)),
+        ],
+    )
 }
 
 /// `client_json` plus the connection age, which the miner page shows in place of the
 /// identifying fields it may not see.
 fn miner_client_json(c: &ClientStats) -> Value {
-    let mut v = client_json(c);
     let connected = c.subscribed_at.map_or(0.0, |t| t.elapsed().as_secs_f64());
-    v.as_object_mut().expect("an object").insert("connected_seconds".into(), json!(connected));
-    v
+    super::with_fields(client_json(c), [("connected_seconds", json!(connected))])
 }
 
 fn job_json(j: &Job) -> Value {

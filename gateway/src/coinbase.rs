@@ -1,7 +1,7 @@
 use crate::template::Template;
 use ratum::bitcoin::opcode::{
-    MAX_DIRECT_PUSH_OPCODE, OP_0, OP_16, OP_CHECKMULTISIG, OP_CHECKMULTISIGVERIFY, OP_CHECKSIG,
-    OP_CHECKSIGVERIFY, OP_N_BASE, OP_PUSHDATA1, OP_PUSHDATA2, OP_PUSHDATA4, OP_RETURN,
+    OP_0, OP_16, OP_CHECKMULTISIG, OP_CHECKMULTISIGVERIFY, OP_CHECKSIG, OP_CHECKSIGVERIFY,
+    OP_N_BASE, OP_RETURN,
 };
 use ratum::bitcoin::{
     HASH_SIZE, LOCK_TIME_SIZE, MIN_OUTPUT_SIZE, NULL_OUTPOINT_INDEX, OUTPOINT_SIZE, SEQUENCE_FINAL,
@@ -243,46 +243,19 @@ const MAX_TXN_COUNT_SIZE: usize = 5;
 
 const COINBASE_WITNESS_BYTES: u64 = 36;
 
+/// The sigop cost a coinbase output script contributes, counting each signature opcode
+/// the way a block's sigop limit does: an unexecuted `OP_CHECKMULTISIG` counts for the
+/// largest key count it could name.
 pub fn output_sigop_cost(script: &[u8]) -> u64 {
     const MAX_PUBKEYS_PER_MULTISIG: u64 = 20;
 
-    let mut cost = 0u64;
-    let mut i = 0usize;
-    while i < script.len() {
-        let op = script[i];
-        i += 1;
-        let push = match op {
-            0x01..=MAX_DIRECT_PUSH_OPCODE => usize::from(op),
-            OP_PUSHDATA1 => {
-                let n = script.get(i).map_or(0, |&b| usize::from(b));
-                i += 1;
-                n
-            }
-            OP_PUSHDATA2 => {
-                let n = script
-                    .get(i..i + size_of::<u16>())
-                    .map_or(0, |b| usize::from(u16::from_le_bytes([b[0], b[1]])));
-                i += size_of::<u16>();
-                n
-            }
-            OP_PUSHDATA4 => {
-                let n = script
-                    .get(i..i + size_of::<u32>())
-                    .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize);
-                i += size_of::<u32>();
-                n
-            }
-            OP_CHECKSIG | OP_CHECKSIGVERIFY => {
-                cost += WITNESS_SCALE_FACTOR;
-                0
-            }
+    ratum::bitcoin::script_ops(script)
+        .map(|op| match op.opcode {
+            OP_CHECKSIG | OP_CHECKSIGVERIFY => WITNESS_SCALE_FACTOR,
             OP_CHECKMULTISIG | OP_CHECKMULTISIGVERIFY => {
-                cost += MAX_PUBKEYS_PER_MULTISIG * WITNESS_SCALE_FACTOR;
-                0
+                MAX_PUBKEYS_PER_MULTISIG * WITNESS_SCALE_FACTOR
             }
             _ => 0,
-        };
-        i = i.saturating_add(push);
-    }
-    cost
+        })
+        .sum()
 }

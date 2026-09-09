@@ -90,6 +90,9 @@ impl ClientConfig {
         let payout_script = c.take(a, "payout script").ok()?.to_vec();
         let prime_id = c.u32("prime id").ok()?;
         let b = c.u8("tag length").ok()? as usize;
+        if b > MAX_COINBASE_TAG {
+            return None;
+        }
         let coinbase_tag = String::from_utf8_lossy(c.take(b, "coinbase tag").ok()?).into_owned();
         let min_difficulty = c.u64("min difficulty").ok()?;
         if c.arr("terminator").ok()? != [0, STRUCT_END] {

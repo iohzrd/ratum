@@ -1,4 +1,4 @@
-use ratum::datum::share::{EXTRANONCE_SIZE_V2, SIA_FIELD_HALF, SIA_FIELD_SIZE};
+use ratum::datum::share::{self, EXTRANONCE_SIZE_V2, SIA_FIELD_SIZE};
 use ratum::header::blake2b_256;
 use ratum::target;
 use std::io::{BufRead, BufReader, Write};
@@ -235,8 +235,7 @@ fn main() -> std::io::Result<()> {
                     "found nonce {nonce:#010x} in {secs:.1}s ({:.0} MH/s)",
                     (f64::from(nonce) / secs) / 1e6
                 );
-                let mut nonce_field = [0u8; SIA_FIELD_SIZE];
-                nonce_field[..SIA_FIELD_HALF].copy_from_slice(&nonce.to_le_bytes());
+                let nonce_field = share::sia_field(nonce, 0);
                 submitted += 1;
                 writeln!(
                     w,

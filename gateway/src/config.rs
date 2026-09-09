@@ -260,6 +260,14 @@ pub const WIDE_PRIME_PUSH_EXTRA_BYTES: usize = 4;
 pub const MAX_CONFIGURED_TAG: usize = 60;
 pub const MAX_CONFIGURED_TAGS_TOTAL: usize = 88;
 
+fn at_least(name: &str, value: u64, min: u64) -> Result<(), String> {
+    if value < min { Err(format!("{name} must be at least {min}")) } else { Ok(()) }
+}
+
+fn at_most(name: &str, value: u64, max: u64) -> Result<(), String> {
+    if value > max { Err(format!("{name} must be at most {max}")) } else { Ok(()) }
+}
+
 impl Config {
     pub fn parse(text: &str) -> Result<Self, String> {
         let mut c: Self = serde_json::from_str(text).map_err(|e| e.to_string())?;
@@ -301,35 +309,31 @@ impl Config {
 
     fn validate_stratum(&mut self) -> Result<(), String> {
         let s = &self.stratum;
-        if s.max_threads > MAX_THREADS {
-            return Err(format!("stratum.max_threads must be at most {MAX_THREADS}"));
-        }
-        if s.max_clients_per_thread > MAX_CLIENTS_THREAD {
-            return Err(format!(
-                "stratum.max_clients_per_thread must be at most {MAX_CLIENTS_THREAD}"
-            ));
-        }
+        at_most("stratum.max_threads", s.max_threads as u64, MAX_THREADS as u64)?;
+        at_most(
+            "stratum.max_clients_per_thread",
+            s.max_clients_per_thread as u64,
+            MAX_CLIENTS_THREAD as u64,
+        )?;
         if s.max_clients > s.max_clients_per_thread * s.max_threads {
             return Err("stratum.max_clients exceeds max_clients_per_thread * max_threads".into());
         }
-        if s.vardiff_min == 0 {
-            return Err("stratum.vardiff_min must be at least 1".into());
-        }
-        if s.vardiff_target_shares_min < MIN_VARDIFF_TARGET_SHARES_MIN {
-            return Err(format!(
-                "stratum.vardiff_target_shares_min must be at least {MIN_VARDIFF_TARGET_SHARES_MIN}"
-            ));
-        }
-        if s.vardiff_quickdiff_count < MIN_VARDIFF_QUICKDIFF_COUNT {
-            return Err(format!(
-                "stratum.vardiff_quickdiff_count must be at least {MIN_VARDIFF_QUICKDIFF_COUNT}"
-            ));
-        }
-        if s.vardiff_quickdiff_delta < MIN_VARDIFF_QUICKDIFF_DELTA {
-            return Err(format!(
-                "stratum.vardiff_quickdiff_delta must be at least {MIN_VARDIFF_QUICKDIFF_DELTA}"
-            ));
-        }
+        at_least("stratum.vardiff_min", s.vardiff_min, 1)?;
+        at_least(
+            "stratum.vardiff_target_shares_min",
+            s.vardiff_target_shares_min,
+            MIN_VARDIFF_TARGET_SHARES_MIN,
+        )?;
+        at_least(
+            "stratum.vardiff_quickdiff_count",
+            s.vardiff_quickdiff_count,
+            MIN_VARDIFF_QUICKDIFF_COUNT,
+        )?;
+        at_least(
+            "stratum.vardiff_quickdiff_delta",
+            s.vardiff_quickdiff_delta,
+            MIN_VARDIFF_QUICKDIFF_DELTA,
+        )?;
         if !SHARE_STALE_SECONDS_RANGE.contains(&s.share_stale_seconds) {
             return Err(format!(
                 "stratum.share_stale_seconds must be {}..{}",

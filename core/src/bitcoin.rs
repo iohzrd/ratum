@@ -255,29 +255,59 @@ pub fn parse_coinbase(tx: &[u8]) -> Result<CoinbaseTx, TxError> {
     })
 }
 
-/// Every data push in `script`, as the offset its data starts at and the data itself.
-/// Scanning stops at the first push that runs past the end of the script.
-pub fn script_pushes(script: &[u8]) -> Vec<(usize, &[u8])> {
-    let mut out = Vec::new();
-    let mut i = 0usize;
-    while i < script.len() {
-        let op = script[i];
-        let (data_at, len) = match op {
-            0x01..=opcode::MAX_DIRECT_PUSH_OPCODE => (i + 1, op as usize),
-            opcode::OP_PUSHDATA1 => {
-                let Some(&n) = script.get(i + 1) else { break };
-                (i + 2, n as usize)
-            }
+/// One step of a script: the opcode, and for a push the offset its data starts at and
+/// the data itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScriptOp<'a> {
+    pub opcode: u8,
+    pub push: Option<(usize, &'a [u8])>,
+}
+
+/// Walks `script` one opcode at a time. Scanning stops at the first push whose length
+/// field or data runs past the end of the script, which is where Bitcoin Core's own
+/// script walk stops.
+pub fn script_ops(script: &[u8]) -> impl Iterator<Item = ScriptOp<'_>> {
+    ScriptOps { script, at: 0 }
+}
+
+struct ScriptOps<'a> {
+    script: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Iterator for ScriptOps<'a> {
+    type Item = ScriptOp<'a>;
+
+    fn next(&mut self) -> Option<ScriptOp<'a>> {
+        let opcode = *self.script.get(self.at)?;
+        let length_bytes = match opcode {
+            0x01..=opcode::MAX_DIRECT_PUSH_OPCODE => 0,
+            opcode::OP_PUSHDATA1 => 1,
+            opcode::OP_PUSHDATA2 => 2,
+            opcode::OP_PUSHDATA4 => 4,
             _ => {
-                i += 1;
-                continue;
+                self.at += 1;
+                return Some(ScriptOp { opcode, push: None });
             }
         };
-        let Some(data) = script.get(data_at..data_at + len) else { break };
-        out.push((data_at, data));
-        i = data_at + len;
+        let after_opcode = self.at + 1;
+        let (data_at, len) = if length_bytes == 0 {
+            (after_opcode, usize::from(opcode))
+        } else {
+            let field = self.script.get(after_opcode..after_opcode + length_bytes)?;
+            let len = field.iter().rev().fold(0usize, |n, b| (n << 8) | usize::from(*b));
+            (after_opcode + length_bytes, len)
+        };
+        let end = data_at.checked_add(len)?;
+        let data = self.script.get(data_at..end)?;
+        self.at = end;
+        Some(ScriptOp { opcode, push: Some((data_at, data)) })
     }
-    out
+}
+
+/// Every data push in `script`, as the offset its data starts at and the data itself.
+pub fn script_pushes(script: &[u8]) -> Vec<(usize, &[u8])> {
+    script_ops(script).filter_map(|op| op.push).collect()
 }
 
 pub fn output_script_size_is_valid(script: &[u8]) -> bool {

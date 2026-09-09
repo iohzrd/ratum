@@ -16,6 +16,11 @@ use std::net::SocketAddr;
 /// and for reporting an unpayable name once rather than per share.
 const MAX_CREDITED_NAMES: usize = 4096;
 
+/// The ending that makes "identit{}" agree with a count.
+fn identity_suffix(count: usize) -> &'static str {
+    if count == 1 { "y" } else { "ies" }
+}
+
 /// One connection's crediting state: what it has already logged, so that a long-lived
 /// connection repeats neither a running total nor an unpayable-name warning.
 pub(crate) struct Crediting {
@@ -94,7 +99,7 @@ impl Crediting {
              script received {value} sats of which {} are owed to {} identit{}:",
             owed.total,
             owed.entries.len(),
-            if owed.entries.len() == 1 { "y" } else { "ies" },
+            identity_suffix(owed.entries.len()),
         );
         self.log_and_record_owed(server, owed);
     }
@@ -133,7 +138,7 @@ impl Crediting {
             a.work.unpaid.len(),
             a.work.paid_to_pool,
             entries.len(),
-            if entries.len() == 1 { "y" } else { "ies" },
+            identity_suffix(entries.len()),
         );
         self.log_and_record_owed(
             server,
