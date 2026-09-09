@@ -1,5 +1,3 @@
-//! Random bytes from libsodium's CSPRNG, the one source the workspace draws from.
-
 pub fn fill(buf: &mut [u8]) {
     dryoc::rng::copy_randombytes(buf);
 }

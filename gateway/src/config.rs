@@ -1,7 +1,3 @@
-//! The gateway's configuration file: the schema it deserializes into and the checks it
-//! must pass before the process starts. The settings page's editor for the same file is
-//! in `settings`.
-
 use serde::Deserialize;
 
 const EXTRA_JOBS_PER_TIP: u64 = 2;

@@ -1,6 +1,3 @@
-//! The pool's record of the shares it credited: the payout window it keeps in memory and
-//! the blocks and owed amounts it has found. The redb file behind it is in `store`.
-
 mod store;
 
 use std::collections::{HashMap, VecDeque};
@@ -8,7 +5,6 @@ use std::io;
 use std::path::Path;
 use store::Store;
 
-/// The most shares the payout window holds, whatever work they sum to.
 pub(crate) const MAX_SHARES: usize = 1 << 20;
 
 pub const SHARES_PER_KEEP_UNIT: u64 = MAX_SHARES as u64;
@@ -24,7 +20,6 @@ pub struct Share {
     pub tag: String,
 }
 
-/// What opening a ledger found in it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ReadBack {
     pub skipped: usize,
@@ -135,7 +130,6 @@ impl Ledger {
         self.shares.len().saturating_sub(before)
     }
 
-    /// Replaces the in-memory window with `shares`, oldest first.
     fn fill(&mut self, shares: Vec<Share>) {
         self.shares.clear();
         self.work_per_identity.clear();

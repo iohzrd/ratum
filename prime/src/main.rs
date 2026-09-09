@@ -69,9 +69,6 @@ fn init_logging() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 }
 
-/// Reads the node's chain and difficulty, which name the ledger file and size the share
-/// window. Without a ledger file the read may fail and the window starts at its floor;
-/// with one the chain must be known, so this waits for the node.
 fn startup_chain_and_window(
     node: &rpc::Client,
     location: &LedgerLocation,
@@ -106,7 +103,6 @@ fn startup_chain_and_window(
     (tip.map(|t| t.chain), window)
 }
 
-/// Starts the thread that follows the node's tip, and reports what it will do.
 fn watch_node_in_background(
     node: &rpc::Client,
     view: &Arc<NodeView>,
@@ -123,7 +119,6 @@ fn watch_node_in_background(
     );
 }
 
-/// The guard against crediting one share twice, seeded with the hashes the ledger holds.
 fn replay_guard(ledger: &ledger::Ledger) -> Arc<Mutex<ReplayGuard>> {
     let mut guard = ReplayGuard::default();
     let seeded = ledger.hashes().fold(0usize, |n, h| n + usize::from(guard.accept(*h)));
@@ -171,8 +166,6 @@ fn accept_connections(listener: TcpListener, server: &Arc<Server>) {
     }
 }
 
-/// The startup lines that say what each setting the operator changed from its default
-/// will do to the connections this pool accepts.
 fn report_settings(s: &Settings) {
     if !s.require_split {
         info!(
@@ -215,7 +208,7 @@ fn main() -> io::Result<()> {
     info!("pool payout script: {}", hex::encode(&payout_script));
 
     let (chain, startup_window) = startup_chain_and_window(&node, &ledger_location, &s);
-    let node_view = Arc::new(NodeView::new());
+    let node_view = Arc::new(NodeView::default());
     watch_node_in_background(&node, &node_view, &s, chain);
 
     let ledger = admin::open_share_ledger(

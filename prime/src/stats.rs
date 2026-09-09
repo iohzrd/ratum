@@ -288,8 +288,6 @@ fn miners_json(
         .collect()
 }
 
-/// Everything the page shows from the ledger, read under one lock so the figures agree
-/// with each other.
 struct LedgerView {
     total_work: u128,
     target_work: u128,
@@ -344,7 +342,6 @@ fn recent_blocks_json(blocks: &[FoundBlock]) -> Vec<Value> {
         .collect()
 }
 
-/// The mean seconds between the blocks the tip history holds, or None until it holds two.
 fn observed_block_seconds(server: &Server) -> Option<f64> {
     let tips = lock(&server.node_view.tip_history);
     match (tips.front(), tips.back()) {

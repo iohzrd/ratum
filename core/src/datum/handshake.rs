@@ -23,7 +23,6 @@ pub(crate) const POOL_BOX_KEY_INDEX: usize = HELLO_KEYS + 1;
 pub(crate) const RESPONSE_KEYS_LEN: usize = (POOL_BOX_KEY_INDEX + 1) * PUBKEY_LEN;
 
 const MAX_USER_AGENT: usize = 256;
-/// The 0xFE that closes the user agent, then the little-endian nonce key.
 const AFTER_UA_LEN: usize = 1 + size_of::<u32>();
 pub const MAX_MOTD: usize = 511;
 

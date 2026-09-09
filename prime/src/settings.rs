@@ -1,7 +1,3 @@
-//! Every setting the pool runs under, resolved from the command line, the configuration
-//! file and the defaults, plus the two startup steps that a setting alone does not give:
-//! the node connection and the pool's payout script.
-
 use crate::abw;
 use crate::cli::{self, Cli, fatal};
 use crate::server::{Resolved, resolve_address};
@@ -49,8 +45,6 @@ pub(crate) struct Settings {
     node: NodeCredential,
 }
 
-/// How the pool authenticates to the node: the flags that name the URL and either a
-/// cookie file or a user and password.
 struct NodeCredential {
     url: Option<String>,
     user: String,
@@ -173,7 +167,6 @@ impl Settings {
     }
 }
 
-/// A URL without a scheme is read as `https://`.
 fn with_scheme(url: String) -> String {
     if url.starts_with("http://") || url.starts_with("https://") {
         url
@@ -238,9 +231,6 @@ impl Payout {
     }
 }
 
-/// `--payout-address` and `--payout-script` name the pool's payout output two ways. A flag
-/// on the command line overrides whichever the configuration file set; naming both from the
-/// same source is refused, since neither is the obvious winner.
 fn payout_choice(c: &Cli, f: &Config) -> Option<(Payout, String)> {
     let sources = [
         (c.payout_address.as_ref(), c.payout_script.as_ref()),
@@ -257,8 +247,6 @@ fn payout_choice(c: &Cli, f: &Config) -> Option<(Payout, String)> {
     None
 }
 
-/// The output script every fallback payment goes to, resolved against the node when the
-/// setting named an address.
 pub(crate) fn payout_script(node: &rpc::Client, payout: Option<(Payout, String)>) -> Vec<u8> {
     let Some((kind, value)) = payout else {
         fatal!(

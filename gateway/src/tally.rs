@@ -29,9 +29,6 @@ pub struct FeeMeter {
 }
 
 impl FeeMeter {
-    /// Adds `bps` basis points of `diff`'s work to the running debt, reporting whether a
-    /// whole share's worth has accrued and is therefore charged now. The debt starts at a
-    /// random point in the first share so that many gateways do not charge in lockstep.
     pub fn charge(&mut self, diff: u64, bps: u64) -> bool {
         if bps == 0 {
             return false;

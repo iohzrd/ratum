@@ -3,8 +3,8 @@ use mio::{Events, Interest, Poll, Token, Waker};
 use std::io::{self, Read, Write};
 use std::time::{Duration, Instant};
 
-pub const SOCKET: Token = Token(0);
-pub const WAKE: Token = Token(1);
+const SOCKET: Token = Token(0);
+const WAKE: Token = Token(1);
 
 const EVENT_CAPACITY: usize = 8;
 
@@ -58,9 +58,6 @@ impl PolledSocket {
         }
     }
 
-    /// Fills `buf`, waiting for readability between reads. `idle` bounds the span between
-    /// two reads that make progress, `total` bounds the whole call; either expiring returns
-    /// `ErrorKind::TimedOut`.
     pub fn read_exact(
         &mut self,
         buf: &mut [u8],

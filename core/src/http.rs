@@ -56,7 +56,6 @@ pub fn path_and_query(req: &Request) -> (String, String) {
     }
 }
 
-/// The `key=value` pairs of a query string or form body, still percent-encoded.
 fn split_pairs(query: &str) -> impl Iterator<Item = (&str, &str)> {
     query
         .split('&')
@@ -81,9 +80,7 @@ fn hex_digit(b: u8) -> Option<u8> {
     }
 }
 
-/// Decodes percent-escapes and `+`. A `%` not followed by two hex digits stands for
-/// itself, and bytes that do not form UTF-8 become the replacement character.
-pub fn url_decode(s: &str) -> String {
+fn url_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -105,8 +102,6 @@ pub fn url_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// The addresses to try for a listener. An empty address means every interface, which is
-/// two candidates: the dual-stack `[::]` first, then IPv4 alone for a host without IPv6.
 fn bind_candidates(addr: &str, port: u16) -> Vec<String> {
     if addr.is_empty() {
         vec![format!("[::]:{port}"), format!("0.0.0.0:{port}")]
@@ -115,8 +110,6 @@ fn bind_candidates(addr: &str, port: u16) -> Vec<String> {
     }
 }
 
-/// Opens a listener on the first candidate address `open` accepts, reporting the last
-/// candidate and its error when none is.
 pub fn bind_first<T, E: std::fmt::Display>(
     addr: &str,
     port: u16,

@@ -151,8 +151,7 @@ impl ShortTxnList {
             return out;
         }
         for id in &self.short_ids {
-            out.extend_from_slice(&(*id as u32).to_le_bytes());
-            out.extend_from_slice(&((*id >> 32) as u16).to_le_bytes());
+            out.extend_from_slice(&id.to_le_bytes()[..SHORT_ID_SIZE]);
         }
         if let Some(x) = self.crosscheck {
             out.extend_from_slice(&x);
@@ -214,7 +213,6 @@ impl TxnBundle {
     }
 }
 
-/// A transaction's length in a bundle: a little-endian u16 followed by its high byte.
 const TXN_SIZE_LEN: usize = 3;
 
 fn decode_txn_size(c: &mut Cursor<'_>) -> Result<usize, Error> {

@@ -2,8 +2,6 @@ use crate::address;
 
 pub type Modifiers = Vec<(String, Vec<(String, f64)>)>;
 
-/// The address a stratum username begins with: everything before the worker suffix
-/// ('.') and before the modifier name ('~').
 pub fn address_of(username: &str) -> &str {
     let end = username.find(['.', '~']).unwrap_or(username.len());
     &username[..end]

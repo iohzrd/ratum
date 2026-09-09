@@ -2,9 +2,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The `getblocktemplate` rules every template request in this workspace asks for.
 const TEMPLATE_RULES: [&str; 2] = ["segwit", "blake2b"];
 
 #[derive(Debug, thiserror::Error)]
@@ -243,7 +242,6 @@ impl Client {
             .ok_or_else(|| Error::BadResponse("no height in waitforblockheight".into()))
     }
 
-    /// The node's block template under the rules this workspace builds blocks for.
     pub fn block_template(&self) -> Result<serde_json::Value, Error> {
         self.call("getblocktemplate", serde_json::json!([{"rules": TEMPLATE_RULES}]))
     }

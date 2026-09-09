@@ -1,6 +1,3 @@
-//! The settings page's view of the configuration file: the fields it may edit, the form
-//! values it renders from, and the edit it applies to the file on disk.
-
 use super::config::{
     Config, Datum, GLOBAL_TIMEOUT_MARGIN_SECS, MAX_CONFIGURED_TAG, MAX_CONFIGURED_TAGS_TOTAL,
     WORK_UPDATE_SECONDS_RANGE,
@@ -168,14 +165,8 @@ const FIELDS: &[Field] = &[
     },
 ];
 
-/// The key the configured pool host is stashed under while `datum.pool_host` is empty.
-/// An empty `pool_host` is what makes the gateway non-pooled, so turning reward sharing off
-/// has to empty it; keeping the host here lets turning sharing back on restore what was
-/// configured, and lets the page go on showing the host the operator typed.
 const OLD_POOL_HOST: &str = "pool_host(old)";
 
-/// The pool host the settings page shows: the configured one, or the stashed one while
-/// reward sharing is off, or the default when neither names a host.
 fn shown_pool_host(cfg: &Config, doc: &Value) -> String {
     if !cfg.datum.pool_host.is_empty() {
         return cfg.datum.pool_host.clone();
@@ -297,11 +288,6 @@ fn submitted<'a>(form: &'a [(String, String)], name: &str) -> Option<&'a str> {
     form.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
 }
 
-/// Applies the reward-sharing choice and the pool host the form carries. "require" and
-/// "prefer" both need a host, so either restores the stashed one or clears the file's empty
-/// `pool_host` back to the default; "never" empties `pool_host` and stashes what it held.
-/// A host typed while sharing is off is written to the stash, so it survives until sharing
-/// is turned back on.
 fn apply_reward_sharing(edit: &mut Edit<'_>, cfg: &Config, form: &[(String, String)]) {
     let mut pool_host = cfg.datum.pool_host.clone();
     let default_host = Datum::default().pool_host;

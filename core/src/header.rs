@@ -199,9 +199,6 @@ impl HeaderV2 {
         Precomputed { h2, hash1, mask }
     }
 
-    /// The proof-of-work hash a mining machine produces for this header, and the block
-    /// hash it XORs to. The two are equal whenever the XOR key is zero, whose mask is all
-    /// zeroes.
     pub fn pow_and_block_hash(&self) -> ([u8; 32], [u8; 32]) {
         let pre = self.precompute();
         let pow = blake2b_256(&self.asic_input_with(&pre.hash1, &pre.h2));
@@ -220,8 +217,6 @@ pub struct Precomputed {
     pub mask: [u8; 32],
 }
 
-/// The commitment a header carries to its proof-of-work XOR key, and the value an
-/// anti-block-withholding assignment names in place of a key the gateway does not hold.
 pub fn xor_key_hash(xor_key: &U128) -> [u8; 32] {
     tagged_sha256("Bitcoin block hash PoW XOR key", xor_key)
 }

@@ -107,8 +107,6 @@ pub fn share_extranonce(field: &[u8; EXTRANONCE_SIZE_V2]) -> Option<Vec<u8>> {
     Some(field[EXTRANONCE_V2_PAD..].to_vec())
 }
 
-/// A Sia stratum field is two little-endian u32 halves: `nonce` carries the header's
-/// nonce then nonce2, `ntime` carries its time offset then nonce3.
 pub fn sia_field(low: u32, high: u32) -> [u8; SIA_FIELD_SIZE] {
     let mut f = [0u8; SIA_FIELD_SIZE];
     f[..SIA_FIELD_HALF].copy_from_slice(&low.to_le_bytes());

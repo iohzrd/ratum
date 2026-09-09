@@ -10,8 +10,6 @@ const COMPACT_MANTISSA_SIGN: u32 = 0x80;
 const COMPACT_MANTISSA_BYTES: usize = 3;
 const MAX_COMPACT_SIZE: usize = 34;
 
-/// `target_for_difficulty` divides 2^QUOTIENT_BITS by the difficulty and writes the
-/// quotient into the top QUOTIENT_BYTES of the target.
 const QUOTIENT_BITS: i32 = 64;
 const QUOTIENT_BYTES: usize = 12;
 
@@ -19,9 +17,6 @@ pub const MAX_TARGET_POT: u8 = (u64::BITS - 1) as u8;
 
 pub const DIFF1_TARGET: Target = target_for_pot(0);
 
-/// The 256-bit target an nBits compact encoding stands for: a 3-byte mantissa scaled by
-/// 256^(size - 3). None for a negative encoding, and for one whose mantissa would carry a
-/// set bit past the top of the target.
 pub fn bits_to_target(bits: u32) -> Option<Target> {
     let exp = (bits >> COMPACT_SIZE_SHIFT) as usize;
     let mant = bits & COMPACT_MANTISSA_MASK;
@@ -88,9 +83,6 @@ fn be_to_f64(v: &Target) -> f64 {
     v.iter().fold(0.0f64, |out, b| out.mul_add(256.0, f64::from(*b)))
 }
 
-/// The largest target a share at difficulty `2^exponent` may have: difficulty-1's target
-/// with every bit below its leading bit set, shifted down by `exponent`. An exponent at or
-/// above `DIFF1_EXPONENT` leaves no bit to set and gives a zero target.
 fn share_target(exponent: u8) -> Target {
     const HIGH_ZERO_BYTES: usize = TARGET_BYTES - (DIFF1_EXPONENT as usize / 8);
     let mut t = [0u8; TARGET_BYTES];
@@ -102,14 +94,11 @@ fn share_target(exponent: u8) -> Target {
     t
 }
 
-/// The inverse of `bits_to_target`. A zero target encodes as 0.
 fn target_to_bits(target: &Target) -> u32 {
     let Some(first) = target.iter().position(|&b| b != 0) else { return 0 };
     let size = (TARGET_BYTES - first) as u32;
     let at = |i: usize| u32::from(target.get(i).copied().unwrap_or(0));
     let (m0, m1, m2) = (at(first), at(first + 1), at(first + 2));
-    // A mantissa whose top byte has its high bit set would read as negative, so it is
-    // shifted down a byte and the size raised to compensate.
     if m0 & COMPACT_MANTISSA_SIGN != 0 {
         ((size + 1) << COMPACT_SIZE_SHIFT) | (m0 << 8) | m1
     } else {

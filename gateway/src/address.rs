@@ -68,8 +68,6 @@ pub fn to_output_script(addr: &str) -> Option<Vec<u8>> {
     }
 }
 
-/// The human-readable part a segwit address must carry, or None when the address is
-/// not one this gateway pays.
 fn segwit_hrp(lower: &str) -> Option<&'static str> {
     if lower.starts_with("bcrt1") {
         Some("bcrt")

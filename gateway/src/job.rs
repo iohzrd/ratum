@@ -101,9 +101,6 @@ impl Job {
         }
     }
 
-    /// Under an anti-block-withholding assignment the gateway holds the pool's key hash
-    /// but not the key itself, so it commits to the assignment's hash in place of the
-    /// one the header's own (always zero) XOR key would give.
     fn precompute(&self, h: &HeaderV2) -> header::Precomputed {
         match self.abw {
             Some(a) => h.precompute_with_key_hash(a.key_hash),
@@ -111,9 +108,6 @@ impl Job {
         }
     }
 
-    /// The hash the mining machine produces. The gateway builds every header with a zero
-    /// XOR key, whose mask is all zeroes, so this is the block hash as well whenever the
-    /// job carries no assignment.
     pub fn share_pow_hash(&self, h: &HeaderV2) -> [u8; 32] {
         let pre = self.precompute(h);
         header::blake2b_256(&h.asic_input_with(&pre.hash1, &pre.h2))
@@ -185,11 +179,11 @@ pub fn merkle_branches(txids: &[[u8; 32]]) -> Vec<[u8; 32]> {
             level.push(last);
         }
         let mut next = Vec::with_capacity(level.len() / 2);
-        for pair in level.chunks(2) {
-            match (pair[0], pair[1]) {
-                (Some(a), Some(b)) => {
-                    combined[..HASH_SIZE].copy_from_slice(&a);
-                    combined[HASH_SIZE..].copy_from_slice(&b);
+        for pair in level.as_chunks::<2>().0 {
+            match pair {
+                [Some(a), Some(b)] => {
+                    combined[..HASH_SIZE].copy_from_slice(a);
+                    combined[HASH_SIZE..].copy_from_slice(b);
                     next.push(Some(ratum::bitcoin::sha256d(&combined)));
                 }
                 _ => next.push(None),

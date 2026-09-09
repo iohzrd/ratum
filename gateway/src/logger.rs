@@ -27,8 +27,6 @@ struct Sink {
 }
 
 impl Sink {
-    /// Runs `f` on whichever stream this sink writes to. Both callers ignore the result:
-    /// a logger that cannot report a failure has nowhere to report it.
     fn on_stream(&self, f: impl FnOnce(&mut dyn Write) -> std::io::Result<()>) {
         let _ = match &self.output {
             Output::Stdout => f(&mut std::io::stdout().lock()),

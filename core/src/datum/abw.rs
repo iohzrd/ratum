@@ -5,7 +5,6 @@ pub const DRAFT_REVISION: u8 = 0;
 pub const ASSIGNMENT_SLOTS: u8 = 16;
 pub const SHARE_TARGET_BASE_BITS: u8 = 32;
 
-/// The proof-of-work XOR key an assignment commits to, and one slot's worth of them.
 pub type XorKey = crate::header::U128;
 pub type SlotKeys = [Option<XorKey>; ASSIGNMENT_SLOTS as usize];
 
@@ -31,8 +30,6 @@ pub fn random_key() -> XorKey {
     crate::rand::bytes()
 }
 
-/// The proof-of-work hash in the little-endian order an ABW reference carries it in,
-/// the reverse of the display order a hash is logged in.
 pub fn raw_hash_le(hash2: &[u8; 32]) -> [u8; 32] {
     crate::bitcoin::reversed(hash2)
 }
@@ -81,8 +78,6 @@ pub struct Reveal {
     pub xor_key: XorKey,
 }
 
-/// Every ABW message is a sub-command byte, the revision, a body of at most a slot and a
-/// 32-byte hash, then the 0xFE terminator.
 const MAX_FRAME_LEN: usize = 2 + 1 + 32 + 1;
 
 fn frame(subcmd: u8, body: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {

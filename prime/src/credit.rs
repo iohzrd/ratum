@@ -1,7 +1,3 @@
-//! What the pool records once a share has verified: the ledger entry crediting its work,
-//! the history of the blocks it found, and the amounts a block's coinbase left owed to the
-//! payout window.
-
 use crate::server::{Payability, Resolver, Server, owed_for_block};
 use log::{debug, error, info, warn};
 use ratum::datum::share::PowSubmit;
@@ -12,17 +8,12 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
 
-/// The most distinct usernames one connection tracks, both for the running credited total
-/// and for reporting an unpayable name once rather than per share.
 const MAX_CREDITED_NAMES: usize = 4096;
 
-/// The ending that makes "identit{}" agree with a count.
 fn identity_suffix(count: usize) -> &'static str {
     if count == 1 { "y" } else { "ies" }
 }
 
-/// One connection's crediting state: what it has already logged, so that a long-lived
-/// connection repeats neither a running total nor an unpayable-name warning.
 pub(crate) struct Crediting {
     peer: SocketAddr,
     credited: HashMap<String, u64>,
@@ -223,8 +214,6 @@ impl Crediting {
                 );
             }
         }
-        // The running total is a log line only, so a connection past MAX_CREDITED_NAMES
-        // distinct usernames reports each further share's own difficulty and keeps none.
         let total = match self.credited.get_mut(&s.username) {
             Some(total) => {
                 *total = total.saturating_add(a.work.difficulty);

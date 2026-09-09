@@ -1,7 +1,3 @@
-//! The pool's requests about a published job: its transaction list, the transactions
-//! themselves, and the block its header builds on. The session hands each request here and
-//! sends back what this returns.
-
 use super::{Settings, Shared};
 use crate::job::Job;
 use log::{info, warn};
@@ -11,8 +7,6 @@ use ratum::datum::validation::{
 };
 use std::sync::Arc;
 
-/// The reply to one validation request from the pool, or None when the request names
-/// something this gateway does not answer.
 pub(super) fn response_to(
     shared: &Shared,
     settings: &Settings,

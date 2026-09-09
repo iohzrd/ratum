@@ -36,8 +36,6 @@ struct Shared {
 }
 
 impl Shared {
-    /// There is work to mine once a job newer than `last_generation` has arrived and the
-    /// subscription has settled how the extranonce is split.
     fn has_work_after(&self, last_generation: u64) -> bool {
         self.generation > last_generation && self.job.is_some() && self.extranonce2_size != 0
     }

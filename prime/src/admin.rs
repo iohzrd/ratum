@@ -1,6 +1,3 @@
-//! Where the share ledger lives, and the maintenance commands that read and edit it with
-//! the pool stopped: `--dump-ledger`, `--settle-block`, `--void-block` and `--record-owed`.
-
 use crate::cli::{Cli, fatal};
 use log::{info, warn};
 use ratum::rpc;
@@ -8,8 +5,6 @@ use ratum_prime::ledger::{self, Ledger};
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// Where the ledger file is named: directly, by the data directory holding one file per
-/// chain, or nowhere, in which case the share window lives in memory alone.
 pub(crate) enum LedgerLocation {
     File(PathBuf),
     InDir(PathBuf),
@@ -25,7 +20,6 @@ impl LedgerLocation {
         }
     }
 
-    /// The file the pool records shares in, once the node has named the chain.
     pub(crate) fn file_for(&self, chain: Option<rpc::Chain>) -> Option<PathBuf> {
         match (self, chain) {
             (Self::File(p), _) => Some(p.clone()),
@@ -42,8 +36,6 @@ impl LedgerLocation {
         }
     }
 
-    /// The one existing file a maintenance command operates on. Unlike `file_for`, no node
-    /// has been consulted, so a data directory must hold exactly one ledger.
     fn existing_file(&self, flag: &str) -> io::Result<PathBuf> {
         Ok(match self {
             Self::File(p) => p.clone(),
@@ -78,8 +70,6 @@ fn ledger_files_in(dir: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(found)
 }
 
-/// Runs the maintenance command the command line names, if it names one. The pool starts
-/// only when this returns `None`.
 pub(crate) fn run_command(cli: &Cli, location: &LedgerLocation) -> Option<io::Result<()>> {
     if cli.dump_ledger {
         return Some(dump_ledger(location));
@@ -147,7 +137,6 @@ fn dump_ledger(location: &LedgerLocation) -> io::Result<()> {
     Ok(())
 }
 
-/// Parses the `identity=sats` entries `--record-owed` takes.
 fn owed_entries(entries: &[String]) -> Vec<(String, u64)> {
     let mut parsed: Vec<(String, u64)> = Vec::with_capacity(entries.len());
     for entry in entries {
@@ -227,7 +216,6 @@ fn void_block(location: &LedgerLocation, arg: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Opens the ledger the pool records shares in, reporting what the read-back found.
 pub(crate) fn open_share_ledger(
     path: Option<&PathBuf>,
     startup_window: u128,

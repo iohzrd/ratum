@@ -1,6 +1,3 @@
-//! What the status and miner-lookup pages are told: the JSON snapshot each one reads,
-//! built from the stratum server, the current job and the pool connection.
-
 use super::Context;
 use crate::config::Config;
 use crate::job::Job;
@@ -26,7 +23,6 @@ fn seconds_ago(t: Option<std::time::Instant>) -> f64 {
     t.map_or(-1.0, |t| t.elapsed().as_secs_f64())
 }
 
-/// An empty configuration string reaches the pages as null, not as "".
 fn or_null(text: &str) -> Value {
     if text.is_empty() { Value::Null } else { json!(text) }
 }
@@ -39,7 +35,6 @@ fn pool_host_json(cfg: &Config) -> Value {
     }
 }
 
-/// The per-connection figures both pages show.
 fn client_json(c: &ClientStats) -> Value {
     json!({
         "last_accepted_seconds": seconds_ago(c.last_accepted),
@@ -54,7 +49,6 @@ fn client_json(c: &ClientStats) -> Value {
     })
 }
 
-/// `client_json` plus the fields only an authorized admin page sees.
 fn admin_client_json(cfg: &Config, c: &ClientStats) -> Value {
     let unpayable = cfg.stratum.require_address_username && !username::is_payable(&c.username);
     super::with_fields(
@@ -71,8 +65,6 @@ fn admin_client_json(cfg: &Config, c: &ClientStats) -> Value {
     )
 }
 
-/// `client_json` plus the connection age, which the miner page shows in place of the
-/// identifying fields it may not see.
 fn miner_client_json(c: &ClientStats) -> Value {
     let connected = c.subscribed_at.map_or(0.0, |t| t.elapsed().as_secs_f64());
     super::with_fields(client_json(c), [("connected_seconds", json!(connected))])

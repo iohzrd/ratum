@@ -39,9 +39,8 @@ fn describe(header: Header, payload: &[u8]) -> String {
         (framing::cmd::HELLO_OR_PING, _) => "ping",
         _ => "unknown",
     };
-    let head: Vec<String> =
-        payload.iter().take(LOG_PAYLOAD_BYTES).map(|b| format!("{b:02x}")).collect();
-    format!("{name}: {} bytes [{}...]", payload.len(), head.join(""))
+    let head = hex::encode(&payload[..payload.len().min(LOG_PAYLOAD_BYTES)]);
+    format!("{name}: {} bytes [{head}...]", payload.len())
 }
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -167,8 +166,6 @@ pub(crate) fn handle(mut stream: TcpStream, server: &Server) -> io::Result<()> {
     conn.run()
 }
 
-/// What handling one share produced: the verdict to answer with, a follow-up request to
-/// send after the answer, and the raw proof-of-work hash when the pool rebuilt the header.
 struct ShareOutcome {
     verdict: ShareVerdict,
     pending: Option<Vec<u8>>,
@@ -369,9 +366,6 @@ impl Connection<'_> {
         }
     }
 
-    /// Sends each reveal and logs why it went out. A reveal marked `again` was already
-    /// sent on an earlier connection of a resumed session; one that is not was due, except
-    /// in the rotation case, where the rotation reached the slot before its delay elapsed.
     fn send_reveals(&mut self, reveals: &[Revealed], rotating: bool) -> io::Result<()> {
         for r in reveals {
             self.send_mining(&r.payload, false)?;
@@ -402,9 +396,6 @@ impl Connection<'_> {
         Ok(())
     }
 
-    /// Sends the reveals whose delay has elapsed, once every share already received has
-    /// been answered: a share on a revealed slot is refused, so no unanswered share may be
-    /// waiting when its slot's key becomes public.
     fn send_due_reveals(&mut self) -> io::Result<()> {
         let now = Instant::now();
         if !self.abw().is_some_and(|m| m.reveal_due(now)) || !self.socket_drained()? {

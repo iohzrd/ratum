@@ -1,6 +1,3 @@
-//! A map and a set that hold at most a fixed number of entries and drop the
-//! oldest insertion once that number is exceeded.
-
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
 
@@ -24,8 +21,6 @@ impl<K: Clone + Eq + Hash, V> BoundedMap<K, V> {
         self.entries.get(key)
     }
 
-    /// Writes `value` under `key` as the newest entry, returning the value it replaced,
-    /// then removes the oldest entries until the capacity holds.
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
         let replaced = self.entries.insert(key.clone(), value);
         if replaced.is_some() {
@@ -45,7 +40,6 @@ impl<K: Clone + Eq + Hash, V> BoundedMap<K, V> {
         Some(removed)
     }
 
-    /// Keeps the entries `keep` accepts, in their existing order.
     pub fn retain(&mut self, keep: impl Fn(&K, &V) -> bool) {
         let entries = &mut self.entries;
         entries.retain(|k, v| keep(k, v));
@@ -67,8 +61,6 @@ impl<T: Clone + Eq + Hash> BoundedSet<T> {
         Self(BoundedMap::new(capacity))
     }
 
-    /// Adds `value` as the newest entry, reporting whether the set did not already hold
-    /// it. A value already held keeps its place in the eviction order.
     pub fn insert(&mut self, value: T) -> bool {
         if self.0.get(&value).is_some() {
             return false;

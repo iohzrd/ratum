@@ -3,11 +3,8 @@ use log::warn;
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
 
-/// The exit status of every refusal to start: a usage or configuration fault, as
-/// distinct from the 1 a running pool exits with.
 pub(crate) const USAGE_EXIT: i32 = 2;
 
-/// Prints the message on stderr and exits with [`USAGE_EXIT`].
 macro_rules! fatal {
     ($($arg:tt)*) => {{
         eprintln!($($arg)*);
@@ -132,8 +129,6 @@ fn load_file(path: &Path, required: bool) -> ratum_prime::config::Config {
     }
 }
 
-/// The command line's value, else the configuration file's, else `default`. Whichever is
-/// used must satisfy `ok`; one that does not exits with a usage message naming `flag`.
 pub(crate) fn resolve<T: Display>(
     cli: Option<T>,
     file: Option<T>,
@@ -145,7 +140,6 @@ pub(crate) fn resolve<T: Display>(
     resolve_opt(cli, file, flag, must_be, ok).unwrap_or(default)
 }
 
-/// `resolve` for a setting with no default, which stays `None` when neither source names it.
 pub(crate) fn resolve_opt<T: Display>(
     cli: Option<T>,
     file: Option<T>,

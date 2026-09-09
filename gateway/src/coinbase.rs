@@ -148,16 +148,12 @@ const PRUNABLE_OP_RETURN: [u8; 3] = [OP_RETURN, 0x01, 0x00];
 
 const MIN_USEFUL_OUTPUT_ROOM: usize = 30;
 
-/// A built coinbase: the two halves the miner splices its extranonce between, where in
-/// `coinb1` the share target's power-of-two byte sits, and the coinbaser outputs that fit.
 pub struct Built {
     pub coinbase: Coinbase,
     pub pot_index: usize,
     pub included: Vec<CoinbaseOutput>,
 }
 
-/// Builds the coinbase for one job, taking the coinbaser outputs in order for as long as
-/// the size and sigop budgets allow and paying whatever is left to the pool's script.
 pub fn build(p: &Params<'_>) -> Built {
     let in_script = p.script_sig.len() <= SCRIPT_SIG_ROOM_FOR_EXTRANONCE;
 
@@ -194,9 +190,6 @@ pub fn build(p: &Params<'_>) -> Built {
     let pot_index = coinb1.len() + p.pot_index_in_script;
     coinb1.extend_from_slice(p.script_sig);
 
-    // coinb1 ends where the miner splices its extranonce in, so the split point moves with
-    // the extranonce: into the scriptSig when it fits, otherwise into a leading OP_RETURN
-    // output that carries it instead.
     let mut coinb2 = Vec::new();
     if in_script {
         coinb1.push(extranonce_push_opcode);
@@ -243,9 +236,6 @@ const MAX_TXN_COUNT_SIZE: usize = 5;
 
 const COINBASE_WITNESS_BYTES: u64 = 36;
 
-/// The sigop cost a coinbase output script contributes, counting each signature opcode
-/// the way a block's sigop limit does: an unexecuted `OP_CHECKMULTISIG` counts for the
-/// largest key count it could name.
 pub fn output_sigop_cost(script: &[u8]) -> u64 {
     const MAX_PUBKEYS_PER_MULTISIG: u64 = 20;
 

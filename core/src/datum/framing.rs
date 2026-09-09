@@ -58,8 +58,6 @@ impl Header {
     }
 }
 
-/// The MurmurHash3 mixing of one 32-bit word, which steps the header-masking key from one
-/// frame to the next and derives the session's nonces.
 pub fn feedback(i: u32) -> u32 {
     let mut h: u32 = 0xb10c_feed;
     let mut k = i;

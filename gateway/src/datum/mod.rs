@@ -1,9 +1,3 @@
-//! The gateway's side of the DATUM protocol: the state the rest of the gateway reads and
-//! writes (the pool's configuration, the share queue, the coinbaser request in flight and
-//! the anti-block-withholding assignment), and the reconnect loop that runs a session over
-//! it. The session itself is in `session`, and the replies it sends to the pool's
-//! requests about a published job are in `validation`.
-
 mod session;
 mod validation;
 

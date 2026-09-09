@@ -51,6 +51,23 @@ fn check_config_fields(
     Ok(())
 }
 
+/// Writes a byte-counted field: one length byte, then the bytes. `check_config_fields` has
+/// already refused a field longer than a length byte holds.
+fn push_counted(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.push(bytes.len() as u8);
+    out.extend_from_slice(bytes);
+}
+
+/// Reads a byte-counted field, returning None for a length above `max` and for one the
+/// remaining input does not hold.
+fn take_counted<'a>(c: &mut Cursor<'a>, what: &'static str, max: usize) -> Option<&'a [u8]> {
+    let len = usize::from(c.u8(what).ok()?);
+    if len > max {
+        return None;
+    }
+    c.take(len, what).ok()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClientConfig {
     pub payout_script: Vec<u8>,
@@ -66,11 +83,9 @@ impl ClientConfig {
         let mut out = Vec::with_capacity(CONFIG_FIXED_LEN + self.payout_script.len() + tag.len());
         out.push(server_subcmd::CONFIG);
         out.push(CONFIG_VERSION);
-        out.push(self.payout_script.len() as u8);
-        out.extend_from_slice(&self.payout_script);
+        push_counted(&mut out, &self.payout_script);
         out.extend_from_slice(&self.prime_id.to_le_bytes());
-        out.push(tag.len() as u8);
-        out.extend_from_slice(tag);
+        push_counted(&mut out, tag);
         out.extend_from_slice(&self.min_difficulty.to_le_bytes());
         out.push(0);
         out.push(STRUCT_END);
@@ -83,17 +98,10 @@ impl ClientConfig {
         if c.u8("version").ok()? != CONFIG_VERSION {
             return None;
         }
-        let a = c.u8("script length").ok()? as usize;
-        if a > MAX_PAYOUT_SCRIPT {
-            return None;
-        }
-        let payout_script = c.take(a, "payout script").ok()?.to_vec();
+        let payout_script = take_counted(&mut c, "payout script", MAX_PAYOUT_SCRIPT)?.to_vec();
         let prime_id = c.u32("prime id").ok()?;
-        let b = c.u8("tag length").ok()? as usize;
-        if b > MAX_COINBASE_TAG {
-            return None;
-        }
-        let coinbase_tag = String::from_utf8_lossy(c.take(b, "coinbase tag").ok()?).into_owned();
+        let tag = take_counted(&mut c, "coinbase tag", MAX_COINBASE_TAG)?;
+        let coinbase_tag = String::from_utf8_lossy(tag).into_owned();
         let min_difficulty = c.u64("min difficulty").ok()?;
         if c.arr("terminator").ok()? != [0, STRUCT_END] {
             return None;
@@ -140,12 +148,10 @@ impl ClientConfigV3 {
         );
         out.push(server_subcmd::CONFIG);
         out.push(CONFIG_VERSION_V3);
-        out.push(self.payout_script.len() as u8);
-        out.extend_from_slice(&self.payout_script);
+        push_counted(&mut out, &self.payout_script);
         out.extend_from_slice(&self.prime_id.to_le_bytes());
         out.extend_from_slice(&self.resume_token);
-        out.push(tag.len() as u8);
-        out.extend_from_slice(tag);
+        push_counted(&mut out, tag);
         out.extend_from_slice(&self.min_difficulty.to_le_bytes());
         out.push(if self.abw_disabled { CONFIG_FLAG_ABW_DISABLED } else { 0 });
         out.push(STRUCT_END);
@@ -161,18 +167,11 @@ impl ClientConfigV3 {
         if c.u8("version").ok()? != CONFIG_VERSION_V3 {
             return None;
         }
-        let a = c.u8("script length").ok()? as usize;
-        if a > MAX_PAYOUT_SCRIPT {
-            return None;
-        }
-        let payout_script = c.take(a, "payout script").ok()?.to_vec();
+        let payout_script = take_counted(&mut c, "payout script", MAX_PAYOUT_SCRIPT)?.to_vec();
         let prime_id = c.u64("prime id").ok()?;
         let resume_token: ResumeToken = c.arr("resume token").ok()?;
-        let b = c.u8("tag length").ok()? as usize;
-        if b > MAX_COINBASE_TAG {
-            return None;
-        }
-        let coinbase_tag = String::from_utf8_lossy(c.take(b, "coinbase tag").ok()?).into_owned();
+        let tag = take_counted(&mut c, "coinbase tag", MAX_COINBASE_TAG)?;
+        let coinbase_tag = String::from_utf8_lossy(tag).into_owned();
         let min_difficulty = c.u64("min difficulty").ok()?;
         let flags = c.u8("flags").ok()?;
         if flags & !CONFIG_FLAG_ABW_DISABLED != 0 || c.u8("terminator").ok()? != STRUCT_END {
@@ -423,7 +422,6 @@ pub mod share_status {
 pub const SHARE_RESPONSE_ABW_MARKER: u8 = 0x06;
 
 const SHARE_RESPONSE_LEN: usize = 1 + 1 + size_of::<u16>() + size_of::<u32>() + 1 + 1;
-/// The raw proof-of-work hash and the 0xFE that closes the reference.
 const ABW_REF_TAIL_LEN: usize = crate::bitcoin::HASH_SIZE + 1;
 const SHARE_RESPONSE_ABW_LEN: usize = SHARE_RESPONSE_LEN + 2 + ABW_REF_TAIL_LEN;
 

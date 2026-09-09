@@ -1,6 +1,3 @@
-//! The stratum v1 server: the clients it holds, the jobs it publishes to them and the
-//! listener that accepts them. One client's connection is in `connection`.
-
 mod connection;
 
 use crate::config::Config;

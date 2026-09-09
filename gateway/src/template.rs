@@ -198,9 +198,6 @@ struct Pending {
     rebuild: bool,
 }
 
-/// A raised but unread block notification. `AnyBlock` names no hash, so it stands for a
-/// tip this thread has not identified and a later hash-carrying notification cannot
-/// narrow it.
 #[derive(Clone, Debug)]
 enum PendingBlock {
     AnyBlock,

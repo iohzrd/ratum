@@ -1,7 +1,3 @@
-//! One connection to the pool: the handshake, the frame loop, and the messages the
-//! gateway sends and answers over it. The state it draws on and publishes to is `Shared`,
-//! in the parent module.
-
 use super::{
     AbwSlots, CoinbaserRequestState, QueuedShare, Settings, Shared, validation, wire_username,
 };
@@ -31,7 +27,6 @@ const HANDSHAKE_READ_POLL: Duration = Duration::from_millis(5);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const MINING_PAD_MAX: usize = 100;
 
-/// Opens a session and runs it until it ends, which is always with an error.
 pub(super) fn run(
     settings: &Settings,
     shared: &Shared,
@@ -199,8 +194,6 @@ impl<'a> Session<'a> {
         Ok(())
     }
 
-    /// Reads one frame body, sharing the session's global timeout with every other read
-    /// since the last message from the pool.
     fn read_body(&mut self, n: usize) -> io::Result<Vec<u8>> {
         let left = self.settings.global_timeout.saturating_sub(self.last_server_msg.elapsed());
         let mut buf = vec![0u8; n];

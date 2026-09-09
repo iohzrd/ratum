@@ -1,10 +1,10 @@
 use std::collections::VecDeque;
 
-pub const CSS: &str = include_str!("web/page.css");
-pub const JS: &str = include_str!("web/page.js");
+const CSS: &str = include_str!("web/page.css");
+const JS: &str = include_str!("web/page.js");
 
 pub const HISTORY_INTERVAL_SECS: u64 = crate::SECS_PER_MINUTE;
-pub const HISTORY_CAP: usize = (crate::SECS_PER_DAY / HISTORY_INTERVAL_SECS) as usize;
+const HISTORY_CAP: usize = (crate::SECS_PER_DAY / HISTORY_INTERVAL_SECS) as usize;
 
 pub type History = VecDeque<(u64, f64)>;
 
@@ -20,7 +20,6 @@ pub fn assemble(page: &str) -> String {
         .replace("<!--shared-js-->", &format!("<script>\n{JS}</script>"))
 }
 
-/// Takes a sample now, then one every `HISTORY_INTERVAL_SECS` on a thread named `name`.
 pub fn sample_periodically(name: &str, sample: impl Fn() + Send + 'static) {
     sample();
     crate::thread::spawn(name, move || {

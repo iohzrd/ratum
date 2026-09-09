@@ -1,6 +1,3 @@
-//! Sending a verified block to the node: the check that the transactions a gateway
-//! returned are the ones its header commits to, and the submission itself.
-
 use log::{debug, error, info, warn};
 use ratum::rpc;
 use ratum_prime::verify::Accepted;
@@ -10,8 +7,6 @@ use std::time::Duration;
 const SUBMIT_ATTEMPTS: usize = 3;
 const SUBMIT_RETRY_DELAY: Duration = Duration::from_millis(500);
 
-/// Relays a block whose transactions the pool already holds, reporting whether the rest of
-/// them must be requested from the gateway first.
 pub(crate) fn submit_or_request_txns(
     peer: SocketAddr,
     node: &rpc::Client,
@@ -27,8 +22,6 @@ pub(crate) fn submit_or_request_txns(
     false
 }
 
-/// Relays the block once the gateway has returned its transactions, unless they do not
-/// build the merkle root the verified header commits to.
 pub(crate) fn submit_with_txns(
     peer: SocketAddr,
     node: &rpc::Client,
@@ -74,7 +67,6 @@ fn block_matches_header(a: &Accepted, txns: &[Vec<u8>]) -> Result<(), String> {
     Ok(())
 }
 
-/// Sends the block to the node, retrying a transport failure but not a rejection.
 fn send(peer: SocketAddr, node: &rpc::Client, block: &[u8]) {
     debug!("[{peer}]      block ({} bytes): {}", block.len(), hex::encode(block));
     for attempt in 1..=SUBMIT_ATTEMPTS {

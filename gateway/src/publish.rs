@@ -29,9 +29,6 @@ impl Publisher {
         })
     }
 
-    /// A new tip publishes the subsidy-only job, which needs no coinbaser and so is ready
-    /// at once; every other job carries the pooled coinbase. `new_block` therefore selects
-    /// both the empty coinbase and the clean-jobs flag the miners are notified with.
     fn build_and_publish(
         &self,
         t: &Arc<Template>,

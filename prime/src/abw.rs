@@ -109,17 +109,10 @@ impl AbwManager {
     }
 
     pub(crate) fn reveals_due(&mut self, now: Instant) -> Vec<Revealed> {
-        let mut out = Vec::new();
-        let mut i = 0;
-        while i < self.retired.len() {
-            if now.duration_since(self.retired[i].at) >= self.reveal_after {
-                let r = self.retired.remove(i);
-                out.push(self.reveal(r));
-            } else {
-                i += 1;
-            }
-        }
-        out
+        let reveal_after = self.reveal_after;
+        let due: Vec<Retired> =
+            self.retired.extract_if(.., |r| now.duration_since(r.at) >= reveal_after).collect();
+        due.into_iter().map(|r| self.reveal(r)).collect()
     }
 
     pub(crate) fn rotate(&mut self, now: Instant) -> (Vec<Revealed>, Vec<u8>) {

@@ -12,21 +12,16 @@ pub const ENPREFIX_SIZE: usize = 2;
 pub const EXTRANONCE_PUSH_SIZE: usize = 1 + ENPREFIX_SIZE + super::share::EXTRANONCE_SIZE;
 pub const TAG_MARKER_BYTES: usize = 2;
 
+/// The coinbase tag push: the primary tag, then `TAG_SEPARATOR` and the secondary tag when
+/// there is one, then `TAG_END`. Two empty tags give the terminator alone.
 pub fn tag_push_data(primary: &[u8], secondary: &[u8]) -> Vec<u8> {
     let mut data = Vec::with_capacity(primary.len() + secondary.len() + TAG_MARKER_BYTES);
-    if !primary.is_empty() {
-        data.extend_from_slice(primary);
-        data.push(if secondary.is_empty() { TAG_END } else { TAG_SEPARATOR });
-    } else if !secondary.is_empty() {
-        data.push(TAG_SEPARATOR);
-    }
+    data.extend_from_slice(primary);
     if !secondary.is_empty() {
+        data.push(TAG_SEPARATOR);
         data.extend_from_slice(secondary);
-        data.push(TAG_END);
     }
-    if data.is_empty() {
-        data.push(TAG_END);
-    }
+    data.push(TAG_END);
     data
 }
 
@@ -35,7 +30,7 @@ pub const UID_PUSH_POT_AT: usize = 1;
 pub fn uid_push(unique_id: u16, prime_id: &[u8]) -> Vec<u8> {
     let len = UID_PUSH_PREFIX_SIZE + prime_id.len();
     debug_assert!(matches!(len, UID_PUSH_SIZE_NO_PRIME | UID_PUSH_SIZE_V1 | UID_PUSH_SIZE_V3));
-    let mut push = Vec::with_capacity(UID_PUSH_POT_AT + len);
+    let mut push = Vec::with_capacity(1 + len);
     push.push(len as u8);
     push.push(POT_TARGET_PLACEHOLDER);
     push.extend_from_slice(&unique_id.to_le_bytes());

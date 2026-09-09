@@ -49,8 +49,6 @@ pub fn sha256d(data: &[u8]) -> [u8; 32] {
     Sha256::digest(first).into()
 }
 
-/// A hash in the opposite byte order, which converts between the internal order hashes
-/// are computed in and the display order they are printed and parsed in.
 pub fn reversed(hash: &[u8; 32]) -> [u8; 32] {
     let mut out = *hash;
     out.reverse();
@@ -68,8 +66,6 @@ pub fn merkle_root(coinbase_txid: &[u8; 32], branches: &[[u8; 32]]) -> [u8; 32] 
     acc
 }
 
-/// The transaction id: the double-SHA256 of the serialization with any witness data
-/// stripped, which is version, the input and output body, then lock_time.
 pub fn txid(tx: &[u8]) -> Result<[u8; 32], TxError> {
     let mut c = Cursor::new(tx);
     let (version, has_witness) = read_version_and_marker(&mut c)?;
@@ -106,8 +102,6 @@ pub fn txid(tx: &[u8]) -> Result<[u8; 32], TxError> {
     Ok(sha256d(&stripped))
 }
 
-/// Reads the version and the optional SegWit marker and flag, reporting whether the
-/// transaction carries witness data.
 fn read_version_and_marker(c: &mut Cursor<'_>) -> Result<(u32, bool), TxError> {
     let version = c.u32("version")?;
     let has_witness = c.peek2() == Some(SEGWIT_MARKER_AND_FLAG);
@@ -117,7 +111,6 @@ fn read_version_and_marker(c: &mut Cursor<'_>) -> Result<(u32, bool), TxError> {
     Ok((version, has_witness))
 }
 
-/// Advances past one witness stack per input.
 fn skip_witnesses(c: &mut Cursor<'_>, inputs: u64) -> Result<(), TxError> {
     for _ in 0..inputs {
         let items = decode_compact_size(c)?;
@@ -129,7 +122,6 @@ fn skip_witnesses(c: &mut Cursor<'_>, inputs: u64) -> Result<(), TxError> {
     Ok(())
 }
 
-/// Reads the closing lock_time and requires that it end the transaction.
 fn read_lock_time(c: &mut Cursor<'_>, tx_len: usize) -> Result<u32, TxError> {
     let lock_time = c.u32("lock time")?;
     if !c.at_end() {
@@ -138,9 +130,6 @@ fn read_lock_time(c: &mut Cursor<'_>, tx_len: usize) -> Result<u32, TxError> {
     Ok(lock_time)
 }
 
-/// The merkle root of a whole block's transaction ids, and whether the tree is mutated:
-/// a level in which a hash is duplicated builds the same root as a shorter list, so a
-/// block carrying one is rejected. None for an empty list, which is not a block.
 pub fn merkle_root_of(txids: &[[u8; 32]]) -> Option<([u8; 32], bool)> {
     if txids.is_empty() {
         return None;
@@ -149,20 +138,15 @@ pub fn merkle_root_of(txids: &[[u8; 32]]) -> Option<([u8; 32], bool)> {
     let mut combined = [0u8; 2 * HASH_SIZE];
     let mut mutated = false;
     while level.len() > 1 {
-        for pair in level.as_chunks::<2>().0 {
-            if pair[0] == pair[1] {
-                mutated = true;
-                break;
-            }
-        }
+        mutated |= level.as_chunks::<2>().0.iter().any(|[a, b]| a == b);
         if level.len() % 2 == 1 {
             let last = *level.last().expect("non-empty");
             level.push(last);
         }
         let mut next = Vec::with_capacity(level.len() / 2);
-        for pair in level.chunks(2) {
-            combined[..HASH_SIZE].copy_from_slice(&pair[0]);
-            combined[HASH_SIZE..].copy_from_slice(&pair[1]);
+        for [a, b] in level.as_chunks::<2>().0 {
+            combined[..HASH_SIZE].copy_from_slice(a);
+            combined[HASH_SIZE..].copy_from_slice(b);
             next.push(sha256d(&combined));
         }
         level = next;
@@ -255,17 +239,12 @@ pub fn parse_coinbase(tx: &[u8]) -> Result<CoinbaseTx, TxError> {
     })
 }
 
-/// One step of a script: the opcode, and for a push the offset its data starts at and
-/// the data itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScriptOp<'a> {
     pub opcode: u8,
     pub push: Option<(usize, &'a [u8])>,
 }
 
-/// Walks `script` one opcode at a time. Scanning stops at the first push whose length
-/// field or data runs past the end of the script, which is where Bitcoin Core's own
-/// script walk stops.
 pub fn script_ops(script: &[u8]) -> impl Iterator<Item = ScriptOp<'_>> {
     ScriptOps { script, at: 0 }
 }
@@ -305,7 +284,6 @@ impl<'a> Iterator for ScriptOps<'a> {
     }
 }
 
-/// Every data push in `script`, as the offset its data starts at and the data itself.
 pub fn script_pushes(script: &[u8]) -> Vec<(usize, &[u8])> {
     script_ops(script).filter_map(|op| op.push).collect()
 }

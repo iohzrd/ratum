@@ -1,7 +1,3 @@
-//! The gateway's two HTTP interfaces: the admin pages, which serve the status page, the
-//! settings editor and the commands behind them, and the miner lookup, which answers for
-//! one address without naming anyone else. What each page is told is in `snapshot`.
-
 mod snapshot;
 
 use crate::stratum::Server;
@@ -91,9 +87,6 @@ fn json_status(code: u16, v: Value) -> Reply {
     http::json(v).with_status_code(code)
 }
 
-/// Every admin action requires `api.admin_password` to be set and the request to carry
-/// HTTP Basic credentials matching it. `without_password` is the reply body when it is
-/// unset, which names the action the caller asked for.
 fn admin_access(ctx: &Context, req: &Request, without_password: &str) -> Result<(), Reply> {
     if ctx.server.config.api.admin_password.is_empty() {
         Err(forbidden(without_password))
@@ -108,7 +101,6 @@ fn settings_access(ctx: &Context, req: &Request) -> Result<(), Reply> {
     admin_access(ctx, req, "The settings page requires api.admin_password to be set.")
 }
 
-/// `base`, which must be a JSON object, with `fields` added to it.
 fn with_fields(mut base: Value, fields: impl IntoIterator<Item = (&'static str, Value)>) -> Value {
     let o = base.as_object_mut().expect("a JSON object");
     o.extend(fields.into_iter().map(|(k, v)| (k.to_string(), v)));
@@ -159,7 +151,6 @@ fn save_settings(ctx: &Context, body: &str) -> (Reply, bool) {
     }
 }
 
-/// Saves the settings form. The bool is whether the process must restart to pick them up.
 fn post_settings(ctx: &Context, req: &mut Request) -> (Reply, bool) {
     if !ctx.server.config.api.modify_conf {
         return (forbidden("Saving settings requires api.modify_conf to be set."), false);

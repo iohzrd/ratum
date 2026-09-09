@@ -137,12 +137,9 @@ fn start_template_thread(
             Arc::clone(&rt.shared),
         );
         let mut listener_started = false;
-        let payout_script = {
-            let rt = rt.clone();
-            move || {
-                rt.shared.payout_script().unwrap_or_else(|| rt.config.pool_output_script.clone())
-            }
-        };
+        let (shared, config) = (Arc::clone(&rt.shared), Arc::clone(&rt.config));
+        let payout_script =
+            move || shared.payout_script().unwrap_or_else(|| config.pool_output_script.clone());
         template::run(
             rt.node.clone(),
             Arc::clone(&rt.config),
@@ -160,7 +157,6 @@ fn start_template_thread(
     });
 }
 
-/// True once `interval` has passed since `last`, which it then advances to now.
 fn due(last: &mut Instant, interval: Duration) -> bool {
     if last.elapsed() < interval {
         return false;
@@ -194,9 +190,6 @@ fn report_stats(server: &stratum::Server, last: &mut Instant) {
     );
 }
 
-/// While the pool is unreachable and datum.pooled_mining_only is set, the listener refuses
-/// new stratum connections; once the reconnect loop has failed FAILURES_BEFORE_SHUTDOWN
-/// times, the clients already connected are disconnected as well, once per outage.
 fn enforce_pooled_only(rt: &Runtime, server: &stratum::Server, warned: &mut bool) {
     let active = rt.shared.is_active();
     if active {
@@ -215,8 +208,6 @@ fn enforce_pooled_only(rt: &Runtime, server: &stratum::Server, warned: &mut bool
     server.rejecting.store(reject, Ordering::Relaxed);
 }
 
-/// The main thread once everything is started: the periodic reports, and the enforcement of
-/// datum.pooled_mining_only when the gateway is configured for a pool.
 fn watch_loop(rt: &Runtime, server: &stratum::Server) -> ! {
     let pooled = !rt.config.datum.pool_host.is_empty();
     let started = Instant::now();

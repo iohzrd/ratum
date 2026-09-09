@@ -1,6 +1,3 @@
-//! One stratum client: its subscription, its difficulty, the jobs it is notified of and
-//! the shares it submits.
-
 use super::{ClientEntry, ClientStats, Server};
 use crate::coinbase::COINBASE_POOLED;
 use crate::datum::QueuedShare;
@@ -91,7 +88,6 @@ pub(super) struct Connection {
 }
 
 impl Connection {
-    /// Serves one accepted client until it disconnects.
     pub(super) fn run(server: Arc<Server>, stream: TcpStream) -> Result<(), Disconnect> {
         let remote = stream.peer_addr().map_or_else(|_| "?".to_string(), |a| a.to_string());
         stream.set_nodelay(true)?;
@@ -469,8 +465,6 @@ impl Connection {
         }
     }
 
-    /// The bookkeeping an accepted share calls for: the client's tallies, the vardiff
-    /// sample, and the quickdiff job a difficulty raise sends out.
     fn count_accepted(&mut self, diff: u64) -> io::Result<()> {
         let now = Instant::now();
         self.with_stats(|st| {
@@ -563,9 +557,6 @@ impl Connection {
         checked
     }
 
-    /// The username the pool credits this share to: the fee address when the gateway fee
-    /// falls on this share, otherwise the miner's own username as the configured username
-    /// modifiers map it. A rejected share never carries the fee.
     fn credited_username(
         &mut self,
         req: &SubmitRequest,

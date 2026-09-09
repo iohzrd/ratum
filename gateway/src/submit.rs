@@ -1,17 +1,9 @@
-//! Sending a block this gateway found to the node: assembling it from the job and the
-//! winning header, and the submissions that carry it.
-
 use crate::job::{COINBASE_SUBSIDY_ONLY, Job};
 use crate::stratum::Server;
 use log::{debug, error, info, warn};
 use ratum::rpc;
 use std::sync::Arc;
 
-/// Assembles the block a winning header names, then sends it to the upstream node and to
-/// every extra node, saving a copy first when `mining.save_submitblocks_dir` names a
-/// directory. The upstream node receives two submissions, one from a thread of its own and
-/// one from this thread, so that an RPC call stalling on either does not hold the block
-/// back; the second is answered "duplicate", which counts as accepted.
 pub fn found_block(
     server: &Server,
     job: &Job,

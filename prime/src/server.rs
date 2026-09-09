@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+#[derive(Default)]
 pub(crate) struct NodeView {
     pub(crate) tip: Mutex<Option<rpc::Tip>>,
     pub(crate) coinbase_value: Mutex<Option<u64>>,
@@ -24,16 +25,6 @@ pub(crate) struct NodeView {
 pub(crate) const TIP_HISTORY_CAP: usize = 64;
 
 impl NodeView {
-    pub(crate) fn new() -> Self {
-        Self {
-            tip: Mutex::new(None),
-            coinbase_value: Mutex::new(None),
-            next_bits: Mutex::new(None),
-            tip_history: Mutex::new(VecDeque::new()),
-            wakers: Mutex::new(Vec::new()),
-        }
-    }
-
     pub(crate) fn add_waker(&self, waker: &Arc<Waker>) {
         lock(&self.wakers).push(Arc::clone(waker));
     }
@@ -42,8 +33,6 @@ impl NodeView {
         lock(&self.wakers).retain(|w| !Arc::ptr_eq(w, waker));
     }
 
-    /// Logs a tip the watcher has not seen before and adds it to the bounded history the
-    /// stats page reads the observed block interval from.
     fn record_tip(&self, t: &rpc::Tip) {
         info!(
             "node tip: height {} difficulty {} {} (chain {})",
@@ -68,7 +57,6 @@ impl NodeView {
     }
 }
 
-/// A ledger serves one chain, so a node that has moved to another one must not be read.
 fn exit_on_wrong_chain(t: &rpc::Tip, expected: Option<rpc::Chain>) {
     let Some(expected) = expected else { return };
     if t.chain == expected {
@@ -84,8 +72,6 @@ fn exit_on_wrong_chain(t: &rpc::Tip, expected: Option<rpc::Chain>) {
     std::process::exit(1);
 }
 
-/// Reads the next block's coinbase value and bits into `view`, reporting whether it now
-/// holds a template. A failed read clears both, so a stale value is never served.
 fn refresh_next_block(node: &rpc::Client, view: &NodeView) -> bool {
     match node.next_block() {
         Ok(n) => {
@@ -219,9 +205,6 @@ impl Default for SessionStore {
 }
 
 impl SessionStore {
-    /// Keeps `session` under the gateway's key, unless a session held longer is already
-    /// saved there: two connections under one key both save on close, and the one that
-    /// held the assignments longest is the one a resume should continue.
     pub(crate) fn save(&mut self, key: [u8; 32], session: SavedSession) {
         let saved_at = session.saved_at;
         self.0.retain(|_, s| !s.expired(saved_at));

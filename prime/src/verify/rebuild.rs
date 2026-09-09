@@ -1,7 +1,3 @@
-//! Rebuilding one submission into the header and coinbase transaction it claims, and
-//! accounting what that coinbase pays: the split the pool dictated, the pool's own payout
-//! script, and the dictated outputs the gateway left out.
-
 use super::{PoolPolicy, Rebuilt, Splits};
 use ratum::bitcoin::{self, CoinbaseTx};
 use ratum::datum::abw::XorKey;

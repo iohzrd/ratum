@@ -1,6 +1,3 @@
-//! The redb file a ledger is kept in: the byte layout of each record and the
-//! transactions that read and write them.
-
 use super::{FoundBlock, HASH_SIZE, MAX_SHARES, OwedBlock, ReadBack, SHARES_PER_KEEP_UNIT, Share};
 use ratum::cursor::Cursor;
 use redb::{
@@ -18,7 +15,6 @@ const META: TableDefinition<&str, &str> = TableDefinition::new("meta");
 const META_CHAIN: &str = "chain";
 const META_CUMULATIVE_WORK: &str = "cumulative_work";
 
-/// A record's variable-length text fields are written last and split on this byte.
 const NAME_SEPARATOR: u8 = 0x00;
 
 fn pack(share: &Share) -> Vec<u8> {
@@ -142,8 +138,6 @@ fn unpack_block(hash: &[u8], bytes: &[u8]) -> Option<FoundBlock> {
     })
 }
 
-/// redb reports a distinct error type per operation, none of which is an `io::Error`.
-/// `db()` turns any of them into one, so the store's calls read as ordinary fallible I/O.
 trait DbResult<T> {
     fn db(self) -> io::Result<T>;
 }
