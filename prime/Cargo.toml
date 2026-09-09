@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 ratum = { path = "../core" }
+bytes.workspace = true
 clap.workspace = true
 env_logger.workspace = true
 hex.workspace = true

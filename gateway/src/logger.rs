@@ -114,7 +114,7 @@ impl Log for Logger {
     }
 }
 
-fn build(cfg: &crate::config::Logger) -> Result<(Logger, Vec<(Level, String)>), String> {
+fn build(cfg: &crate::config::Logging) -> Result<(Logger, Vec<(Level, String)>), String> {
     let mut notes = Vec::new();
     let mut sinks = Vec::with_capacity(2);
 
@@ -145,7 +145,7 @@ fn build(cfg: &crate::config::Logger) -> Result<(Logger, Vec<(Level, String)>), 
     Ok((Logger { sinks, max, calling_function: cfg.log_calling_function }, notes))
 }
 
-pub fn init(cfg: &crate::config::Logger) -> Result<Vec<(Level, String)>, String> {
+pub fn init(cfg: &crate::config::Logging) -> Result<Vec<(Level, String)>, String> {
     let (logger, notes) = build(cfg)?;
     let max = logger.max;
     if log::set_boxed_logger(Box::new(logger)).is_ok() {

@@ -170,7 +170,7 @@ pub struct ExtraBlockSubmissions {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
-pub struct Logger {
+pub struct Logging {
     pub log_to_console: bool,
     pub log_to_stderr: bool,
     pub log_to_file: bool,
@@ -181,7 +181,7 @@ pub struct Logger {
     pub log_level_file: u8,
 }
 
-impl Default for Logger {
+impl Default for Logging {
     fn default() -> Self {
         Self {
             log_to_console: true,
@@ -242,7 +242,7 @@ pub struct Config {
     pub mining: Mining,
     pub api: Api,
     pub extra_block_submissions: ExtraBlockSubmissions,
-    pub logger: Logger,
+    pub logger: Logging,
     pub datum: Datum,
     #[serde(skip)]
     pub warnings: Vec<(log::Level, String)>,

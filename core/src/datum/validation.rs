@@ -1,7 +1,8 @@
 use crate::cursor::{Cursor, Truncated};
 use crate::datum::codes::wire_codes;
+use bytes::BufMut as _;
 
-pub use super::messages::client_subcmd::VALIDATION;
+use super::messages::client_subcmd::VALIDATION;
 
 pub mod request {
     pub const SHORT_TXN_LIST: u8 = 0x10;
@@ -17,7 +18,7 @@ pub mod response {
     pub const PARENT_FETCH: u8 = 0x94;
 }
 
-pub use super::framing::STRUCT_END;
+use super::framing::STRUCT_END;
 pub const JOB_INDEX_INVALID: u8 = 0xFF;
 pub const MAX_SHORT_LIST_TXNS: u16 = 16383;
 
@@ -106,14 +107,14 @@ pub const MAX_PARENT_FETCH_BLOCK: usize =
 impl ParentFetchReply {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(PARENT_FETCH_REPLY_OVERHEAD + self.block.len());
-        out.push(VALIDATION);
-        out.push(response::PARENT_FETCH);
-        out.push(self.job_index);
-        out.push(self.status.code());
-        out.extend_from_slice(&self.parent_hash);
-        out.extend_from_slice(&(self.block.len() as u32).to_le_bytes());
-        out.extend_from_slice(&self.block);
-        out.push(STRUCT_END);
+        out.put_u8(VALIDATION);
+        out.put_u8(response::PARENT_FETCH);
+        out.put_u8(self.job_index);
+        out.put_u8(self.status.code());
+        out.put_slice(&self.parent_hash);
+        out.put_u32_le(self.block.len() as u32);
+        out.put_slice(&self.block);
+        out.put_u8(STRUCT_END);
         out
     }
 }
@@ -146,17 +147,17 @@ impl ShortTxnList {
         if self.status != Status::Ok {
             return out;
         }
-        out.extend_from_slice(&self.txn_count.to_le_bytes());
+        out.put_u16_le(self.txn_count);
         if self.txn_count == 0 {
             return out;
         }
         for id in &self.short_ids {
-            out.extend_from_slice(&id.to_le_bytes()[..SHORT_ID_SIZE]);
+            out.put_slice(&id.to_le_bytes()[..SHORT_ID_SIZE]);
         }
         if let Some(x) = self.crosscheck {
-            out.extend_from_slice(&x);
+            out.put_slice(&x);
         }
-        out.push(STRUCT_END);
+        out.put_u8(STRUCT_END);
         out
     }
 }
@@ -203,12 +204,12 @@ impl TxnBundle {
         if self.status != Status::Ok {
             return out;
         }
-        out.extend_from_slice(&(self.txns.len() as u16).to_le_bytes());
+        out.put_u16_le(self.txns.len() as u16);
         for tx in &self.txns {
             encode_txn_size(&mut out, tx.len());
-            out.extend_from_slice(tx);
+            out.put_slice(tx);
         }
-        out.push(STRUCT_END);
+        out.put_u8(STRUCT_END);
         out
     }
 }
@@ -221,8 +222,8 @@ fn decode_txn_size(c: &mut Cursor<'_>) -> Result<usize, Error> {
 }
 
 fn encode_txn_size(out: &mut Vec<u8>, len: usize) {
-    out.extend_from_slice(&(len as u16).to_le_bytes());
-    out.push((len >> 16) as u8);
+    out.put_u16_le(len as u16);
+    out.put_u8((len >> 16) as u8);
 }
 
 fn body_of(data: &[u8], want: u8) -> Result<Cursor<'_>, Error> {
@@ -258,8 +259,8 @@ pub fn crosscheck(hashes: &[[u8; 32]]) -> [u8; 32] {
 }
 
 pub fn siphash24(key: &[u8; 16], data: &[u8]) -> u64 {
-    let k0 = u64::from_le_bytes(key[..8].try_into().unwrap());
-    let k1 = u64::from_le_bytes(key[8..].try_into().unwrap());
+    let [k0, k1] = key.as_chunks::<8>().0 else { unreachable!("16 bytes hold two words") };
+    let (k0, k1) = (u64::from_le_bytes(*k0), u64::from_le_bytes(*k1));
     let mut v0 = k0 ^ 0x736f_6d65_7073_6575;
     let mut v1 = k1 ^ 0x646f_7261_6e64_6f6d;
     let mut v2 = k0 ^ 0x6c79_6765_6e65_7261;

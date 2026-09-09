@@ -7,7 +7,6 @@ const COMPACT_SIZE_SHIFT: u32 = 24;
 const COMPACT_MANTISSA_MASK: u32 = 0x007f_ffff;
 const COMPACT_SIGN_BIT: u32 = 0x0080_0000;
 const COMPACT_MANTISSA_SIGN: u32 = 0x80;
-const COMPACT_MANTISSA_BYTES: usize = 3;
 const MAX_COMPACT_SIZE: usize = 34;
 
 const QUOTIENT_BITS: i32 = 64;
@@ -18,27 +17,24 @@ pub const MAX_TARGET_POT: u8 = (u64::BITS - 1) as u8;
 pub const DIFF1_TARGET: Target = target_for_pot(0);
 
 pub fn bits_to_target(bits: u32) -> Option<Target> {
-    let exp = (bits >> COMPACT_SIZE_SHIFT) as usize;
-    let mant = bits & COMPACT_MANTISSA_MASK;
     if bits & COMPACT_SIGN_BIT != 0 {
         return None;
     }
-    if exp > MAX_COMPACT_SIZE {
+    let exp = (bits >> COMPACT_SIZE_SHIFT) as isize;
+    if exp > MAX_COMPACT_SIZE as isize {
         return None;
     }
     let mut t = [0u8; TARGET_BYTES];
-    let m = mant.to_be_bytes();
-    if exp <= COMPACT_MANTISSA_BYTES {
-        let v = mant >> (8 * (COMPACT_MANTISSA_BYTES - exp));
-        t[TARGET_BYTES - COMPACT_MANTISSA_BYTES..].copy_from_slice(&v.to_be_bytes()[1..]);
-        return Some(t);
-    }
-    let end = TARGET_BYTES.checked_sub(exp - COMPACT_MANTISSA_BYTES)?;
-    for (i, b) in m[1..].iter().enumerate() {
-        match end.checked_sub(COMPACT_MANTISSA_BYTES - i) {
-            Some(idx) => t[idx] = *b,
-            None if *b == 0 => {}
-            None => return None,
+    // The mantissa's three bytes end `exp` bytes from the front of the target, so the
+    // byte at index i lands at TARGET_BYTES - exp + i. An index past the end is a byte
+    // shifted off the bottom (what an exponent under three drops); a negative index is a
+    // byte shifted past the top, which only a zero byte may be.
+    for (i, b) in (bits & COMPACT_MANTISSA_MASK).to_be_bytes()[1..].iter().enumerate() {
+        match TARGET_BYTES as isize - exp + i as isize {
+            at if at >= TARGET_BYTES as isize => {}
+            at if at >= 0 => t[at as usize] = *b,
+            _ if *b == 0 => {}
+            _ => return None,
         }
     }
     Some(t)

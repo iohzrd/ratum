@@ -1,5 +1,6 @@
 use crate::cursor::Cursor;
 use crate::datum::codes::wire_codes;
+use bytes::BufMut as _;
 
 pub mod server_subcmd {
     pub const CONFIG: u8 = 0x99;
@@ -16,7 +17,7 @@ pub mod client_subcmd {
     pub const VALIDATION: u8 = 0x50;
 }
 
-pub use super::framing::STRUCT_END;
+use super::framing::STRUCT_END;
 pub const CONFIG_VERSION: u8 = 1;
 const CONFIG_FIXED_LEN: usize = 4 + size_of::<u32>() + size_of::<u64>() + 2;
 pub const MAX_PAYOUT_SCRIPT: usize = 83;
@@ -52,8 +53,8 @@ fn check_config_fields(
 }
 
 fn push_counted(out: &mut Vec<u8>, bytes: &[u8]) {
-    out.push(bytes.len() as u8);
-    out.extend_from_slice(bytes);
+    out.put_u8(bytes.len() as u8);
+    out.put_slice(bytes);
 }
 
 fn take_counted<'a>(c: &mut Cursor<'a>, what: &'static str, max: usize) -> Option<&'a [u8]> {
@@ -77,14 +78,14 @@ impl ClientConfig {
         check_config_fields(&self.payout_script, &self.coinbase_tag, self.min_difficulty)?;
         let tag = self.coinbase_tag.as_bytes();
         let mut out = Vec::with_capacity(CONFIG_FIXED_LEN + self.payout_script.len() + tag.len());
-        out.push(server_subcmd::CONFIG);
-        out.push(CONFIG_VERSION);
+        out.put_u8(server_subcmd::CONFIG);
+        out.put_u8(CONFIG_VERSION);
         push_counted(&mut out, &self.payout_script);
-        out.extend_from_slice(&self.prime_id.to_le_bytes());
+        out.put_u32_le(self.prime_id);
         push_counted(&mut out, tag);
-        out.extend_from_slice(&self.min_difficulty.to_le_bytes());
-        out.push(0);
-        out.push(STRUCT_END);
+        out.put_u64_le(self.min_difficulty);
+        out.put_u8(0);
+        out.put_u8(STRUCT_END);
         Ok(out)
     }
 
@@ -119,8 +120,9 @@ const TOKEN_PRIME_ID_LEN: usize = size_of::<u64>();
 
 pub fn new_resume_token(prime_id: u64) -> ResumeToken {
     let mut t = [0u8; RESUME_TOKEN_LEN];
-    t[..TOKEN_PRIME_ID_LEN].copy_from_slice(&prime_id.to_le_bytes());
-    crate::rand::fill(&mut t[TOKEN_PRIME_ID_LEN..]);
+    let (id, rest) = t.split_at_mut(TOKEN_PRIME_ID_LEN);
+    id.copy_from_slice(&prime_id.to_le_bytes());
+    crate::rand::fill(rest);
     t
 }
 
@@ -142,17 +144,17 @@ impl ClientConfigV3 {
         let mut out = Vec::with_capacity(
             CONFIG_V3_FIXED_LEN + self.payout_script.len() + tag.len() + DBF_MARKER.len(),
         );
-        out.push(server_subcmd::CONFIG);
-        out.push(CONFIG_VERSION_V3);
+        out.put_u8(server_subcmd::CONFIG);
+        out.put_u8(CONFIG_VERSION_V3);
         push_counted(&mut out, &self.payout_script);
-        out.extend_from_slice(&self.prime_id.to_le_bytes());
-        out.extend_from_slice(&self.resume_token);
+        out.put_u64_le(self.prime_id);
+        out.put_slice(&self.resume_token);
         push_counted(&mut out, tag);
-        out.extend_from_slice(&self.min_difficulty.to_le_bytes());
-        out.push(if self.abw_disabled { CONFIG_FLAG_ABW_DISABLED } else { 0 });
-        out.push(STRUCT_END);
+        out.put_u64_le(self.min_difficulty);
+        out.put_u8(if self.abw_disabled { CONFIG_FLAG_ABW_DISABLED } else { 0 });
+        out.put_u8(STRUCT_END);
         if self.bulk_framing {
-            out.extend_from_slice(&DBF_MARKER);
+            out.put_slice(&DBF_MARKER);
         }
         Ok(out)
     }
@@ -271,10 +273,10 @@ impl CoinbaserRequest {
 
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(COINBASER_REQUEST_LEN);
-        out.push(client_subcmd::COINBASER_REQUEST);
-        out.extend_from_slice(&self.value.to_le_bytes());
-        out.extend_from_slice(&self.prev_hash);
-        out.push(STRUCT_END);
+        out.put_u8(client_subcmd::COINBASER_REQUEST);
+        out.put_u64_le(self.value);
+        out.put_slice(&self.prev_hash);
+        out.put_u8(STRUCT_END);
         out
     }
 }
@@ -311,16 +313,16 @@ impl CoinbaserResponse {
         let blob_len: usize =
             self.outputs.iter().map(|o| COINBASER_OUTPUT_FIXED_LEN + o.script.len()).sum();
         let mut blob = Vec::with_capacity(1 + blob_len);
-        blob.push(self.coinbaser_id);
+        blob.put_u8(self.coinbaser_id);
         let mut total: u64 = 0;
         for o in &self.outputs {
             if o.script.len() < MIN_OUTPUT_SCRIPT || o.script.len() > MAX_OUTPUT_SCRIPT {
                 return Err(Error::OutOfRange { field: "output script", len: o.script.len() });
             }
             total = total.saturating_add(o.value);
-            blob.extend_from_slice(&o.value.to_le_bytes());
-            blob.push(o.script.len() as u8);
-            blob.extend_from_slice(&o.script);
+            blob.put_u64_le(o.value);
+            blob.put_u8(o.script.len() as u8);
+            blob.put_slice(&o.script);
         }
         if total > self.value {
             return Err(Error::SplitExceedsValue { total, value: self.value });
@@ -330,10 +332,10 @@ impl CoinbaserResponse {
         }
 
         let mut out = Vec::with_capacity(COINBASER_RESPONSE_HEADER_LEN + blob.len());
-        out.push(server_subcmd::COINBASER);
-        out.extend_from_slice(&self.value.to_le_bytes());
-        out.extend_from_slice(&(blob.len() as u32).to_le_bytes());
-        out.extend_from_slice(&blob);
+        out.put_u8(server_subcmd::COINBASER);
+        out.put_u64_le(self.value);
+        out.put_u32_le(blob.len() as u32);
+        out.put_slice(&blob);
         Ok(out)
     }
 
@@ -449,17 +451,17 @@ impl ShareResponse {
         } else {
             SHARE_RESPONSE_LEN
         });
-        out.push(server_subcmd::SHARE_RESPONSE);
-        out.push(status);
-        out.extend_from_slice(&reason.to_le_bytes());
-        out.extend_from_slice(&self.nonce.to_le_bytes());
-        out.push(self.target_byte);
-        out.push(self.job_id);
+        out.put_u8(server_subcmd::SHARE_RESPONSE);
+        out.put_u8(status);
+        out.put_u16_le(reason);
+        out.put_u32_le(self.nonce);
+        out.put_u8(self.target_byte);
+        out.put_u8(self.job_id);
         if let Some(r) = &self.abw_ref {
-            out.push(SHARE_RESPONSE_ABW_MARKER);
-            out.push(r.slot);
-            out.extend_from_slice(&r.raw_pow_hash);
-            out.push(STRUCT_END);
+            out.put_u8(SHARE_RESPONSE_ABW_MARKER);
+            out.put_u8(r.slot);
+            out.put_slice(&r.raw_pow_hash);
+            out.put_u8(STRUCT_END);
         }
         out
     }

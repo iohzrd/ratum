@@ -1,3 +1,5 @@
+use bytes::BufMut as _;
+
 pub const POT_TARGET_PLACEHOLDER: u8 = 0xFF;
 
 pub const TAG_SEPARATOR: u8 = 0x0F;
@@ -14,12 +16,12 @@ pub const TAG_MARKER_BYTES: usize = 2;
 
 pub fn tag_push_data(primary: &[u8], secondary: &[u8]) -> Vec<u8> {
     let mut data = Vec::with_capacity(primary.len() + secondary.len() + TAG_MARKER_BYTES);
-    data.extend_from_slice(primary);
+    data.put_slice(primary);
     if !secondary.is_empty() {
-        data.push(TAG_SEPARATOR);
-        data.extend_from_slice(secondary);
+        data.put_u8(TAG_SEPARATOR);
+        data.put_slice(secondary);
     }
-    data.push(TAG_END);
+    data.put_u8(TAG_END);
     data
 }
 
@@ -29,9 +31,9 @@ pub fn uid_push(unique_id: u16, prime_id: &[u8]) -> Vec<u8> {
     let len = UID_PUSH_PREFIX_SIZE + prime_id.len();
     debug_assert!(matches!(len, UID_PUSH_SIZE_NO_PRIME | UID_PUSH_SIZE_V1 | UID_PUSH_SIZE_V3));
     let mut push = Vec::with_capacity(1 + len);
-    push.push(len as u8);
-    push.push(POT_TARGET_PLACEHOLDER);
-    push.extend_from_slice(&unique_id.to_le_bytes());
-    push.extend_from_slice(prime_id);
+    push.put_u8(len as u8);
+    push.put_u8(POT_TARGET_PLACEHOLDER);
+    push.put_u16_le(unique_id);
+    push.put_slice(prime_id);
     push
 }

@@ -18,7 +18,7 @@ use ratum::datum::validation::{self, TxnBundle};
 use ratum::io::read_exact_deadline;
 use ratum::lock;
 use ratum::poll::PolledSocket;
-use ratum_prime::verify::{Accepted, Rebuilt, Verifier};
+use ratum_prime::verify::{AcceptedShare, RebuiltShare, Verifier};
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::net::TcpStream;
@@ -187,7 +187,7 @@ struct Connection<'a> {
     verifier: Verifier,
     credit: Crediting,
     coinbaser_id: u8,
-    awaiting_txns: HashMap<u8, Accepted>,
+    awaiting_txns: HashMap<u8, AcceptedShare>,
     known_tip: Option<[u8; 32]>,
     known_next_bits: Option<u32>,
     last_send: Instant,
@@ -240,12 +240,12 @@ impl Connection<'_> {
         due.saturating_duration_since(Instant::now())
     }
 
-    fn read_header(&mut self, hdr: &mut [u8; framing::HEADER_LEN]) -> io::Result<Framing> {
+    fn read_header(&mut self, hdr: &mut [u8; framing::HEADER_LEN]) -> io::Result<HeaderRead> {
         let mut got = 0usize;
         let mut partial_since: Option<Instant> = None;
         while got < hdr.len() {
             if !self.socket.readable() {
-                let Some(since) = partial_since else { return Ok(Framing::Idle) };
+                let Some(since) = partial_since else { return Ok(HeaderRead::Idle) };
                 let left = HEADER_TIMEOUT.checked_sub(since.elapsed()).filter(|d| !d.is_zero());
                 let Some(left) = left else {
                     return Err(io::Error::new(
@@ -257,7 +257,7 @@ impl Connection<'_> {
                 continue;
             }
             match self.socket.read(&mut hdr[got..])? {
-                Some(0) => return Ok(Framing::Closed),
+                Some(0) => return Ok(HeaderRead::Closed),
                 Some(n) => {
                     got += n;
                     partial_since.get_or_insert_with(Instant::now);
@@ -265,7 +265,7 @@ impl Connection<'_> {
                 None => {}
             }
         }
-        Ok(Framing::HeaderRead)
+        Ok(HeaderRead::Complete)
     }
 
     fn read_body(&mut self, n: usize) -> io::Result<Vec<u8>> {
@@ -410,7 +410,7 @@ impl Connection<'_> {
         Ok(!self.socket.readable())
     }
 
-    fn send_abw_receipt(&mut self, s: &PowSubmit, work: &Rebuilt) -> io::Result<()> {
+    fn send_abw_receipt(&mut self, s: &PowSubmit, work: &RebuiltShare) -> io::Result<()> {
         let Some(slot) = s.abw_slot.filter(|_| self.v3.is_some()) else { return Ok(()) };
         self.send_mining(&AbwManager::receipt(slot, work.raw_hash), false)?;
         debug!("[{}]   <- ABW receipt for the block on slot {slot}", self.peer);
@@ -436,12 +436,12 @@ impl Connection<'_> {
             }
             let mut hdr = [0u8; framing::HEADER_LEN];
             match self.read_header(&mut hdr)? {
-                Framing::Closed => {
+                HeaderRead::Closed => {
                     debug!("[{peer}] disconnected");
                     return Ok(());
                 }
-                Framing::Idle => continue,
-                Framing::HeaderRead => {}
+                HeaderRead::Idle => continue,
+                HeaderRead::Complete => {}
             }
             let header = self.session.unmask_header(hdr);
             if header.cmd_len as usize > framing::MAX_CMD_DATA_SIZE as usize {
@@ -597,7 +597,12 @@ impl Connection<'_> {
         }
     }
 
-    fn on_accepted(&mut self, s: &PowSubmit, a: &Accepted, now: u64) -> io::Result<ShareOutcome> {
+    fn on_accepted(
+        &mut self,
+        s: &PowSubmit,
+        a: &AcceptedShare,
+        now: u64,
+    ) -> io::Result<ShareOutcome> {
         let peer = self.peer;
         let raw_hash = Some(a.work.raw_hash);
         let mut pending = None;
@@ -721,8 +726,9 @@ impl Connection<'_> {
     }
 }
 
-enum Framing {
-    HeaderRead,
+/// What reading a frame header found.
+enum HeaderRead {
+    Complete,
     Idle,
     Closed,
 }

@@ -1,8 +1,9 @@
 use super::framing::{self, Header, HeaderKeys, KeyRatchet, STRUCT_END, SessionNonces};
 use super::handshake::{
     Channel, Error, Generation, KEYS_LEN, KeyPairs, POOL_BOX_KEY_INDEX, POOL_SIGN_KEY_INDEX,
-    RESPONSE_KEYS_LEN, Signature, key_at,
+    RESPONSE_KEYS_LEN, Signature, key_at, pubkey_at,
 };
+use bytes::BufMut as _;
 use dryoc::classic::crypto_box::{
     PublicKey as BoxPublicKey, crypto_box_beforenm, crypto_box_seal, crypto_box_seal_open,
 };
@@ -66,22 +67,22 @@ impl Client {
         generation: Generation,
     ) -> Vec<u8> {
         let mut body = Vec::with_capacity(KEYS_LEN + user_agent.len() + HELLO_TAIL_MAX);
-        body.extend_from_slice(&self.long_term_keys.sign_pk);
-        body.extend_from_slice(&self.long_term_keys.box_pk);
-        body.extend_from_slice(&self.session_keys.sign_pk);
-        body.extend_from_slice(&self.session_keys.box_pk);
-        body.extend_from_slice(user_agent.as_bytes());
-        body.push(0);
-        body.push(STRUCT_END);
-        body.extend_from_slice(&self.nk.to_le_bytes());
+        body.put_slice(&self.long_term_keys.sign_pk);
+        body.put_slice(&self.long_term_keys.box_pk);
+        body.put_slice(&self.session_keys.sign_pk);
+        body.put_slice(&self.session_keys.box_pk);
+        body.put_slice(user_agent.as_bytes());
+        body.put_u8(0);
+        body.put_u8(STRUCT_END);
+        body.put_u32_le(self.nk);
         if let Generation::V3 { resume } = generation {
-            body.extend_from_slice(&super::handshake::DRS_MARKER);
+            body.put_slice(&super::handshake::DRS_MARKER);
             match resume {
                 Some(t) => {
-                    body.push(super::handshake::DRS_RESUME_PRESENT);
-                    body.extend_from_slice(&t);
+                    body.put_u8(super::handshake::DRS_RESUME_PRESENT);
+                    body.put_slice(&t);
                 }
-                None => body.push(0),
+                None => body.put_u8(0),
             }
         }
         let r = crate::rand::bytes::<2>();
@@ -160,9 +161,8 @@ impl Client {
             return Err(Error::Malformed("response does not echo the client's keys"));
         }
 
-        let key = |n| key_at(signed, n).expect("length checked").try_into().expect("PUBKEY_LEN");
-        let pool_sign: SignPublicKey = key(POOL_SIGN_KEY_INDEX);
-        let pool_box: BoxPublicKey = key(POOL_BOX_KEY_INDEX);
+        let pool_sign: SignPublicKey = pubkey_at(signed, POOL_SIGN_KEY_INDEX);
+        let pool_box: BoxPublicKey = pubkey_at(signed, POOL_BOX_KEY_INDEX);
         let motd = &signed[RESPONSE_KEYS_LEN..];
         let end = motd.iter().position(|&b| b == 0).unwrap_or(motd.len());
         self.motd = String::from_utf8_lossy(&motd[..end]).into_owned();

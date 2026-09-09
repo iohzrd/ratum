@@ -1,7 +1,8 @@
 use crate::cursor::{Cursor, Truncated};
 use crate::header::HeaderV2;
+use bytes::BufMut as _;
 
-pub use super::messages::client_subcmd::SUBMIT_POW;
+use super::messages::client_subcmd::SUBMIT_POW;
 pub const SECTION_JOB: u8 = 0x01;
 pub const SECTION_COINBASE: u8 = 0x02;
 pub const SECTION_BLAKE2B: u8 = 0x03;
@@ -13,7 +14,7 @@ pub const FLAG_SUBSIDY_ONLY: u8 = 0x02;
 pub const FLAG_QUICKDIFF: u8 = 0x04;
 pub const FLAG_BLAKE2B: u8 = 0x08;
 pub const RESERVED_USE_TIME_OFFSET: u8 = 0x01;
-pub use super::framing::STRUCT_END;
+use super::framing::STRUCT_END;
 pub const EXTRANONCE_SIZE: usize = 12;
 pub const EXTRANONCE_SIZE_V2: usize = 16;
 pub const EXTRANONCE_V2_PAD: usize = EXTRANONCE_SIZE_V2 - EXTRANONCE_SIZE;
@@ -77,9 +78,9 @@ pub struct CoinbaseSection {
 impl CoinbaseSection {
     pub fn assemble(&self, extranonce: &[u8]) -> Vec<u8> {
         let mut tx = Vec::with_capacity(self.coinb1.len() + extranonce.len() + self.coinb2.len());
-        tx.extend_from_slice(&self.coinb1);
-        tx.extend_from_slice(extranonce);
-        tx.extend_from_slice(&self.coinb2);
+        tx.put_slice(&self.coinb1);
+        tx.put_slice(extranonce);
+        tx.put_slice(&self.coinb2);
         tx
     }
 }
@@ -109,8 +110,9 @@ pub fn share_extranonce(field: &[u8; EXTRANONCE_SIZE_V2]) -> Option<Vec<u8>> {
 
 pub fn sia_field(low: u32, high: u32) -> [u8; SIA_FIELD_SIZE] {
     let mut f = [0u8; SIA_FIELD_SIZE];
-    f[..SIA_FIELD_HALF].copy_from_slice(&low.to_le_bytes());
-    f[SIA_FIELD_HALF..].copy_from_slice(&high.to_le_bytes());
+    let mut w = &mut f[..];
+    w.put_u32_le(low);
+    w.put_u32_le(high);
     f
 }
 
@@ -173,20 +175,20 @@ fn decode_job_section(r: &mut Cursor<'_>) -> Result<JobSection, Error> {
 }
 
 fn encode_job_section(out: &mut Vec<u8>, j: &JobSection) {
-    out.push(SECTION_JOB);
-    out.extend_from_slice(&j.prev_hash);
-    out.extend_from_slice(&j.target_byte_index.to_le_bytes());
-    out.extend_from_slice(&j.nbits);
-    out.push(j.coinbaser_id);
-    out.extend_from_slice(&j.height.to_le_bytes());
-    out.extend_from_slice(&j.coinbase_value.to_le_bytes());
-    out.extend_from_slice(&j.txn_count.to_le_bytes());
-    out.extend_from_slice(&j.txn_total_weight.to_le_bytes());
-    out.extend_from_slice(&j.txn_total_size.to_le_bytes());
-    out.extend_from_slice(&j.txn_total_sigops.to_le_bytes());
-    out.push(j.merkle_branches.len() as u8);
+    out.put_u8(SECTION_JOB);
+    out.put_slice(&j.prev_hash);
+    out.put_u16_le(j.target_byte_index);
+    out.put_slice(&j.nbits);
+    out.put_u8(j.coinbaser_id);
+    out.put_u32_le(j.height);
+    out.put_u64_le(j.coinbase_value);
+    out.put_u32_le(j.txn_count);
+    out.put_u32_le(j.txn_total_weight);
+    out.put_u32_le(j.txn_total_size);
+    out.put_u32_le(j.txn_total_sigops);
+    out.put_u8(j.merkle_branches.len() as u8);
     for b in &j.merkle_branches {
-        out.extend_from_slice(b);
+        out.put_slice(b);
     }
 }
 
@@ -200,12 +202,12 @@ fn decode_coinbase_section(r: &mut Cursor<'_>) -> Result<CoinbaseSection, Error>
 }
 
 fn encode_coinbase_section(out: &mut Vec<u8>, c: &CoinbaseSection) {
-    out.push(SECTION_COINBASE);
-    out.push(c.coinbase_id);
-    out.extend_from_slice(&(c.coinb1.len() as u16).to_le_bytes());
-    out.extend_from_slice(&(c.coinb2.len() as u16).to_le_bytes());
-    out.extend_from_slice(&c.coinb1);
-    out.extend_from_slice(&c.coinb2);
+    out.put_u8(SECTION_COINBASE);
+    out.put_u8(c.coinbase_id);
+    out.put_u16_le(c.coinb1.len() as u16);
+    out.put_u16_le(c.coinb2.len() as u16);
+    out.put_slice(&c.coinb1);
+    out.put_slice(&c.coinb2);
 }
 
 fn decode_blake2b_section(r: &mut Cursor<'_>) -> Result<Blake2bSection, Error> {
@@ -222,12 +224,12 @@ fn decode_blake2b_section(r: &mut Cursor<'_>) -> Result<Blake2bSection, Error> {
 }
 
 fn encode_blake2b_section(out: &mut Vec<u8>, b: &Blake2bSection) {
-    out.push(SECTION_BLAKE2B);
-    out.push(BLAKE2B_ALGORITHM);
-    out.extend_from_slice(&b.sia_ntime);
-    out.extend_from_slice(&b.sia_nonce);
-    out.push(BLAKE2B_TIME);
-    out.extend_from_slice(&b.time_on_wire.to_le_bytes());
+    out.put_u8(SECTION_BLAKE2B);
+    out.put_u8(BLAKE2B_ALGORITHM);
+    out.put_slice(&b.sia_ntime);
+    out.put_slice(&b.sia_nonce);
+    out.put_u8(BLAKE2B_TIME);
+    out.put_u32_le(b.time_on_wire);
 }
 
 struct Prefix {
@@ -344,29 +346,29 @@ impl PowSubmit {
 
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(64);
-        out.push(SUBMIT_POW);
-        out.push(self.job_id);
-        out.push(self.coinbase_id);
+        out.put_u8(SUBMIT_POW);
+        out.put_u8(self.job_id);
+        out.put_u8(self.coinbase_id);
         let flag = |set: bool, bit: u8| if set { bit } else { 0 };
-        out.push(
+        out.put_u8(
             flag(self.is_block, FLAG_IS_BLOCK)
                 | flag(self.subsidy_only, FLAG_SUBSIDY_ONLY)
                 | flag(self.quickdiff, FLAG_QUICKDIFF)
                 | FLAG_BLAKE2B,
         );
-        out.push(self.target_byte);
-        out.extend_from_slice(&self.ntime.to_le_bytes());
-        out.extend_from_slice(&self.nonce.to_le_bytes());
-        out.extend_from_slice(&self.version.to_le_bytes());
-        out.push(self.extranonce.len() as u8);
-        out.extend_from_slice(&self.extranonce);
-        out.extend_from_slice(self.username.as_bytes());
-        out.push(0);
+        out.put_u8(self.target_byte);
+        out.put_u32_le(self.ntime);
+        out.put_u32_le(self.nonce);
+        out.put_u32_le(self.version);
+        out.put_u8(self.extranonce.len() as u8);
+        out.put_slice(&self.extranonce);
+        out.put_slice(self.username.as_bytes());
+        out.put_u8(0);
         let mut reserved = [0u8; RESERVED_SIZE];
         if self.use_time_offset {
             reserved[0] |= RESERVED_USE_TIME_OFFSET;
         }
-        out.extend_from_slice(&reserved);
+        out.put_slice(&reserved);
         if let Some(j) = &self.job {
             encode_job_section(&mut out, j);
         }
@@ -375,10 +377,10 @@ impl PowSubmit {
         }
         encode_blake2b_section(&mut out, &self.blake2b);
         if let Some(slot) = self.abw_slot {
-            out.push(SECTION_ABW_SLOT);
-            out.push(slot);
+            out.put_u8(SECTION_ABW_SLOT);
+            out.put_u8(slot);
         }
-        out.push(STRUCT_END);
+        out.put_u8(STRUCT_END);
         out
     }
 }

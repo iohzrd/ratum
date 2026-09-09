@@ -1,4 +1,4 @@
-use super::{PoolPolicy, Rebuilt, Splits};
+use super::{PoolPolicy, RebuiltShare, Splits};
 use ratum::bitcoin::{self, CoinbaseTx};
 use ratum::datum::abw::XorKey;
 use ratum::datum::coinbase::{
@@ -16,7 +16,7 @@ pub(super) fn build_work(
     cb: &CoinbaseSection,
     s: &PowSubmit,
     abw_key: Option<XorKey>,
-) -> Result<Rebuilt, RejectReason> {
+) -> Result<RebuiltShare, RejectReason> {
     if s.target_byte > target::MAX_TARGET_POT
         || u64::from(s.target_byte) < u64::from(target::floor_pot(policy.min_difficulty))
     {
@@ -44,10 +44,11 @@ pub(super) fn build_work(
     let h = build_header_v2(job, s, &s.blake2b, &merkle_root, abw_key)?;
 
     let (raw_hash, block_hash) = h.pow_and_block_hash();
-    Ok(Rebuilt {
+    Ok(RebuiltShare {
         difficulty: s.difficulty(),
         block_hash,
         raw_hash,
+        prev_hash: job.prev_hash,
         job_bits: u32::from_le_bytes(job.nbits),
         header: h.serialize(),
         coinbase_tx,

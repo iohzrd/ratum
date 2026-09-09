@@ -1,4 +1,4 @@
-use crate::datum::Shared;
+use crate::datum::Pool;
 use crate::job::{BuildError, Builder, PoolConfig};
 use crate::stratum::Server;
 use crate::template::Template;
@@ -13,17 +13,17 @@ const EMPTY_JOB_HOLD: Duration = Duration::from_millis(50);
 pub struct Publisher {
     builder: Mutex<Builder>,
     server: Arc<Server>,
-    shared: Arc<Shared>,
+    pool: Arc<Pool>,
     template_serial: AtomicU64,
     last_error: Mutex<Option<BuildError>>,
 }
 
 impl Publisher {
-    pub fn new(builder: Builder, server: Arc<Server>, shared: Arc<Shared>) -> Arc<Self> {
+    pub fn new(builder: Builder, server: Arc<Server>, pool: Arc<Pool>) -> Arc<Self> {
         Arc::new(Self {
             builder: Mutex::new(builder),
             server,
-            shared,
+            pool,
             template_serial: AtomicU64::new(0),
             last_error: Mutex::new(None),
         })
@@ -33,20 +33,20 @@ impl Publisher {
         &self,
         t: &Arc<Template>,
         new_block: bool,
-        pool: Option<&PoolConfig>,
+        pool_config: Option<&PoolConfig>,
         coinbaser: Option<CoinbaserResponse>,
         what: &str,
     ) {
-        let require_abw = self.shared.require_abw();
-        let abw = if require_abw { self.shared.abw_assignment() } else { None };
-        if pool.is_some() && require_abw && abw.is_none() {
+        let require_abw = self.pool.require_abw();
+        let abw = if require_abw { self.pool.abw_assignment() } else { None };
+        if pool_config.is_some() && require_abw && abw.is_none() {
             debug!(
                 "waiting for the pool's anti-withholding assignment before building {what} work"
             );
             return;
         }
         let built =
-            ratum::lock(&self.builder).build(Arc::clone(t), new_block, pool, coinbaser, abw);
+            ratum::lock(&self.builder).build(Arc::clone(t), new_block, pool_config, coinbaser, abw);
         let mut last = ratum::lock(&self.last_error);
         match built {
             Ok(job) => {
@@ -75,15 +75,15 @@ impl Publisher {
 
     pub fn on_template(self: &Arc<Self>, t: Arc<Template>, new_block: bool) {
         let serial = self.template_serial.fetch_add(1, Ordering::SeqCst) + 1;
-        let pool = self.shared.pool_config();
+        let pool_config = self.pool.pool_config();
         if new_block {
-            self.build_and_publish(&t, true, pool.as_ref(), None, "new-block");
+            self.build_and_publish(&t, true, pool_config.as_ref(), None, "new-block");
             std::thread::sleep(EMPTY_JOB_HOLD);
-            if pool.is_some() {
-                self.build_and_publish(&t, false, pool.as_ref(), None, "priority");
+            if pool_config.is_some() {
+                self.build_and_publish(&t, false, pool_config.as_ref(), None, "priority");
             }
         }
-        if pool.is_none() {
+        if pool_config.is_none() {
             self.build_and_publish(&t, false, None, None, "full");
         } else {
             self.spawn_coinbaser(t, new_block, serial);
@@ -93,16 +93,16 @@ impl Publisher {
     fn spawn_coinbaser(self: &Arc<Self>, t: Arc<Template>, new_block: bool, serial: u64) {
         let this = Arc::clone(self);
         let spawned = ratum::thread::try_spawn("coinbaser", move || {
-            let coinbaser = this.shared.fetch_coinbaser(t.coinbase_value, t.prev_hash);
+            let coinbaser = this.pool.fetch_coinbaser(t.coinbase_value, t.prev_hash);
             if this.template_serial.load(Ordering::SeqCst) != serial {
                 info!("coinbaser response for a superseded template; not used");
                 return;
             }
-            let pool = this.shared.pool_config();
-            if new_block && pool.is_some() && coinbaser.is_none() {
+            let pool_config = this.pool.pool_config();
+            if new_block && pool_config.is_some() && coinbaser.is_none() {
                 return;
             }
-            this.build_and_publish(&t, false, pool.as_ref(), coinbaser, "full");
+            this.build_and_publish(&t, false, pool_config.as_ref(), coinbaser, "full");
         });
         if let Err(e) = spawned {
             error!("could not start the coinbaser thread: {e}");

@@ -30,6 +30,11 @@ pub(crate) fn key_at(block: &[u8], n: usize) -> Option<&[u8]> {
     block.get(n * PUBKEY_LEN..(n + 1) * PUBKEY_LEN)
 }
 
+/// The Nth key of a block whose length the caller has already checked.
+pub(crate) fn pubkey_at(block: &[u8], n: usize) -> [u8; PUBKEY_LEN] {
+    key_at(block, n).expect("the caller checked the length").try_into().expect("PUBKEY_LEN bytes")
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("unexpected handshake frame header: {0:?}")]
@@ -152,13 +157,12 @@ pub fn open_hello(header: Header, payload: &[u8], pool: &KeyPairs) -> Result<Hel
     }
     let (signed, sig) = plain.split_at(plain.len() - CRYPTO_SIGN_BYTES);
     let sig: Signature = sig.try_into().map_err(|_| Error::Truncated)?;
-    let key = |n| key_at(signed, n).expect("KEYS_LEN checked").try_into().expect("PUBKEY_LEN");
-    let client_sign_pk: SignPublicKey = key(0);
+    let client_sign_pk: SignPublicKey = pubkey_at(signed, 0);
     crypto_sign_verify_detached(&sig, signed, &client_sign_pk).map_err(|_| Error::BadSignature)?;
 
-    let client_box_pk: BoxPublicKey = key(1);
-    let session_sign_pk: SignPublicKey = key(2);
-    let session_box_pk: BoxPublicKey = key(3);
+    let client_box_pk: BoxPublicKey = pubkey_at(signed, 1);
+    let session_sign_pk: SignPublicKey = pubkey_at(signed, 2);
+    let session_box_pk: BoxPublicKey = pubkey_at(signed, 3);
 
     let rest = &signed[KEYS_LEN..];
     let nul = rest.iter().position(|&b| b == 0).ok_or(Error::Malformed("no UA terminator"))?;

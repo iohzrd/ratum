@@ -71,11 +71,21 @@ impl PoolPolicy {
     }
 }
 
+/// Whether the anti-block-withholding key a share was rebuilt with is still the pool's
+/// secret. A share on a revealed slot is refused, because its key is public and anyone
+/// could have produced it, but it is still rebuilt for its exact reference and its receipt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SlotKey {
+    Secret,
+    Revealed,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Rebuilt {
+pub struct RebuiltShare {
     pub difficulty: u64,
     pub block_hash: [u8; 32],
     pub raw_hash: [u8; 32],
+    pub prev_hash: [u8; 32],
     pub job_bits: u32,
     pub header: [u8; header::HEADER_V2_SIZE],
     pub coinbase_tx: Vec<u8>,
@@ -89,8 +99,8 @@ pub struct Rebuilt {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Accepted {
-    pub work: Rebuilt,
+pub struct AcceptedShare {
+    pub work: RebuiltShare,
     pub is_block: bool,
 }
 
@@ -183,7 +193,7 @@ impl Verifier {
         self.splits = splits;
     }
 
-    pub fn unpaid_outputs(&self, work: &Rebuilt) -> Vec<(String, u64)> {
+    pub fn unpaid_outputs(&self, work: &RebuiltShare) -> Vec<(String, u64)> {
         let Some(split) = self.splits.get(&work.coinbaser_id) else {
             return Vec::new();
         };
@@ -242,7 +252,7 @@ impl Verifier {
         }
     }
 
-    fn meets_network_target(&self, work: &Rebuilt) -> bool {
+    fn meets_network_target(&self, work: &RebuiltShare) -> bool {
         self.tip_next_target
             .as_ref()
             .is_some_and(|target| target::meets_target(&work.block_hash, target))
@@ -266,31 +276,31 @@ impl Verifier {
         }
     }
 
-    pub fn verify(&mut self, s: &PowSubmit, now: u64) -> Result<Accepted, RejectReason> {
+    pub fn verify(&mut self, s: &PowSubmit, now: u64) -> Result<AcceptedShare, RejectReason> {
         let work = self.rebuild(s, now)?;
         let is_block = self.meets_network_target(&work);
 
         if !ratum::lock(&self.replay).accept(work.block_hash) {
             return Err(RejectReason::DuplicateWork);
         }
-        Ok(Accepted { work, is_block })
+        Ok(AcceptedShare { work, is_block })
     }
 
-    pub fn rebuild_refused(&self, s: &PowSubmit) -> Option<Rebuilt> {
-        self.build_unchecked(s, true).ok().map(|(work, _, _)| work)
+    pub fn rebuild_refused(&self, s: &PowSubmit) -> Option<RebuiltShare> {
+        self.build_unchecked(s, true).ok().map(|(work, _)| work)
     }
 
-    pub fn block_candidate(&self, work: &Rebuilt) -> bool {
+    pub fn block_candidate(&self, work: &RebuiltShare) -> bool {
         self.meets_network_target(work) || meets_own_bits(work)
     }
 
-    fn build(&self, s: &PowSubmit) -> Result<(Rebuilt, [u8; 32]), RejectReason> {
-        let (work, prev_hash, seeded) = self.build_unchecked(s, false)?;
-        if !seeded {
+    fn build(&self, s: &PowSubmit) -> Result<RebuiltShare, RejectReason> {
+        let (work, key) = self.build_unchecked(s, false)?;
+        if key == SlotKey::Revealed {
             return Err(RejectReason::BadAbwSlot);
         }
 
-        if self.tip == Some(prev_hash)
+        if self.tip == Some(work.prev_hash)
             && let Some(node_target) = self.tip_next_target
         {
             let job_target =
@@ -299,43 +309,42 @@ impl Verifier {
                 return Err(RejectReason::BadTarget);
             }
         }
-        Ok((work, prev_hash))
+        Ok(work)
     }
 
     fn build_unchecked(
         &self,
         s: &PowSubmit,
         allow_evicted: bool,
-    ) -> Result<(Rebuilt, [u8; 32], bool), RejectReason> {
+    ) -> Result<(RebuiltShare, SlotKey), RejectReason> {
         let (job, cb) = self.resolve(s, allow_evicted)?;
-        let (abw_key, seeded) = match &self.abw_keys {
-            None => (None, true),
+        let (abw_key, key) = match &self.abw_keys {
+            None => (None, SlotKey::Secret),
             Some(keys) => {
                 let slot = usize::from(s.abw_slot.ok_or(RejectReason::BadAbwSlot)?);
                 let seeded = keys.seeded.get(slot).copied().flatten();
                 let revealed = keys.revealed.get(slot).copied().flatten();
                 match (seeded, revealed) {
-                    (Some(key), _) => (Some(key), true),
-                    (None, Some(key)) => (Some(key), false),
+                    (Some(key), _) => (Some(key), SlotKey::Secret),
+                    (None, Some(key)) => (Some(key), SlotKey::Revealed),
                     (None, None) => return Err(RejectReason::BadAbwSlot),
                 }
             }
         };
         let work = rebuild::build_work(&self.policy, &self.splits, job, cb, s, abw_key)?;
-        Ok((work, job.prev_hash, seeded))
+        Ok((work, key))
     }
 
     fn check_share(
         &self,
         s: &PowSubmit,
-        work: &Rebuilt,
-        prev_hash: [u8; 32],
+        work: &RebuiltShare,
         now: u64,
     ) -> Result<(), RejectReason> {
         if !self.meets_network_target(work)
             && let Some(tip) = self.tip
-            && prev_hash != tip
-            && !self.within_tip_grace(prev_hash, now)
+            && work.prev_hash != tip
+            && !self.within_tip_grace(work.prev_hash, now)
         {
             return Err(RejectReason::StaleBlock);
         }
@@ -343,7 +352,12 @@ impl Verifier {
         check_username_and_time(&self.policy, s, now)
     }
 
-    fn check_split(&self, s: &PowSubmit, work: &Rebuilt, now: u64) -> Result<(), RejectReason> {
+    fn check_split(
+        &self,
+        s: &PowSubmit,
+        work: &RebuiltShare,
+        now: u64,
+    ) -> Result<(), RejectReason> {
         if !self.policy.require_split
             || s.subsidy_only
             || work.paid_to_split != 0
@@ -363,13 +377,13 @@ impl Verifier {
         }
     }
 
-    fn rebuild(&mut self, s: &PowSubmit, now: u64) -> Result<Rebuilt, RejectReason> {
-        let (work, prev_hash) = self.build(s)?;
+    fn rebuild(&mut self, s: &PowSubmit, now: u64) -> Result<RebuiltShare, RejectReason> {
+        let work = self.build(s)?;
         let meets = target::meets_target(&work.raw_hash, &target::target_for_pot(s.target_byte));
         if meets || self.meets_network_target(&work) {
             self.install_sections(s)?;
         }
-        self.check_share(s, &work, prev_hash, now)?;
+        self.check_share(s, &work, now)?;
         if !meets {
             return Err(RejectReason::HighHash);
         }
@@ -502,7 +516,7 @@ fn check_username_and_time(
     Ok(())
 }
 
-fn meets_own_bits(work: &Rebuilt) -> bool {
+fn meets_own_bits(work: &RebuiltShare) -> bool {
     target::bits_to_target(work.job_bits)
         .is_some_and(|t| target::meets_target(&work.block_hash, &t))
 }

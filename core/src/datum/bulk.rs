@@ -1,4 +1,5 @@
 use crate::cursor::{Cursor, Truncated};
+use bytes::BufMut as _;
 
 pub use super::messages::DBF_MARKER;
 
@@ -70,11 +71,10 @@ pub const ACK_LEN: usize = ACK_MARKER.len() + 2 * size_of::<u32>();
 impl Ack {
     pub fn encode(&self) -> [u8; ACK_LEN] {
         let mut out = [0u8; ACK_LEN];
-        let (marker, rest) = out.split_at_mut(ACK_MARKER.len());
-        let (id, next_offset) = rest.split_at_mut(size_of::<u32>());
-        marker.copy_from_slice(&ACK_MARKER);
-        id.copy_from_slice(&self.id.to_le_bytes());
-        next_offset.copy_from_slice(&self.next_offset.to_le_bytes());
+        let mut w = &mut out[..];
+        w.put_slice(&ACK_MARKER);
+        w.put_u32_le(self.id);
+        w.put_u32_le(self.next_offset);
         out
     }
 }

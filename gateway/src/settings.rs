@@ -12,11 +12,11 @@ struct Field {
     label: &'static str,
     section: &'static str,
     key: &'static str,
-    kind: Kind,
+    kind: FieldKind,
     current: fn(&Config) -> Value,
 }
 
-enum Kind {
+enum FieldKind {
     Text,
     Int(i64, i64),
     Bool,
@@ -29,7 +29,7 @@ const FIELDS: &[Field] = &[
         label: "Bitcoin address",
         section: "mining",
         key: "pool_address",
-        kind: Kind::Text,
+        kind: FieldKind::Text,
         current: |c| json!(c.mining.pool_address),
     },
     Field {
@@ -37,7 +37,7 @@ const FIELDS: &[Field] = &[
         label: "Coinbase tag",
         section: "mining",
         key: "coinbase_tag_secondary",
-        kind: Kind::Text,
+        kind: FieldKind::Text,
         current: |c| json!(c.mining.coinbase_tag_secondary),
     },
     Field {
@@ -45,7 +45,7 @@ const FIELDS: &[Field] = &[
         label: "Unique gateway ID",
         section: "mining",
         key: "coinbase_unique_id",
-        kind: Kind::Int(0, MAX_COINBASE_UNIQUE_ID),
+        kind: FieldKind::Int(0, MAX_COINBASE_UNIQUE_ID),
         current: |c| json!(c.mining.coinbase_unique_id),
     },
     Field {
@@ -53,7 +53,7 @@ const FIELDS: &[Field] = &[
         label: "Pool port",
         section: "datum",
         key: "pool_port",
-        kind: Kind::Int(1, MAX_PORT),
+        kind: FieldKind::Int(1, MAX_PORT),
         current: |c| json!(c.datum.pool_port),
     },
     Field {
@@ -61,7 +61,7 @@ const FIELDS: &[Field] = &[
         label: "Pool public key",
         section: "datum",
         key: "pool_pubkey",
-        kind: Kind::Text,
+        kind: FieldKind::Text,
         current: |c| json!(c.datum.pool_pubkey),
     },
     Field {
@@ -69,7 +69,7 @@ const FIELDS: &[Field] = &[
         label: "Pool web page",
         section: "datum",
         key: "pool_url",
-        kind: Kind::Text,
+        kind: FieldKind::Text,
         current: |c| json!(c.datum.pool_url),
     },
     Field {
@@ -77,7 +77,7 @@ const FIELDS: &[Field] = &[
         label: "Version 3 protocol",
         section: "datum",
         key: "protocol_v3",
-        kind: Kind::Bool,
+        kind: FieldKind::Bool,
         current: |c| json!(c.datum.protocol_v3),
     },
     Field {
@@ -85,7 +85,7 @@ const FIELDS: &[Field] = &[
         label: "Gateway fee",
         section: "datum",
         key: "gateway_fee_bps",
-        kind: Kind::Int(0, ratum::BASIS_POINTS_PER_UNIT as i64),
+        kind: FieldKind::Int(0, ratum::BASIS_POINTS_PER_UNIT as i64),
         current: |c| json!(c.datum.gateway_fee_bps),
     },
     Field {
@@ -93,7 +93,7 @@ const FIELDS: &[Field] = &[
         label: "Gateway fee address",
         section: "datum",
         key: "gateway_fee_address",
-        kind: Kind::Text,
+        kind: FieldKind::Text,
         current: |c| json!(c.datum.gateway_fee_address),
     },
     Field {
@@ -101,7 +101,7 @@ const FIELDS: &[Field] = &[
         label: "Stratum port",
         section: "stratum",
         key: "listen_port",
-        kind: Kind::Int(1, MAX_PORT),
+        kind: FieldKind::Int(1, MAX_PORT),
         current: |c| json!(c.stratum.listen_port),
     },
     Field {
@@ -109,7 +109,7 @@ const FIELDS: &[Field] = &[
         label: "Minimum difficulty",
         section: "stratum",
         key: "vardiff_min",
-        kind: Kind::Int(1, i64::MAX),
+        kind: FieldKind::Int(1, i64::MAX),
         current: |c| json!(c.stratum.vardiff_min),
     },
     Field {
@@ -117,7 +117,7 @@ const FIELDS: &[Field] = &[
         label: "Fingerprint miners",
         section: "stratum",
         key: "fingerprint_miners",
-        kind: Kind::Bool,
+        kind: FieldKind::Bool,
         current: |c| json!(c.stratum.fingerprint_miners),
     },
     Field {
@@ -125,7 +125,7 @@ const FIELDS: &[Field] = &[
         label: "Require an address as the username",
         section: "stratum",
         key: "require_address_username",
-        kind: Kind::Bool,
+        kind: FieldKind::Bool,
         current: |c| json!(c.stratum.require_address_username),
     },
     Field {
@@ -133,7 +133,7 @@ const FIELDS: &[Field] = &[
         label: "Job update interval",
         section: "bitcoind",
         key: "work_update_seconds",
-        kind: Kind::Int(
+        kind: FieldKind::Int(
             *WORK_UPDATE_SECONDS_RANGE.start() as i64,
             *WORK_UPDATE_SECONDS_RANGE.end() as i64,
         ),
@@ -144,7 +144,7 @@ const FIELDS: &[Field] = &[
         label: "bitcoind RPC URL",
         section: "bitcoind",
         key: "rpcurl",
-        kind: Kind::Text,
+        kind: FieldKind::Text,
         current: |c| json!(c.bitcoind.rpcurl),
     },
     Field {
@@ -152,7 +152,7 @@ const FIELDS: &[Field] = &[
         label: "bitcoind RPC user",
         section: "bitcoind",
         key: "rpcuser",
-        kind: Kind::Text,
+        kind: FieldKind::Text,
         current: |c| json!(c.bitcoind.rpcuser),
     },
     Field {
@@ -160,7 +160,7 @@ const FIELDS: &[Field] = &[
         label: "bitcoind RPC password",
         section: "bitcoind",
         key: "rpcpassword",
-        kind: Kind::Password,
+        kind: FieldKind::Password,
         current: |_| Value::Null,
     },
 ];
@@ -207,7 +207,7 @@ fn reward_sharing(cfg: &Config) -> &'static str {
 pub fn form_values(cfg: &Config, doc: &Value) -> Value {
     let mut v = serde_json::Map::new();
     for f in FIELDS {
-        if !matches!(f.kind, Kind::Password) {
+        if !matches!(f.kind, FieldKind::Password) {
             v.insert(f.name.into(), (f.current)(cfg));
         }
     }
@@ -392,16 +392,16 @@ pub fn apply(
         let Some(text) = submitted(form, f.name) else { continue };
         let current = (f.current)(cfg);
         match f.kind {
-            Kind::Text => edit.set_if_changed(f.section, f.key, json!(text.trim()), current),
-            Kind::Int(min, max) => match parse_int(f.label, text, min, max) {
+            FieldKind::Text => edit.set_if_changed(f.section, f.key, json!(text.trim()), current),
+            FieldKind::Int(min, max) => match parse_int(f.label, text, min, max) {
                 Ok(v) => edit.set_if_changed(f.section, f.key, json!(v), current),
                 Err(e) => edit.errors.push(e),
             },
-            Kind::Bool => match parse_bool(f.label, text) {
+            FieldKind::Bool => match parse_bool(f.label, text) {
                 Ok(v) => edit.set_if_changed(f.section, f.key, json!(v), current),
                 Err(e) => edit.errors.push(e),
             },
-            Kind::Password => {
+            FieldKind::Password => {
                 if !text.is_empty() {
                     edit.set(f.section, f.key, json!(text));
                 }

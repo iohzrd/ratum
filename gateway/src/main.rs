@@ -44,7 +44,7 @@ struct Runtime {
     config: Arc<Config>,
     node: ratum::rpc::Client,
     notify: Arc<template::Notify>,
-    shared: Arc<datum::Shared>,
+    pool: Arc<datum::Pool>,
 }
 
 fn install_panic_exit() {
@@ -95,11 +95,11 @@ fn start_datum(rt: &Runtime) {
         hex::encode(identity.box_pk)
     );
     let settings = datum::Settings::from_config(&rt.config);
-    let shared = Arc::clone(&rt.shared);
-    ratum::thread::spawn("datum", move || datum::run_forever(settings, shared, identity));
+    let pool = Arc::clone(&rt.pool);
+    ratum::thread::spawn("datum", move || datum::run_forever(settings, pool, identity));
     let started = Instant::now();
     let mut last_report = 0;
-    while started.elapsed() < POOL_CONNECT_WAIT && !rt.shared.is_active() {
+    while started.elapsed() < POOL_CONNECT_WAIT && !rt.pool.is_active() {
         std::thread::sleep(POOL_CONNECT_POLL);
         let waited = started.elapsed().as_secs();
         if waited != last_report {
@@ -107,7 +107,7 @@ fn start_datum(rt: &Runtime) {
             info!("Waiting for the DATUM pool connection ({waited}s)");
         }
     }
-    if !rt.shared.is_active() && rt.config.datum.pooled_mining_only {
+    if !rt.pool.is_active() && rt.config.datum.pooled_mining_only {
         error!(
             "Could not connect to the DATUM pool within {} seconds; datum.pooled_mining_only is set, so no work is served until it connects",
             POOL_CONNECT_WAIT.as_secs()
@@ -127,24 +127,24 @@ fn spawn_stratum_listener(server: Arc<stratum::Server>) {
 fn start_template_thread(
     rt: &Runtime,
     server: Arc<stratum::Server>,
-    status: Arc<Mutex<template::Status>>,
+    last_error: Arc<template::LastError>,
 ) {
     let rt = rt.clone();
     ratum::thread::spawn("template", move || {
         let publisher = publish::Publisher::new(
             job::Builder::new(Arc::clone(&rt.config)),
             Arc::clone(&server),
-            Arc::clone(&rt.shared),
+            Arc::clone(&rt.pool),
         );
         let mut listener_started = false;
-        let (shared, config) = (Arc::clone(&rt.shared), Arc::clone(&rt.config));
+        let (pool, config) = (Arc::clone(&rt.pool), Arc::clone(&rt.config));
         let payout_script =
-            move || shared.payout_script().unwrap_or_else(|| config.pool_output_script.clone());
+            move || pool.payout_script().unwrap_or_else(|| config.pool_output_script.clone());
         template::run(
             rt.node.clone(),
             Arc::clone(&rt.config),
             Arc::clone(&rt.notify),
-            status,
+            last_error,
             payout_script,
             |t, new_block| {
                 publisher.on_template(t, new_block);
@@ -191,14 +191,14 @@ fn report_stats(server: &stratum::Server, last: &mut Instant) {
 }
 
 fn enforce_pooled_only(rt: &Runtime, server: &stratum::Server, warned: &mut bool) {
-    let active = rt.shared.is_active();
+    let active = rt.pool.is_active();
     if active {
-        rt.shared.failures.store(0, Ordering::Relaxed);
+        rt.pool.failures.store(0, Ordering::Relaxed);
     }
     let reject = rt.config.datum.pooled_mining_only && !active;
     if !reject {
         *warned = false;
-    } else if !*warned && rt.shared.failures.load(Ordering::Relaxed) >= FAILURES_BEFORE_SHUTDOWN {
+    } else if !*warned && rt.pool.failures.load(Ordering::Relaxed) >= FAILURES_BEFORE_SHUTDOWN {
         warn!(
             "The DATUM pool is unreachable and datum.pooled_mining_only is set: disconnecting stratum clients until it is reached again"
         );
@@ -248,7 +248,7 @@ fn main() {
     }
 
     let notify = Arc::new(template::Notify::default());
-    let shared = Arc::new(datum::Shared::new(
+    let pool = Arc::new(datum::Pool::new(
         config.datum.protocol_job_slots,
         config.share_queue_capacity(),
         Arc::clone(&notify),
@@ -256,7 +256,7 @@ fn main() {
     ));
     #[cfg(unix)]
     signals::install(Arc::clone(&notify));
-    let rt = Runtime { config, node, notify, shared };
+    let rt = Runtime { config, node, notify, pool };
     if rt.config.datum.pool_host.is_empty() {
         info!("NON-POOLED MINING: datum.pool_host is empty; every block pays mining.pool_address");
     } else {
@@ -265,11 +265,11 @@ fn main() {
 
     let server = stratum::Server::new(
         Arc::clone(&rt.config),
-        Arc::clone(&rt.shared),
+        Arc::clone(&rt.pool),
         rt.node.clone(),
         Arc::clone(&rt.notify),
     );
-    let template_status = Arc::new(Mutex::new(template::Status::default()));
+    let template_error: Arc<template::LastError> = Arc::default();
 
     if rt.config.bitcoind.notify_fallback {
         let (node, notify) = (rt.node.clone(), Arc::clone(&rt.notify));
@@ -278,12 +278,12 @@ fn main() {
 
     api::start(Arc::new(api::Context {
         server: Arc::clone(&server),
-        template_status: Arc::clone(&template_status),
+        template_error: Arc::clone(&template_error),
         started: Instant::now(),
         csrf: api::csrf_token(),
         config_path: cli.config,
         history: Mutex::default(),
     }));
-    start_template_thread(&rt, Arc::clone(&server), template_status);
+    start_template_thread(&rt, Arc::clone(&server), template_error);
     watch_loop(&rt, &server)
 }

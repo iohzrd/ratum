@@ -1,4 +1,4 @@
-use super::{Settings, Shared};
+use super::{Pool, Settings};
 use crate::job::Job;
 use log::{info, warn};
 use ratum::datum::handshake::KeyPairs;
@@ -8,7 +8,7 @@ use ratum::datum::validation::{
 use std::sync::Arc;
 
 pub(super) fn response_to(
-    shared: &Shared,
+    pool: &Pool,
     settings: &Settings,
     identity: &KeyPairs,
     plain: &[u8],
@@ -17,7 +17,7 @@ pub(super) fn response_to(
     let job_index = plain.get(validation::JOB_INDEX_AT).copied();
     let lookup = job_index
         .ok_or((validation::JOB_INDEX_INVALID, Status::BadRequest))
-        .and_then(|i| shared.slot(i));
+        .and_then(|i| pool.slot(i));
     let response = match sub {
         validation::request::SHORT_TXN_LIST => {
             info!("pool requested the short transaction list of job {job_index:?}");
@@ -47,7 +47,7 @@ pub(super) fn response_to(
                 plain[validation::REQUEST_HEADER_LEN..].try_into().expect("32 bytes");
             let (status, block) = match lookup {
                 Ok(job) if job.template.prev_hash == parent_hash => {
-                    fetch_parent(shared, &job.template.prev_hash_hex)
+                    fetch_parent(pool, &job.template.prev_hash_hex)
                 }
                 _ => (ParentStatus::JobMismatch, Vec::new()),
             };
@@ -65,8 +65,8 @@ pub(super) fn response_to(
     Some(response)
 }
 
-fn fetch_parent(shared: &Shared, hash_hex: &str) -> (ParentStatus, Vec<u8>) {
-    let Some(node) = &shared.node else { return (ParentStatus::Unavailable, Vec::new()) };
+fn fetch_parent(pool: &Pool, hash_hex: &str) -> (ParentStatus, Vec<u8>) {
+    let Some(node) = &pool.node else { return (ParentStatus::Unavailable, Vec::new()) };
     match node.call("getblock", serde_json::json!([hash_hex, 0])) {
         Ok(serde_json::Value::String(hex)) => match hex::decode(&hex) {
             Ok(block) if !block.is_empty() && block.len() <= validation::MAX_PARENT_FETCH_BLOCK => {

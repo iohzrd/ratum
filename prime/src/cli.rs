@@ -93,12 +93,12 @@ pub(crate) struct Cli {
     pub owed: Vec<String>,
 }
 
-pub(crate) struct Loaded {
+pub(crate) struct Invocation {
     pub cli: Cli,
     pub file: ratum_prime::config::Config,
 }
 
-pub(crate) fn load() -> Loaded {
+pub(crate) fn load() -> Invocation {
     let cli = Cli::parse();
     let path = match (&cli.config, &cli.data_dir) {
         (Some(p), _) => Some(PathBuf::from(p)),
@@ -109,7 +109,7 @@ pub(crate) fn load() -> Loaded {
         Some(path) => load_file(&path, cli.config.is_some()),
         None => ratum_prime::config::Config::default(),
     };
-    Loaded { cli, file }
+    Invocation { cli, file }
 }
 
 fn load_file(path: &Path, required: bool) -> ratum_prime::config::Config {

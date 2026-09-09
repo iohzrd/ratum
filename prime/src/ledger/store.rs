@@ -1,4 +1,5 @@
 use super::{FoundBlock, HASH_SIZE, MAX_SHARES, OwedBlock, ReadBack, SHARES_PER_KEEP_UNIT, Share};
+use bytes::BufMut as _;
 use ratum::cursor::Cursor;
 use redb::{
     Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
@@ -20,12 +21,12 @@ const NAME_SEPARATOR: u8 = 0x00;
 fn pack(share: &Share) -> Vec<u8> {
     let hash = share.hash.unwrap_or([0u8; HASH_SIZE]);
     let mut v = Vec::with_capacity(SHARE_PREFIX_LEN + 1 + share.identity.len() + share.tag.len());
-    v.extend_from_slice(&share.at.to_le_bytes());
-    v.extend_from_slice(&share.difficulty.to_le_bytes());
-    v.extend_from_slice(&hash);
-    v.extend_from_slice(share.identity.as_bytes());
-    v.push(NAME_SEPARATOR);
-    v.extend_from_slice(share.tag.as_bytes());
+    v.put_u64_le(share.at);
+    v.put_u64_le(share.difficulty);
+    v.put_slice(&hash);
+    v.put_slice(share.identity.as_bytes());
+    v.put_u8(NAME_SEPARATOR);
+    v.put_slice(share.tag.as_bytes());
     v
 }
 
@@ -57,15 +58,15 @@ fn split_at_separator(rest: &[u8]) -> (&[u8], &[u8]) {
 fn pack_owed(o: &OwedBlock) -> Vec<u8> {
     let entries: usize = o.entries.iter().map(|(i, _)| OWED_ENTRY_PREFIX_LEN + i.len()).sum();
     let mut v = Vec::with_capacity(OWED_PREFIX_LEN + entries);
-    v.extend_from_slice(&o.at.to_le_bytes());
-    v.extend_from_slice(&o.height.to_le_bytes());
-    v.extend_from_slice(&o.total.to_le_bytes());
-    v.extend_from_slice(&o.settled_at.unwrap_or(0).to_le_bytes());
-    v.extend_from_slice(&(o.entries.len() as u16).to_le_bytes());
+    v.put_u64_le(o.at);
+    v.put_u32_le(o.height);
+    v.put_u64_le(o.total);
+    v.put_u64_le(o.settled_at.unwrap_or(0));
+    v.put_u16_le(o.entries.len() as u16);
     for (identity, sats) in &o.entries {
-        v.extend_from_slice(&(identity.len() as u16).to_le_bytes());
-        v.extend_from_slice(identity.as_bytes());
-        v.extend_from_slice(&sats.to_le_bytes());
+        v.put_u16_le(identity.len() as u16);
+        v.put_slice(identity.as_bytes());
+        v.put_u64_le(*sats);
     }
     v
 }
@@ -100,15 +101,15 @@ fn unpack_owed(hash: &[u8], bytes: &[u8]) -> Option<OwedBlock> {
 
 fn pack_block(b: &FoundBlock) -> Vec<u8> {
     let mut v = Vec::with_capacity(BLOCK_PREFIX_LEN + 1 + b.finder.len() + b.tag.len());
-    v.extend_from_slice(&b.at.to_le_bytes());
-    v.extend_from_slice(&b.height.to_le_bytes());
-    v.extend_from_slice(&b.paid_to_split.to_le_bytes());
-    v.extend_from_slice(&b.paid_to_pool.to_le_bytes());
-    v.extend_from_slice(&b.difficulty.to_bits().to_le_bytes());
-    v.extend_from_slice(&b.cumulative_work.to_le_bytes());
-    v.extend_from_slice(b.finder.as_bytes());
-    v.push(NAME_SEPARATOR);
-    v.extend_from_slice(b.tag.as_bytes());
+    v.put_u64_le(b.at);
+    v.put_u32_le(b.height);
+    v.put_u64_le(b.paid_to_split);
+    v.put_u64_le(b.paid_to_pool);
+    v.put_f64_le(b.difficulty);
+    v.put_u128_le(b.cumulative_work);
+    v.put_slice(b.finder.as_bytes());
+    v.put_u8(NAME_SEPARATOR);
+    v.put_slice(b.tag.as_bytes());
     v
 }
 

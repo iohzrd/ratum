@@ -115,7 +115,7 @@ pub(super) fn status_json(ctx: &Context, with_clients: bool) -> Value {
     let cfg = &server.config;
     let datum_stats = ratum::lock(&server.datum.stats).clone();
     let pool = server.datum.pool_config();
-    let template_error = ratum::lock(&ctx.template_status).error.clone();
+    let template_error = ratum::lock(&ctx.template_error).clone();
     let current = server.current_job();
     let status = if let Some(e) = &template_error {
         format!("ERROR: {e}")
@@ -176,14 +176,14 @@ pub(super) fn status_json(ctx: &Context, with_clients: bool) -> Value {
 }
 
 #[derive(Default)]
-struct Totals {
+struct MinerTotals {
     accepted: Tally,
     rejected: Tally,
     fee: Tally,
     hashrate_ths: f64,
 }
 
-impl Totals {
+impl MinerTotals {
     fn add(&mut self, c: &ClientStats) {
         self.accepted.merge(&c.accepted);
         self.rejected.merge(&c.rejected);
@@ -198,7 +198,7 @@ pub(super) fn miner_lookup_json(ctx: &Context, addr: Option<&str>) -> Value {
     let clients = valid.map_or_else(Vec::new, |a| {
         ctx.server.client_stats_where(|c| c.subscribed && username::address_of(&c.username) == a)
     });
-    let mut totals = Totals::default();
+    let mut totals = MinerTotals::default();
     let connections: Vec<Value> = clients
         .iter()
         .map(|c| {

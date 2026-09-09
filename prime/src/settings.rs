@@ -2,7 +2,8 @@ use crate::abw;
 use crate::cli::{self, Cli, fatal};
 use crate::server::{Resolved, resolve_address};
 use log::warn;
-use ratum::bitcoin::{OP_RETURN, output_script_size_is_valid};
+use ratum::bitcoin::opcode::OP_RETURN;
+use ratum::bitcoin::output_script_size_is_valid;
 use ratum::rpc;
 use ratum_prime::config::Config;
 use std::path::PathBuf;
@@ -55,10 +56,6 @@ struct NodeCredential {
 
 impl Settings {
     pub(crate) fn resolve(c: &Cli, f: Config) -> Self {
-        let reveal_range = abw::REVEAL_AFTER_SECS_RANGE;
-        let reveal_must_be =
-            format!("{} to {} (seconds)", reveal_range.start(), reveal_range.end());
-        let max_poll_secs = ratum::SECS_PER_HOUR as f64;
         let payout = payout_choice(c, &f);
         let data_dir = c.data_dir.clone().or(f.data_dir).map(PathBuf::from);
         Self {
@@ -69,21 +66,13 @@ impl Settings {
             key_path: key_path(c.key.clone().or(f.key), data_dir.as_ref()),
             data_dir,
             motd: cli::resolve_str(c.motd.clone(), f.motd, DEFAULT_MOTD),
-            allowed_agents: cli::resolve_str(c.allow_agent.clone(), f.allow_agent, "")
-                .split(',')
-                .map(str::trim)
-                .filter(|p| !p.is_empty())
-                .map(str::to_string)
-                .collect(),
-            require_v3: c.require_v3.or(f.require_v3).unwrap_or(false),
-            abw_reveal_after: Duration::from_secs(cli::resolve(
-                c.abw_reveal_after,
-                f.abw_reveal_after,
-                abw::DEFAULT_REVEAL_AFTER.as_secs(),
-                "--abw-reveal-after",
-                &reveal_must_be,
-                |n| reveal_range.contains(n),
+            allowed_agents: agent_prefixes(&cli::resolve_str(
+                c.allow_agent.clone(),
+                f.allow_agent,
+                "",
             )),
+            require_v3: c.require_v3.or(f.require_v3).unwrap_or(false),
+            abw_reveal_after: reveal_after(c.abw_reveal_after, f.abw_reveal_after),
             min_difficulty: cli::resolve(
                 c.min_diff,
                 f.min_diff,
@@ -143,14 +132,7 @@ impl Settings {
                 ),
                 |n| *n <= MAX_FEE_BPS,
             ),
-            poll: Duration::from_secs_f64(cli::resolve(
-                c.poll,
-                f.poll,
-                DEFAULT_POLL_SECS,
-                "--poll",
-                &format!("a positive number of seconds up to {max_poll_secs:.0}"),
-                |n| n.is_finite() && *n > 0.0 && *n <= max_poll_secs,
-            )),
+            poll: poll_interval(c.poll, f.poll),
             require_split: c.require_split.or(f.require_split).unwrap_or(true),
             node: NodeCredential {
                 url: c.rpc.clone().or(f.rpc),
@@ -165,6 +147,35 @@ impl Settings {
     pub(crate) fn connect_node(&self) -> std::io::Result<rpc::Client> {
         self.node.connect()
     }
+}
+
+fn agent_prefixes(list: &str) -> Vec<String> {
+    list.split(',').map(str::trim).filter(|p| !p.is_empty()).map(str::to_string).collect()
+}
+
+fn reveal_after(cli: Option<u64>, file: Option<u64>) -> Duration {
+    let range = abw::REVEAL_AFTER_SECS_RANGE;
+    let must_be = format!("{} to {} (seconds)", range.start(), range.end());
+    Duration::from_secs(cli::resolve(
+        cli,
+        file,
+        abw::DEFAULT_REVEAL_AFTER.as_secs(),
+        "--abw-reveal-after",
+        &must_be,
+        |n| range.contains(n),
+    ))
+}
+
+fn poll_interval(cli: Option<f64>, file: Option<f64>) -> Duration {
+    const MAX_SECS: f64 = ratum::SECS_PER_HOUR as f64;
+    Duration::from_secs_f64(cli::resolve(
+        cli,
+        file,
+        DEFAULT_POLL_SECS,
+        "--poll",
+        &format!("a positive number of seconds up to {MAX_SECS:.0}"),
+        |n| n.is_finite() && *n > 0.0 && *n <= MAX_SECS,
+    ))
 }
 
 fn with_scheme(url: String) -> String {

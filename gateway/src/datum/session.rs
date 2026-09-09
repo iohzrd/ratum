@@ -1,5 +1,5 @@
 use super::{
-    AbwSlots, CoinbaserRequestState, QueuedShare, Settings, Shared, validation, wire_username,
+    AbwSlots, CoinbaserRequestState, Pool, QueuedShare, Settings, validation, wire_username,
 };
 use crate::job::PoolConfig;
 use log::{debug, error, info, warn};
@@ -29,10 +29,10 @@ const MINING_PAD_MAX: usize = 100;
 
 pub(super) fn run(
     settings: &Settings,
-    shared: &Shared,
+    pool: &Pool,
     identity: &KeyPairs,
 ) -> Result<(), SessionError> {
-    Session::open(settings, shared, identity).and_then(|mut session| session.run())
+    Session::open(settings, pool, identity).and_then(|mut session| session.run())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -53,7 +53,7 @@ pub(super) enum SessionError {
 
 struct Session<'a> {
     settings: &'a Settings,
-    shared: &'a Shared,
+    pool: &'a Pool,
     identity: &'a KeyPairs,
     socket: PolledSocket,
     client: Client,
@@ -119,7 +119,7 @@ fn connect(settings: &Settings) -> Result<TcpStream, SessionError> {
 impl<'a> Session<'a> {
     fn open(
         settings: &'a Settings,
-        shared: &'a Shared,
+        pool: &'a Pool,
         identity: &'a KeyPairs,
     ) -> Result<Self, SessionError> {
         let mut stream = connect(settings)?;
@@ -128,7 +128,7 @@ impl<'a> Session<'a> {
         let mut client =
             Client::with_key_pairs(identity.clone(), KeyPairs::generate(), ratum::rand::u32());
         let hello = if settings.protocol_v3 {
-            let token = shared.resume_token();
+            let token = pool.resume_token();
             client.hello_resumable(&settings.pool_box_pk, &settings.user_agent, token.as_ref())
         } else {
             client.hello(&settings.pool_box_pk, &settings.user_agent)
@@ -159,12 +159,12 @@ impl<'a> Session<'a> {
         info!("DATUM Server MOTD: {}", client.motd());
 
         let socket = PolledSocket::new(stream)?;
-        *ratum::lock(&shared.waker) = Some(Arc::new(socket.waker()?));
+        *ratum::lock(&pool.waker) = Some(Arc::new(socket.waker()?));
 
-        let slots = ratum::lock(&shared.slots).len();
+        let slots = ratum::lock(&pool.slots).len();
         Ok(Session {
             settings,
-            shared,
+            pool,
             identity,
             socket,
             client,
@@ -298,7 +298,7 @@ impl<'a> Session<'a> {
             Some(server_subcmd::VALIDATION) => self.on_validation(plain)?,
             Some(server_subcmd::BLOCKNOTIFY) => {
                 debug!("pool blocknotify");
-                self.shared.notify.raise();
+                self.pool.notify.raise();
             }
             other => warn!("unknown DATUM mining sub-command {other:?}"),
         }
@@ -306,7 +306,7 @@ impl<'a> Session<'a> {
     }
 
     fn on_coinbaser_response(&self, plain: &[u8]) {
-        let Some(state) = ratum::lock(&self.shared.coinbaser).clone() else {
+        let Some(state) = ratum::lock(&self.pool.coinbaser).clone() else {
             warn!("coinbaser response with no request waiting");
             return;
         };
@@ -333,7 +333,7 @@ impl<'a> Session<'a> {
         if self.settings.protocol_v3
             && let Some(c) = ClientConfigV3::decode(plain)
         {
-            *ratum::lock(&self.shared.resume_token) = Some(c.resume_token);
+            *ratum::lock(&self.pool.resume_token) = Some(c.resume_token);
             self.on_config(PoolConfig::from_message_v3(c));
             return;
         }
@@ -358,9 +358,9 @@ impl<'a> Session<'a> {
             config.min_difficulty,
             hex::encode(&config.payout_script)
         );
-        let previous = self.shared.set_config(config.clone());
+        let previous = self.pool.set_config(config.clone());
         if previous.is_none() {
-            ratum::lock(&self.shared.stats).motd = self.client.motd().to_string();
+            ratum::lock(&self.pool.stats).motd = self.client.motd().to_string();
         }
         if config.protocol_v3 {
             info!(
@@ -369,10 +369,10 @@ impl<'a> Session<'a> {
             );
         }
         if previous.as_ref().is_some_and(|p| p.abw_disabled != config.abw_disabled) {
-            *ratum::lock(&self.shared.abw) = AbwSlots::default();
+            *ratum::lock(&self.pool.abw) = AbwSlots::default();
         }
         if previous.as_ref() != Some(&config) {
-            self.shared.notify.rebuild();
+            self.pool.notify.rebuild();
         }
     }
 
@@ -380,18 +380,18 @@ impl<'a> Session<'a> {
         let Some(notice) = decoded("assignment notice", AssignmentNotice::decode(plain)) else {
             return;
         };
-        ratum::lock(&self.shared.abw).install(notice.slot, notice.key_hash, notice.active);
+        ratum::lock(&self.pool.abw).install(notice.slot, notice.key_hash, notice.active);
         debug!("ABW assignment for slot {} (active {})", notice.slot, notice.active);
         if notice.active {
-            self.shared.notify.rebuild();
+            self.pool.notify.rebuild();
         }
     }
 
     fn on_abw_activation(&self, plain: &[u8]) {
         let Some(act) = decoded("activation", Activation::decode(plain)) else { return };
-        if ratum::lock(&self.shared.abw).activate(act.slot) {
+        if ratum::lock(&self.pool.abw).activate(act.slot) {
             debug!("ABW slot {} activated", act.slot);
-            self.shared.notify.rebuild();
+            self.pool.notify.rebuild();
         } else {
             error!("ABW activation for slot {} that was not seeded", act.slot);
         }
@@ -399,7 +399,7 @@ impl<'a> Session<'a> {
 
     fn on_abw_reveal(&self, plain: &[u8]) {
         let Some(reveal) = decoded("reveal", Reveal::decode(plain)) else { return };
-        if !ratum::lock(&self.shared.abw).reveal(reveal.slot, &reveal.xor_key) {
+        if !ratum::lock(&self.pool.abw).reveal(reveal.slot, &reveal.xor_key) {
             error!("ABW reveal for slot {} does not match its commitment; ignored", reveal.slot);
             return;
         }
@@ -408,14 +408,14 @@ impl<'a> Session<'a> {
 
     fn on_share_response(&mut self, r: ShareResponse) {
         let diff = if r.target_byte == ratum::datum::coinbase::POT_TARGET_PLACEHOLDER {
-            self.shared.min_difficulty().max(1)
+            self.pool.min_difficulty().max(1)
         } else {
             target::diff_for_pot(r.target_byte)
         };
         let accepted =
             matches!(r.verdict, ShareVerdict::Accepted | ShareVerdict::AcceptedTentatively);
         {
-            let mut st = ratum::lock(&self.shared.stats);
+            let mut st = ratum::lock(&self.pool.stats);
             if accepted { &mut st.accepted } else { &mut st.rejected }.add(diff);
         }
         let what = format!("job {} nonce {:08x} diff {diff}", r.job_id, r.nonce);
@@ -439,14 +439,14 @@ impl<'a> Session<'a> {
     }
 
     fn on_validation(&mut self, plain: &[u8]) -> Result<(), SessionError> {
-        match validation::response_to(self.shared, self.settings, self.identity, plain) {
+        match validation::response_to(self.pool, self.settings, self.identity, plain) {
             Some(response) => self.send_mining(&response),
             None => Ok(()),
         }
     }
 
     fn send_pending(&mut self) -> Result<(), SessionError> {
-        let request = ratum::lock(&self.shared.coinbaser).clone();
+        let request = ratum::lock(&self.pool.coinbaser).clone();
         if let Some(state) = request
             && !self.requested.as_ref().is_some_and(|r| Arc::ptr_eq(r, &state))
         {
@@ -456,12 +456,12 @@ impl<'a> Session<'a> {
             self.requested = Some(state);
         }
         if self.settings.protocol_v3
-            && (!self.shared.is_active()
-                || (self.shared.require_abw() && self.shared.abw_assignment().is_none()))
+            && (!self.pool.is_active()
+                || (self.pool.require_abw() && self.pool.abw_assignment().is_none()))
         {
             return Ok(());
         }
-        let batch = std::mem::take(&mut *ratum::lock(&self.shared.queue));
+        let batch = std::mem::take(&mut *ratum::lock(&self.pool.queue));
         for share in &batch {
             self.send_share(share)?;
         }
@@ -480,7 +480,7 @@ impl<'a> Session<'a> {
         }
         let job_section = (!std::mem::replace(&mut sent.job, true)).then(|| JobSection {
             prev_hash: job.template.prev_hash,
-            target_byte_index: job.target_pot_index as u16,
+            target_byte_index: job.pooled.pot_index as u16,
             nbits: job.template.nbits.to_le_bytes(),
             coinbaser_id: job.coinbaser_id,
             height: job.template.height,
@@ -505,13 +505,13 @@ impl<'a> Session<'a> {
     fn send_share(&mut self, share: &QueuedShare) -> Result<(), SessionError> {
         let job = &share.job;
         let current =
-            ratum::lock(&self.shared.slots)[job.datum_slot as usize].as_ref().map(|j| j.serial);
+            ratum::lock(&self.pool.slots)[job.datum_slot as usize].as_ref().map(|j| j.serial);
         if current != Some(job.serial) {
             debug!("share for job {} whose DATUM slot was reused; not sent", job.serial);
             return Ok(());
         }
         if let Some(a) = job.abw
-            && !ratum::lock(&self.shared.abw).holds(a)
+            && !ratum::lock(&self.pool.abw).holds(a)
         {
             warn!(
                 "share on ABW slot {} whose commitment this session does not hold (revealed, \

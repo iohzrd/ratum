@@ -1,5 +1,6 @@
 use super::framing::STRUCT_END;
 use crate::cursor::Cursor;
+use bytes::BufMut as _;
 
 pub const DRAFT_REVISION: u8 = 0;
 pub const ASSIGNMENT_SLOTS: u8 = 16;
@@ -82,10 +83,10 @@ const MAX_FRAME_LEN: usize = 2 + 1 + 32 + 1;
 
 fn frame(subcmd: u8, body: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
     let mut out = Vec::with_capacity(MAX_FRAME_LEN);
-    out.push(subcmd);
-    out.push(DRAFT_REVISION);
+    out.put_u8(subcmd);
+    out.put_u8(DRAFT_REVISION);
     body(&mut out);
-    out.push(STRUCT_END);
+    out.put_u8(STRUCT_END);
     out
 }
 
@@ -116,9 +117,9 @@ fn close(c: &mut Cursor<'_>) -> Result<(), Error> {
 impl AssignmentNotice {
     pub fn encode(&self) -> Vec<u8> {
         frame(subcmd::ASSIGNMENT_NOTICE, |out| {
-            out.push(u8::from(self.active));
-            out.push(self.slot);
-            out.extend_from_slice(&self.key_hash);
+            out.put_u8(u8::from(self.active));
+            out.put_u8(self.slot);
+            out.put_slice(&self.key_hash);
         })
     }
 
@@ -137,7 +138,7 @@ impl AssignmentNotice {
 
 impl Activation {
     pub fn encode(&self) -> Vec<u8> {
-        frame(subcmd::ACTIVATION, |out| out.push(self.slot))
+        frame(subcmd::ACTIVATION, |out| out.put_u8(self.slot))
     }
 
     pub fn decode(data: &[u8]) -> Result<Self, Error> {
@@ -152,8 +153,8 @@ impl Candidate {
     pub fn encode(&self, subcmd: u8) -> Vec<u8> {
         debug_assert!(matches!(subcmd, subcmd::CANDIDATE_RECEIPT | subcmd::CANDIDATE_RELEASE));
         frame(subcmd, |out| {
-            out.push(self.slot);
-            out.extend_from_slice(&self.raw_pow_hash);
+            out.put_u8(self.slot);
+            out.put_slice(&self.raw_pow_hash);
         })
     }
 
@@ -169,8 +170,8 @@ impl Candidate {
 impl Reveal {
     pub fn encode(&self) -> Vec<u8> {
         frame(subcmd::REVEAL, |out| {
-            out.push(self.slot);
-            out.extend_from_slice(&self.xor_key);
+            out.put_u8(self.slot);
+            out.put_slice(&self.xor_key);
         })
     }
 

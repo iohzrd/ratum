@@ -1,6 +1,6 @@
 use log::{debug, error, info, warn};
 use ratum::rpc;
-use ratum_prime::verify::Accepted;
+use ratum_prime::verify::AcceptedShare;
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -10,7 +10,7 @@ const SUBMIT_RETRY_DELAY: Duration = Duration::from_millis(500);
 pub(crate) fn submit_or_request_txns(
     peer: SocketAddr,
     node: &rpc::Client,
-    a: &Accepted,
+    a: &AcceptedShare,
     subsidy_only: bool,
 ) -> bool {
     let template_txns = a.work.txn_count;
@@ -26,7 +26,7 @@ pub(crate) fn submit_with_txns(
     peer: SocketAddr,
     node: &rpc::Client,
     job_index: u8,
-    a: &Accepted,
+    a: &AcceptedShare,
     txns: &[Vec<u8>],
 ) {
     if let Err(why) = block_matches_header(a, txns) {
@@ -36,7 +36,7 @@ pub(crate) fn submit_with_txns(
     send(peer, node, &ratum::bitcoin::serialize_block(&a.work.header, &a.work.coinbase_tx, txns));
 }
 
-fn block_matches_header(a: &Accepted, txns: &[Vec<u8>]) -> Result<(), String> {
+fn block_matches_header(a: &AcceptedShare, txns: &[Vec<u8>]) -> Result<(), String> {
     let committed = ratum::header::HeaderV2::deserialize(&a.work.header)
         .ok_or_else(|| "the header does not deserialize".to_string())?
         .merkle_root;

@@ -3,7 +3,7 @@ use log::{debug, error, info, warn};
 use ratum::datum::share::PowSubmit;
 use ratum::lock;
 use ratum_prime::ledger;
-use ratum_prime::verify::{Accepted, Verifier};
+use ratum_prime::verify::{AcceptedShare, Verifier};
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
@@ -48,7 +48,7 @@ impl Crediting {
     pub(crate) fn record_found_block(
         &self,
         server: &Server,
-        a: &Accepted,
+        a: &AcceptedShare,
         s: &PowSubmit,
         now: u64,
     ) {
@@ -74,7 +74,7 @@ impl Crediting {
         }
     }
 
-    pub(crate) fn record_owed_block(&self, server: &Server, a: &Accepted, now: u64) {
+    pub(crate) fn record_owed_block(&self, server: &Server, a: &AcceptedShare, now: u64) {
         let peer = self.peer;
         let value = a.work.paid_to_pool;
         let Some(owed) = owed_for_block(server, a.work.height, a.work.block_hash, value, now)
@@ -99,7 +99,7 @@ impl Crediting {
         &self,
         server: &Server,
         verifier: &Verifier,
-        a: &Accepted,
+        a: &AcceptedShare,
         now: u64,
     ) {
         let peer = self.peer;
@@ -171,7 +171,7 @@ impl Crediting {
         &mut self,
         server: &Server,
         s: &PowSubmit,
-        a: &Accepted,
+        a: &AcceptedShare,
         now: u64,
     ) -> io::Result<()> {
         let peer = self.peer;

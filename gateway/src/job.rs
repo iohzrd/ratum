@@ -45,7 +45,6 @@ pub struct Job {
     pub block_target: Target,
     pub prevblock_hidden: [u8; 32],
     pub merkle_branches: Vec<[u8; 32]>,
-    pub target_pot_index: usize,
     pub pooled: Coinbase,
     pub subsidy_only: Coinbase,
     pub coinbaser_id: u8,
@@ -82,8 +81,9 @@ impl Job {
     }
 
     pub fn full_coinbase(&self, id: u8, pot: u8) -> Option<Vec<u8>> {
-        let mut tx = self.coinbase(id).assemble(&[0u8; EXTRANONCE_SIZE]);
-        *tx.get_mut(self.target_pot_index)? = pot;
+        let coinbase = self.coinbase(id);
+        let mut tx = coinbase.assemble(&[0u8; EXTRANONCE_SIZE]);
+        *tx.get_mut(coinbase.pot_index)? = pot;
         Some(tx)
     }
 
@@ -210,7 +210,6 @@ pub enum BuildError {
 struct CoinbaseSet {
     pooled: Coinbase,
     subsidy_only: Coinbase,
-    target_pot_index: usize,
     included: Vec<CoinbaseOutput>,
 }
 
@@ -284,7 +283,6 @@ impl Builder {
             block_target: target::bits_to_target(template.nbits).ok_or(BuildError::BadBits)?,
             prevblock_hidden: header::prevblock_hidden(&template.prev_hash),
             merkle_branches,
-            target_pot_index: set.target_pot_index,
             pooled: set.pooled,
             subsidy_only: set.subsidy_only,
             coinbaser_id,
@@ -327,7 +325,7 @@ fn coinbase_set(
     pool_script: &[u8],
     outputs: &[CoinbaseOutput],
 ) -> CoinbaseSet {
-    let params = |outs, budget, sigops, subsidy_only| coinbase::Params {
+    let spec = |outs, budget, sigops, subsidy_only| coinbase::Spec {
         script_sig: script,
         pot_index_in_script: pot_in_script,
         enprefix,
@@ -342,7 +340,7 @@ fn coinbase_set(
         output_budget: budget,
         sigop_budget: sigops,
     };
-    let subsidy_only = coinbase::build(&params(&[], 0, 0, true));
+    let (subsidy_only, _) = coinbase::build(&spec(&[], 0, 0, true));
     let fixed =
         coinbase::fixed_bytes(script.len(), pool_script.len(), template.witness_commitment.len());
     let budget = if outputs.is_empty() { 0 } else { coinbase::output_budget(fixed, template) };
@@ -350,14 +348,11 @@ fn coinbase_set(
         .sigoplimit
         .saturating_sub(u64::from(template.totals.sigops))
         .saturating_sub(coinbase::output_sigop_cost(pool_script));
-    let pooled = coinbase::build(&params(outputs, budget, sigops, false));
+    let (pooled, included) = coinbase::build(&spec(outputs, budget, sigops, false));
+    // Both coinbases put the byte at the same offset: they share a script_sig, so their
+    // coinb1 prefixes are the same length. The job section names the one offset for both.
     debug_assert_eq!(pooled.pot_index, subsidy_only.pot_index);
-    CoinbaseSet {
-        pooled: pooled.coinbase,
-        subsidy_only: subsidy_only.coinbase,
-        target_pot_index: pooled.pot_index,
-        included: pooled.included,
-    }
+    CoinbaseSet { pooled, subsidy_only, included }
 }
 
 pub const JOB_ID_TIME_CHARS: usize = 8;

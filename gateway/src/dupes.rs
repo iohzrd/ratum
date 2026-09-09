@@ -1,5 +1,5 @@
 use log::info;
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 const MIN_CAPACITY: usize = 1024;
@@ -7,53 +7,37 @@ const MIN_FREED_PERCENT: usize = 5;
 const GROWTH_PERCENT: usize = 25;
 
 pub struct Dupes {
-    seen: HashSet<[u8; 32]>,
-    order: VecDeque<([u8; 32], Instant)>,
+    seen: HashMap<[u8; 32], Instant>,
     capacity: usize,
     window: Duration,
 }
 
 impl Dupes {
     pub fn new(capacity: usize, window: Duration) -> Self {
-        Self {
-            seen: HashSet::new(),
-            order: VecDeque::new(),
-            capacity: capacity.max(MIN_CAPACITY),
-            window,
-        }
+        Self { seen: HashMap::new(), capacity: capacity.max(MIN_CAPACITY), window }
     }
 
+    /// Records `h` against the time its job was built and returns false when the table
+    /// already holds it. At capacity, entries whose job is older than the stale window are
+    /// removed first; when that frees too little the capacity is raised instead.
     pub fn insert(&mut self, h: [u8; 32], job_created: Instant) -> bool {
-        if self.seen.contains(&h) {
+        if self.seen.contains_key(&h) {
             return false;
         }
-        if self.order.len() >= self.capacity {
-            let freed = self.prune();
+        if self.seen.len() >= self.capacity {
+            let held = self.seen.len();
+            let window = self.window;
+            self.seen.retain(|_, created| created.elapsed() <= window);
+            let freed = held - self.seen.len();
             if freed < self.capacity * MIN_FREED_PERCENT / 100 {
                 self.capacity += self.capacity * GROWTH_PERCENT / 100;
                 info!(
-                    "duplicate-share table grown to {} entries: {freed} of {} were stale",
-                    self.capacity,
-                    self.order.len() + freed
+                    "duplicate-share table grown to {} entries: {freed} of {held} were stale",
+                    self.capacity
                 );
             }
         }
-        self.seen.insert(h);
-        self.order.push_back((h, job_created));
+        self.seen.insert(h, job_created);
         true
-    }
-
-    fn prune(&mut self) -> usize {
-        let before = self.order.len();
-        let window = self.window;
-        let seen = &mut self.seen;
-        self.order.retain(|(h, created)| {
-            let keep = created.elapsed() <= window;
-            if !keep {
-                seen.remove(h);
-            }
-            keep
-        });
-        before - self.order.len()
     }
 }

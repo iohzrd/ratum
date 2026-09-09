@@ -16,7 +16,7 @@ static CONFIG_HTML: LazyLock<String> =
 
 pub struct Context {
     pub server: Arc<Server>,
-    pub template_status: Arc<Mutex<crate::template::Status>>,
+    pub template_error: Arc<crate::template::LastError>,
     pub started: std::time::Instant,
     pub csrf: String,
     pub config_path: String,

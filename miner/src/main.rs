@@ -26,7 +26,7 @@ struct Job {
 }
 
 #[derive(Default)]
-struct Shared {
+struct Work {
     extranonce1: Vec<u8>,
     extranonce2_size: usize,
     difficulty: f64,
@@ -35,7 +35,7 @@ struct Shared {
     closed: bool,
 }
 
-impl Shared {
+impl Work {
     fn has_work_after(&self, last_generation: u64) -> bool {
         self.generation > last_generation && self.job.is_some() && self.extranonce2_size != 0
     }
@@ -72,7 +72,7 @@ fn mine(
 
 fn read_messages(
     stream: TcpStream,
-    state: Arc<(Mutex<Shared>, Condvar)>,
+    state: Arc<(Mutex<Work>, Condvar)>,
     generation: Arc<AtomicU64>,
 ) {
     let (lock, waiting) = &*state;
@@ -181,8 +181,7 @@ fn main() -> std::io::Result<()> {
     writeln!(w, r#"{{"id":"2","method":"mining.authorize","params":["{user}","x"]}}"#)?;
     w.flush()?;
 
-    let state =
-        Arc::new((Mutex::new(Shared { difficulty: 1.0, ..Shared::default() }), Condvar::new()));
+    let state = Arc::new((Mutex::new(Work { difficulty: 1.0, ..Work::default() }), Condvar::new()));
     let generation = Arc::new(AtomicU64::new(0));
     let reader = {
         let state = Arc::clone(&state);

@@ -82,7 +82,7 @@ pub struct ClientSummary {
 
 pub struct Server {
     pub config: Arc<Config>,
-    pub datum: Arc<datum::Shared>,
+    pub datum: Arc<datum::Pool>,
     pub node: ratum::rpc::Client,
     pub notify: Arc<crate::template::Notify>,
     pub jobs: Mutex<Jobs>,
@@ -99,7 +99,7 @@ pub struct Server {
 impl Server {
     pub fn new(
         config: Arc<Config>,
-        datum: Arc<datum::Shared>,
+        datum: Arc<datum::Pool>,
         node: ratum::rpc::Client,
         notify: Arc<crate::template::Notify>,
     ) -> Arc<Self> {

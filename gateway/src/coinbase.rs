@@ -53,6 +53,8 @@ pub fn fixed_bytes(
 pub struct Coinbase {
     pub coinb1: Vec<u8>,
     pub coinb2: Vec<u8>,
+    /// Where the difficulty exponent byte sits in the transaction `assemble` returns.
+    pub pot_index: usize,
 }
 
 impl Coinbase {
@@ -131,7 +133,7 @@ fn tag_push_data_that_fits(t: &Tagging<'_>) -> Result<Vec<u8>, String> {
     Ok(data)
 }
 
-pub struct Params<'a> {
+pub struct Spec<'a> {
     pub script_sig: &'a [u8],
     pub pot_index_in_script: usize,
     pub enprefix: u16,
@@ -148,13 +150,8 @@ const PRUNABLE_OP_RETURN: [u8; 3] = [OP_RETURN, 0x01, 0x00];
 
 const MIN_USEFUL_OUTPUT_ROOM: usize = 30;
 
-pub struct Built {
-    pub coinbase: Coinbase,
-    pub pot_index: usize,
-    pub included: Vec<CoinbaseOutput>,
-}
-
-pub fn build(p: &Params<'_>) -> Built {
+/// Builds the coinbase `p` describes, and reports which of the dictated outputs fit in it.
+pub fn build(p: &Spec<'_>) -> (Coinbase, Vec<CoinbaseOutput>) {
     let in_script = p.script_sig.len() <= SCRIPT_SIG_ROOM_FOR_EXTRANONCE;
 
     let mut included = Vec::new();
@@ -216,7 +213,7 @@ pub fn build(p: &Params<'_>) -> Built {
         coinb2.extend_from_slice(&encode_output(0, wc));
     }
     coinb2.extend_from_slice(&[0u8; LOCK_TIME_SIZE]);
-    Built { coinbase: Coinbase { coinb1, coinb2 }, pot_index, included }
+    (Coinbase { coinb1, coinb2, pot_index }, included)
 }
 
 pub const COINBASE_POOLED: u8 = 1;

@@ -127,7 +127,7 @@ pub struct CoinbaserRequestState {
     pub superseded: AtomicBool,
 }
 
-pub struct Shared {
+pub struct Pool {
     pub(in crate::datum) config: Mutex<Option<PoolConfig>>,
     min_difficulty: AtomicU64,
     pub stats: Mutex<Stats>,
@@ -143,7 +143,7 @@ pub struct Shared {
     pub(in crate::datum) waker: Mutex<Option<Arc<Waker>>>,
 }
 
-impl Shared {
+impl Pool {
     pub fn new(
         slots: usize,
         queue_capacity: usize,
@@ -359,19 +359,19 @@ pub fn user_agent() -> String {
 const RECONNECT_DELAY_MIN: Duration = Duration::from_secs(5);
 const RECONNECT_DELAY_SPREAD: Duration = Duration::from_secs(15);
 
-pub fn run_forever(settings: Settings, shared: Arc<Shared>, identity: KeyPairs) {
+pub fn run_forever(settings: Settings, pool: Arc<Pool>, identity: KeyPairs) {
     loop {
         info!("connecting to DATUM pool {}:{}", settings.host, settings.port);
-        let outcome = session::run(&settings, &shared, &identity);
-        let was_active = shared.disconnected();
+        let outcome = session::run(&settings, &pool, &identity);
+        let was_active = pool.disconnected();
         if let Err(e) = outcome {
             error!("DATUM connection ended: {e}");
         }
         if was_active {
-            shared.failures.store(1, Ordering::Relaxed);
-            shared.notify.rebuild();
+            pool.failures.store(1, Ordering::Relaxed);
+            pool.notify.rebuild();
         } else {
-            shared.failures.fetch_add(1, Ordering::Relaxed);
+            pool.failures.fetch_add(1, Ordering::Relaxed);
         }
         let delay = RECONNECT_DELAY_MIN
             + Duration::from_millis(u64::from(

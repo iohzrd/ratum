@@ -1,4 +1,5 @@
 use crate::cursor::{Cursor, Truncated};
+use bytes::BufMut as _;
 use sha2::{Digest, Sha256};
 
 pub mod opcode {
@@ -41,8 +42,6 @@ pub const SEQUENCE_FINAL: [u8; SEQUENCE_SIZE] = [0xff; SEQUENCE_SIZE];
 pub const MAX_OUTPUT_SCRIPT_SIZE: usize = 34;
 pub const MAX_OUTPUT_DATA_SIZE: usize = 83;
 pub const MAX_COMPACT_SIZE_LEN: usize = 1 + size_of::<u64>();
-
-pub use opcode::OP_RETURN;
 
 pub fn sha256d(data: &[u8]) -> [u8; 32] {
     let first = Sha256::digest(data);
@@ -96,9 +95,9 @@ pub fn txid(tx: &[u8]) -> Result<[u8; 32], TxError> {
 
     let framing = TX_VERSION_SIZE + LOCK_TIME_SIZE;
     let mut stripped = Vec::with_capacity(framing + (body_end - body_start));
-    stripped.extend_from_slice(&version.to_le_bytes());
-    stripped.extend_from_slice(&tx[body_start..body_end]);
-    stripped.extend_from_slice(&lock_time.to_le_bytes());
+    stripped.put_u32_le(version);
+    stripped.put_slice(&tx[body_start..body_end]);
+    stripped.put_u32_le(lock_time);
     Ok(sha256d(&stripped))
 }
 
@@ -292,7 +291,8 @@ pub fn output_script_size_is_valid(script: &[u8]) -> bool {
     if script.is_empty() {
         return true;
     }
-    let limit = if script[0] == OP_RETURN { MAX_OUTPUT_DATA_SIZE } else { MAX_OUTPUT_SCRIPT_SIZE };
+    let limit =
+        if script[0] == opcode::OP_RETURN { MAX_OUTPUT_DATA_SIZE } else { MAX_OUTPUT_SCRIPT_SIZE };
     script.len() <= limit
 }
 
@@ -318,51 +318,51 @@ fn decode_compact_size(c: &mut Cursor<'_>) -> Result<u64, TxError> {
 }
 
 pub fn encode_compact_size(n: u64) -> Vec<u8> {
+    let mut v = Vec::with_capacity(MAX_COMPACT_SIZE_LEN);
     match n {
-        0..=COMPACT_SIZE_MAX_1 => vec![n as u8],
+        0..=COMPACT_SIZE_MAX_1 => v.put_u8(n as u8),
         _ if n <= COMPACT_SIZE_MAX_2 => {
-            let mut v = vec![COMPACT_SIZE_U16_TAG];
-            v.extend_from_slice(&(n as u16).to_le_bytes());
-            v
+            v.put_u8(COMPACT_SIZE_U16_TAG);
+            v.put_u16_le(n as u16);
         }
         _ if n <= COMPACT_SIZE_MAX_4 => {
-            let mut v = vec![COMPACT_SIZE_U32_TAG];
-            v.extend_from_slice(&(n as u32).to_le_bytes());
-            v
+            v.put_u8(COMPACT_SIZE_U32_TAG);
+            v.put_u32_le(n as u32);
         }
         _ => {
-            let mut v = vec![COMPACT_SIZE_U64_TAG];
-            v.extend_from_slice(&n.to_le_bytes());
-            v
+            v.put_u8(COMPACT_SIZE_U64_TAG);
+            v.put_u64_le(n);
         }
     }
+    v
 }
 
 pub fn encode_push(data: &[u8]) -> Vec<u8> {
     debug_assert!(u8::try_from(data.len()).is_ok());
-    let mut out = if data.len() <= opcode::MAX_DIRECT_PUSH {
-        vec![data.len() as u8]
-    } else {
-        vec![opcode::OP_PUSHDATA1, data.len() as u8]
-    };
-    out.extend_from_slice(data);
+    let mut out = Vec::with_capacity(2 + data.len());
+    if data.len() > opcode::MAX_DIRECT_PUSH {
+        out.put_u8(opcode::OP_PUSHDATA1);
+    }
+    out.put_u8(data.len() as u8);
+    out.put_slice(data);
     out
 }
 
 pub fn encode_output(value: u64, script: &[u8]) -> Vec<u8> {
-    let mut v = value.to_le_bytes().to_vec();
-    v.extend_from_slice(&encode_compact_size(script.len() as u64));
-    v.extend_from_slice(script);
+    let mut v = Vec::with_capacity(VALUE_SIZE + MAX_COMPACT_SIZE_LEN + script.len());
+    v.put_u64_le(value);
+    v.put_slice(&encode_compact_size(script.len() as u64));
+    v.put_slice(script);
     v
 }
 
 pub fn serialize_block(header: &[u8], coinbase: &[u8], other_txns: &[Vec<u8>]) -> Vec<u8> {
     let mut out = Vec::with_capacity(header.len() + coinbase.len() + MAX_COMPACT_SIZE_LEN);
-    out.extend_from_slice(header);
-    out.extend_from_slice(&encode_compact_size(other_txns.len() as u64 + 1));
-    out.extend_from_slice(coinbase);
+    out.put_slice(header);
+    out.put_slice(&encode_compact_size(other_txns.len() as u64 + 1));
+    out.put_slice(coinbase);
     for tx in other_txns {
-        out.extend_from_slice(tx);
+        out.put_slice(tx);
     }
     out
 }

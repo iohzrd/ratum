@@ -116,7 +116,7 @@ impl Connection {
             subscribed: false,
             username: String::new(),
             vardiff: Vardiff::new(
-                vardiff::Params {
+                vardiff::Thresholds {
                     min: s.vardiff_min,
                     target_shares_min: s.vardiff_target_shares_min,
                     quickdiff_count: s.vardiff_quickdiff_count,

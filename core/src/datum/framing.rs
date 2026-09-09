@@ -6,6 +6,9 @@ pub const MAX_CMD_DATA_SIZE: u32 = 1 << CMD_LEN_BITS;
 pub const INITIAL_HELLO_KEY: u32 = 0xDC87_1829;
 pub const NONCE_LEN: usize = 24;
 const WORD: usize = size_of::<u32>();
+const NONCE_SEED_AT: usize = 7;
+const NONCE_STEP: u32 = 42;
+const SENDER_MASK: u32 = 0x5757_5757;
 pub const STRUCT_END: u8 = 0xFE;
 
 pub mod cmd {
@@ -125,12 +128,14 @@ impl SessionNonces {
     pub fn derive(nk: u32, session_pk_ed25519: &[u8; 32]) -> Self {
         let mut receiver = [0u8; NONCE_LEN];
         let mut sender = [0u8; NONCE_LEN];
-        let mut n = nk.wrapping_sub(42);
-        n ^= u32::from_le_bytes(session_pk_ed25519[7..7 + WORD].try_into().unwrap());
-        for j in (0..NONCE_LEN).step_by(WORD) {
-            let r = feedback(n.wrapping_sub(42));
-            receiver[j..j + WORD].copy_from_slice(&r.to_le_bytes());
-            sender[j..j + WORD].copy_from_slice(&(r ^ 0x5757_5757).to_le_bytes());
+        let seed: [u8; WORD] =
+            session_pk_ed25519[NONCE_SEED_AT..NONCE_SEED_AT + WORD].try_into().expect("WORD bytes");
+        let mut n = nk.wrapping_sub(NONCE_STEP) ^ u32::from_le_bytes(seed);
+        let sender_words = sender.as_chunks_mut::<WORD>().0.iter_mut();
+        for (rx, tx) in receiver.as_chunks_mut::<WORD>().0.iter_mut().zip(sender_words) {
+            let r = feedback(n.wrapping_sub(NONCE_STEP));
+            *rx = r.to_le_bytes();
+            *tx = (r ^ SENDER_MASK).to_le_bytes();
             n = !r;
         }
         Self { client_receiver: receiver, client_sender: sender }
@@ -138,10 +143,10 @@ impl SessionNonces {
 }
 
 pub fn increment_nonce(nonce: &mut [u8; NONCE_LEN]) {
-    for j in (0..NONCE_LEN).step_by(WORD) {
-        let w = u32::from_le_bytes(nonce[j..j + WORD].try_into().unwrap()).wrapping_add(1);
-        nonce[j..j + WORD].copy_from_slice(&w.to_le_bytes());
-        if w != 0 {
+    for word in nonce.as_chunks_mut::<WORD>().0 {
+        let raised = u32::from_le_bytes(*word).wrapping_add(1);
+        *word = raised.to_le_bytes();
+        if raised != 0 {
             return;
         }
     }

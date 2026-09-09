@@ -39,7 +39,7 @@ pub fn install(notify: Arc<Notify>) {
         }
     });
     match spawned {
-        Ok(_) => info!("SIGUSR1 raises a block notification (blocknotify by signal)"),
+        Ok(()) => info!("SIGUSR1 raises a block notification (blocknotify by signal)"),
         Err(e) => warn!("could not start the SIGUSR1 thread; SIGUSR1 is not handled: {e}"),
     }
 }

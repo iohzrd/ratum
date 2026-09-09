@@ -8,7 +8,7 @@ const MIN_QUICKDIFF_SHIFT: u32 = 2;
 const MIN_SHARES_TO_DOUBLE: u64 = 16;
 
 #[derive(Clone, Copy, Debug)]
-pub struct Params {
+pub struct Thresholds {
     pub min: u64,
     pub target_shares_min: u64,
     pub quickdiff_count: u64,
@@ -16,7 +16,7 @@ pub struct Params {
 }
 
 pub struct Vardiff {
-    params: Params,
+    params: Thresholds,
     current: u64,
     last_sent: u64,
     forced_floor: u64,
@@ -27,7 +27,7 @@ pub struct Vardiff {
 }
 
 impl Vardiff {
-    pub fn new(params: Params, now: Instant) -> Self {
+    pub fn new(params: Thresholds, now: Instant) -> Self {
         Self {
             params,
             current: params.min,

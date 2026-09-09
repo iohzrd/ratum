@@ -283,11 +283,6 @@ pub fn fallback_notifier(node: rpc::Client, notify: Arc<Notify>) {
     }
 }
 
-#[derive(Clone, Default)]
-pub struct Status {
-    pub error: Option<String>,
-}
-
 const NOTIFY_PATIENCE: Duration = Duration::from_secs(4);
 const NOTIFY_RETRY_DELAY: Duration = Duration::from_millis(250);
 const REPEAT_WINDOW: Duration = Duration::from_millis(2500);
@@ -300,9 +295,13 @@ enum Action {
     Retry,
 }
 
+/// The template poller's most recent refusal, for the status page. `None` while templates
+/// are being served.
+pub type LastError = Mutex<Option<String>>;
+
 struct Poller {
     config: Arc<Config>,
-    status: Arc<Mutex<Status>>,
+    last_error: Arc<LastError>,
     announced: Announced,
     last_prev: Option<String>,
     no_v2_rule_reported: Option<u32>,
@@ -314,10 +313,10 @@ struct Poller {
 }
 
 impl Poller {
-    fn new(config: Arc<Config>, status: Arc<Mutex<Status>>) -> Self {
+    fn new(config: Arc<Config>, last_error: Arc<LastError>) -> Self {
         Self {
             config,
-            status,
+            last_error,
             announced: Announced::default(),
             last_prev: None,
             no_v2_rule_reported: None,
@@ -333,19 +332,19 @@ impl Poller {
         let raw = match node.block_template() {
             Ok(v) => v,
             Err(e) => {
-                ratum::lock(&self.status).error = Some("Could not fetch new template!".into());
+                *ratum::lock(&self.last_error) = Some("Could not fetch new template!".into());
                 error!("Could not fetch new template from {}! ({e})", self.config.bitcoind.rpcurl);
                 return None;
             }
         };
         match parse(&raw, payout_script, &mut self.announced) {
             Ok(t) => {
-                ratum::lock(&self.status).error = None;
+                *ratum::lock(&self.last_error) = None;
                 self.last_refusal = None;
                 Some(t)
             }
             Err(TemplateError::Refused(why)) => {
-                ratum::lock(&self.status).error = Some(why.clone());
+                *ratum::lock(&self.last_error) = Some(why.clone());
                 if self.last_refusal.as_deref() == Some(why.as_str()) {
                     debug!("template refused: {why}");
                 } else {
@@ -355,7 +354,7 @@ impl Poller {
                 None
             }
             Err(e) => {
-                ratum::lock(&self.status).error = Some(e.to_string());
+                *ratum::lock(&self.last_error) = Some(e.to_string());
                 error!("{e}");
                 None
             }
@@ -429,12 +428,12 @@ pub fn run(
     node: rpc::Client,
     config: Arc<Config>,
     notify: Arc<Notify>,
-    status: Arc<Mutex<Status>>,
+    last_error: Arc<LastError>,
     payout_script: impl Fn() -> Vec<u8>,
     mut on_template: impl FnMut(Arc<Template>, bool),
 ) {
     let interval = Duration::from_secs(config.bitcoind.work_update_seconds);
-    let mut p = Poller::new(config, status);
+    let mut p = Poller::new(config, last_error);
     loop {
         let Some(template) = p.poll(&node, &payout_script()) else {
             std::thread::sleep(POLL_RETRY_DELAY);
