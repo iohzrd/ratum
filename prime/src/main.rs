@@ -1,6 +1,7 @@
 mod abw;
 mod admin;
 mod cli;
+mod coinbaser;
 mod connection;
 mod credit;
 mod relay;
@@ -113,7 +114,7 @@ fn watch_node_in_background(
     chain: Option<rpc::Chain>,
 ) {
     let (watcher, view, poll) = (node.clone(), Arc::clone(view), s.poll);
-    std::thread::spawn(move || watch_node(watcher, view, poll, chain));
+    ratum::thread::spawn("node-watch", move || watch_node(watcher, view, poll, chain));
     info!(
         "watching the node at {}: waiting on each new block, \
          re-reading the tip at least every {:.3}s",
@@ -153,21 +154,42 @@ fn accept_connections(listener: TcpListener, server: &Arc<Server>) {
             continue;
         }
         let conn = Arc::clone(server);
-        if let Err(e) =
-            std::thread::Builder::new().name("connection".to_string()).spawn(move || {
-                let _open = OpenConnectionGuard(Arc::clone(&conn));
-                let peer = stream.peer_addr().ok();
-                if let Err(e) = handle(stream, &conn) {
-                    match peer {
-                        Some(p) => warn!("[{p}] connection error: {e}"),
-                        None => warn!("connection error: {e}"),
-                    }
+        let spawned = ratum::thread::try_spawn("connection", move || {
+            let _open = OpenConnectionGuard(Arc::clone(&conn));
+            let peer = stream.peer_addr().ok();
+            if let Err(e) = handle(stream, &conn) {
+                match peer {
+                    Some(p) => warn!("[{p}] connection error: {e}"),
+                    None => warn!("connection error: {e}"),
                 }
-            })
-        {
+            }
+        });
+        if let Err(e) = spawned {
             server.open_connections.fetch_sub(1, Ordering::Relaxed);
             error!("could not start a thread for a connection: {e}");
         }
+    }
+}
+
+/// The startup lines that say what each setting the operator changed from its default
+/// will do to the connections this pool accepts.
+fn report_settings(s: &Settings) {
+    if !s.require_split {
+        info!(
+            "--require-split=false: a coinbase paying only the pool script is accepted from any job"
+        );
+    }
+    if !s.allowed_agents.is_empty() {
+        info!(
+            "gateway user agents restricted to the prefixes {:?}; others are refused at hello",
+            s.allowed_agents
+        );
+    }
+    if s.require_v3 {
+        info!(
+            "version 3 protocol required: a hello without the DRS extension is refused, so \
+             every connection is under an anti-block-withholding assignment"
+        );
     }
 }
 
@@ -208,6 +230,7 @@ fn main() -> io::Result<()> {
         s.window_multiple, s.window_floor, s.min_payout, s.fee_bps
     );
 
+    report_settings(&s);
     let config = ClientConfig {
         payout_script,
         prime_id: s.prime_id,
@@ -220,23 +243,6 @@ fn main() -> io::Result<()> {
     };
     let mut policy = PoolPolicy::from_config(&config);
     policy.require_split = s.require_split;
-    if !policy.require_split {
-        info!(
-            "--require-split=false: a coinbase paying only the pool script is accepted from any job"
-        );
-    }
-    if !s.allowed_agents.is_empty() {
-        info!(
-            "gateway user agents restricted to the prefixes {:?}; others are refused at hello",
-            s.allowed_agents
-        );
-    }
-    if s.require_v3 {
-        info!(
-            "version 3 protocol required: a hello without the DRS extension is refused, so \
-             every connection is under an anti-block-withholding assignment"
-        );
-    }
 
     let server = Arc::new(Server {
         pool_keys,

@@ -253,7 +253,7 @@ pub fn listen(server: Arc<Server>) -> io::Result<()> {
             continue;
         }
         let server = Arc::clone(&server);
-        let spawned = std::thread::Builder::new().name("stratum-client".into()).spawn(move || {
+        let spawned = ratum::thread::try_spawn("stratum-client", move || {
             match Connection::run(server, stream) {
                 Ok(()) | Err(Disconnect::Io(_) | Disconnect::Killed | Disconnect::Idle(_)) => {}
                 Err(e @ Disconnect::Protocol(_)) => info!("Stratum client connection closed: {e}"),

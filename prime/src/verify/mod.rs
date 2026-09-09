@@ -369,6 +369,10 @@ impl Verifier {
         }
     }
 
+    /// Rebuilds the work a submission claims and decides whether it is credited. The job
+    /// and coinbase sections it carries are installed only once the hash proves work
+    /// against its own target or the network's, so a peer cannot fill the job tables with
+    /// sections it never mined against.
     fn rebuild(&mut self, s: &PowSubmit, now: u64) -> Result<Rebuilt, RejectReason> {
         let (work, prev_hash) = self.build(s)?;
         let meets = target::meets_target(&work.raw_hash, &target::target_for_pot(s.target_byte));
@@ -388,6 +392,10 @@ impl Verifier {
         })
     }
 
+    /// The job and coinbase sections this submission is rebuilt from: the ones it carries
+    /// where it carries them, otherwise the ones its job slot already holds. `allow_evicted`
+    /// reads a slot whose parent block is gone, which only the refused-share path does, to
+    /// report what the gateway was working on.
     fn resolve<'a>(
         &'a self,
         s: &'a PowSubmit,
@@ -432,6 +440,10 @@ impl Verifier {
         Ok((job, cb))
     }
 
+    /// Installs the sections this submission carries into its job slot, holding the total
+    /// bytes of every installed coinbase section under `MAX_INSTALLED_COINBASE_BYTES`. A
+    /// new job in a slot releases the coinbase sections that slot held, and a coinbase id
+    /// already installed replaces its own bytes rather than adding to them.
     fn install_sections(&mut self, s: &PowSubmit) -> Result<(), RejectReason> {
         let idx = s.job_id as usize;
         let new_job = self.brings_new_job(s);

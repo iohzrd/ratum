@@ -138,6 +138,9 @@ fn read_lock_time(c: &mut Cursor<'_>, tx_len: usize) -> Result<u32, TxError> {
     Ok(lock_time)
 }
 
+/// The merkle root of a whole block's transaction ids, and whether the tree is mutated:
+/// a level in which a hash is duplicated builds the same root as a shorter list, so a
+/// block carrying one is rejected. None for an empty list, which is not a block.
 pub fn merkle_root_of(txids: &[[u8; 32]]) -> Option<([u8; 32], bool)> {
     if txids.is_empty() {
         return None;
@@ -252,6 +255,8 @@ pub fn parse_coinbase(tx: &[u8]) -> Result<CoinbaseTx, TxError> {
     })
 }
 
+/// Every data push in `script`, as the offset its data starts at and the data itself.
+/// Scanning stops at the first push that runs past the end of the script.
 pub fn script_pushes(script: &[u8]) -> Vec<(usize, &[u8])> {
     let mut out = Vec::new();
     let mut i = 0usize;

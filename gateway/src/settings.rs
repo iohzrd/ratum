@@ -168,6 +168,14 @@ const FIELDS: &[Field] = &[
     },
 ];
 
+/// The key the configured pool host is stashed under while `datum.pool_host` is empty.
+/// An empty `pool_host` is what makes the gateway non-pooled, so turning reward sharing off
+/// has to empty it; keeping the host here lets turning sharing back on restore what was
+/// configured, and lets the page go on showing the host the operator typed.
+const OLD_POOL_HOST: &str = "pool_host(old)";
+
+/// The pool host the settings page shows: the configured one, or the stashed one while
+/// reward sharing is off, or the default when neither names a host.
 fn shown_pool_host(cfg: &Config, doc: &Value) -> String {
     if !cfg.datum.pool_host.is_empty() {
         return cfg.datum.pool_host.clone();
@@ -176,7 +184,7 @@ fn shown_pool_host(cfg: &Config, doc: &Value) -> String {
 }
 
 fn old_pool_host(doc: &Value) -> Option<String> {
-    doc.get("datum")?.get("pool_host(old)")?.as_str().map(str::to_string)
+    doc.get("datum")?.get(OLD_POOL_HOST)?.as_str().map(str::to_string)
 }
 
 fn secondary_tag_max(cfg: &Config) -> usize {
@@ -289,6 +297,11 @@ fn submitted<'a>(form: &'a [(String, String)], name: &str) -> Option<&'a str> {
     form.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
 }
 
+/// Applies the reward-sharing choice and the pool host the form carries. "require" and
+/// "prefer" both need a host, so either restores the stashed one or clears the file's empty
+/// `pool_host` back to the default; "never" empties `pool_host` and stashes what it held.
+/// A host typed while sharing is off is written to the stash, so it survives until sharing
+/// is turned back on.
 fn apply_reward_sharing(edit: &mut Edit<'_>, cfg: &Config, form: &[(String, String)]) {
     let mut pool_host = cfg.datum.pool_host.clone();
     let default_host = Datum::default().pool_host;
@@ -305,7 +318,7 @@ fn apply_reward_sharing(edit: &mut Edit<'_>, cfg: &Config, form: &[(String, Stri
             if pool_host.is_empty() {
                 match old_pool_host(edit.doc) {
                     Some(old) => {
-                        edit.remove("datum", "pool_host(old)");
+                        edit.remove("datum", OLD_POOL_HOST);
                         edit.set("datum", "pool_host", json!(old));
                         pool_host = old;
                     }
@@ -327,7 +340,7 @@ fn apply_reward_sharing(edit: &mut Edit<'_>, cfg: &Config, form: &[(String, Stri
             if !pool_host.is_empty() {
                 if let Some(named) = edit.doc.get("datum").and_then(|d| d.get("pool_host")).cloned()
                 {
-                    edit.set("datum", "pool_host(old)", named);
+                    edit.set("datum", OLD_POOL_HOST, named);
                 }
                 edit.set("datum", "pool_host", json!(""));
                 pool_host.clear();
@@ -342,7 +355,7 @@ fn apply_reward_sharing(edit: &mut Edit<'_>, cfg: &Config, form: &[(String, Stri
             edit.set_if_changed("datum", "pool_host", json!(host), json!(pool_host));
         } else if host != default_host || old_pool_host(edit.doc).is_some() {
             let old = old_pool_host(edit.doc).map_or(Value::Null, |o| json!(o));
-            edit.set_if_changed("datum", "pool_host(old)", json!(host), old);
+            edit.set_if_changed("datum", OLD_POOL_HOST, json!(host), old);
         }
     }
 }

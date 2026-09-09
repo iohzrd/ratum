@@ -96,10 +96,7 @@ fn start_datum(rt: &Runtime) {
     );
     let settings = datum::Settings::from_config(&rt.config);
     let shared = Arc::clone(&rt.shared);
-    std::thread::Builder::new()
-        .name("datum".into())
-        .spawn(move || datum::run_forever(settings, shared, identity))
-        .expect("datum thread");
+    ratum::thread::spawn("datum", move || datum::run_forever(settings, shared, identity));
     let started = Instant::now();
     let mut last_report = 0;
     while started.elapsed() < POOL_CONNECT_WAIT && !rt.shared.is_active() {
@@ -119,15 +116,12 @@ fn start_datum(rt: &Runtime) {
 }
 
 fn spawn_stratum_listener(server: Arc<stratum::Server>) {
-    std::thread::Builder::new()
-        .name("stratum-listener".into())
-        .spawn(move || {
-            if let Err(e) = stratum::listen(server) {
-                error!("stratum listener: {e}");
-                std::process::exit(1);
-            }
-        })
-        .expect("stratum listener thread");
+    ratum::thread::spawn("stratum-listener", move || {
+        if let Err(e) = stratum::listen(server) {
+            error!("stratum listener: {e}");
+            std::process::exit(1);
+        }
+    });
 }
 
 fn start_template_thread(
@@ -136,41 +130,93 @@ fn start_template_thread(
     status: Arc<Mutex<template::Status>>,
 ) {
     let rt = rt.clone();
-    std::thread::Builder::new()
-        .name("template".into())
-        .spawn(move || {
-            let publisher = publish::Publisher::new(
-                job::Builder::new(Arc::clone(&rt.config)),
-                Arc::clone(&server),
-                Arc::clone(&rt.shared),
-            );
-            let mut listener_started = false;
-            let payout_script = {
-                let rt = rt.clone();
-                move || {
-                    rt.shared
-                        .payout_script()
-                        .unwrap_or_else(|| rt.config.pool_output_script.clone())
+    ratum::thread::spawn("template", move || {
+        let publisher = publish::Publisher::new(
+            job::Builder::new(Arc::clone(&rt.config)),
+            Arc::clone(&server),
+            Arc::clone(&rt.shared),
+        );
+        let mut listener_started = false;
+        let payout_script = {
+            let rt = rt.clone();
+            move || {
+                rt.shared.payout_script().unwrap_or_else(|| rt.config.pool_output_script.clone())
+            }
+        };
+        template::run(
+            rt.node.clone(),
+            Arc::clone(&rt.config),
+            Arc::clone(&rt.notify),
+            status,
+            payout_script,
+            |t, new_block| {
+                publisher.on_template(t, new_block);
+                if !listener_started {
+                    listener_started = true;
+                    spawn_stratum_listener(Arc::clone(&server));
                 }
-            };
-            template::run(
-                rt.node.clone(),
-                Arc::clone(&rt.config),
-                Arc::clone(&rt.notify),
-                status,
-                payout_script,
-                |t, new_block| {
-                    publisher.on_template(t, new_block);
-                    if !listener_started {
-                        listener_started = true;
-                        spawn_stratum_listener(Arc::clone(&server));
-                    }
-                },
-            );
-        })
-        .expect("template thread");
+            },
+        );
+    });
 }
 
+/// True once `interval` has passed since `last`, which it then advances to now.
+fn due(last: &mut Instant, interval: Duration) -> bool {
+    if last.elapsed() < interval {
+        return false;
+    }
+    *last = Instant::now();
+    true
+}
+
+fn report_missing_job(server: &stratum::Server, started: Instant, last_report: &mut Instant) {
+    if server.current_job().is_some() || started.elapsed() <= FIRST_JOB_PATIENCE {
+        return;
+    }
+    if due(last_report, NO_JOB_REPORT_INTERVAL) {
+        error!(
+            "Did not see an initial stratum job after ~{} seconds. Is your node properly setup?",
+            started.elapsed().as_secs()
+        );
+    }
+}
+
+fn report_stats(server: &stratum::Server, last: &mut Instant) {
+    if !due(last, STATS_INTERVAL) {
+        return;
+    }
+    let s = server.summary();
+    info!(
+        "Server stats: {} client{} / {:.2} Th/s",
+        s.subscribed,
+        if s.subscribed == 1 { "" } else { "s" },
+        s.hashrate_ths
+    );
+}
+
+/// While the pool is unreachable and datum.pooled_mining_only is set, the listener refuses
+/// new stratum connections; once the reconnect loop has failed FAILURES_BEFORE_SHUTDOWN
+/// times, the clients already connected are disconnected as well, once per outage.
+fn enforce_pooled_only(rt: &Runtime, server: &stratum::Server, warned: &mut bool) {
+    let active = rt.shared.is_active();
+    if active {
+        rt.shared.failures.store(0, Ordering::Relaxed);
+    }
+    let reject = rt.config.datum.pooled_mining_only && !active;
+    if !reject {
+        *warned = false;
+    } else if !*warned && rt.shared.failures.load(Ordering::Relaxed) >= FAILURES_BEFORE_SHUTDOWN {
+        warn!(
+            "The DATUM pool is unreachable and datum.pooled_mining_only is set: disconnecting stratum clients until it is reached again"
+        );
+        server.shutdown_all();
+        *warned = true;
+    }
+    server.rejecting.store(reject, Ordering::Relaxed);
+}
+
+/// The main thread once everything is started: the periodic reports, and the enforcement of
+/// datum.pooled_mining_only when the gateway is configured for a pool.
 fn watch_loop(rt: &Runtime, server: &stratum::Server) -> ! {
     let pooled = !rt.config.datum.pool_host.is_empty();
     let started = Instant::now();
@@ -179,48 +225,11 @@ fn watch_loop(rt: &Runtime, server: &stratum::Server) -> ! {
     let mut last_no_job_report = Instant::now();
     loop {
         std::thread::sleep(WATCH_TICK);
-        if server.current_job().is_none()
-            && started.elapsed() > FIRST_JOB_PATIENCE
-            && last_no_job_report.elapsed() >= NO_JOB_REPORT_INTERVAL
-        {
-            last_no_job_report = Instant::now();
-            error!(
-                "Did not see an initial stratum job after ~{} seconds. Is your node properly setup?",
-                started.elapsed().as_secs()
-            );
+        report_missing_job(server, started, &mut last_no_job_report);
+        report_stats(server, &mut last_stats);
+        if pooled {
+            enforce_pooled_only(rt, server, &mut warned);
         }
-        if last_stats.elapsed() >= STATS_INTERVAL {
-            last_stats = Instant::now();
-            let s = server.summary();
-            info!(
-                "Server stats: {} client{} / {:.2} Th/s",
-                s.subscribed,
-                if s.subscribed == 1 { "" } else { "s" },
-                s.hashrate_ths
-            );
-        }
-        if !pooled {
-            continue;
-        }
-        let active = rt.shared.is_active();
-        if active {
-            rt.shared.failures.store(0, Ordering::Relaxed);
-        }
-        let reject = rt.config.datum.pooled_mining_only && !active;
-        if reject
-            && rt.shared.failures.load(Ordering::Relaxed) >= FAILURES_BEFORE_SHUTDOWN
-            && !warned
-        {
-            warn!(
-                "The DATUM pool is unreachable and datum.pooled_mining_only is set: disconnecting stratum clients until it is reached again"
-            );
-            server.shutdown_all();
-            warned = true;
-        }
-        if !reject {
-            warned = false;
-        }
-        server.rejecting.store(reject, Ordering::Relaxed);
     }
 }
 
@@ -273,10 +282,7 @@ fn main() {
 
     if rt.config.bitcoind.notify_fallback {
         let (node, notify) = (rt.node.clone(), Arc::clone(&rt.notify));
-        std::thread::Builder::new()
-            .name("notify-fallback".into())
-            .spawn(move || template::fallback_notifier(node, notify))
-            .expect("fallback notifier thread");
+        ratum::thread::spawn("notify-fallback", move || template::fallback_notifier(node, notify));
     }
 
     api::start(Arc::new(api::Context {

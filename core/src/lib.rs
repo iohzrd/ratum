@@ -9,6 +9,7 @@ pub mod poll;
 pub mod rand;
 pub mod rpc;
 pub mod target;
+pub mod thread;
 pub mod web;
 
 pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("RATUM_GIT_COMMIT"), ")");

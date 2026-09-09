@@ -348,7 +348,7 @@ fn coinbase_set(
         output_budget: budget,
         sigop_budget: sigops,
     };
-    let (subsidy_only, target_pot_index, _) = coinbase::build(&params(&[], 0, 0, true));
+    let subsidy_only = coinbase::build(&params(&[], 0, 0, true));
     let fixed =
         coinbase::fixed_bytes(script.len(), pool_script.len(), template.witness_commitment.len());
     let budget = if outputs.is_empty() { 0 } else { coinbase::output_budget(fixed, template) };
@@ -356,9 +356,14 @@ fn coinbase_set(
         .sigoplimit
         .saturating_sub(u64::from(template.totals.sigops))
         .saturating_sub(coinbase::output_sigop_cost(pool_script));
-    let (pooled, pot, included) = coinbase::build(&params(outputs, budget, sigops, false));
-    debug_assert_eq!(pot, target_pot_index);
-    CoinbaseSet { pooled, subsidy_only, target_pot_index, included }
+    let pooled = coinbase::build(&params(outputs, budget, sigops, false));
+    debug_assert_eq!(pooled.pot_index, subsidy_only.pot_index);
+    CoinbaseSet {
+        pooled: pooled.coinbase,
+        subsidy_only: subsidy_only.coinbase,
+        target_pot_index: pooled.pot_index,
+        included: pooled.included,
+    }
 }
 
 pub const JOB_ID_TIME_CHARS: usize = 8;

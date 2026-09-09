@@ -137,12 +137,9 @@ pub fn bind(addr: &str, port: u16) -> Result<Server, String> {
 }
 
 pub fn serve(name: &str, server: Server, handle: impl Fn(Request) + Send + 'static) {
-    std::thread::Builder::new()
-        .name(name.to_string())
-        .spawn(move || {
-            for req in server.incoming_requests() {
-                handle(req);
-            }
-        })
-        .expect("http thread");
+    crate::thread::spawn(name, move || {
+        for req in server.incoming_requests() {
+            handle(req);
+        }
+    });
 }

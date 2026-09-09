@@ -95,7 +95,7 @@ impl Publisher {
 
     fn spawn_coinbaser(self: &Arc<Self>, t: Arc<Template>, new_block: bool, serial: u64) {
         let this = Arc::clone(self);
-        let spawned = std::thread::Builder::new().name("coinbaser".into()).spawn(move || {
+        let spawned = ratum::thread::try_spawn("coinbaser", move || {
             let coinbaser = this.shared.fetch_coinbaser(t.coinbase_value, t.prev_hash);
             if this.template_serial.load(Ordering::SeqCst) != serial {
                 info!("coinbaser response for a superseded template; not used");

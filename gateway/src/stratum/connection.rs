@@ -11,7 +11,7 @@ use crate::job::{
 use crate::tally::FeeMeter;
 use crate::username;
 use crate::vardiff::{self, Vardiff};
-use log::{debug, error, info, warn};
+use log::{debug, info, warn};
 use ratum::datum::share::{
     EXTRANONCE_SIZE_V2, EXTRANONCE_V2_PAD, EXTRANONCE1_SIZE, EXTRANONCE2_SIZE,
 };
@@ -460,25 +460,32 @@ impl Connection {
         match self.evaluate(&req) {
             Ok(()) => {
                 self.reply_result(id, Value::Bool(true))?;
-                self.with_stats(|st| {
-                    st.accepted.add(diff);
-                    st.last_accepted = Some(Instant::now());
-                });
-                self.vardiff.count_share();
-                self.window_active = self.window_active.saturating_add(diff);
-                self.last_accepted = Some(Instant::now());
-                if self.vardiff.update(false, Instant::now())
-                    && let Some(job) = self.server.current_job()
-                {
-                    self.notify(&job, true, true, false)?;
-                }
-                Ok(())
+                self.count_accepted(diff)
             }
             Err(reject) => {
                 self.with_stats(|st| st.rejected.add(diff));
                 self.reply_error(id, reject)
             }
         }
+    }
+
+    /// The bookkeeping an accepted share calls for: the client's tallies, the vardiff
+    /// sample, and the quickdiff job a difficulty raise sends out.
+    fn count_accepted(&mut self, diff: u64) -> io::Result<()> {
+        let now = Instant::now();
+        self.with_stats(|st| {
+            st.accepted.add(diff);
+            st.last_accepted = Some(now);
+        });
+        self.vardiff.count_share();
+        self.window_active = self.window_active.saturating_add(diff);
+        self.last_accepted = Some(now);
+        if self.vardiff.update(false, now)
+            && let Some(job) = self.server.current_job()
+        {
+            self.notify(&job, true, true, false)?;
+        }
+        Ok(())
     }
 
     fn parse_submit(&self, params: &Value) -> Result<SubmitRequest, (Reject, Option<u64>)> {
@@ -529,23 +536,19 @@ impl Connection {
             for _ in 0..BLOCK_FOUND_LOG_LINES {
                 warn!("******** BLOCK FOUND - {display} ********");
             }
-            self.submit_block(job, r.coinbase, pot, &header.serialize(), &display);
+            crate::submit::found_block(
+                &self.server,
+                job,
+                r.coinbase,
+                pot,
+                &header.serialize(),
+                &display,
+            );
         }
 
         let checked = self.check_share(job, &hash, pot, &req.miner_username);
         if job.is_datum_job && (is_block || checked.is_ok()) {
-            let wire_username = if checked.is_ok() && self.fee_charged(req.job_diff) {
-                self.server.config.fee_address().to_string()
-            } else {
-                let cfg = &self.server.config;
-                username::apply_modifier(
-                    &cfg.stratum.username_modifiers,
-                    &cfg.mining.pool_address,
-                    &req.miner_username,
-                    &hash,
-                )
-                .unwrap_or_else(|| req.miner_username.clone())
-            };
+            let wire_username = self.credited_username(req, &hash, checked.is_ok());
             self.server.datum.submit(QueuedShare {
                 job: Arc::clone(job),
                 coinbase_id: r.coinbase,
@@ -558,6 +561,28 @@ impl Connection {
             });
         }
         checked
+    }
+
+    /// The username the pool credits this share to: the fee address when the gateway fee
+    /// falls on this share, otherwise the miner's own username as the configured username
+    /// modifiers map it. A rejected share never carries the fee.
+    fn credited_username(
+        &mut self,
+        req: &SubmitRequest,
+        hash: &[u8; 32],
+        accepted: bool,
+    ) -> String {
+        if accepted && self.fee_charged(req.job_diff) {
+            return self.server.config.fee_address().to_string();
+        }
+        let cfg = &self.server.config;
+        username::apply_modifier(
+            &cfg.stratum.username_modifiers,
+            &cfg.mining.pool_address,
+            &req.miner_username,
+            hash,
+        )
+        .unwrap_or_else(|| req.miner_username.clone())
     }
 
     fn check_share(
@@ -584,38 +609,6 @@ impl Connection {
             return Err(UNAUTHORIZED_WORKER);
         }
         Ok(())
-    }
-
-    fn submit_block(
-        &self,
-        job: &Arc<Job>,
-        coinbase_index: u8,
-        pot: u8,
-        header: &[u8; ratum::header::HEADER_V2_SIZE],
-        hash_hex: &str,
-    ) {
-        let Some(block) = crate::submit::assemble(job, coinbase_index, pot, header) else {
-            error!("could not assemble the block for {hash_hex}");
-            return;
-        };
-        debug!("Block Payload: {}", hex::encode(&block));
-        let block = Arc::new(block);
-        let cfg = &self.server.config;
-        crate::submit::submit_redundant(
-            self.server.node.clone(),
-            self.server.extra_nodes.clone(),
-            Arc::clone(&block),
-            hash_hex.to_string(),
-            Arc::clone(&self.server.notify),
-        );
-        if !cfg.mining.save_submitblocks_dir.is_empty() {
-            crate::submit::save_to_dir(&cfg.mining.save_submitblocks_dir, hash_hex, &block);
-        }
-        let accepted =
-            crate::submit::submit_to(&self.server.node, "upstream node", &block, hash_hex);
-        if accepted {
-            self.server.notify.raise_for(hash_hex);
-        }
     }
 
     fn fee_charged(&mut self, diff: u64) -> bool {

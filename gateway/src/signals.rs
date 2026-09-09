@@ -27,7 +27,7 @@ pub fn install(notify: Arc<Notify>) {
         warn!("could not install the SIGUSR1 handler; SIGUSR1 is not handled");
         return;
     }
-    let spawned = std::thread::Builder::new().name("sigusr1".into()).spawn(move || {
+    let spawned = ratum::thread::try_spawn("sigusr1", move || {
         let mut buf = [0u8; 16];
         loop {
             let n = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), buf.len()) };

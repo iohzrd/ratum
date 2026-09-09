@@ -1,8 +1,42 @@
-use crate::job::{COINBASE_SUBSIDY_ONLY, Job};
-use log::{debug, info, warn};
-use ratum::rpc;
+//! Sending a block this gateway found to the node: assembling it from the job and the
+//! winning header, and the submissions that carry it.
 
-pub fn assemble(
+use crate::job::{COINBASE_SUBSIDY_ONLY, Job};
+use crate::stratum::Server;
+use log::{debug, error, info, warn};
+use ratum::rpc;
+use std::sync::Arc;
+
+/// Assembles the block a winning header names, then sends it to the upstream node and to
+/// every extra node, saving a copy first when `mining.save_submitblocks_dir` names a
+/// directory. The upstream node receives two submissions, one from a thread of its own and
+/// one from this thread, so that an RPC call stalling on either does not hold the block
+/// back; the second is answered "duplicate", which counts as accepted.
+pub fn found_block(
+    server: &Server,
+    job: &Job,
+    coinbase_id: u8,
+    pot: u8,
+    header: &[u8; ratum::header::HEADER_V2_SIZE],
+    hash_hex: &str,
+) {
+    let Some(block) = assemble(job, coinbase_id, pot, header) else {
+        error!("could not assemble the block for {hash_hex}");
+        return;
+    };
+    debug!("Block Payload: {}", hex::encode(&block));
+    let block = Arc::new(block);
+    spawn_redundant(server, Arc::clone(&block), hash_hex);
+    let dir = &server.config.mining.save_submitblocks_dir;
+    if !dir.is_empty() {
+        save_to_dir(dir, hash_hex, &block);
+    }
+    if submit_to(&server.node, "upstream node", &block, hash_hex) {
+        server.notify.raise_for(hash_hex);
+    }
+}
+
+fn assemble(
     job: &Job,
     coinbase_id: u8,
     pot: u8,
@@ -15,7 +49,7 @@ pub fn assemble(
     Some(ratum::bitcoin::serialize_block(header, &coinbase, &others))
 }
 
-pub fn submit_to(node: &rpc::Client, what: &str, block: &[u8], hash_hex: &str) -> bool {
+fn submit_to(node: &rpc::Client, what: &str, block: &[u8], hash_hex: &str) -> bool {
     let accepted = match node.submit_block(block) {
         Ok(None) => {
             info!("Block {hash_hex} submitted to {what} successfully!");
@@ -41,14 +75,10 @@ pub fn submit_to(node: &rpc::Client, what: &str, block: &[u8], hash_hex: &str) -
     accepted
 }
 
-pub fn submit_redundant(
-    node: rpc::Client,
-    extras: Vec<rpc::Client>,
-    block: std::sync::Arc<Vec<u8>>,
-    hash_hex: String,
-    notify: std::sync::Arc<crate::template::Notify>,
-) {
-    let spawned = std::thread::Builder::new().name("submitblock".into()).spawn(move || {
+fn spawn_redundant(server: &Server, block: Arc<Vec<u8>>, hash_hex: &str) {
+    let (node, extras) = (server.node.clone(), server.extra_nodes.clone());
+    let (notify, hash_hex) = (Arc::clone(&server.notify), hash_hex.to_string());
+    let spawned = ratum::thread::try_spawn("submitblock", move || {
         if submit_to(&node, "upstream node (redundant)", &block, &hash_hex) {
             notify.raise_for(&hash_hex);
         }
@@ -92,7 +122,7 @@ pub fn extra_client(url: &str) -> Option<rpc::Client> {
 const HTTP_PORT: u16 = 80;
 const HTTPS_PORT: u16 = 443;
 
-pub fn save_to_dir(dir: &str, hash_hex: &str, block: &[u8]) {
+fn save_to_dir(dir: &str, hash_hex: &str, block: &[u8]) {
     let path = format!("{dir}/datum_submitblock_{hash_hex}.json");
     let body = serde_json::json!({
         "jsonrpc": "1.0", "id": hash_hex, "method": "submitblock", "params": [hex::encode(block)]

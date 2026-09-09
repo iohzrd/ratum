@@ -148,7 +148,17 @@ const PRUNABLE_OP_RETURN: [u8; 3] = [OP_RETURN, 0x01, 0x00];
 
 const MIN_USEFUL_OUTPUT_ROOM: usize = 30;
 
-pub fn build(p: &Params<'_>) -> (Coinbase, usize, Vec<CoinbaseOutput>) {
+/// A built coinbase: the two halves the miner splices its extranonce between, where in
+/// `coinb1` the share target's power-of-two byte sits, and the coinbaser outputs that fit.
+pub struct Built {
+    pub coinbase: Coinbase,
+    pub pot_index: usize,
+    pub included: Vec<CoinbaseOutput>,
+}
+
+/// Builds the coinbase for one job, taking the coinbaser outputs in order for as long as
+/// the size and sigop budgets allow and paying whatever is left to the pool's script.
+pub fn build(p: &Params<'_>) -> Built {
     let in_script = p.script_sig.len() <= SCRIPT_SIG_ROOM_FOR_EXTRANONCE;
 
     let mut included = Vec::new();
@@ -213,7 +223,7 @@ pub fn build(p: &Params<'_>) -> (Coinbase, usize, Vec<CoinbaseOutput>) {
         coinb2.extend_from_slice(&encode_output(0, wc));
     }
     coinb2.extend_from_slice(&[0u8; LOCK_TIME_SIZE]);
-    (Coinbase { coinb1, coinb2 }, pot_index, included)
+    Built { coinbase: Coinbase { coinb1, coinb2 }, pot_index, included }
 }
 
 pub const COINBASE_POOLED: u8 = 1;

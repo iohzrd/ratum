@@ -1,7 +1,8 @@
 use crate::abw::{AbwManager, Revealed};
+use crate::coinbaser;
 use crate::credit::Crediting;
 use crate::relay;
-use crate::server::{SavedSession, Server, SessionState, dictated_outputs};
+use crate::server::{SavedSession, Server, SessionState};
 use log::{debug, error, info, warn};
 use mio::Waker;
 use ratum::datum::abw::raw_hash_le;
@@ -9,8 +10,8 @@ use ratum::datum::bulk::{self, Reassembler};
 use ratum::datum::framing::{self, Header, KeyRatchet};
 use ratum::datum::handshake::{Generation, Session, accept, open_hello};
 use ratum::datum::messages::{
-    AbwShareRef, CoinbaseOutput, CoinbaserRequest, CoinbaserResponse, RejectReason, ResumeToken,
-    ShareResponse, ShareVerdict, blocknotify, client_subcmd,
+    AbwShareRef, CoinbaserRequest, RejectReason, ResumeToken, ShareResponse, ShareVerdict,
+    blocknotify, client_subcmd,
 };
 use ratum::datum::share::PowSubmit;
 use ratum::datum::validation::{self, TxnBundle};
@@ -23,8 +24,6 @@ use std::io::{self, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-
-const COINBASE_VALUE_TOLERANCE: f64 = 2.0;
 
 const LOG_PAYLOAD_BYTES: usize = 16;
 const LOG_HEX_CHARS: usize = 16;
@@ -526,73 +525,17 @@ impl Connection<'_> {
             req.value,
             &hex::encode(req.prev_hash)[..LOG_HEX_CHARS]
         );
-        let reference = *lock(&self.server.node_view.coinbase_value);
-        if let Some(reference) = reference {
-            let low = (reference as f64 / COINBASE_VALUE_TOLERANCE) as u64;
-            let high = (reference as f64 * COINBASE_VALUE_TOLERANCE) as u64;
-            if req.value < low || req.value > high {
-                warn!(
-                    "[{peer}]      refusing a split for {} sats: this node's template pays \
-                     {reference} sats",
-                    req.value
-                );
-                return Ok(());
-            }
+        if !coinbaser::value_is_plausible(self.server, peer, req.value) {
+            return Ok(());
         }
-        let (dictated, shares, work) = dictated_outputs(self.server, req.value);
-        let paid: u64 = dictated.iter().map(|(_, o)| o.value).sum();
-        let outputs: Vec<CoinbaseOutput> = dictated.iter().map(|(_, o)| o.clone()).collect();
+        self.coinbaser_id = coinbaser::next_id(self.coinbaser_id);
+        let split = coinbaser::dictate(self.server, peer, req.value, self.coinbaser_id)?;
+        self.verifier.record_dictated(&split.response, split.identities, ratum::unix_now());
+        self.send_mining(&split.payload, false)?;
         info!(
-            "[{peer}]      paying {} miners {} of {} sats from a window of {shares} shares ({work} work)",
-            outputs.len(),
-            paid,
-            req.value,
-        );
-        self.coinbaser_id = self.coinbaser_id.wrapping_add(1);
-        if self.coinbaser_id == 0 {
-            self.coinbaser_id = 1;
-        }
-        let coinbaser_id = self.coinbaser_id;
-        let mut response = CoinbaserResponse { value: req.value, coinbaser_id, outputs };
-        let removed = response.retain_payable();
-        if removed != 0 {
-            warn!("[{peer}]      removed {removed} unpayable outputs from the split");
-        }
-        let payload = loop {
-            match response.encode() {
-                Ok(p) => break p,
-                Err(e) if response.outputs.len() > 1 => {
-                    let removed = response.outputs.pop();
-                    warn!(
-                        "[{peer}]      split too large ({e}); removed an output of {} sats",
-                        removed.map_or(0, |o| o.value)
-                    );
-                }
-                Err(e) => {
-                    error!("[{peer}]      could not build the split ({e}); paying the pool");
-                    response.outputs = vec![CoinbaseOutput {
-                        value: req.value,
-                        script: self.server.policy.payout_script.clone(),
-                    }];
-                    break response.encode().map_err(|e| io::Error::other(e.to_string()))?;
-                }
-            }
-        };
-        let mut rest = dictated.iter();
-        let identities: Vec<String> = response
-            .outputs
-            .iter()
-            .map(|o| {
-                rest.by_ref()
-                    .find(|(_, d)| d.value == o.value && d.script == o.script)
-                    .map_or_else(String::new, |(identity, _)| identity.clone())
-            })
-            .collect();
-        self.verifier.record_dictated(&response, identities, ratum::unix_now());
-        self.send_mining(&payload, false)?;
-        info!(
-            "[{peer}]   <- coinbaser response ({} outputs, id {coinbaser_id})",
-            response.outputs.len()
+            "[{peer}]   <- coinbaser response ({} outputs, id {})",
+            split.response.outputs.len(),
+            self.coinbaser_id
         );
         Ok(())
     }
