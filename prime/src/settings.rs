@@ -67,7 +67,7 @@ impl Settings {
         let max_poll_secs = ratum::SECS_PER_HOUR as f64;
         let payout = payout_choice(c, &f);
         let data_dir = c.data_dir.clone().or(f.data_dir).map(PathBuf::from);
-        Settings {
+        Self {
             listen: cli::resolve_str(c.listen.clone(), f.listen, DEFAULT_LISTEN),
             stats_listen: c.stats_listen.clone().or(f.stats_listen),
             advertise_address: c.advertise_address.clone().or(f.advertise_address),
@@ -81,32 +81,25 @@ impl Settings {
                 .filter(|p| !p.is_empty())
                 .map(str::to_string)
                 .collect(),
-            require_v3: cli::resolve::<bool>(
-                c.require_v3.as_deref(),
-                f.require_v3,
-                false,
-                "--require-v3",
-                "true or false",
-                |_| true,
-            ),
-            abw_reveal_after: Duration::from_secs(cli::resolve::<u64>(
-                c.abw_reveal_after.as_deref(),
+            require_v3: c.require_v3.or(f.require_v3).unwrap_or(false),
+            abw_reveal_after: Duration::from_secs(cli::resolve(
+                c.abw_reveal_after,
                 f.abw_reveal_after,
                 abw::DEFAULT_REVEAL_AFTER.as_secs(),
                 "--abw-reveal-after",
                 &reveal_must_be,
                 |n| reveal_range.contains(n),
             )),
-            min_difficulty: cli::resolve::<u64>(
-                c.min_diff.as_deref(),
+            min_difficulty: cli::resolve(
+                c.min_diff,
                 f.min_diff,
                 DEFAULT_MIN_DIFFICULTY,
                 "--min-diff",
                 "a power of two",
                 |n| n.is_power_of_two(),
             ),
-            max_connections: cli::resolve::<usize>(
-                c.max_connections.as_deref(),
+            max_connections: cli::resolve(
+                c.max_connections,
                 f.max_connections,
                 DEFAULT_MAX_CONNECTIONS,
                 "--max-connections",
@@ -119,8 +112,8 @@ impl Settings {
                 f.coinbase_tag,
                 DEFAULT_COINBASE_TAG,
             ),
-            prime_id: cli::resolve::<u32>(
-                c.prime_id.as_deref(),
+            prime_id: cli::resolve(
+                c.prime_id,
                 f.prime_id,
                 1,
                 "--prime-id",
@@ -128,40 +121,25 @@ impl Settings {
                 |n| *n > 0,
             ),
             ledger_path: c.ledger.clone().or(f.ledger),
-            ledger_keep: cli::resolve_opt::<usize>(
-                c.ledger_keep.as_deref(),
+            ledger_keep: cli::resolve_opt(
+                c.ledger_keep,
                 f.ledger_keep,
                 "--ledger-keep",
                 "at least 1",
                 |n| *n >= 1,
             ),
-            window_multiple: cli::resolve::<f64>(
-                c.window.as_deref(),
+            window_multiple: cli::resolve(
+                c.window,
                 f.window,
                 DEFAULT_WINDOW_MULTIPLE,
                 "--window",
                 "a positive number",
                 |n| n.is_finite() && *n > 0.0,
             ),
-            window_floor: cli::resolve::<u128>(
-                c.window_floor.as_deref(),
-                f.window_floor,
-                1,
-                "--window-floor",
-                "a sum of share difficulty",
-                |_| true,
-            )
-            .max(1),
-            min_payout: cli::resolve::<u64>(
-                c.min_payout.as_deref(),
-                f.min_payout,
-                DUST_THRESHOLD_P2PKH,
-                "--min-payout",
-                "a count of satoshis",
-                |_| true,
-            ),
-            fee_bps: cli::resolve::<u16>(
-                c.fee_bps.as_deref(),
+            window_floor: c.window_floor.or(f.window_floor).unwrap_or(1).max(1),
+            min_payout: c.min_payout.or(f.min_payout).unwrap_or(DUST_THRESHOLD_P2PKH),
+            fee_bps: cli::resolve(
+                c.fee_bps,
                 f.fee_bps,
                 0,
                 "--fee-bps",
@@ -171,22 +149,15 @@ impl Settings {
                 ),
                 |n| *n <= MAX_FEE_BPS,
             ),
-            poll: Duration::from_secs_f64(cli::resolve::<f64>(
-                c.poll.as_deref(),
+            poll: Duration::from_secs_f64(cli::resolve(
+                c.poll,
                 f.poll,
                 DEFAULT_POLL_SECS,
                 "--poll",
                 &format!("a positive number of seconds up to {max_poll_secs:.0}"),
                 |n| n.is_finite() && *n > 0.0 && *n <= max_poll_secs,
             )),
-            require_split: cli::resolve::<bool>(
-                c.require_split.as_deref(),
-                f.require_split,
-                true,
-                "--require-split",
-                "true or false",
-                |_| true,
-            ),
+            require_split: c.require_split.or(f.require_split).unwrap_or(true),
             node: NodeCredential {
                 url: c.rpc.clone().or(f.rpc),
                 user: cli::resolve_str(c.rpc_user.clone(), f.rpc_user, ""),
@@ -261,8 +232,8 @@ pub(crate) enum Payout {
 impl Payout {
     fn flag(self) -> &'static str {
         match self {
-            Payout::Address => "--payout-address",
-            Payout::Script => "--payout-script",
+            Self::Address => "--payout-address",
+            Self::Script => "--payout-script",
         }
     }
 }

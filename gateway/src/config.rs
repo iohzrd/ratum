@@ -15,10 +15,6 @@ const MIN_VARDIFF_QUICKDIFF_DELTA: u64 = 3;
 const SHARE_STALE_SECONDS_RANGE: std::ops::RangeInclusive<u64> = 60..=150;
 pub const GLOBAL_TIMEOUT_MARGIN_SECS: u64 = 5;
 
-fn t() -> bool {
-    true
-}
-
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Bitcoind {
@@ -27,13 +23,12 @@ pub struct Bitcoind {
     pub rpcpassword: String,
     pub rpcurl: String,
     pub work_update_seconds: u64,
-    #[serde(default = "t")]
     pub notify_fallback: bool,
 }
 
 impl Default for Bitcoind {
     fn default() -> Self {
-        Bitcoind {
+        Self {
             rpccookiefile: String::new(),
             rpcuser: String::new(),
             rpcpassword: String::new(),
@@ -101,7 +96,7 @@ fn deserialize_modifiers<'de, D: serde::Deserializer<'de>>(
 
 impl Default for Stratum {
     fn default() -> Self {
-        Stratum {
+        Self {
             listen_addr: String::new(),
             listen_port: 23334,
             max_clients_per_thread: 128,
@@ -135,7 +130,7 @@ pub struct Mining {
 
 impl Default for Mining {
     fn default() -> Self {
-        Mining {
+        Self {
             pool_address: String::new(),
             coinbase_tag_primary: "DATUM Gateway".into(),
             coinbase_tag_secondary: "DATUM User".into(),
@@ -159,7 +154,7 @@ pub struct Api {
 
 impl Default for Api {
     fn default() -> Self {
-        Api {
+        Self {
             admin_password: String::new(),
             allow_insecure_auth: false,
             listen_addr: String::new(),
@@ -192,7 +187,7 @@ pub struct Logger {
 
 impl Default for Logger {
     fn default() -> Self {
-        Logger {
+        Self {
             log_to_console: true,
             log_to_stderr: false,
             log_to_file: false,
@@ -225,7 +220,7 @@ pub struct Datum {
 
 impl Default for Datum {
     fn default() -> Self {
-        Datum {
+        Self {
             pool_host: "datum-beta1.mine.ocean.xyz".into(),
             pool_port: 28915,
             pool_url: String::new(),
@@ -266,8 +261,8 @@ pub const MAX_CONFIGURED_TAG: usize = 60;
 pub const MAX_CONFIGURED_TAGS_TOTAL: usize = 88;
 
 impl Config {
-    pub fn parse(text: &str) -> Result<Config, String> {
-        let mut c: Config = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let mut c: Self = serde_json::from_str(text).map_err(|e| e.to_string())?;
         c.validate()?;
         Ok(c)
     }

@@ -27,12 +27,12 @@ pub enum Error {
 
 impl Error {
     pub fn is_unauthorized(&self) -> bool {
-        matches!(self, Error::Http(401 | 403, _))
+        matches!(self, Self::Http(401 | 403, _))
     }
 
     pub fn is_method_not_found(&self) -> bool {
         match self {
-            Error::Rpc(m) => m.contains("-32601") || m.contains("Method not found"),
+            Self::Rpc(m) => m.contains("-32601") || m.contains("Method not found"),
             _ => false,
         }
     }
@@ -49,25 +49,25 @@ pub enum Chain {
 }
 
 impl Chain {
-    fn parse(name: &str) -> Chain {
+    fn parse(name: &str) -> Self {
         match name {
-            "main" => Chain::Main,
-            "test" => Chain::Test,
-            "testnet4" => Chain::Testnet4,
-            "signet" => Chain::Signet,
-            "regtest" => Chain::Regtest,
-            _ => Chain::Other,
+            "main" => Self::Main,
+            "test" => Self::Test,
+            "testnet4" => Self::Testnet4,
+            "signet" => Self::Signet,
+            "regtest" => Self::Regtest,
+            _ => Self::Other,
         }
     }
 
     pub fn name(self) -> &'static str {
         match self {
-            Chain::Main => "main",
-            Chain::Test => "test",
-            Chain::Testnet4 => "testnet4",
-            Chain::Signet => "signet",
-            Chain::Regtest => "regtest",
-            Chain::Other => "other",
+            Self::Main => "main",
+            Self::Test => "test",
+            Self::Testnet4 => "testnet4",
+            Self::Signet => "signet",
+            Self::Regtest => "regtest",
+            Self::Other => "other",
         }
     }
 }
@@ -134,7 +134,7 @@ impl Client {
         if authority.is_empty() || !authority.contains(':') {
             return Err(Error::BadUrl(url.to_string()));
         }
-        Ok(Client {
+        Ok(Self {
             url: url.to_string(),
             authorization: Arc::new(Mutex::new(authorization)),
             cookie_path,

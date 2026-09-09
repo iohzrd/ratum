@@ -204,7 +204,7 @@ pub enum TxError {
 
 impl From<Truncated> for TxError {
     fn from(t: Truncated) -> Self {
-        TxError::Truncated(t.0)
+        Self::Truncated(t.0)
     }
 }
 

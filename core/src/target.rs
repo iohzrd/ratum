@@ -19,6 +19,9 @@ pub const MAX_TARGET_POT: u8 = (u64::BITS - 1) as u8;
 
 pub const DIFF1_TARGET: Target = target_for_pot(0);
 
+/// The 256-bit target an nBits compact encoding stands for: a 3-byte mantissa scaled by
+/// 256^(size - 3). None for a negative encoding, and for one whose mantissa would carry a
+/// set bit past the top of the target.
 pub fn bits_to_target(bits: u32) -> Option<Target> {
     let exp = (bits >> COMPACT_SIZE_SHIFT) as usize;
     let mant = bits & COMPACT_MANTISSA_MASK;

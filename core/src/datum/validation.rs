@@ -37,13 +37,13 @@ wire_codes! {
 impl std::fmt::Display for Status {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Status::Ok => write!(f, "ok"),
-            Status::JobEmpty => write!(f, "job slot empty"),
-            Status::NoTemplate => write!(f, "no block template"),
-            Status::TooManyTxns => write!(f, "too many transactions for a short list"),
-            Status::BadJobIndex => write!(f, "bad job index"),
-            Status::BadRequest => write!(f, "bad transaction request"),
-            Status::Unknown(b) => write!(f, "unknown status {b:#04x}"),
+            Self::Ok => write!(f, "ok"),
+            Self::JobEmpty => write!(f, "job slot empty"),
+            Self::NoTemplate => write!(f, "no block template"),
+            Self::TooManyTxns => write!(f, "too many transactions for a short list"),
+            Self::BadJobIndex => write!(f, "bad job index"),
+            Self::BadRequest => write!(f, "bad transaction request"),
+            Self::Unknown(b) => write!(f, "unknown status {b:#04x}"),
         }
     }
 }
@@ -64,7 +64,7 @@ pub enum Error {
 
 impl From<Truncated> for Error {
     fn from(t: Truncated) -> Self {
-        Error::Truncated(t.0)
+        Self::Truncated(t.0)
     }
 }
 
@@ -137,7 +137,7 @@ pub const CROSSCHECK_SEED: [u8; 32] = [
 
 impl ShortTxnList {
     pub fn empty(job_index: u8, status: Status) -> Self {
-        ShortTxnList { job_index, status, txn_count: 0, short_ids: Vec::new(), crosscheck: None }
+        Self { job_index, status, txn_count: 0, short_ids: Vec::new(), crosscheck: None }
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -172,7 +172,7 @@ pub struct TxnBundle {
 
 impl TxnBundle {
     pub fn empty(selector: u8, job_index: u8, status: Status) -> Self {
-        TxnBundle { selector, job_index, status, txns: Vec::new() }
+        Self { selector, job_index, status, txns: Vec::new() }
     }
 
     pub fn decode(data: &[u8], selector: u8) -> Result<Self, Error> {
@@ -180,7 +180,7 @@ impl TxnBundle {
         let job_index = c.u8("job index")?;
         let status = Status::from_code(c.u8("status")?);
         if status != Status::Ok {
-            return Ok(TxnBundle::empty(selector, job_index, status));
+            return Ok(Self::empty(selector, job_index, status));
         }
         let stated = usize::from(c.u16("txn count")?);
 
@@ -196,7 +196,7 @@ impl TxnBundle {
         if c.u8("terminator")? != STRUCT_END {
             return Err(Error::MissingTerminator);
         }
-        Ok(TxnBundle { selector, job_index, status, txns })
+        Ok(Self { selector, job_index, status, txns })
     }
 
     pub fn encode(&self) -> Vec<u8> {

@@ -1,8 +1,7 @@
 use crate::abw::{AbwManager, Revealed};
+use crate::credit::Crediting;
 use crate::relay;
-use crate::server::{
-    Payability, Resolver, SavedSession, Server, SessionState, dictated_outputs, owed_for_block,
-};
+use crate::server::{SavedSession, Server, SessionState, dictated_outputs};
 use log::{debug, error, info, warn};
 use mio::Waker;
 use ratum::datum::abw::raw_hash_le;
@@ -18,9 +17,8 @@ use ratum::datum::validation::{self, TxnBundle};
 use ratum::io::read_exact_deadline;
 use ratum::lock;
 use ratum::poll::PolledSocket;
-use ratum_prime::ledger;
 use ratum_prime::verify::{Accepted, Rebuilt, Verifier};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
@@ -148,8 +146,7 @@ pub(crate) fn handle(mut stream: TcpStream, server: &Server) -> io::Result<()> {
         waker,
         session,
         verifier: Verifier::new(server.policy.clone(), Arc::clone(&server.replay)),
-        credited: HashMap::new(),
-        reported_unpayable: HashSet::new(),
+        credit: Crediting::new(peer),
         coinbaser_id: 0,
         awaiting_txns: HashMap::new(),
         known_tip: None,
@@ -170,8 +167,6 @@ pub(crate) fn handle(mut stream: TcpStream, server: &Server) -> io::Result<()> {
 
     conn.run()
 }
-
-const MAX_CREDITED_NAMES: usize = 4096;
 
 /// What handling one share produced: the verdict to answer with, a follow-up request to
 /// send after the answer, and the raw proof-of-work hash when the pool rebuilt the header.
@@ -194,8 +189,7 @@ struct Connection<'a> {
     waker: Arc<Waker>,
     session: Session,
     verifier: Verifier,
-    credited: HashMap<String, u64>,
-    reported_unpayable: HashSet<String>,
+    credit: Crediting,
     coinbaser_id: u8,
     awaiting_txns: HashMap<u8, Accepted>,
     known_tip: Option<[u8; 32]>,
@@ -702,11 +696,11 @@ impl Connection<'_> {
                 }
                 pending = Some(validation::request_block_txns(s.job_id));
             }
-            self.record_found_block(a, s, now);
+            self.credit.record_found_block(self.server, a, s, now);
             if !a.work.unpaid.is_empty() {
-                self.record_unpaid_outputs(a, now);
+                self.credit.record_unpaid_outputs(self.server, &self.verifier, a, now);
             } else if a.work.paid_to_split == 0 {
-                self.record_owed_block(a, now);
+                self.credit.record_owed_block(self.server, a, now);
             }
         } else if s.is_block {
             warn!(
@@ -714,11 +708,11 @@ impl Connection<'_> {
                  network target"
             );
         }
-        if self.is_unpayable(&s.username) {
+        if self.credit.is_unpayable(self.server, &s.username) {
             let verdict = ShareVerdict::Rejected(RejectReason::BadUsername);
             return Ok(ShareOutcome { verdict, pending, raw_hash });
         }
-        if let Err(e) = self.record_and_credit(s, a, now) {
+        if let Err(e) = self.credit.record_and_credit(self.server, s, a, now) {
             error!(
                 "[{peer}]   !! could not record the share to the ledger ({e}); it is \
                  not credited and its hash was removed from the ReplayGuard so a \
@@ -756,201 +750,6 @@ impl Connection<'_> {
             pending: None,
             raw_hash: work.map(|w| w.raw_hash),
         })
-    }
-
-    fn log_and_record_owed(&self, owed: ledger::OwedBlock) {
-        let peer = self.peer;
-        for (identity, sats) in &owed.entries {
-            warn!("[{peer}]   **   {identity} {sats} sats");
-        }
-        let hash = hex::encode(owed.block_hash);
-        warn!(
-            "[{peer}]   ** recorded as owed by block hash {hash}; after paying it from the \
-             pool's wallet, run: ratum-prime --settle-block {hash} (with --ledger or \
-             --data-dir, pool stopped)"
-        );
-        let recorded = lock(&self.server.ledger).record_owed(owed);
-        if let Err(e) = recorded {
-            error!(
-                "[{peer}]   !! could not record the owed amounts to the ledger ({e}); they \
-                 are in this log only"
-            );
-        }
-    }
-
-    fn record_found_block(&self, a: &Accepted, s: &PowSubmit, now: u64) {
-        let difficulty = lock(&self.server.node_view.tip).map_or(0.0, |t| t.difficulty);
-        let mut l = lock(&self.server.ledger);
-        let block = ledger::FoundBlock {
-            at: now,
-            height: a.work.height,
-            block_hash: a.work.block_hash,
-            paid_to_split: a.work.paid_to_split,
-            paid_to_pool: a.work.paid_to_pool,
-            finder: ledger::identity_of(&s.username).to_string(),
-            tag: a.work.tag_secondary.clone(),
-            difficulty,
-            cumulative_work: l.cumulative_work(),
-        };
-        if let Err(e) = l.record_block(block) {
-            error!(
-                "[{}]   !! could not record the block to the ledger's history ({e}); the \
-                 block itself was already relayed",
-                self.peer
-            );
-        }
-    }
-
-    fn record_owed_block(&self, a: &Accepted, now: u64) {
-        let peer = self.peer;
-        let value = a.work.paid_to_pool;
-        let Some(owed) = owed_for_block(self.server, a.work.height, a.work.block_hash, value, now)
-        else {
-            warn!(
-                "[{peer}]   ** the block's {value} sats went to the pool's payout script and \
-                 the window names nobody to owe them to"
-            );
-            return;
-        };
-        warn!(
-            "[{peer}]   ** the block's coinbase paid the window nothing; the pool's payout \
-             script received {value} sats of which {} are owed to {} identit{}:",
-            owed.total,
-            owed.entries.len(),
-            if owed.entries.len() == 1 { "y" } else { "ies" },
-        );
-        self.log_and_record_owed(owed);
-    }
-
-    fn record_unpaid_outputs(&self, a: &Accepted, now: u64) {
-        let peer = self.peer;
-        let value = a.work.paid_to_split.saturating_add(a.work.paid_to_pool);
-        let fee = self.server.payout.fee_on(value);
-        let available = a.work.paid_to_pool.saturating_sub(fee);
-        let mut entries = self.verifier.unpaid_outputs(&a.work);
-        let dictated: u64 = entries.iter().map(|(_, sats)| *sats).sum();
-        if dictated > available {
-            warn!(
-                "[{peer}]   ** the coinbase left out {dictated} sats of dictated outputs but the \
-                 pool's payout script received only {available} sats beyond the fee; the owed \
-                 amounts are scaled down to what it received"
-            );
-            for (_, sats) in &mut entries {
-                *sats = (u128::from(*sats) * u128::from(available) / u128::from(dictated)) as u64;
-            }
-            entries.retain(|(_, sats)| *sats > 0);
-        }
-        let total: u64 = entries.iter().map(|(_, sats)| *sats).sum();
-        if total == 0 {
-            return;
-        }
-        warn!(
-            "[{peer}]   ** the block's coinbase left out {} of the dictated outputs; the pool's \
-             payout script received {} sats of which {total} are owed to {} identit{}:",
-            a.work.unpaid.len(),
-            a.work.paid_to_pool,
-            entries.len(),
-            if entries.len() == 1 { "y" } else { "ies" },
-        );
-        self.log_and_record_owed(ledger::OwedBlock {
-            at: now,
-            height: a.work.height,
-            block_hash: a.work.block_hash,
-            total,
-            settled_at: None,
-            entries,
-        });
-    }
-
-    fn is_unpayable(&mut self, username: &str) -> bool {
-        let identity = ledger::identity_of(username);
-        let Payability::Unpayable(why) =
-            Resolver::payability(&self.server.resolver, &self.server.node, identity)
-        else {
-            return false;
-        };
-        let first = self.reported_unpayable.len() < MAX_CREDITED_NAMES
-            && self.reported_unpayable.insert(identity.to_string());
-        if first {
-            warn!(
-                "[{}]   <- rejecting shares from {identity:?}, which cannot be paid: {why}. \
-                 The gateway sends the miner's own stratum username when \
-                 pool_pass_full_users is set; that username must be an address this chain's \
-                 node accepts, optionally followed by '.workername'.",
-                self.peer
-            );
-        } else {
-            debug!("[{}]   <- rejected: {identity:?} cannot be paid ({why})", self.peer);
-        }
-        true
-    }
-
-    fn record_and_credit(&mut self, s: &PowSubmit, a: &Accepted, now: u64) -> io::Result<()> {
-        let peer = self.peer;
-        let identity = ledger::identity_of(&s.username).to_string();
-        let network = lock(&self.server.node_view.tip).map(|t| t.difficulty);
-        {
-            let mut l = lock(&self.server.ledger);
-            if let Some(d) = network {
-                let w = ledger::window_for_difficulty(
-                    d,
-                    self.server.payout.window_multiple,
-                    self.server.payout.window_floor,
-                );
-                if w != l.window() {
-                    let re_read = l.set_window(w);
-                    if re_read != 0 {
-                        info!(
-                            "[{peer}]      difficulty rose; the wider window \
-                             re-read {re_read} share(s) from the ledger"
-                        );
-                    }
-                }
-            }
-            if let Err(e) = l.record(
-                now,
-                &identity,
-                a.work.difficulty,
-                &a.work.block_hash,
-                &a.work.tag_secondary,
-            ) {
-                drop(l);
-                lock(&self.server.replay).remove(&a.work.block_hash);
-                return Err(e);
-            }
-            let removed = l.take_removed();
-            if removed != 0 {
-                info!(
-                    "[{peer}]      ledger retention removed {removed} \
-                     share(s) past --ledger-keep"
-                );
-            }
-        }
-        // The running total is a log line only, so a connection past MAX_CREDITED_NAMES
-        // distinct usernames reports each further share's own difficulty and keeps none.
-        let total = match self.credited.get_mut(&s.username) {
-            Some(total) => {
-                *total = total.saturating_add(a.work.difficulty);
-                *total
-            }
-            None => {
-                if self.credited.len() < MAX_CREDITED_NAMES {
-                    self.credited.insert(s.username.clone(), a.work.difficulty);
-                }
-                a.work.difficulty
-            }
-        };
-        debug!(
-            "[{peer}]   <- accepted diff={} hash={} height={} split={} pool={} sats; {} credited {}",
-            a.work.difficulty,
-            hex::encode(a.work.block_hash),
-            a.work.height,
-            a.work.paid_to_split,
-            a.work.paid_to_pool,
-            s.username,
-            total,
-        );
-        Ok(())
     }
 
     fn on_block_txns(&mut self, plain: &[u8]) {

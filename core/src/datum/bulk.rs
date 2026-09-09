@@ -30,7 +30,7 @@ pub enum Error {
 
 impl From<Truncated> for Error {
     fn from(_: Truncated) -> Self {
-        Error::Truncated
+        Self::Truncated
     }
 }
 
@@ -93,7 +93,7 @@ struct Transfer {
 
 impl Reassembler {
     pub fn new() -> Self {
-        Reassembler::default()
+        Self::default()
     }
 
     pub fn accept(&mut self, f: &Fragment<'_>) -> Result<(Ack, Option<Vec<u8>>), Error> {

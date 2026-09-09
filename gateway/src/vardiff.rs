@@ -28,7 +28,7 @@ pub struct Vardiff {
 
 impl Vardiff {
     pub fn new(params: Params, now: Instant) -> Self {
-        Vardiff {
+        Self {
             params,
             current: params.min,
             last_sent: 0,

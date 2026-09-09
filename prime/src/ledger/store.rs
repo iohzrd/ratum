@@ -242,7 +242,7 @@ impl Store {
             shares.last().db()?.map_or(0, |(k, _)| k.value() + 1)
         };
         let retain = keep.map(|k| (k.max(1) as u64).saturating_mul(SHARES_PER_KEEP_UNIT));
-        Ok((Store { db, next_seq, retain_bound: retain, cumulative_work }, stamped))
+        Ok((Self { db, next_seq, retain_bound: retain, cumulative_work }, stamped))
     }
 
     pub(super) fn insert(&mut self, share: &Share) -> io::Result<bool> {

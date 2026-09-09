@@ -21,12 +21,7 @@ impl PolledSocket {
         let mut stream = TcpStream::from_std(stream);
         let poll = Poll::new()?;
         poll.registry().register(&mut stream, SOCKET, Interest::READABLE | Interest::WRITABLE)?;
-        Ok(PolledSocket {
-            stream,
-            poll,
-            events: Events::with_capacity(EVENT_CAPACITY),
-            readable: false,
-        })
+        Ok(Self { stream, poll, events: Events::with_capacity(EVENT_CAPACITY), readable: false })
     }
 
     pub fn waker(&self) -> io::Result<Waker> {

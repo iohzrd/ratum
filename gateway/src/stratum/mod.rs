@@ -119,7 +119,7 @@ impl Server {
             })
             .collect();
         let dupes = Dupes::new(config.dupe_table_capacity(), config.stale_window());
-        Arc::new(Server {
+        Arc::new(Self {
             config,
             datum,
             node,

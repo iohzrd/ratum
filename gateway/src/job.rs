@@ -229,7 +229,7 @@ pub struct Builder {
 
 impl Builder {
     pub fn new(config: Arc<Config>) -> Self {
-        Builder { serial: 0, enprefix: 0, datum_slot: 0, config }
+        Self { serial: 0, enprefix: 0, datum_slot: 0, config }
     }
 
     pub fn build(
@@ -389,7 +389,7 @@ impl JobRef {
         }
     }
 
-    pub fn parse(s: &str) -> Option<(JobRef, &str)> {
+    pub fn parse(s: &str) -> Option<(Self, &str)> {
         const PREFIXED: usize = NOTIFY_ID_CHARS + 1;
         let (quickdiff, empty, rest) = match s.len() {
             NOTIFY_ID_CHARS => (false, false, s),
@@ -403,7 +403,7 @@ impl JobRef {
         if empty && coinbase != COINBASE_SUBSIDY_ONLY {
             return None;
         }
-        Some((JobRef { global_index, quickdiff, empty, coinbase }, job_id))
+        Some((Self { global_index, quickdiff, empty, coinbase }, job_id))
     }
 }
 

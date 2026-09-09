@@ -13,7 +13,7 @@ pub struct BoundedMap<K, V> {
 
 impl<K: Clone + Eq + Hash, V> BoundedMap<K, V> {
     pub fn new(capacity: usize) -> Self {
-        BoundedMap { entries: HashMap::new(), order: VecDeque::new(), capacity: capacity.max(1) }
+        Self { entries: HashMap::new(), order: VecDeque::new(), capacity: capacity.max(1) }
     }
 
     pub fn get<Q>(&self, key: &Q) -> Option<&V>
@@ -64,7 +64,7 @@ pub struct BoundedSet<T>(BoundedMap<T, ()>);
 
 impl<T: Clone + Eq + Hash> BoundedSet<T> {
     pub fn new(capacity: usize) -> Self {
-        BoundedSet(BoundedMap::new(capacity))
+        Self(BoundedMap::new(capacity))
     }
 
     /// Adds `value` as the newest entry, reporting whether the set did not already hold

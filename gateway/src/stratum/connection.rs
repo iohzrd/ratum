@@ -113,7 +113,7 @@ impl Connection {
         debug!("New Stratum client connected. {remote} ({unique_id})");
         let now = Instant::now();
         let s = &server.config.stratum;
-        let mut c = Connection {
+        let mut c = Self {
             entry: Arc::clone(&entry),
             socket,
             remote,
@@ -620,7 +620,7 @@ impl Connection {
 
     fn fee_charged(&mut self, diff: u64) -> bool {
         let bps = u64::from(self.server.config.datum.gateway_fee_bps);
-        let charged = self.fee.charge(diff, bps, ratum::rand::u64);
+        let charged = self.fee.charge(diff, bps);
         if charged {
             self.with_stats(|st| st.fee.add(diff));
             ratum::lock(&self.server.fee).add(diff);

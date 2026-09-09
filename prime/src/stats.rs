@@ -308,7 +308,7 @@ impl LedgerView {
         let cutoff = ratum::unix_now().saturating_sub(HASHRATE_SPAN_SECS);
         let l = lock(&server.ledger);
         let (recent_work, recent_by_identity) = l.work_since(cutoff);
-        LedgerView {
+        Self {
             total_work: l.total_work(),
             target_work: l.window(),
             shares: l.len(),

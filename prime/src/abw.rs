@@ -1,8 +1,6 @@
-use ratum::datum::abw::{self, AssignmentNotice, Candidate, Reveal, raw_hash_le, subcmd};
+use ratum::datum::abw::{self, AssignmentNotice, Candidate, Reveal, SlotKeys, raw_hash_le, subcmd};
 use ratum_prime::verify::AbwKeys;
 use std::time::{Duration, Instant};
-
-pub(crate) type SlotKeys = [Option<[u8; 16]>; abw::ASSIGNMENT_SLOTS as usize];
 
 pub(crate) const ROTATE_AFTER_SHARES: u64 = 16384;
 pub(crate) const ROTATE_AFTER: Duration = Duration::from_secs(600);
@@ -35,7 +33,7 @@ pub(crate) struct AbwManager {
 
 impl AbwManager {
     pub(crate) fn start(now: Instant, reveal_after: Duration) -> Self {
-        let mut m = AbwManager {
+        let mut m = Self {
             keys: [None; abw::ASSIGNMENT_SLOTS as usize],
             revealed: [None; abw::ASSIGNMENT_SLOTS as usize],
             active: 0,

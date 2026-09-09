@@ -25,7 +25,7 @@ pub(crate) const TIP_HISTORY_CAP: usize = 64;
 
 impl NodeView {
     pub(crate) fn new() -> Self {
-        NodeView {
+        Self {
             tip: Mutex::new(None),
             coinbase_value: Mutex::new(None),
             next_bits: Mutex::new(None),
@@ -214,7 +214,7 @@ pub(crate) struct SessionStore(BoundedMap<[u8; 32], SavedSession>);
 
 impl Default for SessionStore {
     fn default() -> Self {
-        SessionStore(BoundedMap::new(MAX_SAVED_SESSIONS))
+        Self(BoundedMap::new(MAX_SAVED_SESSIONS))
     }
 }
 
@@ -330,9 +330,9 @@ pub(crate) enum Unpayable {
 impl std::fmt::Display for Unpayable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Unpayable::NotAnAddress => write!(f, "not a valid address"),
-            Unpayable::NoScript => write!(f, "an address the node returns no script for"),
-            Unpayable::ScriptTooLong(n) => {
+            Self::NotAnAddress => write!(f, "not a valid address"),
+            Self::NoScript => write!(f, "an address the node returns no script for"),
+            Self::ScriptTooLong(n) => {
                 write!(f, "over the coinbase output limit ({n} bytes)")
             }
         }
@@ -347,7 +347,7 @@ pub(crate) enum Payability {
 
 impl Resolver {
     pub(crate) fn new() -> Self {
-        Resolver { scripts: BoundedMap::new(MAX_CACHED_ADDRESSES) }
+        Self { scripts: BoundedMap::new(MAX_CACHED_ADDRESSES) }
     }
 
     fn remember(&mut self, address: &str, script: Result<Vec<u8>, Unpayable>) {
@@ -359,7 +359,7 @@ impl Resolver {
     }
 
     pub(crate) fn payability(cache: &Mutex<Self>, node: &rpc::Client, address: &str) -> Payability {
-        if let Some(known) = Resolver::cached(cache, address) {
+        if let Some(known) = Self::cached(cache, address) {
             return known.into();
         }
         let resolved = match resolve_address(node, address) {
@@ -380,8 +380,8 @@ impl Resolver {
 impl From<Result<Vec<u8>, Unpayable>> for Payability {
     fn from(r: Result<Vec<u8>, Unpayable>) -> Self {
         match r {
-            Ok(script) => Payability::Script(script),
-            Err(why) => Payability::Unpayable(why),
+            Ok(script) => Self::Script(script),
+            Err(why) => Self::Unpayable(why),
         }
     }
 }

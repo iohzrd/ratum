@@ -47,7 +47,7 @@ impl Header {
 
     pub fn from_bytes(b: [u8; HEADER_LEN]) -> Self {
         let v = u32::from_le_bytes(b);
-        Header {
+        Self {
             cmd_len: v & MAX_CMD_LEN,
             reserved: ((v >> RESERVED_SHIFT) & RESERVED_MASK) as u8,
             is_signed: v & (1 << SIGNED_BIT) != 0,
@@ -58,6 +58,8 @@ impl Header {
     }
 }
 
+/// The MurmurHash3 mixing of one 32-bit word, which steps the header-masking key from one
+/// frame to the next and derives the session's nonces.
 pub fn feedback(i: u32) -> u32 {
     let mut h: u32 = 0xb10c_feed;
     let mut k = i;
@@ -83,11 +85,11 @@ pub struct KeyRatchet {
 
 impl KeyRatchet {
     pub fn new(key: u32) -> Self {
-        KeyRatchet { key }
+        Self { key }
     }
 
     pub fn hello() -> Self {
-        KeyRatchet::new(INITIAL_HELLO_KEY)
+        Self::new(INITIAL_HELLO_KEY)
     }
 
     pub fn mask(&mut self, h: Header) -> [u8; HEADER_LEN] {
@@ -111,7 +113,7 @@ pub struct HeaderKeys {
 
 impl HeaderKeys {
     pub fn from_nk(nk: u32) -> Self {
-        HeaderKeys { client_to_server: feedback(nk), server_to_client: feedback(!nk) }
+        Self { client_to_server: feedback(nk), server_to_client: feedback(!nk) }
     }
 }
 
@@ -133,7 +135,7 @@ impl SessionNonces {
             sender[j..j + WORD].copy_from_slice(&(r ^ 0x5757_5757).to_le_bytes());
             n = !r;
         }
-        SessionNonces { client_receiver: receiver, client_sender: sender }
+        Self { client_receiver: receiver, client_sender: sender }
     }
 }
 

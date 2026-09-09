@@ -71,7 +71,7 @@ pub struct Ledger {
 
 impl Ledger {
     pub fn new(window: u128) -> Self {
-        Ledger {
+        Self {
             removed: 0,
             shares: VecDeque::new(),
             work_per_identity: HashMap::new(),
@@ -92,7 +92,7 @@ impl Ledger {
         keep: Option<usize>,
         chain: Option<&str>,
     ) -> io::Result<(Self, ReadBack)> {
-        let mut ledger = Ledger::new(window);
+        let mut ledger = Self::new(window);
         let (store, stamped) = Store::open(path, keep, chain)?;
         let (shares, mut read_back) = store.read_back(ledger.window)?;
         read_back.stamped = stamped;

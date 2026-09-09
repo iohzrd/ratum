@@ -5,6 +5,10 @@ pub const DRAFT_REVISION: u8 = 0;
 pub const ASSIGNMENT_SLOTS: u8 = 16;
 pub const SHARE_TARGET_BASE_BITS: u8 = 32;
 
+/// The proof-of-work XOR key an assignment commits to, and one slot's worth of them.
+pub type XorKey = crate::header::U128;
+pub type SlotKeys = [Option<XorKey>; ASSIGNMENT_SLOTS as usize];
+
 pub mod subcmd {
     pub const CANDIDATE_RECEIPT: u8 = 0xA5;
     pub const ACTIVATION: u8 = 0xA6;
@@ -19,11 +23,11 @@ pub fn clear_bits(target_pot: u8) -> u8 {
 
 pub use crate::header::xor_key_hash;
 
-pub fn key_matches_hash(xor_key: &[u8; 16], hash: &[u8; 32]) -> bool {
+pub fn key_matches_hash(xor_key: &XorKey, hash: &[u8; 32]) -> bool {
     xor_key_hash(xor_key) == *hash
 }
 
-pub fn random_key() -> [u8; 16] {
+pub fn random_key() -> XorKey {
     crate::rand::bytes()
 }
 
@@ -49,7 +53,7 @@ pub enum Error {
 
 impl From<crate::cursor::Truncated> for Error {
     fn from(t: crate::cursor::Truncated) -> Self {
-        Error::Truncated(t.0)
+        Self::Truncated(t.0)
     }
 }
 
@@ -74,7 +78,7 @@ pub struct Candidate {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Reveal {
     pub slot: u8,
-    pub xor_key: [u8; 16],
+    pub xor_key: XorKey,
 }
 
 /// Every ABW message is a sub-command byte, the revision, a body of at most a slot and a
@@ -132,7 +136,7 @@ impl AssignmentNotice {
         let slot = slot_checked(c.u8("slot")?)?;
         let key_hash: [u8; 32] = c.arr("key hash")?;
         close(&mut c)?;
-        Ok(AssignmentNotice { active: flags & 0x01 != 0, slot, key_hash })
+        Ok(Self { active: flags & 0x01 != 0, slot, key_hash })
     }
 }
 
@@ -145,7 +149,7 @@ impl Activation {
         let mut c = open(data, subcmd::ACTIVATION)?;
         let slot = slot_checked(c.u8("slot")?)?;
         close(&mut c)?;
-        Ok(Activation { slot })
+        Ok(Self { slot })
     }
 }
 
@@ -163,7 +167,7 @@ impl Candidate {
         let slot = slot_checked(c.u8("slot")?)?;
         let raw_pow_hash: [u8; 32] = c.arr("raw pow hash")?;
         close(&mut c)?;
-        Ok(Candidate { slot, raw_pow_hash })
+        Ok(Self { slot, raw_pow_hash })
     }
 }
 
@@ -178,8 +182,8 @@ impl Reveal {
     pub fn decode(data: &[u8]) -> Result<Self, Error> {
         let mut c = open(data, subcmd::REVEAL)?;
         let slot = slot_checked(c.u8("slot")?)?;
-        let xor_key: [u8; 16] = c.arr("xor key")?;
+        let xor_key: XorKey = c.arr("xor key")?;
         close(&mut c)?;
-        Ok(Reveal { slot, xor_key })
+        Ok(Self { slot, xor_key })
     }
 }

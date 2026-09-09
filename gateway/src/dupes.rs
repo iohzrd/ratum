@@ -15,7 +15,7 @@ pub struct Dupes {
 
 impl Dupes {
     pub fn new(capacity: usize, window: Duration) -> Self {
-        Dupes {
+        Self {
             seen: HashSet::new(),
             order: VecDeque::new(),
             capacity: capacity.max(MIN_CAPACITY),

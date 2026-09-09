@@ -71,7 +71,7 @@ impl KeyPairs {
     pub fn generate() -> Self {
         let (sign_pk, sign_sk) = crypto_sign_keypair();
         let (box_pk, box_sk) = crypto_box_keypair();
-        KeyPairs { sign_pk, sign_sk, box_pk, box_sk }
+        Self { sign_pk, sign_sk, box_pk, box_sk }
     }
 
     pub fn pubkey_hex(&self) -> String {
@@ -97,7 +97,7 @@ impl KeyPairs {
         let (sign_pk, rest) = raw.split_at(size_of::<SignPublicKey>());
         let (sign_sk, rest) = rest.split_at(size_of::<SignSecretKey>());
         let (box_pk, box_sk) = rest.split_at(size_of::<BoxPublicKey>());
-        Some(KeyPairs {
+        Some(Self {
             sign_pk: sign_pk.try_into().ok()?,
             sign_sk: sign_sk.try_into().ok()?,
             box_pk: box_pk.try_into().ok()?,
@@ -211,7 +211,7 @@ pub struct Channel {
 
 impl Channel {
     pub fn before_handshake() -> Self {
-        Channel {
+        Self {
             precomp: None,
             tx_nonce: [0; framing::NONCE_LEN],
             rx_nonce: [0; framing::NONCE_LEN],
@@ -227,7 +227,7 @@ impl Channel {
         rx_nonce: [u8; framing::NONCE_LEN],
         precomp: Option<PrecompKey>,
     ) -> Self {
-        Channel { precomp, tx_nonce, rx_nonce, tx_headers, rx_headers }
+        Self { precomp, tx_nonce, rx_nonce, tx_headers, rx_headers }
     }
 
     pub fn set_precomp(&mut self, precomp: PrecompKey) {

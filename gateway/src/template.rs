@@ -210,8 +210,8 @@ enum PendingBlock {
 impl PendingBlock {
     fn hash(self) -> Option<String> {
         match self {
-            PendingBlock::AnyBlock => None,
-            PendingBlock::Hash(h) => Some(h),
+            Self::AnyBlock => None,
+            Self::Hash(h) => Some(h),
         }
     }
 }
@@ -318,7 +318,7 @@ struct Poller {
 
 impl Poller {
     fn new(config: Arc<Config>, status: Arc<Mutex<Status>>) -> Self {
-        Poller {
+        Self {
             config,
             status,
             announced: Announced::default(),

@@ -108,7 +108,7 @@ impl HeaderV2 {
         if v & V2_FLAG == 0 {
             return None;
         }
-        let mut h = HeaderV2 {
+        let mut h = Self {
             version: (v & !V2_FLAG) as i32,
             prev_block: r.arr("prev block").ok()?,
             merkle_root: r.arr("merkle root").ok()?,

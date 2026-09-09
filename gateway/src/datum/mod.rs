@@ -1,9 +1,11 @@
 //! The gateway's side of the DATUM protocol: the state the rest of the gateway reads and
 //! writes (the pool's configuration, the share queue, the coinbaser request in flight and
 //! the anti-block-withholding assignment), and the reconnect loop that runs a session over
-//! it. The session itself is in `session`.
+//! it. The session itself is in `session`, and the replies it sends to the pool's
+//! requests about a published job are in `validation`.
 
 mod session;
+mod validation;
 
 use crate::config::Config;
 use crate::job::{Abw, Job, PoolConfig};
@@ -15,7 +17,7 @@ use ratum::datum::abw;
 use ratum::datum::handshake::{KeyPairs, PUBKEY_LEN};
 use ratum::datum::messages::{ClientConfig, ClientConfigV3, CoinbaserResponse, ResumeToken};
 use ratum::datum::share;
-use ratum::datum::validation::{self, Status};
+use ratum::datum::validation::{JOB_INDEX_INVALID, Status};
 use ratum::header::HeaderV2;
 use ratum::target;
 use std::collections::VecDeque;
@@ -58,7 +60,7 @@ impl AbwSlots {
         true
     }
 
-    pub(in crate::datum) fn reveal(&mut self, slot: u8, xor_key: &[u8; 16]) -> bool {
+    pub(in crate::datum) fn reveal(&mut self, slot: u8, xor_key: &abw::XorKey) -> bool {
         if let Some(hash) = self.keys[slot as usize]
             && !abw::key_matches_hash(xor_key, &hash)
         {
@@ -82,7 +84,7 @@ fn rounded_min_difficulty(min_difficulty: u64) -> u64 {
 
 impl PoolConfig {
     pub(in crate::datum) fn from_message(c: ClientConfig) -> Self {
-        PoolConfig {
+        Self {
             payout_script: c.payout_script,
             prime_id: u64::from(c.prime_id),
             coinbase_tag: c.coinbase_tag,
@@ -93,7 +95,7 @@ impl PoolConfig {
     }
 
     pub(in crate::datum) fn from_message_v3(c: ClientConfigV3) -> Self {
-        PoolConfig {
+        Self {
             payout_script: c.payout_script,
             prime_id: c.prime_id,
             coinbase_tag: c.coinbase_tag,
@@ -154,7 +156,7 @@ impl Shared {
         notify: Arc<Notify>,
         node: Option<ratum::rpc::Client>,
     ) -> Self {
-        Shared {
+        Self {
             config: Mutex::new(None),
             min_difficulty: AtomicU64::new(0),
             stats: Mutex::new(Stats::default()),
@@ -227,7 +229,7 @@ impl Shared {
     pub(in crate::datum) fn slot(&self, index: u8) -> Result<Arc<Job>, (u8, Status)> {
         let slots = ratum::lock(&self.slots);
         if index as usize >= slots.len() {
-            return Err((validation::JOB_INDEX_INVALID, Status::BadJobIndex));
+            return Err((JOB_INDEX_INVALID, Status::BadJobIndex));
         }
         slots[index as usize].clone().ok_or((index, Status::JobEmpty))
     }
@@ -315,7 +317,7 @@ impl Settings {
     pub fn from_config(config: &Config) -> Self {
         let (pool_sign_pk, pool_box_pk) =
             parse_pool_pubkey(&config.datum.pool_pubkey).expect("validated");
-        Settings {
+        Self {
             host: config.datum.pool_host.clone(),
             port: config.datum.pool_port,
             pool_sign_pk,

@@ -1,7 +1,7 @@
 use clap::Parser;
 use log::warn;
+use std::fmt::Display;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 
 /// The exit status of every refusal to start: a usage or configuration fault, as
 /// distinct from the 1 a running pool exits with.
@@ -45,15 +45,15 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub allow_agent: Option<String>,
     #[arg(long)]
-    pub require_split: Option<String>,
+    pub require_split: Option<bool>,
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
-    pub require_v3: Option<String>,
+    pub require_v3: Option<bool>,
     #[arg(long)]
-    pub abw_reveal_after: Option<String>,
+    pub abw_reveal_after: Option<u64>,
     #[arg(long)]
-    pub min_diff: Option<String>,
+    pub min_diff: Option<u64>,
     #[arg(long)]
-    pub max_connections: Option<String>,
+    pub max_connections: Option<usize>,
     #[arg(long)]
     pub payout_address: Option<String>,
     #[arg(long)]
@@ -61,19 +61,19 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub coinbase_tag: Option<String>,
     #[arg(long)]
-    pub prime_id: Option<String>,
+    pub prime_id: Option<u32>,
     #[arg(long)]
     pub ledger: Option<String>,
     #[arg(long)]
-    pub ledger_keep: Option<String>,
+    pub ledger_keep: Option<usize>,
     #[arg(long)]
-    pub window: Option<String>,
+    pub window: Option<f64>,
     #[arg(long)]
-    pub window_floor: Option<String>,
+    pub window_floor: Option<u128>,
     #[arg(long)]
-    pub min_payout: Option<String>,
+    pub min_payout: Option<u64>,
     #[arg(long)]
-    pub fee_bps: Option<String>,
+    pub fee_bps: Option<u16>,
     #[arg(long)]
     pub rpc: Option<String>,
     #[arg(long)]
@@ -83,7 +83,7 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub rpc_cookie: Option<String>,
     #[arg(long)]
-    pub poll: Option<String>,
+    pub poll: Option<f64>,
     #[arg(long)]
     pub dump_ledger: bool,
     #[arg(long)]
@@ -132,12 +132,10 @@ fn load_file(path: &Path, required: bool) -> ratum_prime::config::Config {
     }
 }
 
-pub(crate) fn refuse(flag: &str, must_be: &str, got: &str) -> ! {
-    fatal!("{flag} must be {must_be}, got {got}");
-}
-
-pub(crate) fn resolve<T: FromStr>(
-    cli: Option<&str>,
+/// The command line's value, else the configuration file's, else `default`. Whichever is
+/// used must satisfy `ok`; one that does not exits with a usage message naming `flag`.
+pub(crate) fn resolve<T: Display>(
+    cli: Option<T>,
     file: Option<T>,
     default: T,
     flag: &str,
@@ -147,24 +145,19 @@ pub(crate) fn resolve<T: FromStr>(
     resolve_opt(cli, file, flag, must_be, ok).unwrap_or(default)
 }
 
-pub(crate) fn resolve_opt<T: FromStr>(
-    cli: Option<&str>,
+/// `resolve` for a setting with no default, which stays `None` when neither source names it.
+pub(crate) fn resolve_opt<T: Display>(
+    cli: Option<T>,
     file: Option<T>,
     flag: &str,
     must_be: &str,
     ok: impl Fn(&T) -> bool,
 ) -> Option<T> {
-    match cli {
-        Some(s) => {
-            let value = s.parse::<T>().unwrap_or_else(|_| refuse(flag, must_be, &format!("{s:?}")));
-            if ok(&value) { Some(value) } else { refuse(flag, must_be, &format!("{s:?}")) }
-        }
-        None => match file {
-            Some(value) if ok(&value) => Some(value),
-            Some(_) => refuse(flag, must_be, "the configured value"),
-            None => None,
-        },
+    let value = cli.or(file)?;
+    if !ok(&value) {
+        fatal!("{flag} must be {must_be}, got {value}");
     }
+    Some(value)
 }
 
 pub(crate) fn resolve_str(cli: Option<String>, file: Option<String>, default: &str) -> String {

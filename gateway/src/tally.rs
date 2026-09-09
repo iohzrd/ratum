@@ -12,7 +12,7 @@ impl Tally {
         self.diff = self.diff.saturating_add(diff);
     }
 
-    pub fn merge(&mut self, other: &Tally) {
+    pub fn merge(&mut self, other: &Self) {
         self.count = self.count.saturating_add(other.count);
         self.diff = self.diff.saturating_add(other.diff);
     }
@@ -29,14 +29,17 @@ pub struct FeeMeter {
 }
 
 impl FeeMeter {
-    pub fn charge(&mut self, diff: u64, bps: u64, seed: impl FnOnce() -> u64) -> bool {
+    /// Adds `bps` basis points of `diff`'s work to the running debt, reporting whether a
+    /// whole share's worth has accrued and is therefore charged now. The debt starts at a
+    /// random point in the first share so that many gateways do not charge in lockstep.
+    pub fn charge(&mut self, diff: u64, bps: u64) -> bool {
         if bps == 0 {
             return false;
         }
         let share_work = diff.saturating_mul(ratum::BASIS_POINTS_PER_UNIT);
         if !self.started {
             self.started = true;
-            self.owed = seed() % share_work.max(1);
+            self.owed = ratum::rand::u64() % share_work.max(1);
         }
         self.owed = self.owed.saturating_add(diff.saturating_mul(bps));
         if self.owed >= share_work {

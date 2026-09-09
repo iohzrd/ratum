@@ -19,26 +19,26 @@ pub(crate) enum LedgerLocation {
 impl LedgerLocation {
     pub(crate) fn new(ledger_path: Option<String>, data_dir: Option<&PathBuf>) -> Self {
         match (ledger_path, data_dir) {
-            (Some(p), _) => LedgerLocation::File(PathBuf::from(p)),
-            (None, Some(dir)) => LedgerLocation::InDir(dir.clone()),
-            (None, None) => LedgerLocation::None,
+            (Some(p), _) => Self::File(PathBuf::from(p)),
+            (None, Some(dir)) => Self::InDir(dir.clone()),
+            (None, None) => Self::None,
         }
     }
 
     /// The file the pool records shares in, once the node has named the chain.
     pub(crate) fn file_for(&self, chain: Option<rpc::Chain>) -> Option<PathBuf> {
         match (self, chain) {
-            (LedgerLocation::File(p), _) => Some(p.clone()),
-            (LedgerLocation::InDir(dir), Some(rpc::Chain::Other)) => fatal!(
+            (Self::File(p), _) => Some(p.clone()),
+            (Self::InDir(dir), Some(rpc::Chain::Other)) => fatal!(
                 "the node reports a chain this pool has no name for, so it cannot name the \
                  ledger in {}; give --ledger a file for it",
                 dir.display()
             ),
-            (LedgerLocation::InDir(dir), Some(c)) => Some(dir.join(format!("{}.redb", c.name()))),
-            (LedgerLocation::InDir(_), None) => {
+            (Self::InDir(dir), Some(c)) => Some(dir.join(format!("{}.redb", c.name()))),
+            (Self::InDir(_), None) => {
                 unreachable!("a data directory waits for the chain")
             }
-            (LedgerLocation::None, _) => None,
+            (Self::None, _) => None,
         }
     }
 
@@ -46,8 +46,8 @@ impl LedgerLocation {
     /// has been consulted, so a data directory must hold exactly one ledger.
     fn existing_file(&self, flag: &str) -> io::Result<PathBuf> {
         Ok(match self {
-            LedgerLocation::File(p) => p.clone(),
-            LedgerLocation::InDir(dir) => match ledger_files_in(dir)?.as_slice() {
+            Self::File(p) => p.clone(),
+            Self::InDir(dir) => match ledger_files_in(dir)?.as_slice() {
                 [one] => one.clone(),
                 [] => fatal!("no ledger (*.redb) in {}", dir.display()),
                 many => {
@@ -59,7 +59,7 @@ impl LedgerLocation {
                     )
                 }
             },
-            LedgerLocation::None => fatal!("{flag} needs a ledger: give --ledger or --data-dir"),
+            Self::None => fatal!("{flag} needs a ledger: give --ledger or --data-dir"),
         })
     }
 

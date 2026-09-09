@@ -95,7 +95,7 @@ impl ClientConfig {
         if c.arr("terminator").ok()? != [0, STRUCT_END] {
             return None;
         }
-        Some(ClientConfig { payout_script, prime_id, coinbase_tag, min_difficulty })
+        Some(Self { payout_script, prime_id, coinbase_tag, min_difficulty })
     }
 }
 
@@ -176,7 +176,7 @@ impl ClientConfigV3 {
             return None;
         }
         let bulk_framing = c.rest().get(..DBF_MARKER.len()) == Some(&DBF_MARKER[..]);
-        Some(ClientConfigV3 {
+        Some(Self {
             payout_script,
             prime_id,
             resume_token,
@@ -218,7 +218,7 @@ impl MigrationRequest {
                 if c.u8("terminator").ok()? != STRUCT_END || !c.at_end() {
                     return None;
                 }
-                Some(MigrationRequest { target: None })
+                Some(Self { target: None })
             }
             MIGRATION_ACTION_REDIRECT => {
                 let host_len = c.u16("host length").ok()? as usize;
@@ -238,7 +238,7 @@ impl MigrationRequest {
                 if c.u8("terminator").ok()? != STRUCT_END || !c.at_end() {
                     return None;
                 }
-                Some(MigrationRequest { target: Some(MigrationTarget { host, port, pubkey }) })
+                Some(Self { target: Some(MigrationTarget { host, port, pubkey }) })
             }
             _ => None,
         }
@@ -268,7 +268,7 @@ impl CoinbaserRequest {
         if c.u8("terminator").ok()? != STRUCT_END {
             return None;
         }
-        Some(CoinbaserRequest { value, prev_hash })
+        Some(Self { value, prev_hash })
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -367,7 +367,7 @@ impl CoinbaserResponse {
                 break;
             }
         }
-        Some(CoinbaserResponse { value, coinbaser_id, outputs })
+        Some(Self { value, coinbaser_id, outputs })
     }
 }
 
@@ -496,7 +496,7 @@ impl ShareResponse {
             }
             _ => None,
         };
-        Some(ShareResponse { verdict, nonce, target_byte, job_id, abw_ref })
+        Some(Self { verdict, nonce, target_byte, job_id, abw_ref })
     }
 }
 

@@ -103,10 +103,9 @@ fn pool_host_json(cfg: &crate::config::Config) -> Value {
     }
 }
 
-/// The per-connection figures both pages show. `identity` adds the fields only the
-/// admin page is allowed to see, and selects the connection-age field it reads.
-fn client_json(cfg: &crate::config::Config, c: &ClientStats, identity: bool) -> Value {
-    let mut v = json!({
+/// The per-connection figures both pages show.
+fn client_json(c: &ClientStats) -> Value {
+    json!({
         "last_accepted_seconds": seconds_ago(c.last_accepted),
         "vardiff": c.current_diff,
         "accepted_diff": c.accepted.diff,
@@ -116,25 +115,31 @@ fn client_json(cfg: &crate::config::Config, c: &ClientStats, identity: bool) -> 
         "fee_diff": c.fee.diff,
         "fee_count": c.fee.count,
         "hashrate_ths": c.hashrate_ths(),
-    });
+    })
+}
+
+/// `client_json` plus the fields only an authorized admin page sees.
+fn admin_client_json(cfg: &crate::config::Config, c: &ClientStats) -> Value {
+    let mut v = client_json(c);
+    let unpayable =
+        cfg.stratum.require_address_username && !crate::username::is_payable(&c.username);
     let o = v.as_object_mut().expect("an object");
-    if identity {
-        o.insert("subscribed_seconds".into(), json!(seconds_ago(c.subscribed_at)));
-        o.insert("id".into(), json!(c.unique_id));
-        o.insert("remote".into(), json!(c.remote));
-        o.insert("username".into(), json!(c.username));
-        o.insert(
-            "unpayable".into(),
-            json!(
-                cfg.stratum.require_address_username && !crate::username::is_payable(&c.username)
-            ),
-        );
-        o.insert("useragent".into(), json!(c.useragent));
-        o.insert("subscribed".into(), json!(c.subscribed));
-    } else {
-        let connected = c.subscribed_at.map_or(0.0, |t| t.elapsed().as_secs_f64());
-        o.insert("connected_seconds".into(), json!(connected));
-    }
+    o.insert("subscribed_seconds".into(), json!(seconds_ago(c.subscribed_at)));
+    o.insert("id".into(), json!(c.unique_id));
+    o.insert("remote".into(), json!(c.remote));
+    o.insert("username".into(), json!(c.username));
+    o.insert("unpayable".into(), json!(unpayable));
+    o.insert("useragent".into(), json!(c.useragent));
+    o.insert("subscribed".into(), json!(c.subscribed));
+    v
+}
+
+/// `client_json` plus the connection age, which the miner page shows in place of the
+/// identifying fields it may not see.
+fn miner_client_json(c: &ClientStats) -> Value {
+    let mut v = client_json(c);
+    let connected = c.subscribed_at.map_or(0.0, |t| t.elapsed().as_secs_f64());
+    v.as_object_mut().expect("an object").insert("connected_seconds".into(), json!(connected));
     v
 }
 
@@ -201,7 +206,7 @@ fn status_json(ctx: &Context, with_clients: bool) -> Value {
     let job = current.as_deref().map(job_json);
     let coinbaser = current.as_deref().map(coinbaser_json);
     let clients = with_clients.then(|| {
-        server.client_stats().iter().map(|c| client_json(cfg, c, true)).collect::<Vec<_>>()
+        server.client_stats().iter().map(|c| admin_client_json(cfg, c)).collect::<Vec<_>>()
     });
     let summary = server.summary();
     json!({
@@ -273,7 +278,7 @@ fn miner_lookup_json(ctx: &Context, addr: Option<&str>) -> Value {
         .iter()
         .map(|c| {
             totals.add(c);
-            client_json(cfg, c, false)
+            miner_client_json(c)
         })
         .collect();
     json!({

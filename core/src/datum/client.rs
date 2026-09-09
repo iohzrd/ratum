@@ -32,7 +32,7 @@ pub struct Client {
 
 impl Client {
     pub fn with_key_pairs(long_term_keys: KeyPairs, session_keys: KeyPairs, nk: u32) -> Self {
-        Client {
+        Self {
             long_term_keys,
             session_keys,
             nk,

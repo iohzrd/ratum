@@ -20,7 +20,7 @@ pub struct Publisher {
 
 impl Publisher {
     pub fn new(builder: Builder, server: Arc<Server>, shared: Arc<Shared>) -> Arc<Self> {
-        Arc::new(Publisher {
+        Arc::new(Self {
             builder: Mutex::new(builder),
             server,
             shared,

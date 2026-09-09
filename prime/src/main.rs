@@ -2,6 +2,7 @@ mod abw;
 mod admin;
 mod cli;
 mod connection;
+mod credit;
 mod relay;
 mod server;
 mod settings;

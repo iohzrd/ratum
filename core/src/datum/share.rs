@@ -48,7 +48,7 @@ pub enum Error {
 
 impl From<Truncated> for Error {
     fn from(t: Truncated) -> Self {
-        Error::Truncated(t.0)
+        Self::Truncated(t.0)
     }
 }
 
@@ -124,7 +124,7 @@ pub fn sia_halves(field: &[u8; SIA_FIELD_SIZE]) -> (u32, u32) {
 
 impl Blake2bSection {
     pub fn from_header(h: &HeaderV2) -> Self {
-        Blake2bSection {
+        Self {
             sia_ntime: sia_field(h.time_offset, h.nonce3),
             sia_nonce: sia_field(h.nonce, h.nonce2),
             time_on_wire: h.time_on_wire(),
@@ -277,7 +277,7 @@ impl PowSubmit {
         }
         let blake2b = blake2b.ok_or(Error::MissingBlake2bSection)?;
 
-        Ok(PowSubmit {
+        Ok(Self {
             job_id,
             coinbase_id,
             is_block: flags & FLAG_IS_BLOCK != 0,
