@@ -248,3 +248,7 @@ pub fn u256_from_display_hex(s: &str) -> Option<U256> {
     let v: U256 = hex::decode(s).ok()?.try_into().ok()?;
     Some(crate::bitcoin::reversed(&v))
 }
+
+pub fn u256_to_display_hex(v: &U256) -> String {
+    hex::encode(crate::bitcoin::reversed(v))
+}

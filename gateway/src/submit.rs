@@ -95,20 +95,20 @@ pub fn extra_client(url: &str) -> Option<rpc::Client> {
         }
         None => ("", "", rest),
     };
-    let (authority, path) = host.split_once('/').map_or((host, ""), |(a, p)| (a, p));
+    let (authority, path) = match host.split_once('/') {
+        Some((authority, path)) => (authority, format!("/{path}")),
+        None => (host, String::new()),
+    };
     if authority.is_empty() {
         return None;
     }
     let has_port = authority.rsplit_once(']').map_or(authority, |(_, after)| after).contains(':');
-    let port = if has_port {
-        String::new()
-    } else if scheme == "https" {
-        format!(":{HTTPS_PORT}")
-    } else {
-        format!(":{HTTP_PORT}")
+    let port = match (has_port, scheme) {
+        (true, _) => String::new(),
+        (false, "https") => format!(":{HTTPS_PORT}"),
+        (false, _) => format!(":{HTTP_PORT}"),
     };
-    let slash = if host.contains('/') { "/" } else { "" };
-    rpc::Client::new(&format!("{scheme}://{authority}{port}{slash}{path}"), user, pass).ok()
+    rpc::Client::new(&format!("{scheme}://{authority}{port}{path}"), user, pass).ok()
 }
 
 const HTTP_PORT: u16 = 80;

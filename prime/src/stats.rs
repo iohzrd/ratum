@@ -98,7 +98,7 @@ fn network_json(
     json!({
         "chain": t.chain.name(),
         "tip_height": t.height,
-        "tip_hash": hex::encode(ratum::bitcoin::reversed(&t.hash)),
+        "tip_hash": ratum::header::u256_to_display_hex(&t.hash),
         "difficulty": t.difficulty,
         "coinbase_value": coinbase_value,
         "observed_block_seconds": observed_block_secs,
@@ -114,14 +114,14 @@ fn network_json(
 
 fn owed_json(owed: &[ledger::OwedBlock]) -> (u64, Vec<Value>, Vec<Value>) {
     let mut unsettled: u64 = 0;
-    let mut by_identity: HashMap<String, u64> = HashMap::new();
+    let mut unsettled_per_identity: HashMap<String, u64> = HashMap::new();
     let blocks: Vec<Value> = owed
         .iter()
         .map(|o| {
             if o.settled_at.is_none() {
                 unsettled += o.total;
                 for (identity, sats) in &o.entries {
-                    *by_identity.entry(identity.clone()).or_insert(0) += sats;
+                    *unsettled_per_identity.entry(identity.clone()).or_insert(0) += sats;
                 }
             }
             json!({
@@ -136,9 +136,9 @@ fn owed_json(owed: &[ledger::OwedBlock]) -> (u64, Vec<Value>, Vec<Value>) {
             })
         })
         .collect();
-    let mut by_identity: Vec<(String, u64)> = by_identity.into_iter().collect();
-    by_identity.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    let by_identity = by_identity
+    let mut ranked: Vec<(String, u64)> = unsettled_per_identity.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let by_identity = ranked
         .into_iter()
         .map(|(identity, sats)| json!({ "identity": identity, "sats": sats }))
         .collect();

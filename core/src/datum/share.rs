@@ -230,6 +230,29 @@ fn encode_blake2b_section(out: &mut Vec<u8>, b: &Blake2bSection) {
     out.extend_from_slice(&b.time_on_wire.to_le_bytes());
 }
 
+struct Prefix {
+    job_id: u8,
+    coinbase_id: u8,
+    flags: u8,
+    target_byte: u8,
+    ntime: u32,
+    nonce: u32,
+}
+
+impl Prefix {
+    fn read(r: &mut Cursor<'_>) -> Result<Self, Truncated> {
+        r.skip_if(SUBMIT_POW);
+        Ok(Self {
+            job_id: r.u8("job id")?,
+            coinbase_id: r.u8("coinbase id")?,
+            flags: r.u8("flags")?,
+            target_byte: r.u8("target byte")?,
+            ntime: r.u32("ntime")?,
+            nonce: r.u32("nonce")?,
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PowSubmit {
     pub job_id: u8,
@@ -260,26 +283,14 @@ impl PowSubmit {
     }
 
     pub fn prefix(data: &[u8]) -> Option<(u8, u8, u32)> {
-        let mut r = Cursor::new(data);
-        r.skip_if(SUBMIT_POW);
-        let job_id = r.u8("job id").ok()?;
-        r.u8("coinbase id").ok()?;
-        r.u8("flags").ok()?;
-        let target_byte = r.u8("target byte").ok()?;
-        r.u32("ntime").ok()?;
-        let nonce = r.u32("nonce").ok()?;
-        Some((job_id, target_byte, nonce))
+        let p = Prefix::read(&mut Cursor::new(data)).ok()?;
+        Some((p.job_id, p.target_byte, p.nonce))
     }
 
     pub fn decode(data: &[u8]) -> Result<Self, Error> {
         let mut r = Cursor::new(data);
-        r.skip_if(SUBMIT_POW);
-        let job_id = r.u8("job id")?;
-        let coinbase_id = r.u8("coinbase id")?;
-        let flags = r.u8("flags")?;
-        let target_byte = r.u8("target byte")?;
-        let ntime = r.u32("ntime")?;
-        let nonce = r.u32("nonce")?;
+        let Prefix { job_id, coinbase_id, flags, target_byte, ntime, nonce } =
+            Prefix::read(&mut r)?;
         let version = r.u32("version")?;
         let en_size = r.u8("extranonce size")?;
         if en_size as usize != EXTRANONCE_SIZE {

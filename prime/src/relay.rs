@@ -60,8 +60,8 @@ fn block_matches_header(a: &Accepted, txns: &[Vec<u8>]) -> Result<(), String> {
     if built != committed {
         return Err(format!(
             "{count} transactions have merkle root {}, but the header commits to {}",
-            hex::encode(ratum::bitcoin::reversed(&built)),
-            hex::encode(ratum::bitcoin::reversed(&committed))
+            ratum::header::u256_to_display_hex(&built),
+            ratum::header::u256_to_display_hex(&committed)
         ));
     }
     Ok(())

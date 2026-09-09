@@ -51,15 +51,11 @@ fn check_config_fields(
     Ok(())
 }
 
-/// Writes a byte-counted field: one length byte, then the bytes. `check_config_fields` has
-/// already refused a field longer than a length byte holds.
 fn push_counted(out: &mut Vec<u8>, bytes: &[u8]) {
     out.push(bytes.len() as u8);
     out.extend_from_slice(bytes);
 }
 
-/// Reads a byte-counted field, returning None for a length above `max` and for one the
-/// remaining input does not hold.
 fn take_counted<'a>(c: &mut Cursor<'a>, what: &'static str, max: usize) -> Option<&'a [u8]> {
     let len = usize::from(c.u8(what).ok()?);
     if len > max {

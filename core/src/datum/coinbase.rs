@@ -12,8 +12,6 @@ pub const ENPREFIX_SIZE: usize = 2;
 pub const EXTRANONCE_PUSH_SIZE: usize = 1 + ENPREFIX_SIZE + super::share::EXTRANONCE_SIZE;
 pub const TAG_MARKER_BYTES: usize = 2;
 
-/// The coinbase tag push: the primary tag, then `TAG_SEPARATOR` and the secondary tag when
-/// there is one, then `TAG_END`. Two empty tags give the terminator alone.
 pub fn tag_push_data(primary: &[u8], secondary: &[u8]) -> Vec<u8> {
     let mut data = Vec::with_capacity(primary.len() + secondary.len() + TAG_MARKER_BYTES);
     data.extend_from_slice(primary);

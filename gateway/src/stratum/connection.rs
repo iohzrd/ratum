@@ -74,7 +74,6 @@ pub(super) struct Connection {
     remote: String,
     sid: u32,
     subscribed: bool,
-    authorized: bool,
     username: String,
     vardiff: Vardiff,
     job_diffs: Vec<Option<u64>>,
@@ -115,7 +114,6 @@ impl Connection {
             remote,
             sid,
             subscribed: false,
-            authorized: false,
             username: String::new(),
             vardiff: Vardiff::new(
                 vardiff::Params {
@@ -172,8 +170,8 @@ impl Connection {
                         ));
                     }
                     while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-                        let line: Vec<u8> = buf.drain(..=pos).collect();
-                        let line = String::from_utf8_lossy(&line[..line.len() - 1]).into_owned();
+                        let line = String::from_utf8_lossy(&buf[..pos]).into_owned();
+                        buf.drain(..=pos);
                         self.handle_line(line.trim_end_matches('\r'))?;
                     }
                 }
@@ -351,7 +349,6 @@ impl Connection {
             );
             return self.reply(id, Some(UNAUTHORIZED_WORKER), Value::Bool(false));
         }
-        self.authorized = true;
         self.reply_result(id, Value::Bool(true))
     }
 

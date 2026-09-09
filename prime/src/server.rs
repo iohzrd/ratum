@@ -38,7 +38,7 @@ impl NodeView {
             "node tip: height {} difficulty {} {} (chain {})",
             t.height,
             t.difficulty,
-            hex::encode(ratum::bitcoin::reversed(&t.hash)),
+            ratum::header::u256_to_display_hex(&t.hash),
             t.chain.name()
         );
         let mut history = lock(&self.tip_history);

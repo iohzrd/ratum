@@ -62,7 +62,8 @@ struct Session<'a> {
     last_share_accepted: Option<Instant>,
     sent_job: Vec<Option<SentSections>>,
     requested: Option<Arc<CoinbaserRequestState>>,
-    pending_header: Vec<u8>,
+    pending_header: [u8; framing::HEADER_LEN],
+    pending_header_len: usize,
 }
 
 const COINBASE_SLOTS: usize = 8;
@@ -172,7 +173,8 @@ impl<'a> Session<'a> {
             last_share_accepted: None,
             sent_job: vec![None; slots],
             requested: None,
-            pending_header: Vec::with_capacity(framing::HEADER_LEN),
+            pending_header: [0u8; framing::HEADER_LEN],
+            pending_header_len: 0,
         })
     }
 
@@ -202,17 +204,16 @@ impl<'a> Session<'a> {
     }
 
     fn poll_header(&mut self) -> Result<Option<Header>, SessionError> {
-        let mut buf = [0u8; framing::HEADER_LEN];
-        match self.socket.read(&mut buf[..framing::HEADER_LEN - self.pending_header.len()])? {
+        match self.socket.read(&mut self.pending_header[self.pending_header_len..])? {
             Some(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into()),
-            Some(n) => self.pending_header.extend_from_slice(&buf[..n]),
+            Some(n) => self.pending_header_len += n,
             None => {}
         }
-        if self.pending_header.len() < framing::HEADER_LEN {
+        if self.pending_header_len < framing::HEADER_LEN {
             return Ok(None);
         }
-        let header = self.client.unmask_header(self.pending_header[..].try_into().unwrap());
-        self.pending_header.clear();
+        self.pending_header_len = 0;
+        let header = self.client.unmask_header(self.pending_header);
         if header.cmd_len > framing::MAX_CMD_DATA_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
