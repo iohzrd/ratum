@@ -1,16 +1,17 @@
+//! One stratum client: its subscription, its difficulty, the jobs it is notified of and
+//! the shares it submits.
+
+use super::{ClientEntry, ClientStats, Server};
 use crate::coinbase::COINBASE_POOLED;
-use crate::config::Config;
-use crate::datum::{self, QueuedShare};
-use crate::dupes::Dupes;
+use crate::datum::QueuedShare;
 use crate::job::{
     COINBASE_SUBSIDY_ONLY, JOB_ID_TIME_CHARS, Job, JobRef, MAX_JOBS, SIA_FIELD_SIZE,
     parse_sia_field,
 };
-use crate::tally::{FeeMeter, Tally};
+use crate::tally::FeeMeter;
 use crate::username;
 use crate::vardiff::{self, Vardiff};
 use log::{debug, error, info, warn};
-use mio::Waker;
 use ratum::datum::share::{
     EXTRANONCE_SIZE_V2, EXTRANONCE_V2_PAD, EXTRANONCE1_SIZE, EXTRANONCE2_SIZE,
 };
@@ -18,8 +19,8 @@ use ratum::poll::PolledSocket;
 use ratum::target;
 use serde_json::{Value, json};
 use std::io;
-use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::net::TcpStream;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -30,15 +31,11 @@ const MAX_USERNAME_CHARS: usize = 191;
 const NICEHASH_MIN_DIFFICULTY: u64 = 524_288;
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_millis(11150);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
-const STAT_CYCLE: Duration = Duration::from_secs(60);
-const HASHRATE_WINDOW_VALID: Duration = Duration::from_secs(3 * ratum::SECS_PER_MINUTE);
-const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
-const REJECT_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const FIRST_IDLE_CHECK_DELAY: Duration = Duration::from_secs(10);
 const READ_CHUNK: usize = 4096;
-const DIFF_TO_THS: f64 = ratum::HASHES_PER_DIFFICULTY / ratum::HASHES_PER_TERAHASH;
 const SESSION_ID_XOR: u32 = 0xB10C_F00D;
 const BLOCK_FOUND_LOG_LINES: usize = 3;
+const STAT_CYCLE: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy)]
 struct Reject(i64, &'static str);
@@ -52,7 +49,7 @@ const UNAUTHORIZED_WORKER: Reject = Reject(24, "unauthorized-worker");
 const METHOD_NOT_FOUND: Reject = Reject(-3, "Method not found");
 
 #[derive(Debug, thiserror::Error)]
-enum Disconnect {
+pub(super) enum Disconnect {
     #[error("{0}")]
     Io(#[from] io::Error),
     #[error("{0}")]
@@ -61,262 +58,6 @@ enum Disconnect {
     Idle(&'static str),
     #[error("kill request")]
     Killed,
-}
-
-#[derive(Default)]
-pub struct Jobs {
-    pub ring: Vec<Option<Arc<Job>>>,
-    pub current: Option<Arc<Job>>,
-    pub empty: bool,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct ClientStats {
-    pub remote: String,
-    pub unique_id: u64,
-    pub useragent: String,
-    pub username: String,
-    pub subscribed: bool,
-    pub subscribed_at: Option<Instant>,
-    pub current_diff: u64,
-    pub accepted: Tally,
-    pub rejected: Tally,
-    pub fee: Tally,
-    pub last_accepted: Option<Instant>,
-    pub window_diff: u64,
-    pub window: Duration,
-    pub window_ended: Option<Instant>,
-}
-
-impl ClientStats {
-    pub fn hashrate_ths(&self) -> Option<f64> {
-        let ended = self.window_ended?;
-        if ended.elapsed() > HASHRATE_WINDOW_VALID || self.window.is_zero() {
-            return None;
-        }
-        Some(self.window_diff as f64 / self.window.as_secs_f64() * DIFF_TO_THS)
-    }
-}
-
-pub struct ClientEntry {
-    pub kill: AtomicBool,
-    pub stats: Mutex<ClientStats>,
-    waker: Arc<Waker>,
-}
-
-impl ClientEntry {
-    fn wake(&self) {
-        if let Err(e) = self.waker.wake() {
-            debug!("could not wake a stratum connection thread: {e}");
-        }
-    }
-
-    fn request_kill(&self) {
-        self.kill.store(true, Ordering::Relaxed);
-        self.wake();
-    }
-}
-
-#[derive(Default)]
-pub struct ClientSummary {
-    pub connections: usize,
-    pub subscribed: usize,
-    pub hashrate_ths: f64,
-}
-
-pub struct Server {
-    pub config: Arc<Config>,
-    pub datum: Arc<datum::Shared>,
-    pub node: ratum::rpc::Client,
-    pub notify: Arc<crate::template::Notify>,
-    pub jobs: Mutex<Jobs>,
-    generation: AtomicU64,
-    clients: Mutex<Vec<Arc<ClientEntry>>>,
-    dupes: Mutex<Dupes>,
-    next_unique_id: AtomicU64,
-    pub rejecting: AtomicBool,
-    pub fee: Mutex<Tally>,
-    pub extra_nodes: Vec<ratum::rpc::Client>,
-    pub listening: AtomicBool,
-}
-
-impl Server {
-    pub fn new(
-        config: Arc<Config>,
-        datum: Arc<datum::Shared>,
-        node: ratum::rpc::Client,
-        notify: Arc<crate::template::Notify>,
-    ) -> Arc<Self> {
-        let extra_nodes = config
-            .extra_block_submissions
-            .urls
-            .iter()
-            .filter_map(|u| {
-                let c = crate::submit::extra_client(u);
-                if c.is_none() {
-                    warn!("extra_block_submissions url {u:?} is not http[s]://[user:pass@]host:port; ignored");
-                }
-                c
-            })
-            .collect();
-        let dupes = Dupes::new(config.dupe_table_capacity(), config.stale_window());
-        Arc::new(Server {
-            config,
-            datum,
-            node,
-            notify,
-            jobs: Mutex::new(Jobs { ring: vec![None; MAX_JOBS], ..Default::default() }),
-            generation: AtomicU64::new(0),
-            clients: Mutex::new(Vec::new()),
-            dupes: Mutex::new(dupes),
-            next_unique_id: AtomicU64::new(1),
-            rejecting: AtomicBool::new(false),
-            fee: Mutex::new(Tally::default()),
-            extra_nodes,
-            listening: AtomicBool::new(false),
-        })
-    }
-
-    pub fn publish(&self, job: Arc<Job>, empty: bool) {
-        {
-            let mut slots = ratum::lock(&self.datum.slots);
-            let i = job.datum_slot as usize;
-            if i < slots.len() {
-                slots[i] = Some(Arc::clone(&job));
-            }
-        }
-        let mut j = ratum::lock(&self.jobs);
-        if job.is_new_block {
-            for other in j.ring.iter().flatten() {
-                other.stale_prevblock.store(true, Ordering::Relaxed);
-            }
-        }
-        j.ring[job.global_index as usize] = Some(Arc::clone(&job));
-        j.current = Some(job);
-        j.empty = empty;
-        self.generation.fetch_add(1, Ordering::Release);
-        drop(j);
-        for c in ratum::lock(&self.clients).iter() {
-            c.wake();
-        }
-    }
-
-    pub fn current_job(&self) -> Option<Arc<Job>> {
-        ratum::lock(&self.jobs).current.clone()
-    }
-
-    fn current_for_send(&self) -> (Option<Arc<Job>>, bool, u64) {
-        let j = ratum::lock(&self.jobs);
-        (j.current.clone(), j.empty, self.generation.load(Ordering::Acquire))
-    }
-
-    pub fn connection_count(&self) -> usize {
-        ratum::lock(&self.clients).len()
-    }
-
-    pub fn summary(&self) -> ClientSummary {
-        let mut s = ClientSummary::default();
-        for c in ratum::lock(&self.clients).iter() {
-            let st = ratum::lock(&c.stats);
-            s.connections += 1;
-            s.subscribed += usize::from(st.subscribed);
-            s.hashrate_ths += st.hashrate_ths().unwrap_or(0.0);
-        }
-        s
-    }
-
-    pub fn subscriber_count(&self) -> usize {
-        self.summary().subscribed
-    }
-
-    pub fn client_stats(&self) -> Vec<ClientStats> {
-        self.client_stats_where(|_| true)
-    }
-
-    pub fn client_stats_where(&self, keep: impl Fn(&ClientStats) -> bool) -> Vec<ClientStats> {
-        ratum::lock(&self.clients)
-            .iter()
-            .filter_map(|c| {
-                let st = ratum::lock(&c.stats);
-                keep(&st).then(|| st.clone())
-            })
-            .collect()
-    }
-
-    pub fn shutdown_all(&self) {
-        info!("Disconnecting all stratum clients");
-        for c in ratum::lock(&self.clients).iter() {
-            c.request_kill();
-        }
-    }
-
-    pub fn kill_client(&self, unique_id: u64) -> bool {
-        for c in ratum::lock(&self.clients).iter() {
-            if ratum::lock(&c.stats).unique_id == unique_id {
-                c.request_kill();
-                return true;
-            }
-        }
-        false
-    }
-}
-
-pub fn listen(server: Arc<Server>) -> io::Result<()> {
-    let s = &server.config.stratum;
-    let mut listener = None;
-    let mut last = io::Error::other("no address to bind");
-    for addr in ratum::http::bind_candidates(&s.listen_addr, s.listen_port) {
-        match TcpListener::bind(&addr) {
-            Ok(l) => {
-                listener = Some(l);
-                break;
-            }
-            Err(e) => {
-                debug!("could not bind {addr} ({e})");
-                last = e;
-            }
-        }
-    }
-    let listener = listener.ok_or(last)?;
-    info!("Stratum V1 Server Init complete: listening on {}", listener.local_addr()?);
-    server.listening.store(true, Ordering::Relaxed);
-    let mut last_reject_log: Option<Instant> = None;
-    let mut rejected = 0u64;
-    for stream in listener.incoming() {
-        let stream = match stream {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("accept failed: {e}");
-                std::thread::sleep(ACCEPT_RETRY_DELAY);
-                continue;
-            }
-        };
-        if server.rejecting.load(Ordering::Relaxed) {
-            rejected += 1;
-            if last_reject_log.is_none_or(|t| t.elapsed() >= REJECT_LOG_INTERVAL) {
-                warn!(
-                    "Refusing stratum connections while the pool is unreachable and datum.pooled_mining_only is set ({rejected} refused)"
-                );
-                last_reject_log = Some(Instant::now());
-            }
-            continue;
-        }
-        if server.connection_count() >= s.max_clients {
-            debug!("refusing a connection: {} clients connected", s.max_clients);
-            continue;
-        }
-        let server = Arc::clone(&server);
-        let spawned = std::thread::Builder::new().name("stratum-client".into()).spawn(move || {
-            match Connection::run(server, stream) {
-                Ok(()) | Err(Disconnect::Io(_) | Disconnect::Killed | Disconnect::Idle(_)) => {}
-                Err(e @ Disconnect::Protocol(_)) => info!("Stratum client connection closed: {e}"),
-            }
-        });
-        if let Err(e) = spawned {
-            warn!("could not start a client thread: {e}");
-        }
-    }
-    Ok(())
 }
 
 struct SubmitRequest {
@@ -329,7 +70,7 @@ struct SubmitRequest {
     miner_username: String,
 }
 
-struct Connection {
+pub(super) struct Connection {
     server: Arc<Server>,
     entry: Arc<ClientEntry>,
     socket: PolledSocket,
@@ -350,7 +91,8 @@ struct Connection {
 }
 
 impl Connection {
-    fn run(server: Arc<Server>, stream: TcpStream) -> Result<(), Disconnect> {
+    /// Serves one accepted client until it disconnects.
+    pub(super) fn run(server: Arc<Server>, stream: TcpStream) -> Result<(), Disconnect> {
         let remote = stream.peer_addr().map_or_else(|_| "?".to_string(), |a| a.to_string());
         stream.set_nodelay(true)?;
         let socket = PolledSocket::new(stream)?;

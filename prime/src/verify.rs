@@ -1,3 +1,4 @@
+use crate::bounded::BoundedSet;
 use ratum::bitcoin::{self, CoinbaseTx};
 use ratum::datum::coinbase::{
     TAG_END, TAG_SEPARATOR, UID_PUSH_PREFIX_SIZE, UID_PUSH_SIZE_V1, UID_PUSH_SIZE_V3,
@@ -9,7 +10,7 @@ use ratum::datum::share::{
 };
 use ratum::header::{self, HeaderV2};
 use ratum::target;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 const MAX_COINBASE_TYPES: u8 = 6;
@@ -17,39 +18,21 @@ const MAX_SEEN: usize = 1 << 20;
 
 const MAX_INSTALLED_COINBASE_BYTES: usize = 16 << 20;
 
+/// The block hashes of the shares already credited, so a resend is not credited twice.
 #[derive(Debug)]
-pub struct ReplayGuard {
-    seen: HashSet<[u8; 32]>,
-    order: VecDeque<[u8; 32]>,
-    capacity: usize,
-}
+pub struct ReplayGuard(BoundedSet<[u8; 32]>);
 
 impl ReplayGuard {
     pub fn new(capacity: usize) -> Self {
-        ReplayGuard { seen: HashSet::new(), order: VecDeque::new(), capacity: capacity.max(1) }
+        ReplayGuard(BoundedSet::new(capacity))
     }
 
     pub fn accept(&mut self, hash: [u8; 32]) -> bool {
-        if !self.seen.insert(hash) {
-            return false;
-        }
-        self.order.push_back(hash);
-        while self.order.len() > self.capacity {
-            if let Some(old) = self.order.pop_front() {
-                self.seen.remove(&old);
-            }
-        }
-        true
+        self.0.insert(hash)
     }
 
     pub fn remove(&mut self, hash: &[u8; 32]) -> bool {
-        if !self.seen.remove(hash) {
-            return false;
-        }
-        if let Some(pos) = self.order.iter().position(|h| h == hash) {
-            self.order.remove(pos);
-        }
-        true
+        self.0.remove(hash)
     }
 }
 
@@ -626,7 +609,7 @@ fn locate_pot_byte(tx: &CoinbaseTx, policy: &PoolPolicy) -> Result<(usize, Strin
             let Some(id) = data.get(UID_PUSH_PREFIX_SIZE..) else { return false };
             match data.len() {
                 UID_PUSH_SIZE_V1 => {
-                    policy.prime_id <= u64::from(u32::MAX) && id == &prime[..size_of::<u32>()]
+                    u32::try_from(policy.prime_id).is_ok() && id == &prime[..size_of::<u32>()]
                 }
                 UID_PUSH_SIZE_V3 => id == prime,
                 _ => false,

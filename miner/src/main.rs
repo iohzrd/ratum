@@ -233,7 +233,7 @@ fn main() -> std::io::Result<()> {
                 let secs = started.elapsed().as_secs_f64();
                 println!(
                     "found nonce {nonce:#010x} in {secs:.1}s ({:.0} MH/s)",
-                    (nonce as f64 / secs) / 1e6
+                    (f64::from(nonce) / secs) / 1e6
                 );
                 let mut nonce_field = [0u8; SIA_FIELD_SIZE];
                 nonce_field[..SIA_FIELD_HALF].copy_from_slice(&nonce.to_le_bytes());

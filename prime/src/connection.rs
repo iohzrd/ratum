@@ -1,4 +1,5 @@
-use crate::abw::AbwManager;
+use crate::abw::{AbwManager, Revealed};
+use crate::relay;
 use crate::server::{
     Payability, Resolver, SavedSession, Server, SessionState, dictated_outputs, owed_for_block,
 };
@@ -15,8 +16,8 @@ use ratum::datum::messages::{
 use ratum::datum::share::PowSubmit;
 use ratum::datum::validation::{self, TxnBundle};
 use ratum::io::read_exact_deadline;
+use ratum::lock;
 use ratum::poll::PolledSocket;
-use ratum::{lock, rpc};
 use ratum_prime::ledger;
 use ratum_prime::verify::{Accepted, Rebuilt, Verifier};
 use std::collections::{HashMap, HashSet};
@@ -375,51 +376,49 @@ impl Connection<'_> {
         }
     }
 
+    /// Sends each reveal and logs why it went out. A reveal marked `again` was already
+    /// sent on an earlier connection of a resumed session; one that is not was due, except
+    /// in the rotation case, where the rotation reached the slot before its delay elapsed.
+    fn send_reveals(&mut self, reveals: &[Revealed], rotating: bool) -> io::Result<()> {
+        for r in reveals {
+            self.send_mining(&r.payload, false)?;
+            match (rotating, r.again) {
+                (_, true) => {
+                    debug!("[{}]   <- sent the reveal of ABW slot {} again", self.peer, r.slot);
+                }
+                (false, false) => {
+                    debug!("[{}]   <- revealed the retired ABW slot {}", self.peer, r.slot);
+                }
+                (true, false) => warn!(
+                    "[{}]   <- revealed ABW slot {} early: the rotation reached it again \
+                     before its reveal was due",
+                    self.peer, r.slot
+                ),
+            }
+        }
+        Ok(())
+    }
+
     fn rotate_abw(&mut self, why: &str) -> io::Result<()> {
         let Some((reveals, notice)) = self.with_abw(|m| m.rotate(Instant::now())) else {
             return Ok(());
         };
-        for r in &reveals {
-            self.send_mining(&r.payload, false)?;
-            if r.again {
-                debug!("[{}]   <- sent the reveal of ABW slot {} again", self.peer, r.slot);
-            } else {
-                warn!(
-                    "[{}]   <- revealed ABW slot {} early: the rotation reached it again \
-                     before its reveal was due",
-                    self.peer, r.slot
-                );
-            }
-        }
+        self.send_reveals(&reveals, true)?;
         self.send_mining(&notice, false)?;
         debug!("[{}]   <- rotated the ABW assignment ({why})", self.peer);
         Ok(())
     }
 
+    /// Sends the reveals whose delay has elapsed, once every share already received has
+    /// been answered: a share on a revealed slot is refused, so no unanswered share may be
+    /// waiting when its slot's key becomes public.
     fn send_due_reveals(&mut self) -> io::Result<()> {
         let now = Instant::now();
-        if !self.abw().is_some_and(|m| m.reveal_due(now)) {
-            return Ok(());
-        }
-        if !self.socket_drained()? {
+        if !self.abw().is_some_and(|m| m.reveal_due(now)) || !self.socket_drained()? {
             return Ok(());
         }
         let reveals = self.with_abw(|m| m.reveals_due(now)).unwrap_or_default();
-        if reveals.is_empty() {
-            return Ok(());
-        }
-        for r in &reveals {
-            self.send_mining(&r.payload, false)?;
-            if r.again {
-                debug!(
-                    "[{}]   <- sent the reveal of ABW slot {} again (resumed session)",
-                    self.peer, r.slot
-                );
-            } else {
-                debug!("[{}]   <- revealed the retired ABW slot {}", self.peer, r.slot);
-            }
-        }
-        Ok(())
+        self.send_reveals(&reveals, false)
     }
 
     fn socket_drained(&mut self) -> io::Result<bool> {
@@ -692,7 +691,7 @@ impl Connection<'_> {
             self.send_abw_receipt(s, &a.work)?;
         }
         if a.is_block {
-            if relay_or_request_txns(peer, &self.server.node, a, s.subsidy_only) {
+            if relay::submit_or_request_txns(peer, &self.server.node, a, s.subsidy_only) {
                 if let Some(prev) = self.awaiting_txns.insert(s.job_id, a.clone()) {
                     error!(
                         "[{peer}]   !! a block on job {} was still awaiting its \
@@ -927,15 +926,19 @@ impl Connection<'_> {
                 );
             }
         }
-        let room = self.credited.len() < MAX_CREDITED_NAMES;
-        let total = if let Some(t) = self.credited.get_mut(&s.username) {
-            *t = t.saturating_add(a.work.difficulty);
-            *t
-        } else if room {
-            self.credited.insert(s.username.clone(), a.work.difficulty);
-            a.work.difficulty
-        } else {
-            a.work.difficulty
+        // The running total is a log line only, so a connection past MAX_CREDITED_NAMES
+        // distinct usernames reports each further share's own difficulty and keeps none.
+        let total = match self.credited.get_mut(&s.username) {
+            Some(total) => {
+                *total = total.saturating_add(a.work.difficulty);
+                *total
+            }
+            None => {
+                if self.credited.len() < MAX_CREDITED_NAMES {
+                    self.credited.insert(s.username.clone(), a.work.difficulty);
+                }
+                a.work.difficulty
+            }
         };
         debug!(
             "[{peer}]   <- accepted diff={} hash={} height={} split={} pool={} sats; {} credited {}",
@@ -981,13 +984,7 @@ impl Connection<'_> {
             error!("[{peer}]      cannot assemble the block: {}", bundle.status);
             return;
         }
-        if let Err(why) = block_matches_header(&a, &bundle.txns) {
-            error!("[{peer}]      not relaying job {}: {why}", bundle.job_index);
-            return;
-        }
-        let block =
-            ratum::bitcoin::serialize_block(&a.work.header, &a.work.coinbase_tx, &bundle.txns);
-        submit(peer, &self.server.node, &block);
+        relay::submit_with_txns(peer, &self.server.node, bundle.job_index, &a, &bundle.txns);
     }
 }
 
@@ -995,89 +992,6 @@ enum Framing {
     HeaderRead,
     Idle,
     Closed,
-}
-
-fn block_matches_header(a: &Accepted, txns: &[Vec<u8>]) -> Result<(), String> {
-    let committed = ratum::header::HeaderV2::deserialize(&a.work.header)
-        .ok_or_else(|| "the header does not deserialize".to_string())?
-        .merkle_root;
-
-    let mut ids = Vec::with_capacity(txns.len() + 1);
-    ids.push(ratum::bitcoin::sha256d(&a.work.coinbase_tx));
-    for (i, raw) in txns.iter().enumerate() {
-        match ratum::bitcoin::txid(raw) {
-            Ok(id) => ids.push(id),
-            Err(e) => return Err(format!("transaction {i} does not decode: {e}")),
-        }
-    }
-    let count = ids.len();
-    let (built, mutated) = ratum::bitcoin::merkle_root_of(&ids).ok_or("no transactions")?;
-    if mutated {
-        return Err(format!(
-            "{count} transactions form a mutated merkle tree (duplicate hashes); \
-             the node would reject the block"
-        ));
-    }
-    if built != committed {
-        return Err(format!(
-            "{count} transactions have merkle root {}, but the header commits to {}",
-            hex::encode(ratum::bitcoin::reversed(&built)),
-            hex::encode(ratum::bitcoin::reversed(&committed))
-        ));
-    }
-    Ok(())
-}
-
-fn relay_or_request_txns(
-    peer: std::net::SocketAddr,
-    node: &rpc::Client,
-    a: &Accepted,
-    subsidy_only: bool,
-) -> bool {
-    let template_txns = a.work.txn_count;
-    if !subsidy_only && template_txns != 0 {
-        info!("[{peer}]      block has {template_txns} more transactions; requesting them");
-        return true;
-    }
-    submit(peer, node, &ratum::bitcoin::serialize_block(&a.work.header, &a.work.coinbase_tx, &[]));
-    false
-}
-
-const SUBMIT_ATTEMPTS: usize = 3;
-const SUBMIT_RETRY_DELAY: Duration = Duration::from_millis(500);
-
-fn submit(peer: std::net::SocketAddr, node: &rpc::Client, block: &[u8]) {
-    debug!("[{peer}]      block ({} bytes): {}", block.len(), hex::encode(block));
-    for attempt in 1..=SUBMIT_ATTEMPTS {
-        match node.submit_block(block) {
-            Ok(None) => {
-                info!("[{peer}]      submitted: node accepted the block");
-                return;
-            }
-            Ok(Some(reason)) => {
-                warn!("[{peer}]      submitted: node rejected the block ({reason:?})");
-                return;
-            }
-            Err(e) if e.is_unauthorized() => {
-                error!(
-                    "[{peer}]      could not relay: the node refused the pool's RPC credential \
-                     ({e}); if the node has restarted, its cookie has changed"
-                );
-                break;
-            }
-            Err(e) => {
-                warn!("[{peer}]      could not relay (attempt {attempt}/{SUBMIT_ATTEMPTS}): {e}");
-                if attempt < SUBMIT_ATTEMPTS {
-                    std::thread::sleep(SUBMIT_RETRY_DELAY);
-                }
-            }
-        }
-    }
-    error!(
-        "[{peer}]      stopped relaying the block after {SUBMIT_ATTEMPTS} attempts; resubmit with \
-         submitblock: {}",
-        hex::encode(block)
-    );
 }
 
 fn describe_share(s: &PowSubmit) -> String {

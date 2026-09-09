@@ -372,7 +372,7 @@ fn apply_username_behaviour(edit: &mut Edit<'_>, cfg: &Config, form: &[(String, 
             );
         }
         Some(_) => {
-            edit.errors.push("Miner usernames must be full_users, workers or private".into())
+            edit.errors.push("Miner usernames must be full_users, workers or private".into());
         }
     }
 }

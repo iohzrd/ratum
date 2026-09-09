@@ -3,7 +3,9 @@ use crate::config::Config;
 use crate::template::Template;
 use ratum::bitcoin::HASH_SIZE;
 use ratum::datum::messages::{CoinbaseOutput, CoinbaserResponse};
-use ratum::datum::share::{self, EXTRANONCE_SIZE, EXTRANONCE_SIZE_V2, SIA_FIELD_HALF};
+use ratum::datum::share::{
+    self, EXTRANONCE_SIZE, EXTRANONCE_SIZE_V2, MAX_MERKLE_BRANCHES, SIA_FIELD_HALF,
+};
 use ratum::header::{self, HeaderV2};
 use ratum::target::{self, Target};
 use std::collections::HashMap;
@@ -205,7 +207,7 @@ pub enum BuildError {
     #[error("{0}")]
     Tagging(String),
     #[error("{0} merkle branches; the protocol carries at most {max}",
-            max = ratum::datum::share::MAX_MERKLE_BRANCHES)]
+            max = MAX_MERKLE_BRANCHES)]
     TooManyBranches(usize),
     #[error("the template's bits do not decode")]
     BadBits,
@@ -273,7 +275,7 @@ impl Builder {
 
         let txids: Vec<[u8; 32]> = template.txns.iter().map(|t| t.txid).collect();
         let merkle_branches = merkle_branches(&txids);
-        if merkle_branches.len() > ratum::datum::share::MAX_MERKLE_BRANCHES {
+        if merkle_branches.len() > MAX_MERKLE_BRANCHES {
             return Err(BuildError::TooManyBranches(merkle_branches.len()));
         }
         let now = ratum::unix_now() as u32;

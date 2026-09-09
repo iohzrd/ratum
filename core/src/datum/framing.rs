@@ -37,11 +37,11 @@ pub struct Header {
 impl Header {
     pub fn to_bytes(self) -> [u8; HEADER_LEN] {
         let v = (self.cmd_len & MAX_CMD_LEN)
-            | ((self.reserved as u32 & RESERVED_MASK) << RESERVED_SHIFT)
-            | ((self.is_signed as u32) << SIGNED_BIT)
-            | ((self.is_encrypted_pubkey as u32) << ENCRYPTED_PUBKEY_BIT)
-            | ((self.is_encrypted_channel as u32) << ENCRYPTED_CHANNEL_BIT)
-            | ((self.proto_cmd as u32 & PROTO_CMD_MASK) << PROTO_CMD_SHIFT);
+            | ((u32::from(self.reserved) & RESERVED_MASK) << RESERVED_SHIFT)
+            | (u32::from(self.is_signed) << SIGNED_BIT)
+            | (u32::from(self.is_encrypted_pubkey) << ENCRYPTED_PUBKEY_BIT)
+            | (u32::from(self.is_encrypted_channel) << ENCRYPTED_CHANNEL_BIT)
+            | ((u32::from(self.proto_cmd) & PROTO_CMD_MASK) << PROTO_CMD_SHIFT);
         v.to_le_bytes()
     }
 

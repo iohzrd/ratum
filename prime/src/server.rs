@@ -5,6 +5,7 @@ use ratum::bitcoin::output_script_size_is_valid;
 use ratum::datum::handshake::KeyPairs;
 use ratum::datum::messages::{self, CoinbaseOutput};
 use ratum::{lock, rpc};
+use ratum_prime::bounded::BoundedMap;
 use ratum_prime::ledger::{Ledger, OwedBlock};
 use ratum_prime::verify::{PoolPolicy, ReplayGuard, Splits};
 use std::collections::{HashMap, VecDeque};
@@ -209,42 +210,29 @@ impl SavedSession {
     }
 }
 
-#[derive(Default)]
-pub(crate) struct SessionStore {
-    map: HashMap<[u8; 32], SavedSession>,
-    order: VecDeque<[u8; 32]>,
+pub(crate) struct SessionStore(BoundedMap<[u8; 32], SavedSession>);
+
+impl Default for SessionStore {
+    fn default() -> Self {
+        SessionStore(BoundedMap::new(MAX_SAVED_SESSIONS))
+    }
 }
 
 impl SessionStore {
+    /// Keeps `session` under the gateway's key, unless a session held longer is already
+    /// saved there: two connections under one key both save on close, and the one that
+    /// held the assignments longest is the one a resume should continue.
     pub(crate) fn save(&mut self, key: [u8; 32], session: SavedSession) {
-        self.prune_expired(session.saved_at);
-        if self.map.get(&key).is_some_and(|kept| kept.held_since > session.held_since) {
+        let saved_at = session.saved_at;
+        self.0.retain(|_, s| !s.expired(saved_at));
+        if self.0.get(&key).is_some_and(|kept| kept.held_since > session.held_since) {
             return;
         }
-        if self.map.insert(key, session).is_some() {
-            self.order.retain(|k| *k != key);
-        }
-        self.order.push_back(key);
-        while self.map.len() > MAX_SAVED_SESSIONS {
-            match self.order.pop_front() {
-                Some(oldest) => {
-                    self.map.remove(&oldest);
-                }
-                None => break,
-            }
-        }
+        self.0.insert(key, session);
     }
 
     pub(crate) fn take(&mut self, key: &[u8; 32]) -> Option<SavedSession> {
-        let session = self.map.remove(key)?;
-        self.order.retain(|k| k != key);
-        Some(session)
-    }
-
-    fn prune_expired(&mut self, now: Instant) {
-        self.map.retain(|_, s| !s.expired(now));
-        let map = &self.map;
-        self.order.retain(|k| map.contains_key(k));
+        self.0.remove(key)
     }
 }
 
@@ -327,8 +315,7 @@ pub(crate) fn split_after_fee(l: &Ledger, payout: &PayoutPolicy, value: u64) -> 
 }
 
 pub(crate) struct Resolver {
-    scripts: HashMap<String, Result<Vec<u8>, Unpayable>>,
-    order: VecDeque<String>,
+    scripts: BoundedMap<String, Result<Vec<u8>, Unpayable>>,
 }
 
 const MAX_CACHED_ADDRESSES: usize = 1 << 16;
@@ -360,18 +347,11 @@ pub(crate) enum Payability {
 
 impl Resolver {
     pub(crate) fn new() -> Self {
-        Resolver { scripts: HashMap::new(), order: VecDeque::new() }
+        Resolver { scripts: BoundedMap::new(MAX_CACHED_ADDRESSES) }
     }
 
-    fn insert(&mut self, address: &str, script: Result<Vec<u8>, Unpayable>) {
-        if self.scripts.insert(address.to_string(), script).is_none() {
-            self.order.push_back(address.to_string());
-        }
-        while self.order.len() > MAX_CACHED_ADDRESSES {
-            if let Some(old) = self.order.pop_front() {
-                self.scripts.remove(&old);
-            }
-        }
+    fn remember(&mut self, address: &str, script: Result<Vec<u8>, Unpayable>) {
+        self.scripts.insert(address.to_string(), script);
     }
 
     pub(crate) fn cached(cache: &Mutex<Self>, address: &str) -> Option<Result<Vec<u8>, Unpayable>> {
@@ -392,7 +372,7 @@ impl Resolver {
         if let Err(why) = &resolved {
             warn!("payout address {address:?} cannot be paid: {why}");
         }
-        lock(cache).insert(address, resolved.clone());
+        lock(cache).remember(address, resolved.clone());
         resolved.into()
     }
 }

@@ -3,6 +3,20 @@ use log::warn;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+/// The exit status of every refusal to start: a usage or configuration fault, as
+/// distinct from the 1 a running pool exits with.
+pub(crate) const USAGE_EXIT: i32 = 2;
+
+/// Prints the message on stderr and exits with [`USAGE_EXIT`].
+macro_rules! fatal {
+    ($($arg:tt)*) => {{
+        eprintln!($($arg)*);
+        std::process::exit($crate::cli::USAGE_EXIT);
+    }};
+}
+
+pub(crate) use fatal;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "ratum-prime",
@@ -107,26 +121,19 @@ fn load_file(path: &Path, required: bool) -> ratum_prime::config::Config {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound && !required => {
             return ratum_prime::config::Config::default();
         }
-        Err(e) => {
-            eprintln!("cannot read {}: {e}", path.display());
-            std::process::exit(2);
-        }
+        Err(e) => fatal!("cannot read {}: {e}", path.display()),
     };
     match ratum_prime::config::parse(&text) {
         Ok(c) => {
             warn_if_readable(path, &c);
             c
         }
-        Err(e) => {
-            eprintln!("{}: {e}", path.display());
-            std::process::exit(2);
-        }
+        Err(e) => fatal!("{}: {e}", path.display()),
     }
 }
 
 pub(crate) fn refuse(flag: &str, must_be: &str, got: &str) -> ! {
-    eprintln!("{flag} must be {must_be}, got {got}");
-    std::process::exit(2);
+    fatal!("{flag} must be {must_be}, got {got}");
 }
 
 pub(crate) fn resolve<T: FromStr>(

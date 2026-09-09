@@ -326,7 +326,7 @@ pub fn encode_compact_size(n: u64) -> Vec<u8> {
 }
 
 pub fn encode_push(data: &[u8]) -> Vec<u8> {
-    debug_assert!(data.len() <= usize::from(u8::MAX));
+    debug_assert!(u8::try_from(data.len()).is_ok());
     let mut out = if data.len() <= opcode::MAX_DIRECT_PUSH {
         vec![data.len() as u8]
     } else {

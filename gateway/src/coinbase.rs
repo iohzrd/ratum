@@ -220,10 +220,10 @@ pub const COINBASE_POOLED: u8 = 1;
 
 pub fn output_budget(fixed_bytes: usize, t: &Template) -> usize {
     let around = (ratum::header::HEADER_V2_SIZE + MAX_TXN_COUNT_SIZE) as u64;
-    let size_used = t.totals.size as u64 + around + COINBASE_WITNESS_BYTES;
+    let size_used = u64::from(t.totals.size) + around + COINBASE_WITNESS_BYTES;
     let by_size = t.sizelimit.saturating_sub(size_used);
     let weight_used =
-        t.totals.weight as u64 + WITNESS_SCALE_FACTOR * around + COINBASE_WITNESS_BYTES;
+        u64::from(t.totals.weight) + WITNESS_SCALE_FACTOR * around + COINBASE_WITNESS_BYTES;
     let by_weight = t.weightlimit.saturating_sub(weight_used) / WITNESS_SCALE_FACTOR;
     let room = by_size.min(by_weight).min(MAX_COINBASE_SECTION_BYTES as u64) as usize;
     room.saturating_sub(fixed_bytes)

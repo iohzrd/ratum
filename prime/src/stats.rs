@@ -3,6 +3,7 @@ use log::warn;
 use ratum::http;
 use ratum::lock;
 use ratum_prime::ledger::{self, FoundBlock};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
@@ -62,7 +63,7 @@ pub(crate) fn spawn(server: Arc<Server>, listen: &str) -> Result<SocketAddr, Str
     let history: HashrateHistory = Arc::new(Mutex::new(ratum::web::History::new()));
     let (sampler, sampler_history) = (Arc::clone(&server), Arc::clone(&history));
     ratum::web::sample_periodically("stats-sampler", move || {
-        sample_hashrate(&sampler, &sampler_history)
+        sample_hashrate(&sampler, &sampler_history);
     });
     http::serve("stats", http, move |request| {
         if let Err(e) = handle(&server, &history, request) {
@@ -115,7 +116,7 @@ fn usable_host(host: &str) -> bool {
         && host.chars().all(|c| c.is_ascii_alphanumeric() || "-.:[]".contains(c))
 }
 
-fn page(snapshot: &serde_json::Value, origin: Option<&str>) -> String {
+fn page(snapshot: &Value, origin: Option<&str>) -> String {
     let chain = snapshot["network"]["chain"].as_str();
     PAGE_TEMPLATE
         .replace("<!--head-->", &head(chain, origin))
@@ -153,7 +154,7 @@ fn head(chain: Option<&str>, origin: Option<&str>) -> String {
     )
 }
 
-fn summary(snapshot: &serde_json::Value) -> String {
+fn summary(snapshot: &Value) -> String {
     let chain = snapshot["network"]["chain"].as_str().unwrap_or("");
     let height = snapshot["network"]["tip_height"].as_u64();
     let rate = snapshot["hashrate"]["pool_hs"].as_f64().unwrap_or(0.0);
@@ -192,17 +193,17 @@ fn network_json(
     tip: Option<ratum::rpc::Tip>,
     coinbase_value: Option<u64>,
     observed_block_secs: Option<f64>,
-) -> serde_json::Value {
+) -> Value {
     let Some(t) = tip else {
-        return serde_json::json!({
-            "chain": serde_json::Value::Null,
-            "tip_height": serde_json::Value::Null,
-            "tip_hash": serde_json::Value::Null,
-            "difficulty": serde_json::Value::Null,
+        return json!({
+            "chain": Value::Null,
+            "tip_height": Value::Null,
+            "tip_hash": Value::Null,
+            "difficulty": Value::Null,
             "coinbase_value": coinbase_value,
         });
     };
-    serde_json::json!({
+    json!({
         "chain": t.chain.name(),
         "tip_height": t.height,
         "tip_hash": hex::encode(ratum::bitcoin::reversed(&t.hash)),
@@ -219,10 +220,10 @@ fn network_json(
     })
 }
 
-fn owed_json(owed: &[ledger::OwedBlock]) -> (u64, Vec<serde_json::Value>, Vec<serde_json::Value>) {
+fn owed_json(owed: &[ledger::OwedBlock]) -> (u64, Vec<Value>, Vec<Value>) {
     let mut unsettled: u64 = 0;
     let mut by_identity: HashMap<String, u64> = HashMap::new();
-    let blocks: Vec<serde_json::Value> = owed
+    let blocks: Vec<Value> = owed
         .iter()
         .map(|o| {
             if o.settled_at.is_none() {
@@ -231,14 +232,14 @@ fn owed_json(owed: &[ledger::OwedBlock]) -> (u64, Vec<serde_json::Value>, Vec<se
                     *by_identity.entry(identity.clone()).or_insert(0) += sats;
                 }
             }
-            serde_json::json!({
+            json!({
                 "height": o.height,
                 "block_hash": hex::encode(o.block_hash),
                 "found_at": o.at,
                 "total_sats": o.total,
                 "settled_at": o.settled_at,
                 "miners": o.entries.iter().map(|(identity, sats)| {
-                    serde_json::json!({ "identity": identity, "sats": sats })
+                    json!({ "identity": identity, "sats": sats })
                 }).collect::<Vec<_>>(),
             })
         })
@@ -247,7 +248,7 @@ fn owed_json(owed: &[ledger::OwedBlock]) -> (u64, Vec<serde_json::Value>, Vec<se
     by_identity.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     let by_identity = by_identity
         .into_iter()
-        .map(|(identity, sats)| serde_json::json!({ "identity": identity, "sats": sats }))
+        .map(|(identity, sats)| json!({ "identity": identity, "sats": sats }))
         .collect();
     (unsettled, by_identity, blocks)
 }
@@ -259,7 +260,7 @@ fn miners_json(
     payout_sats: &HashMap<String, u64>,
     recent_by_identity: &HashMap<String, u128>,
     tags: &HashMap<String, String>,
-) -> Vec<serde_json::Value> {
+) -> Vec<Value> {
     work_by_identity
         .iter()
         .map(|(identity, work)| {
@@ -270,7 +271,7 @@ fn miners_json(
                 Some(Err(why)) => (Some(false), Some(why.to_string())),
                 None => (None, None),
             };
-            serde_json::json!({
+            json!({
                 "identity": identity,
                 "work": work.to_string(),
                 "share_percent": share_percent,
@@ -287,36 +288,50 @@ fn miners_json(
         .collect()
 }
 
-fn snapshot(server: &Server, history: &Mutex<ratum::web::History>) -> serde_json::Value {
-    let tip = *lock(&server.node_view.tip);
-    let coinbase_value = *lock(&server.node_view.coinbase_value);
-    let operator_fee = coinbase_value.map_or(0, |v| server.payout.fee_on(v));
+/// Everything the page shows from the ledger, read under one lock so the figures agree
+/// with each other.
+struct LedgerView {
+    total_work: u128,
+    target_work: u128,
+    shares: usize,
+    work_by_identity: Vec<(String, u128)>,
+    tags: HashMap<String, String>,
+    payout_sats: HashMap<String, u64>,
+    owed: Vec<ledger::OwedBlock>,
+    blocks: Vec<FoundBlock>,
+    recent_work: u128,
+    recent_by_identity: HashMap<String, u128>,
+}
 
-    let hashrate_cutoff = ratum::unix_now().saturating_sub(HASHRATE_SPAN_SECS);
-    let (total_work, target_work, shares, work_by_identity, tags, split, owed, recent, blocks) = {
+impl LedgerView {
+    fn read(server: &Server, coinbase_value: Option<u64>) -> Self {
+        let cutoff = ratum::unix_now().saturating_sub(HASHRATE_SPAN_SECS);
         let l = lock(&server.ledger);
-        (
-            l.total_work(),
-            l.window(),
-            l.len(),
-            l.work_by_identity(),
-            l.tags_by_identity(),
-            split_after_fee(&l, &server.payout, coinbase_value.unwrap_or(0)),
-            l.owed().to_vec(),
-            l.work_since(hashrate_cutoff),
-            l.blocks().to_vec(),
-        )
-    };
-    let payout_sats: HashMap<String, u64> = split.into_iter().collect();
-    let (recent_work, recent_by_identity) = recent;
+        let (recent_work, recent_by_identity) = l.work_since(cutoff);
+        LedgerView {
+            total_work: l.total_work(),
+            target_work: l.window(),
+            shares: l.len(),
+            work_by_identity: l.work_by_identity(),
+            tags: l.tags_by_identity(),
+            payout_sats: split_after_fee(&l, &server.payout, coinbase_value.unwrap_or(0))
+                .into_iter()
+                .collect(),
+            owed: l.owed().to_vec(),
+            blocks: l.blocks().to_vec(),
+            recent_work,
+            recent_by_identity,
+        }
+    }
+}
 
-    let (luck, luck_blocks) = luck_percent(&blocks);
-    let recent_blocks: Vec<serde_json::Value> = blocks
+fn recent_blocks_json(blocks: &[FoundBlock]) -> Vec<Value> {
+    blocks
         .iter()
         .rev()
         .take(RECENT_BLOCKS)
         .map(|b| {
-            serde_json::json!({
+            json!({
                 "height": b.height,
                 "block_hash": hex::encode(b.block_hash),
                 "found_at": b.at,
@@ -326,30 +341,39 @@ fn snapshot(server: &Server, history: &Mutex<ratum::web::History>) -> serde_json
                 "tag": b.tag,
             })
         })
-        .collect();
+        .collect()
+}
 
-    let observed_block_secs = {
-        let tips = lock(&server.node_view.tip_history);
-        match (tips.front(), tips.back()) {
-            (Some(&(h0, t0)), Some(&(h1, t1))) if h1 > h0 && t1 > t0 => {
-                Some((t1 - t0) as f64 / f64::from(h1 - h0))
-            }
-            _ => None,
+/// The mean seconds between the blocks the tip history holds, or None until it holds two.
+fn observed_block_seconds(server: &Server) -> Option<f64> {
+    let tips = lock(&server.node_view.tip_history);
+    match (tips.front(), tips.back()) {
+        (Some(&(h0, t0)), Some(&(h1, t1))) if h1 > h0 && t1 > t0 => {
+            Some((t1 - t0) as f64 / f64::from(h1 - h0))
         }
-    };
+        _ => None,
+    }
+}
 
-    let (owed_unsettled, owed_by_identity, owed_blocks) = owed_json(&owed);
+fn snapshot(server: &Server, history: &Mutex<ratum::web::History>) -> Value {
+    let tip = *lock(&server.node_view.tip);
+    let coinbase_value = *lock(&server.node_view.coinbase_value);
+    let operator_fee = coinbase_value.map_or(0, |v| server.payout.fee_on(v));
+    let l = LedgerView::read(server, coinbase_value);
+
+    let (luck, luck_blocks) = luck_percent(&l.blocks);
+    let (owed_unsettled, owed_by_identity, owed_blocks) = owed_json(&l.owed);
     let miners = miners_json(
         server,
-        &work_by_identity,
-        total_work,
-        &payout_sats,
-        &recent_by_identity,
-        &tags,
+        &l.work_by_identity,
+        l.total_work,
+        &l.payout_sats,
+        &l.recent_by_identity,
+        &l.tags,
     );
-    let network = network_json(tip, coinbase_value, observed_block_secs);
+    let network = network_json(tip, coinbase_value, observed_block_seconds(server));
 
-    serde_json::json!({
+    json!({
         "pool": {
             "motd": server.motd,
             "version": ratum::VERSION,
@@ -372,17 +396,17 @@ fn snapshot(server: &Server, history: &Mutex<ratum::web::History>) -> serde_json
         },
         "hashrate": {
             "span_seconds": HASHRATE_SPAN_SECS,
-            "pool_hs": hashes_per_second(recent_work, HASHRATE_SPAN_SECS),
+            "pool_hs": hashes_per_second(l.recent_work, HASHRATE_SPAN_SECS),
             "interval_seconds": ratum::web::HISTORY_INTERVAL_SECS,
             "history": lock(history)
                 .iter()
-                .map(|&(t, hs)| serde_json::json!([t, hs as u64]))
+                .map(|&(t, hs)| json!([t, hs as u64]))
                 .collect::<Vec<_>>(),
         },
         "window": {
-            "work": total_work.to_string(),
-            "target_work": target_work.to_string(),
-            "shares": shares,
+            "work": l.total_work.to_string(),
+            "target_work": l.target_work.to_string(),
+            "shares": l.shares,
             "operator_fee_sats": operator_fee,
             "miners": miners,
         },
@@ -392,10 +416,10 @@ fn snapshot(server: &Server, history: &Mutex<ratum::web::History>) -> serde_json
             "blocks": owed_blocks,
         },
         "blocks": {
-            "found": blocks.len(),
+            "found": l.blocks.len(),
             "luck_percent": luck,
             "luck_blocks": luck_blocks,
-            "recent": recent_blocks,
+            "recent": recent_blocks_json(&l.blocks),
         },
         "generated_at": ratum::unix_now(),
     })

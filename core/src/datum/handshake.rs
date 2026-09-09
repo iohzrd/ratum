@@ -263,7 +263,7 @@ impl Channel {
             None => payload,
         };
         let ct_len = plain.len() + CRYPTO_BOX_MACBYTES;
-        if ct_len as u64 > framing::MAX_CMD_LEN as u64 {
+        if ct_len as u64 > u64::from(framing::MAX_CMD_LEN) {
             return Err(Error::TooLarge(ct_len));
         }
         let mut ct = vec![0u8; ct_len];

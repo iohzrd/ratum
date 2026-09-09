@@ -105,7 +105,9 @@ pub fn url_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-pub fn bind_candidates(addr: &str, port: u16) -> Vec<String> {
+/// The addresses to try for a listener. An empty address means every interface, which is
+/// two candidates: the dual-stack `[::]` first, then IPv4 alone for a host without IPv6.
+fn bind_candidates(addr: &str, port: u16) -> Vec<String> {
     if addr.is_empty() {
         vec![format!("[::]:{port}"), format!("0.0.0.0:{port}")]
     } else {
@@ -113,15 +115,25 @@ pub fn bind_candidates(addr: &str, port: u16) -> Vec<String> {
     }
 }
 
-pub fn bind(addr: &str, port: u16) -> Result<Server, String> {
+/// Opens a listener on the first candidate address `open` accepts, reporting the last
+/// candidate and its error when none is.
+pub fn bind_first<T, E: std::fmt::Display>(
+    addr: &str,
+    port: u16,
+    open: impl Fn(&str) -> Result<T, E>,
+) -> Result<T, String> {
     let mut last = String::new();
     for candidate in bind_candidates(addr, port) {
-        match Server::http(&candidate) {
-            Ok(s) => return Ok(s),
+        match open(&candidate) {
+            Ok(listener) => return Ok(listener),
             Err(e) => last = format!("{candidate}: {e}"),
         }
     }
     Err(last)
+}
+
+pub fn bind(addr: &str, port: u16) -> Result<Server, String> {
+    bind_first(addr, port, |candidate: &str| Server::http(candidate))
 }
 
 pub fn serve(name: &str, server: Server, handle: impl Fn(Request) + Send + 'static) {

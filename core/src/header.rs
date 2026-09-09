@@ -177,7 +177,7 @@ impl HeaderV2 {
         h1d.extend_from_slice(&self.time_on_wire().to_le_bytes());
         h1d.push(0);
         h1d.extend_from_slice(&self.bits.to_le_bytes());
-        h1d.extend_from_slice(&(self.txcount as u32).to_le_bytes());
+        h1d.extend_from_slice(&u32::from(self.txcount).to_le_bytes());
         h1d.push(self.flags);
         h1d.push(self.xor_key_mask_clear_bits);
         h1d.extend_from_slice(&xor_key_hash);

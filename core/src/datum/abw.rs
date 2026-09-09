@@ -117,7 +117,7 @@ fn close(c: &mut Cursor<'_>) -> Result<(), Error> {
 impl AssignmentNotice {
     pub fn encode(&self) -> Vec<u8> {
         frame(subcmd::ASSIGNMENT_NOTICE, |out| {
-            out.push(self.active as u8);
+            out.push(u8::from(self.active));
             out.push(self.slot);
             out.extend_from_slice(&self.key_hash);
         })
