@@ -36,9 +36,12 @@ ignored. `RUST_LOG` overrides `logger.log_level_console`.
 - SIGUSR1 is a block notification, as in C (`blocknotify=kill -USR1 <pid>`); `/NOTIFY` on
   the API port does the same over HTTP. Unix only.
 
-- `api.miner_listen_port` defaults to `8000` (the C gateway leaves the lookup page off).
+- `api.miner_listen_port` defaults to `8000` and serves one endpoint, the miner lookup
+  `GET /?addr=<address>` (the C gateway leaves the lookup off). It answers JSON and is
+  unauthenticated: it reports only what the given address is already mining under. The page
+  that used to render it now lives in a separate frontend project.
 - `datum.pool_url` (not a C key; empty by default) names the pool's web page, and the status
-  and miner pages link the pool host to it when it is set.
+  page links the pool host to it when it is set.
 - `/clients` and `/coinbaser` are not served: `/login` prompts for `api.admin_password`,
   after which the status page renders both tables from `/stats.json`. Authentication is
   HTTP Basic, not Digest: keep the API behind TLS or on a private interface. `/cmd` takes
@@ -119,7 +122,7 @@ pool dictates where the coinbase pays, verifies the shares and relays the blocks
 The workspace holds the `core` library (the protocol, the version 2 header, the RPC client and
 the code the binaries share), `ratum-prime` (the pool), `ratum-gateway` (a reimplementation of
 the [CONVOY DATUM Gateway](https://github.com/CONVOYMining/datum_gateway), see [Gateway](#gateway))
-and `sia-test-miner` (the CPU miner the end-to-end tests drive). The header hash and share
+and `sia-test-miner` (a CPU miner that mines against a gateway). The header hash and share
 format are byte-coupled between the pool and the gateway, so they are one release.
 
 ### Build and test
@@ -127,13 +130,19 @@ format are byte-coupled between the pool and the gateway, so they are one releas
 ```
 cargo build --workspace --release        # target/release/ratum-prime, ratum-gateway, sia-test-miner
 cargo test --workspace
-cargo test --workspace --release -- --ignored  # shares and blocks, ~2^32 hashes each
-tests/e2e/full_stack.sh                  # the activation block
-tests/e2e/multi_miner.sh                 # three miners, two gateways: credit and payout split
-tests/e2e/gateway_fee.sh                 # a gateway charging a fee beside one charging none
+cargo test --workspace --release -- --ignored  # searches ~2^32 hashes for the test nonces
+e2e/full_stack.sh                        # the activation block
+e2e/multi_miner.sh                       # three miners, two gateways: credit and payout split
+e2e/gateway_fee.sh                       # a gateway charging a fee beside one charging none
 ```
 
-The scripts need a Knots build with the BLAKE2b change (`BITCOIND`, `BITCOIN_CLI`);
+`core/tests/header_vectors.rs` reproduces the five version 2 header vectors in
+`core/tests/data/block_header_v2.json`, taken from the C implementation: the serialization,
+the tagged SHA-256 chain, the BLAKE2b work root, the ASIC input of each of the four profiles
+and the XOR mask. `core/tests/decoders.rs` feeds every decoder random and damaged input and
+requires that none panics and that whatever decodes re-encodes to a fixed point.
+
+The e2e scripts need a Knots build with the BLAKE2b change (`BITCOIND`, `BITCOIN_CLI`);
 `DATUM_GATEWAY` runs another gateway build instead of this workspace's.
 
 The `gateway` GitHub Actions workflow builds `ratum-gateway` for x86_64 and aarch64 Linux
@@ -251,32 +260,26 @@ history that has none.
 
 ### Stats interface
 
-`--stats-listen <address>` serves a read-only page at `/` and its snapshot at `/stats.json`:
-the tip, the coinbase value, the fee, the connected gateways, the build (`--version` prints the
+`--stats-listen <address>` serves one endpoint, the read-only snapshot at `/stats.json`;
+every other path is a 404. It carries the tip, the coinbase value, the fee, the connected gateways, the build (`--version` prints the
 same string), an approximate hashrate (accepted-share difficulty over the last 10 minutes,
 at 2^32 hashes per difficulty unit, for the pool and per miner) and each miner's share of the
 window with `payable`, `unpayable_reason` and `tag` (the secondary coinbase tag of the
 miner's newest share in the window, the gateway's `mining.coinbase_tag_secondary`). Every
 accepted block is recorded in the ledger's `blocks` table and listed with its coinbase
 amounts, finder, and the secondary coinbase tag its coinbase carried; from the record and
-a cumulative work counter the page derives a luck figure (blocks found over blocks
+a cumulative work counter it derives a luck figure (blocks found over blocks
 expected), and from the observed block spacing an expected time to the pool's next block and
-the next difficulty adjustment (height, countdown, estimated factor). The
-page shows the DATUM address, the public key and a `datum_gateway` config block to point a
+the next difficulty adjustment (height, countdown, estimated factor). It also carries the
+DATUM address, the public key and the values a `datum_gateway` config block needs to point a
 gateway at the pool; `--advertise-address host[:port]` sets the address when the public one
-differs. `--public-gateway <url>` puts a banner at the top of the page linking a gateway that
-accepts miners who do not run their own (a value without a scheme is read as `https://`);
-unset, the page shows no such banner. It is unauthenticated: bind it to `127.0.0.1` unless it
-is behind a reverse proxy.
+differs. `--public-gateway <url>` names a gateway that accepts miners who do not run their
+own (a value without a scheme is read as `https://`); unset, the field is null. It is
+unauthenticated: bind it to `127.0.0.1` unless it is behind a reverse proxy.
 
-The page is served with the snapshot it renders embedded in it, so the first paint needs no
-fetch, and with a one-paragraph summary of the same figures inside `<noscript>` for a reader
-or crawler that runs no script. Its head carries a
-title naming the chain, a description, the Open Graph and card tags a link preview reads, and
-the canonical URL built from the request's `Host` (and `X-Forwarded-Proto` when a reverse
-proxy sets it). `/robots.txt` allows crawling everywhere, since a crawler that renders the
-page fetches `/stats.json`; that response carries `X-Robots-Tag: noindex` so the JSON is not
-a search result of its own.
+The response carries `X-Robots-Tag: noindex`, so the snapshot is not a search result of its
+own. Rendering it is the job of a separate frontend project, which serves the snapshot from
+its own origin so the browser makes no cross-origin request.
 
 ## References
 

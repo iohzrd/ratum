@@ -1,8 +1,4 @@
-//! From a template to the jobs the stratum server serves: the new-tip sequence, the
-//! coinbaser request on its own thread, and the once-per-reason reporting of a job that
-//! could not be built.
-
-use crate::datum::Shared;
+use crate::datum::Pool;
 use crate::job::{BuildError, Builder, PoolConfig};
 use crate::stratum::Server;
 use crate::template::Template;
@@ -12,63 +8,52 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+const EMPTY_JOB_HOLD: Duration = Duration::from_millis(50);
+
 pub struct Publisher {
     builder: Mutex<Builder>,
     server: Arc<Server>,
-    shared: Arc<Shared>,
-    /// Counts the templates passed in; a coinbaser response for any but the latest is
-    /// discarded.
+    pool: Arc<Pool>,
     template_serial: AtomicU64,
-    /// The last build error reported, so a permanent one (a payout script the coinbase
-    /// cannot carry) is logged once per reason rather than on every poll.
     last_error: Mutex<Option<BuildError>>,
 }
 
 impl Publisher {
-    pub fn new(builder: Builder, server: Arc<Server>, shared: Arc<Shared>) -> Arc<Self> {
-        Arc::new(Publisher {
+    pub fn new(builder: Builder, server: Arc<Server>, pool: Arc<Pool>) -> Arc<Self> {
+        Arc::new(Self {
             builder: Mutex::new(builder),
             server,
-            shared,
+            pool,
             template_serial: AtomicU64::new(0),
             last_error: Mutex::new(None),
         })
     }
 
-    /// Build a job for `t` and publish it; `empty` marks new-block empty work. `what` names
-    /// the job in the log.
     fn build_and_publish(
         &self,
         t: &Arc<Template>,
         new_block: bool,
-        empty: bool,
-        pool: Option<&PoolConfig>,
+        pool_config: Option<&PoolConfig>,
         coinbaser: Option<CoinbaserResponse>,
         what: &str,
     ) {
-        // Under the version 3 protocol a pooled job commits to the pool's ABW assignment; until
-        // the pool has seeded one, no job is built. The C gateway builds solo work meanwhile
-        // (`datum_protocol_is_active` is false without an assignment, so its coinbaser pays
-        // its own address); this gateway serves none, since the pool sends the assignment
-        // with its configuration.
-        // With no ABW requirement (a v1 pool, or a v3 pool that disabled it) the work commits
-        // to the null key and the gateway classifies blocks itself.
-        let abw = if self.shared.require_abw() { self.shared.abw_assignment() } else { None };
-        if pool.is_some() && self.shared.require_abw() && abw.is_none() {
+        let require_abw = self.pool.require_abw();
+        let abw = if require_abw { self.pool.abw_assignment() } else { None };
+        if pool_config.is_some() && require_abw && abw.is_none() {
             debug!(
                 "waiting for the pool's anti-withholding assignment before building {what} work"
             );
             return;
         }
         let built =
-            ratum::lock(&self.builder).build(Arc::clone(t), new_block, pool, coinbaser, abw);
+            ratum::lock(&self.builder).build(Arc::clone(t), new_block, pool_config, coinbaser, abw);
         let mut last = ratum::lock(&self.last_error);
         match built {
             Ok(job) => {
                 *last = None;
                 let job = Arc::new(job);
-                self.server.publish(Arc::clone(&job), empty);
-                if !empty {
+                self.server.publish(Arc::clone(&job), new_block);
+                if !new_block {
                     info!(
                         "Stratum job {} ready ({what}): height {}, {} coinbaser outputs, {}pooled (sent to {} subscribers)",
                         job.job_id,
@@ -88,45 +73,36 @@ impl Publisher {
         }
     }
 
-    /// The jobs for a template. On a new tip, the C gateway's sequence: empty (subsidy-only)
-    /// work at once, then full work with the blank coinbase, then the job with the pool's
-    /// payout split once the coinbaser responds. Miners are never left on subsidy-only work
-    /// while the request is open.
     pub fn on_template(self: &Arc<Self>, t: Arc<Template>, new_block: bool) {
         let serial = self.template_serial.fetch_add(1, Ordering::SeqCst) + 1;
-        let pool = self.shared.pool_config();
+        let pool_config = self.pool.pool_config();
         if new_block {
-            self.build_and_publish(&t, true, true, pool.as_ref(), None, "new-block");
-            std::thread::sleep(Duration::from_millis(50));
-            if pool.is_some() {
-                self.build_and_publish(&t, false, false, pool.as_ref(), None, "priority");
+            self.build_and_publish(&t, true, pool_config.as_ref(), None, "new-block");
+            std::thread::sleep(EMPTY_JOB_HOLD);
+            if pool_config.is_some() {
+                self.build_and_publish(&t, false, pool_config.as_ref(), None, "priority");
             }
         }
-        if pool.is_none() {
-            self.build_and_publish(&t, false, false, None, None, "full");
+        if pool_config.is_none() {
+            self.build_and_publish(&t, false, None, None, "full");
         } else {
             self.spawn_coinbaser(t, new_block, serial);
         }
     }
 
-    /// The coinbaser wait (up to `COINBASER_WAIT`) runs on its own thread, as the C
-    /// gateway's coinbaser thread does, so the template thread keeps polling the node and
-    /// answering block notifications meanwhile.
     fn spawn_coinbaser(self: &Arc<Self>, t: Arc<Template>, new_block: bool, serial: u64) {
         let this = Arc::clone(self);
-        let spawned = std::thread::Builder::new().name("coinbaser".into()).spawn(move || {
-            let coinbaser = this.shared.fetch_coinbaser(t.coinbase_value, t.prev_hash);
+        let spawned = ratum::thread::try_spawn("coinbaser", move || {
+            let coinbaser = this.pool.fetch_coinbaser(t.coinbase_value, t.prev_hash);
             if this.template_serial.load(Ordering::SeqCst) != serial {
                 info!("coinbaser response for a superseded template; not used");
                 return;
             }
-            let pool = this.shared.pool_config();
-            // On a new tip the blank full job is already out; without a coinbaser there is
-            // nothing to replace it with.
-            if new_block && pool.is_some() && coinbaser.is_none() {
+            let pool_config = this.pool.pool_config();
+            if new_block && pool_config.is_some() && coinbaser.is_none() {
                 return;
             }
-            this.build_and_publish(&t, false, false, pool.as_ref(), coinbaser, "full");
+            this.build_and_publish(&t, false, pool_config.as_ref(), coinbaser, "full");
         });
         if let Err(e) = spawned {
             error!("could not start the coinbaser thread: {e}");

@@ -1,4 +1,4 @@
-use super::framing::{self, Header, HeaderKeys, KeyRatchet, SessionNonces};
+use super::framing::{self, Header, HeaderKeys, KeyRatchet, STRUCT_END, SessionNonces};
 use dryoc::classic::crypto_box::{
     PublicKey as BoxPublicKey, SecretKey as BoxSecretKey, crypto_box_beforenm,
     crypto_box_easy_afternm, crypto_box_keypair, crypto_box_open_easy_afternm, crypto_box_seal,
@@ -15,17 +15,24 @@ use dryoc::constants::{
 pub(crate) type PrecompKey = [u8; CRYPTO_BOX_BEFORENMBYTES];
 pub(crate) type Signature = [u8; CRYPTO_SIGN_BYTES];
 
-/// Four 32-byte public keys: the client's long-term pair and its session pair.
-pub(crate) const KEYS_LEN: usize = 128;
+pub const PUBKEY_LEN: usize = 32;
+pub(crate) const HELLO_KEYS: usize = 4;
+pub(crate) const KEYS_LEN: usize = HELLO_KEYS * PUBKEY_LEN;
+pub(crate) const POOL_SIGN_KEY_INDEX: usize = HELLO_KEYS;
+pub(crate) const POOL_BOX_KEY_INDEX: usize = HELLO_KEYS + 1;
+pub(crate) const RESPONSE_KEYS_LEN: usize = (POOL_BOX_KEY_INDEX + 1) * PUBKEY_LEN;
 
-/// The most of a hello's user agent to keep and log. The field runs to a NUL and a peer can
-/// make it as long as a hello frame allows (megabytes), so it is truncated before it is
-/// stored or logged. The C gateway's own user agent is about 52 bytes (version, "/", commit
-/// hash, optional "(tag)") and at most 385.
 const MAX_USER_AGENT: usize = 256;
-use super::framing::STRUCT_END;
-/// The gateway reads the motd into `motd[512]` with `strncpy(..., 511)`.
+const AFTER_UA_LEN: usize = 1 + size_of::<u32>();
 pub const MAX_MOTD: usize = 511;
+
+pub(crate) fn key_at(block: &[u8], n: usize) -> Option<&[u8]> {
+    block.get(n * PUBKEY_LEN..(n + 1) * PUBKEY_LEN)
+}
+
+pub(crate) fn pubkey_at(block: &[u8], n: usize) -> [u8; PUBKEY_LEN] {
+    key_at(block, n).expect("the caller checked the length").try_into().expect("PUBKEY_LEN bytes")
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -55,7 +62,6 @@ pub enum Error {
     TooLarge(usize),
 }
 
-/// A signing key pair and a box key pair: one end's long-term keys or its session keys.
 #[derive(Clone)]
 pub struct KeyPairs {
     pub sign_pk: SignPublicKey,
@@ -68,31 +74,51 @@ impl KeyPairs {
     pub fn generate() -> Self {
         let (sign_pk, sign_sk) = crypto_sign_keypair();
         let (box_pk, box_sk) = crypto_box_keypair();
-        KeyPairs { sign_pk, sign_sk, box_pk, box_sk }
+        Self { sign_pk, sign_sk, box_pk, box_sk }
     }
 
     pub fn pubkey_hex(&self) -> String {
-        let mut v = Vec::with_capacity(64);
+        let mut v = Vec::with_capacity(2 * PUBKEY_LEN);
         v.extend_from_slice(&self.sign_pk);
         v.extend_from_slice(&self.box_pk);
         hex::encode(v)
     }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(KEY_PAIRS_LEN);
+        v.extend_from_slice(&self.sign_pk);
+        v.extend_from_slice(&self.sign_sk);
+        v.extend_from_slice(&self.box_pk);
+        v.extend_from_slice(&self.box_sk);
+        v
+    }
+
+    pub fn from_bytes(raw: &[u8]) -> Option<Self> {
+        if raw.len() != KEY_PAIRS_LEN {
+            return None;
+        }
+        let (sign_pk, rest) = raw.split_at(size_of::<SignPublicKey>());
+        let (sign_sk, rest) = rest.split_at(size_of::<SignSecretKey>());
+        let (box_pk, box_sk) = rest.split_at(size_of::<BoxPublicKey>());
+        Some(Self {
+            sign_pk: sign_pk.try_into().ok()?,
+            sign_sk: sign_sk.try_into().ok()?,
+            box_pk: box_pk.try_into().ok()?,
+            box_sk: box_sk.try_into().ok()?,
+        })
+    }
 }
 
-/// The DRS extension marker a version 3 hello carries after `nk`, then a flag byte and, when
-/// the flag is 1, the 40-byte resume token. `open_hello` removes the signature before
-/// reading past `nk`, so in a version 1 hello only the pad follows: the C gateway and
-/// `Client::hello` pad with 1 to 200 repeats of one byte, which cannot match four distinct
-/// ones. A ratum-gateway built before the version 3 protocol padded with independent random
-/// bytes, which match with probability 2^-32 per hello.
-pub const DRS_MARKER: [u8; 4] = *b"DRS\x01";
+pub const KEY_PAIRS_LEN: usize = size_of::<SignPublicKey>()
+    + size_of::<SignSecretKey>()
+    + size_of::<BoxPublicKey>()
+    + size_of::<BoxSecretKey>();
 
-/// The protocol generation a hello asks for, read from the DRS extension: absent in a
-/// version 1 hello; present in a version 3 hello, carrying the prior session's resume token
-/// when the client asks to resume it. To accept a resume the server echoes the identical
-/// 40 bytes (and the matching prime ID) in its version 3 configuration; anything else is a
-/// decline and the client discards its replay backlog. The configuration version the server
-/// must send follows from this.
+pub const DRS_MARKER: [u8; 4] = *b"DRS\x01";
+pub const DRS_RESUME_PRESENT: u8 = 1;
+pub const DRS_FLAG_AT: usize = DRS_MARKER.len();
+pub const DRS_TOKEN_AT: usize = DRS_FLAG_AT + 1;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Generation {
     V1,
@@ -110,7 +136,6 @@ pub struct Hello {
     pub generation: Generation,
 }
 
-/// Unseal the hello, verify its long-term signature, and parse it.
 pub fn open_hello(header: Header, payload: &[u8], pool: &KeyPairs) -> Result<Hello, Error> {
     if header.proto_cmd != framing::cmd::HELLO_OR_PING
         || !header.is_signed
@@ -131,30 +156,30 @@ pub fn open_hello(header: Header, payload: &[u8], pool: &KeyPairs) -> Result<Hel
     }
     let (signed, sig) = plain.split_at(plain.len() - CRYPTO_SIGN_BYTES);
     let sig: Signature = sig.try_into().map_err(|_| Error::Truncated)?;
-    let client_sign_pk: SignPublicKey = signed[0..32].try_into().unwrap();
+    let client_sign_pk: SignPublicKey = pubkey_at(signed, 0);
     crypto_sign_verify_detached(&sig, signed, &client_sign_pk).map_err(|_| Error::BadSignature)?;
 
-    let client_box_pk: BoxPublicKey = signed[32..64].try_into().unwrap();
-    let session_sign_pk: SignPublicKey = signed[64..96].try_into().unwrap();
-    let session_box_pk: BoxPublicKey = signed[96..128].try_into().unwrap();
+    let client_box_pk: BoxPublicKey = pubkey_at(signed, 1);
+    let session_sign_pk: SignPublicKey = pubkey_at(signed, 2);
+    let session_box_pk: BoxPublicKey = pubkey_at(signed, 3);
 
     let rest = &signed[KEYS_LEN..];
     let nul = rest.iter().position(|&b| b == 0).ok_or(Error::Malformed("no UA terminator"))?;
     let user_agent = String::from_utf8_lossy(&rest[..nul.min(MAX_USER_AGENT)]).into_owned();
     let after = &rest[nul + 1..];
-    if after.len() < 5 {
+    if after.len() < AFTER_UA_LEN {
         return Err(Error::Truncated);
     }
     if after[0] != STRUCT_END {
         return Err(Error::Malformed("no 0xFE after user agent"));
     }
-    let nk = u32::from_le_bytes(after[1..5].try_into().unwrap());
+    let nk = u32::from_le_bytes(after[1..AFTER_UA_LEN].try_into().expect("AFTER_UA_LEN - 1 bytes"));
 
-    let tail = &after[5..];
-    let generation = if tail.len() >= 5 && tail[..4] == DRS_MARKER {
-        let resume = if tail[4] != 0 {
+    let tail = &after[AFTER_UA_LEN..];
+    let generation = if tail.len() > DRS_FLAG_AT && tail[..DRS_FLAG_AT] == DRS_MARKER {
+        let resume = if tail[DRS_FLAG_AT] != 0 {
             let token: super::messages::ResumeToken = tail
-                .get(5..5 + super::messages::RESUME_TOKEN_LEN)
+                .get(DRS_TOKEN_AT..DRS_TOKEN_AT + super::messages::RESUME_TOKEN_LEN)
                 .ok_or(Error::Malformed("DRS flag set without a token"))?
                 .try_into()
                 .expect("length checked");
@@ -178,12 +203,7 @@ pub fn open_hello(header: Header, payload: &[u8], pool: &KeyPairs) -> Result<Hel
     })
 }
 
-/// One end of the encrypted channel: the precomputed box key, the two nonces, and the two
-/// header ratchets. `Session` and [`super::client::Client`] hold the same state and
-/// differ only in which keys and nonces go in which direction, so both wrap this.
 pub struct Channel {
-    /// `None` until the handshake response is built (server) or read (client) and the box key
-    /// is precomputed; encrypting or decrypting before then is an error, not a panic.
     precomp: Option<PrecompKey>,
     tx_nonce: [u8; framing::NONCE_LEN],
     rx_nonce: [u8; framing::NONCE_LEN],
@@ -192,9 +212,8 @@ pub struct Channel {
 }
 
 impl Channel {
-    /// The state both ends start in: hello-keyed ratchets and no box key.
     pub fn before_handshake() -> Self {
-        Channel {
+        Self {
             precomp: None,
             tx_nonce: [0; framing::NONCE_LEN],
             rx_nonce: [0; framing::NONCE_LEN],
@@ -210,24 +229,21 @@ impl Channel {
         rx_nonce: [u8; framing::NONCE_LEN],
         precomp: Option<PrecompKey>,
     ) -> Self {
-        Channel { precomp, tx_nonce, rx_nonce, tx_headers, rx_headers }
+        Self { precomp, tx_nonce, rx_nonce, tx_headers, rx_headers }
     }
 
     pub fn set_precomp(&mut self, precomp: PrecompKey) {
         self.precomp = Some(precomp);
     }
 
-    /// Mask a bare frame header with the sending ratchet, for the handshake frames that
-    /// are not channel-encrypted.
-    pub fn mask_header(&mut self, header: Header) -> [u8; 4] {
+    pub fn mask_header(&mut self, header: Header) -> [u8; framing::HEADER_LEN] {
         self.tx_headers.mask(header)
     }
 
-    pub fn unmask_header(&mut self, bytes: [u8; 4]) -> Header {
+    pub fn unmask_header(&mut self, bytes: [u8; framing::HEADER_LEN]) -> Header {
         self.rx_headers.unmask(bytes)
     }
 
-    /// Encrypt one message, signing it first when `sign_with` carries a key.
     pub fn encrypt(
         &mut self,
         proto_cmd: u8,
@@ -248,11 +264,8 @@ impl Channel {
             }
             None => payload,
         };
-        // The ciphertext length is fixed by the plaintext, so check it before encrypting.
-        // Advancing the nonce for a frame that is then rejected as too large would leave this
-        // end's nonce one increment past the peer's, and every later frame would fail to decrypt.
         let ct_len = plain.len() + CRYPTO_BOX_MACBYTES;
-        if ct_len as u64 > framing::MAX_CMD_LEN as u64 {
+        if ct_len as u64 > u64::from(framing::MAX_CMD_LEN) {
             return Err(Error::TooLarge(ct_len));
         }
         let mut ct = vec![0u8; ct_len];
@@ -266,14 +279,12 @@ impl Channel {
             proto_cmd,
             ..Default::default()
         };
-        let mut out = Vec::with_capacity(4 + ct.len());
+        let mut out = Vec::with_capacity(framing::HEADER_LEN + ct.len());
         out.extend_from_slice(&self.tx_headers.mask(header));
         out.extend_from_slice(&ct);
         Ok(out)
     }
 
-    /// Decrypt one message, checking its signature against `verify_with` when the header
-    /// flags one.
     pub fn decrypt(
         &mut self,
         header: Header,
@@ -292,8 +303,6 @@ impl Channel {
     }
 }
 
-/// When `header.is_signed`, verify the detached signature at the end of `plain` against
-/// `verify_with` and remove it; otherwise return `plain` unchanged.
 pub fn strip_signature(
     mut plain: Vec<u8>,
     header: Header,
@@ -323,7 +332,7 @@ impl Session {
         self.channel.encrypt(proto_cmd, payload, sign.then_some(&self.session_sign_sk))
     }
 
-    pub fn unmask_header(&mut self, bytes: [u8; 4]) -> Header {
+    pub fn unmask_header(&mut self, bytes: [u8; framing::HEADER_LEN]) -> Header {
         self.channel.unmask_header(bytes)
     }
 
@@ -341,7 +350,7 @@ pub fn accept(hello: Hello, pool: &KeyPairs, motd: &str) -> Result<(Vec<u8>, Ses
     let (session_sign_pk, session_sign_sk) = crypto_sign_keypair();
     let (session_box_pk, session_box_sk) = crypto_box_keypair();
 
-    let mut body = Vec::with_capacity(KEYS_LEN + 64 + motd.len() + 1);
+    let mut body = Vec::with_capacity(RESPONSE_KEYS_LEN + motd.len() + 1);
     body.extend_from_slice(&hello.client_sign_pk);
     body.extend_from_slice(&hello.client_box_pk);
     body.extend_from_slice(&hello.session_sign_pk);
@@ -372,7 +381,7 @@ pub fn accept(hello: Hello, pool: &KeyPairs, motd: &str) -> Result<(Vec<u8>, Ses
         proto_cmd: framing::cmd::HANDSHAKE_RESPONSE,
         ..Default::default()
     };
-    let mut out = Vec::with_capacity(4 + sealed.len());
+    let mut out = Vec::with_capacity(framing::HEADER_LEN + sealed.len());
     out.extend_from_slice(&tx_headers.mask(header));
     out.extend_from_slice(&sealed);
 
@@ -398,6 +407,10 @@ pub fn accept(hello: Hello, pool: &KeyPairs, motd: &str) -> Result<(Vec<u8>, Ses
 
 #[cfg(test)]
 mod tests {
+
+    fn client_with_generated_keys(nk: u32) -> Client {
+        Client::with_key_pairs(KeyPairs::generate(), KeyPairs::generate(), nk)
+    }
     use super::*;
     use crate::datum::client::Client;
 
@@ -407,9 +420,6 @@ mod tests {
         open_hello(header, &wire[4..4 + header.cmd_len as usize], pool)
     }
 
-    /// A hello whose 17 pad bytes are nonzero. The gateway pads a hello with 1 to 200 bytes
-    /// of one random value (`datum_protocol.c`, `memset(&hello_msg[i], rand(), j)`); they are
-    /// not checked, so `open_hello` must read past whatever is there.
     #[test]
     fn hello_tail_bytes_are_ignored() {
         let pool = KeyPairs::generate();
@@ -450,7 +460,7 @@ mod tests {
     fn rejects_hello_sealed_to_another_pool() {
         let pool = KeyPairs::generate();
         let other = KeyPairs::generate();
-        let mut client = Client::new(7);
+        let mut client = client_with_generated_keys(7);
         let wire = client.hello(&other.box_pk, "v0.4.1-beta");
         assert!(matches!(server_read_hello(&wire, &pool), Err(Error::Unseal)));
     }
@@ -458,7 +468,7 @@ mod tests {
     #[test]
     fn rejects_hello_whose_sealed_bytes_are_altered() {
         let pool = KeyPairs::generate();
-        let mut client = Client::new(7);
+        let mut client = client_with_generated_keys(7);
         let mut bad = client.hello(&pool.box_pk, "v0.4.1-beta");
         let n = bad.len();
         bad[n - 1] ^= 0x01;

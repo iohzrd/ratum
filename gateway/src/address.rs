@@ -1,107 +1,132 @@
-//! Addresses to output scripts, as the C gateway's `addr_2_output_script`: bech32 version 0
-//! (20- or 32-byte program) and bech32m version 1 (32-byte program) under the `bc`, `tb` and
-//! `bcrt` prefixes, and base58check P2PKH (version 0 or 111) and P2SH (version 5 or 196). No
-//! network check: an address of any of these chains is accepted whatever chain the node is on.
-
 use bech32::Hrp;
+use ratum::bitcoin::opcode::{
+    OP_0, OP_1, OP_16, OP_CHECKSIG, OP_DUP, OP_EQUAL, OP_EQUALVERIFY, OP_HASH160, OP_N_BASE,
+    OP_RETURN,
+};
 
-/// The output script an address pays to, or `None` when it is not one of the accepted forms.
+const PUBKEY_ADDRESS_MAIN: u8 = 0;
+const PUBKEY_ADDRESS_TEST: u8 = 111;
+const SCRIPT_ADDRESS_MAIN: u8 = 5;
+const SCRIPT_ADDRESS_TEST: u8 = 196;
+
+const HASH160_SIZE: usize = 20;
+const BASE58_PAYLOAD_SIZE: usize = 1 + HASH160_SIZE;
+
+const P2PKH_SIZE: usize = 25;
+const P2PKH_HASH_AT: std::ops::Range<usize> = 3..3 + HASH160_SIZE;
+const P2SH_SIZE: usize = 23;
+const P2SH_HASH_AT: std::ops::Range<usize> = 2..2 + HASH160_SIZE;
+const WITNESS_V1_PROGRAM_SIZE: usize = 32;
+const WITNESS_V0_PROGRAM_SIZES: [usize; 2] = [HASH160_SIZE, WITNESS_V1_PROGRAM_SIZE];
+const WITNESS_PROGRAM_SIZES: std::ops::RangeInclusive<usize> = 2..=40;
+const WITNESS_SCRIPT_PREFIX_SIZE: usize = 2;
+
+const ADDRESS_CHARS: std::ops::Range<usize> = 16..128;
+
 pub fn to_output_script(addr: &str) -> Option<Vec<u8>> {
-    if addr.len() < 16 {
+    if !ADDRESS_CHARS.contains(&addr.len()) {
         return None;
     }
     let lower = addr.to_ascii_lowercase();
-    if lower.starts_with("bc") || lower.starts_with("tb") {
-        let hrp = if lower.starts_with('t') {
-            Hrp::parse("tb").ok()?
-        } else if lower.starts_with("bcrt1") {
-            Hrp::parse("bcrt").ok()?
-        } else {
-            Hrp::parse("bc").ok()?
-        };
+    if let Some(expected) = segwit_hrp(&lower) {
         let (found_hrp, version, program) = bech32::segwit::decode(addr).ok()?;
-        if found_hrp != hrp {
+        if found_hrp != Hrp::parse(expected).ok()? {
             return None;
         }
         let v = version.to_u8();
-        let ok = (v == 0 && (program.len() == 20 || program.len() == 32))
-            || (v == 1 && program.len() == 32);
+        let ok = (v == 0 && WITNESS_V0_PROGRAM_SIZES.contains(&program.len()))
+            || (v == 1 && program.len() == WITNESS_V1_PROGRAM_SIZE);
         if !ok {
             return None;
         }
-        let mut script = Vec::with_capacity(2 + program.len());
-        script.push(if v == 0 { 0x00 } else { 0x50 + v });
+        let mut script = Vec::with_capacity(WITNESS_SCRIPT_PREFIX_SIZE + program.len());
+        script.push(witness_version_opcode(v));
         script.push(program.len() as u8);
         script.extend_from_slice(&program);
         return Some(script);
     }
     let decoded = bs58::decode(addr).with_check(None).into_vec().ok()?;
-    if decoded.len() != 21 {
+    if decoded.len() != BASE58_PAYLOAD_SIZE {
         return None;
     }
     let (version, hash) = (decoded[0], &decoded[1..]);
     match version {
-        0 | 111 => {
-            let mut s = vec![0x76, 0xa9, 0x14];
+        PUBKEY_ADDRESS_MAIN | PUBKEY_ADDRESS_TEST => {
+            let mut s = vec![OP_DUP, OP_HASH160, HASH160_SIZE as u8];
             s.extend_from_slice(hash);
-            s.extend_from_slice(&[0x88, 0xac]);
+            s.extend_from_slice(&[OP_EQUALVERIFY, OP_CHECKSIG]);
             Some(s)
         }
-        5 | 196 => {
-            let mut s = vec![0xa9, 0x14];
+        SCRIPT_ADDRESS_MAIN | SCRIPT_ADDRESS_TEST => {
+            let mut s = vec![OP_HASH160, HASH160_SIZE as u8];
             s.extend_from_slice(hash);
-            s.push(0x87);
+            s.push(OP_EQUAL);
             Some(s)
         }
         _ => None,
     }
 }
 
+fn segwit_hrp(lower: &str) -> Option<&'static str> {
+    if lower.starts_with("bcrt1") {
+        Some("bcrt")
+    } else if lower.starts_with("tb1") {
+        Some("tb")
+    } else if lower.starts_with("bc1") {
+        Some("bc")
+    } else {
+        None
+    }
+}
+
+fn witness_version_opcode(version: u8) -> u8 {
+    if version == 0 { OP_0 } else { OP_N_BASE + version }
+}
+
 pub fn is_valid(addr: &str) -> bool {
     to_output_script(addr).is_some()
 }
 
-/// The address part of a stratum username: everything before the first `.` or `~`.
-pub fn username_address(username: &str) -> &str {
-    let end = username.find(['.', '~']).unwrap_or(username.len());
-    &username[..end]
-}
-
-/// Whether a username begins with an address a coinbase output can pay
-/// (`datum_stratum_username_is_payable`).
-pub fn username_is_payable(username: &str) -> bool {
-    let a = username_address(username);
-    !a.is_empty() && a.len() < 128 && is_valid(a)
-}
-
-/// The display form of an output script (`output_script_2_addr`): mainnet prefixes whatever
-/// the chain, `OP_RETURN` for a data output, `UNKNOWN` otherwise.
 pub fn output_script_to_display(script: &[u8]) -> String {
-    if script.first() == Some(&0x6a) {
+    if script.first() == Some(&OP_RETURN) {
         return "OP_RETURN".to_string();
     }
-    if script.len() == 23 && script[0] == 0xa9 && script[1] == 0x14 && script[22] == 0x87 {
-        let mut payload = vec![5u8];
-        payload.extend_from_slice(&script[2..22]);
-        return bs58::encode(payload).with_check().into_string();
+    if script.len() == P2SH_SIZE
+        && script[0] == OP_HASH160
+        && script[1] == HASH160_SIZE as u8
+        && script[P2SH_SIZE - 1] == OP_EQUAL
+    {
+        return base58check(SCRIPT_ADDRESS_MAIN, &script[P2SH_HASH_AT]);
     }
-    if script.len() == 25 && script[0] == 0x76 && script[1] == 0xa9 && script[2] == 0x14 {
-        let mut payload = vec![0u8];
-        payload.extend_from_slice(&script[3..23]);
-        return bs58::encode(payload).with_check().into_string();
+    if script.len() == P2PKH_SIZE
+        && script[0] == OP_DUP
+        && script[1] == OP_HASH160
+        && script[2] == HASH160_SIZE as u8
+    {
+        return base58check(PUBKEY_ADDRESS_MAIN, &script[P2PKH_HASH_AT]);
     }
-    if script.len() >= 4 && (script[0] == 0x00 || (0x51..=0x60).contains(&script[0])) {
-        let version = if script[0] == 0x00 { 0 } else { script[0] - 0x50 };
+    let shortest_witness = WITNESS_SCRIPT_PREFIX_SIZE + WITNESS_PROGRAM_SIZES.start();
+    if script.len() >= shortest_witness
+        && (script[0] == OP_0 || (OP_1..=OP_16).contains(&script[0]))
+    {
+        let version = if script[0] == OP_0 { 0 } else { script[0] - OP_N_BASE };
         let len = script[1] as usize;
-        if (2..=40).contains(&len)
-            && script.len() == 2 + len
+        if WITNESS_PROGRAM_SIZES.contains(&len)
+            && script.len() == WITNESS_SCRIPT_PREFIX_SIZE + len
             && let (Ok(hrp), Ok(v)) = (Hrp::parse("bc"), bech32::Fe32::try_from(version))
-            && let Ok(s) = bech32::segwit::encode(hrp, v, &script[2..])
+            && let Ok(s) = bech32::segwit::encode(hrp, v, &script[WITNESS_SCRIPT_PREFIX_SIZE..])
         {
             return s;
         }
     }
     "UNKNOWN".to_string()
+}
+
+fn base58check(version: u8, hash: &[u8]) -> String {
+    let mut payload = Vec::with_capacity(BASE58_PAYLOAD_SIZE);
+    payload.push(version);
+    payload.extend_from_slice(hash);
+    bs58::encode(payload).with_check().into_string()
 }
 
 #[cfg(test)]
@@ -134,18 +159,7 @@ mod tests {
         assert!(!is_valid("lazyminer"));
         assert!(!is_valid(""));
         assert!(!is_valid("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t5"));
-        // A witness version above 1.
         assert!(!is_valid("bc1zw508d6qejxtdg4y5r3zarvaryvaxxpcs"));
-    }
-
-    #[test]
-    fn username_forms() {
-        assert!(username_is_payable("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"));
-        assert!(username_is_payable("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4.worker"));
-        assert!(username_is_payable("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4~mod"));
-        assert!(!username_is_payable("lazyminer.worker"));
-        assert!(!username_is_payable(".worker"));
-        assert_eq!(username_address("a.b~c"), "a");
     }
 
     #[test]

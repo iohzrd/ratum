@@ -1,68 +1,38 @@
-//! Anti-block-withholding (version 3 protocol). The pool chooses a 16-byte XOR key per
-//! assignment and discloses only its commitment; the mask derived from the key masks every
-//! PoW hash below the top `32 + PoT` bits, so neither hasher nor gateway can distinguish a
-//! block from an ordinary share until the pool reveals the key. The five subcommands here carry
-//! the assignment lifecycle; the key and mask arithmetic itself lives in
-//! [`crate::header`] (`xor_mask`, the `xor_key_hash` tag), because it is also consensus.
-
 use super::framing::STRUCT_END;
 use crate::cursor::Cursor;
-use crate::header::tagged_sha256;
+use bytes::BufMut as _;
 
-/// `DATUM_ABW_DRAFT_REVISION`: every payload's first byte after the subcommand.
 pub const DRAFT_REVISION: u8 = 0;
-/// `DATUM_ABW_ASSIGNMENT_SLOTS`: slots are 0..15 in the serialized message; the C gateway stores slot+1
-/// internally so 0 can mean unset.
 pub const ASSIGNMENT_SLOTS: u8 = 16;
-/// `DATUM_ABW_SHARE_TARGET_BASE_BITS`: the clear-bits floor, matching the 32 zero bits a
-/// difficulty-1 share requires.
 pub const SHARE_TARGET_BASE_BITS: u8 = 32;
 
+pub type XorKey = crate::header::U128;
+pub type SlotKeys = [Option<XorKey>; ASSIGNMENT_SLOTS as usize];
+
 pub mod subcmd {
-    /// Pool handled this candidate (slot + raw hash).
     pub const CANDIDATE_RECEIPT: u8 = 0xA5;
-    /// Make a seeded slot the active assignment.
     pub const ACTIVATION: u8 = 0xA6;
-    /// The gateway may discard this candidate (does nothing under the default gateway
-    /// config, which retains every proof until the reveal).
     pub const CANDIDATE_RELEASE: u8 = 0xA7;
-    /// Install a key-hash commitment into a slot, optionally activating it.
     pub const ASSIGNMENT_NOTICE: u8 = 0xA8;
-    /// Disclose a slot's XOR key.
     pub const REVEAL: u8 = 0xA9;
 }
 
-/// `datum_blake2b_abw_clear_bits`: how many leading mask bits an assignment clears for a
-/// share of PoT exponent `target_pot`. Exactly the bits the share check inspects, so share
-/// validity is verifiable without the key and block validity is not.
 pub fn clear_bits(target_pot: u8) -> u8 {
-    (u32::from(SHARE_TARGET_BASE_BITS) + u32::from(target_pot)).min(255) as u8
+    (u32::from(SHARE_TARGET_BASE_BITS) + u32::from(target_pot)).min(u32::from(u8::MAX)) as u8
 }
 
-/// The commitment to an XOR key that H1 carries and the assignment notice delivers.
-pub fn xor_key_hash(xor_key: &[u8; 16]) -> [u8; 32] {
-    tagged_sha256("Bitcoin block hash PoW XOR key", xor_key)
-}
+pub use crate::header::xor_key_hash;
 
-pub fn key_matches_hash(xor_key: &[u8; 16], hash: &[u8; 32]) -> bool {
-    // Not secret data on this side: the commitment is public once sent.
+pub fn key_matches_hash(xor_key: &XorKey, hash: &[u8; 32]) -> bool {
     xor_key_hash(xor_key) == *hash
 }
 
-/// A random 16-byte XOR key from the CSPRNG, for the pool to seed an assignment with.
-pub fn random_key() -> [u8; 16] {
-    let mut key = [0u8; 16];
-    dryoc::rng::copy_randombytes(&mut key);
-    key
+pub fn random_key() -> XorKey {
+    crate::rand::bytes()
 }
 
-/// The raw PoW hash in the byte order the C gateway retains a proof under and matches an
-/// 0xA5 receipt and the 0x8F exact reference against: `datum_blake2b_pow_hash_le`, the
-/// BLAKE2b output reversed. `HashComponents::hash2` is the BLAKE2b output order.
 pub fn raw_hash_le(hash2: &[u8; 32]) -> [u8; 32] {
-    let mut le = *hash2;
-    le.reverse();
-    le
+    crate::bitcoin::reversed(hash2)
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -81,12 +51,10 @@ pub enum Error {
 
 impl From<crate::cursor::Truncated> for Error {
     fn from(t: crate::cursor::Truncated) -> Self {
-        Error::Truncated(t.0)
+        Self::Truncated(t.0)
     }
 }
 
-/// 0xA8: `A8 00 <flags> <slot> <key_hash 32> FE`. `active` is flag bit 0; the C gateway
-/// rejects any other flag bit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AssignmentNotice {
     pub active: bool,
@@ -94,24 +62,32 @@ pub struct AssignmentNotice {
     pub key_hash: [u8; 32],
 }
 
-/// 0xA6: `A6 00 <slot> FE`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Activation {
     pub slot: u8,
 }
 
-/// 0xA5 and 0xA7 share one layout: `Ax 00 <slot> <raw_pow_hash 32> FE`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Candidate {
     pub slot: u8,
     pub raw_pow_hash: [u8; 32],
 }
 
-/// 0xA9: `A9 00 <slot> <xor_key 16> FE`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Reveal {
     pub slot: u8,
-    pub xor_key: [u8; 16],
+    pub xor_key: XorKey,
+}
+
+const MAX_FRAME_LEN: usize = 2 + 1 + 32 + 1;
+
+fn frame(subcmd: u8, body: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
+    let mut out = Vec::with_capacity(MAX_FRAME_LEN);
+    out.put_u8(subcmd);
+    out.put_u8(DRAFT_REVISION);
+    body(&mut out);
+    out.put_u8(STRUCT_END);
+    out
 }
 
 fn open(data: &[u8], subcmd: u8) -> Result<Cursor<'_>, Error> {
@@ -131,8 +107,6 @@ fn slot_checked(slot: u8) -> Result<u8, Error> {
     Ok(slot)
 }
 
-/// The C handlers check exact lengths, so decoding requires the terminator to be the last
-/// byte.
 fn close(c: &mut Cursor<'_>) -> Result<(), Error> {
     if c.u8("terminator")? != STRUCT_END || !c.at_end() {
         return Err(Error::BadShape);
@@ -142,14 +116,11 @@ fn close(c: &mut Cursor<'_>) -> Result<(), Error> {
 
 impl AssignmentNotice {
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(37);
-        out.push(subcmd::ASSIGNMENT_NOTICE);
-        out.push(DRAFT_REVISION);
-        out.push(self.active as u8);
-        out.push(self.slot);
-        out.extend_from_slice(&self.key_hash);
-        out.push(STRUCT_END);
-        out
+        frame(subcmd::ASSIGNMENT_NOTICE, |out| {
+            out.put_u8(u8::from(self.active));
+            out.put_u8(self.slot);
+            out.put_slice(&self.key_hash);
+        })
     }
 
     pub fn decode(data: &[u8]) -> Result<Self, Error> {
@@ -161,33 +132,30 @@ impl AssignmentNotice {
         let slot = slot_checked(c.u8("slot")?)?;
         let key_hash: [u8; 32] = c.arr("key hash")?;
         close(&mut c)?;
-        Ok(AssignmentNotice { active: flags & 0x01 != 0, slot, key_hash })
+        Ok(Self { active: flags & 0x01 != 0, slot, key_hash })
     }
 }
 
 impl Activation {
     pub fn encode(&self) -> Vec<u8> {
-        vec![subcmd::ACTIVATION, DRAFT_REVISION, self.slot, STRUCT_END]
+        frame(subcmd::ACTIVATION, |out| out.put_u8(self.slot))
     }
 
     pub fn decode(data: &[u8]) -> Result<Self, Error> {
         let mut c = open(data, subcmd::ACTIVATION)?;
         let slot = slot_checked(c.u8("slot")?)?;
         close(&mut c)?;
-        Ok(Activation { slot })
+        Ok(Self { slot })
     }
 }
 
 impl Candidate {
     pub fn encode(&self, subcmd: u8) -> Vec<u8> {
         debug_assert!(matches!(subcmd, subcmd::CANDIDATE_RECEIPT | subcmd::CANDIDATE_RELEASE));
-        let mut out = Vec::with_capacity(36);
-        out.push(subcmd);
-        out.push(DRAFT_REVISION);
-        out.push(self.slot);
-        out.extend_from_slice(&self.raw_pow_hash);
-        out.push(STRUCT_END);
-        out
+        frame(subcmd, |out| {
+            out.put_u8(self.slot);
+            out.put_slice(&self.raw_pow_hash);
+        })
     }
 
     pub fn decode(data: &[u8], subcmd: u8) -> Result<Self, Error> {
@@ -195,27 +163,24 @@ impl Candidate {
         let slot = slot_checked(c.u8("slot")?)?;
         let raw_pow_hash: [u8; 32] = c.arr("raw pow hash")?;
         close(&mut c)?;
-        Ok(Candidate { slot, raw_pow_hash })
+        Ok(Self { slot, raw_pow_hash })
     }
 }
 
 impl Reveal {
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(20);
-        out.push(subcmd::REVEAL);
-        out.push(DRAFT_REVISION);
-        out.push(self.slot);
-        out.extend_from_slice(&self.xor_key);
-        out.push(STRUCT_END);
-        out
+        frame(subcmd::REVEAL, |out| {
+            out.put_u8(self.slot);
+            out.put_slice(&self.xor_key);
+        })
     }
 
     pub fn decode(data: &[u8]) -> Result<Self, Error> {
         let mut c = open(data, subcmd::REVEAL)?;
         let slot = slot_checked(c.u8("slot")?)?;
-        let xor_key: [u8; 16] = c.arr("xor key")?;
+        let xor_key: XorKey = c.arr("xor key")?;
         close(&mut c)?;
-        Ok(Reveal { slot, xor_key })
+        Ok(Self { slot, xor_key })
     }
 }
 
@@ -234,14 +199,12 @@ mod tests {
 
     #[test]
     fn key_hash_matches_the_header_commitment_path() {
-        // The C test proves header_commitment(key) == header_commitment_from_key_hash(hash);
-        // here the same key hash must be what a HeaderV2 carrying the key commits to.
         let mut key = [0u8; 16];
         for (i, b) in key.iter_mut().enumerate() {
             *b = i as u8 + 1;
         }
         let h = HeaderV2 { xor_key: key, ..Default::default() };
-        assert_eq!(h.precompute().xor_key_hash, xor_key_hash(&key));
+        assert_eq!(h.precompute(), h.precompute_with_key_hash(xor_key_hash(&key)));
         assert!(key_matches_hash(&key, &xor_key_hash(&key)));
         let mut wrong = xor_key_hash(&key);
         wrong[0] ^= 1;
@@ -252,19 +215,14 @@ mod tests {
     fn the_mask_leaves_exactly_the_share_bits_clear() {
         let key = [0x5au8; 16];
         let m = xor_mask(&key, clear_bits(10));
-        // 42 bits: five whole bytes and two bits of the sixth.
         assert!(m[..5].iter().all(|&b| b == 0));
         assert_eq!(m[5] & 0xC0, 0);
         assert!(m[6..].iter().any(|&b| b != 0));
-        // The all-zero key means no mask, matching the pre-ABW behavior.
         assert_eq!(xor_mask(&[0u8; 16], 0), [0u8; 32]);
     }
 
     #[test]
     fn the_pool_and_a_commitment_only_gateway_compute_the_same_raw_hash() {
-        // The pool holds the key; the gateway holds only its commitment. Both must arrive at
-        // the same unmasked hash (H2 depends on the key hash through H1), and the masked
-        // result must equal the raw hash on the top 32+PoT bits the share check reads.
         let key = {
             let mut k = [0u8; 16];
             for (i, b) in k.iter_mut().enumerate() {
@@ -275,7 +233,6 @@ mod tests {
         let pot = 10u8;
         let cb = clear_bits(pot);
 
-        // The pool's header carries the real key and clear bits.
         let mut pool = HeaderV2 {
             version: 0x2000_0000,
             merkle_root: [0x33; 32],
@@ -290,25 +247,19 @@ mod tests {
             ..Default::default()
         };
         pool.prev_block = [0x22; 32];
-        let pool_hc = pool.hash_components();
+        let (pool_pow, pool_block) = pool.pow_and_block_hash();
 
-        // The gateway builds the same header but with no key, committing to the hash instead.
         let mut gw = pool.clone();
         gw.xor_key = [0u8; 16];
         let gw_pre = gw.precompute_with_key_hash(xor_key_hash(&key));
 
-        // The gateway's ASIC input and hash2 (the raw hash) match the pool's, without the key.
         let gw_asic = gw.asic_input_with(&gw_pre.hash1, &gw_pre.h2);
         let gw_raw = crate::header::blake2b_256(&gw_asic);
-        assert_eq!(gw_raw, pool_hc.hash2, "raw hash must not depend on holding the key");
+        assert_eq!(gw_raw, pool_pow, "raw hash must not depend on holding the key");
 
-        // The masked result (what consensus compares) equals the raw hash on the top
-        // 42 bits, the ones the share check at PoT 10 inspects.
         let cleared_bytes = (cb / 8) as usize;
-        assert_eq!(&pool_hc.result[..cleared_bytes], &pool_hc.hash2[..cleared_bytes]);
-        // Below the cleared prefix the mask is nonzero, so a block is indistinguishable from a
-        // share without the key.
-        assert!(pool_hc.result[cleared_bytes..] != pool_hc.hash2[cleared_bytes..]);
+        assert_eq!(&pool_block[..cleared_bytes], &pool_pow[..cleared_bytes]);
+        assert!(pool_block[cleared_bytes..] != pool_pow[cleared_bytes..]);
     }
 
     #[test]
@@ -367,7 +318,6 @@ mod tests {
         let mut bad = good;
         bad.push(0x00);
         assert!(matches!(AssignmentNotice::decode(&bad), Err(Error::BadShape)));
-        // The C reveal test overwrites the terminator with 0.
         let mut bad = Reveal { slot: 3, xor_key: [2; 16] }.encode();
         bad[19] = 0;
         assert!(matches!(Reveal::decode(&bad), Err(Error::BadShape)));

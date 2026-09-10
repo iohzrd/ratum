@@ -1,8 +1,3 @@
-//! Fixtures the crate's unit tests and the integration harness share: the coinbase a
-//! gateway would build, in the tagging layout the pool's `ratum_prime::verify` checks. The unit tests and
-//! the integration tests must use that layout byte for byte, so it is written once here
-//! rather than once per test tree. The pool binary does not use this module.
-
 use crate::bitcoin::{encode_compact_size, encode_output, encode_push};
 use crate::datum::messages::CoinbaseOutput;
 use crate::datum::share::{self, CoinbaseSection};
@@ -21,20 +16,12 @@ pub fn out(value: u64, script: &[u8]) -> Vec<u8> {
     encode_output(value, script)
 }
 
-/// How the coinbase identifies the pool: the tag push the pool searches for, then the 7-byte
-/// push whose last four bytes are its prime id. The PoT (power-of-two difficulty) byte is the
-/// first byte of that 7-byte push.
 pub struct Tagging<'a> {
     pub tag: &'a str,
-    /// The gateway operator's own tag, written after the pool's tag and a 0x0f marker;
-    /// empty writes no marker. The layout is `coinbase::script_sig` in the gateway crate.
     pub tag_secondary: &'a str,
     pub prime_id: u32,
 }
 
-/// A coinbase split in two around the extranonce: it pays `outputs`, then the remainder
-/// to `payout_script`, then a zero-value witness commitment. Returns the section and the
-/// index of the PoT byte in the assembled transaction.
 pub fn coinbase(
     tagging: &Tagging<'_>,
     payout_script: &[u8],
@@ -42,8 +29,6 @@ pub fn coinbase(
     coinbase_value: u64,
 ) -> (CoinbaseSection, usize) {
     let mut script = push(&[0x0c, 0xd2, 0x26]);
-    // The tag push, in the gateway's layout: the primary tag, then 0x00 when it is the only
-    // tag or 0x0f followed by the secondary tag and 0x00 when one follows.
     let (tag0, tag1) = (tagging.tag.as_bytes(), tagging.tag_secondary.as_bytes());
     let mut tag = Vec::with_capacity(tag0.len() + tag1.len() + 2);
     if !tag0.is_empty() {
@@ -60,14 +45,10 @@ pub fn coinbase(
         tag.push(0x00);
     }
     script.extend_from_slice(&push(&tag));
-    // The uid push (`generate_coinbase_uid_tag`): the PoT placeholder 0xFF, the 2-byte
-    // `coinbase_unique_id` little-endian (0x1234 here; the gateway default is 4242), then the
-    // prime id.
     let mut uid = vec![0xff, 0x34, 0x12];
     uid.extend_from_slice(&tagging.prime_id.to_le_bytes());
     script.extend_from_slice(&push(&uid));
     let pot_in_script = script.len() - 7;
-    // PUSH 14: the 2-byte enprefix, then the 12-byte extranonce the assembler inserts.
     script.push(0x0e);
     script.extend_from_slice(&[0xab, 0xcd]);
 

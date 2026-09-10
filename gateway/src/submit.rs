@@ -1,14 +1,39 @@
-//! Block assembly and `submitblock`: to the local node, then to any extra node configured,
-//! with `preciousblock` after each.
-
 use crate::job::{COINBASE_SUBSIDY_ONLY, Job};
-use log::{debug, info, warn};
+use crate::stratum::Server;
+use log::{debug, error, info, warn};
 use ratum::rpc;
+use std::sync::Arc;
 
-/// The serialized block a share names: the header, the transaction count, the coinbase
-/// (without witness; the node adds the witness nonce in `submitblock`), then the template's
-/// transactions unless the work was subsidy-only.
-pub fn assemble(job: &Job, coinbase_id: u8, pot: u8, header: &[u8; 164]) -> Option<Vec<u8>> {
+pub fn found_block(
+    server: &Server,
+    job: &Job,
+    coinbase_id: u8,
+    pot: u8,
+    header: &[u8; ratum::header::HEADER_V2_SIZE],
+    hash_hex: &str,
+) {
+    let Some(block) = assemble(job, coinbase_id, pot, header) else {
+        error!("could not assemble the block for {hash_hex}");
+        return;
+    };
+    debug!("Block Payload: {}", hex::encode(&block));
+    let block = Arc::new(block);
+    spawn_redundant(server, Arc::clone(&block), hash_hex);
+    let dir = &server.config.mining.save_submitblocks_dir;
+    if !dir.is_empty() {
+        save_to_dir(dir, hash_hex, &block);
+    }
+    if submit_to(&server.node, "upstream node", &block, hash_hex) {
+        server.notify.raise_for(hash_hex);
+    }
+}
+
+fn assemble(
+    job: &Job,
+    coinbase_id: u8,
+    pot: u8,
+    header: &[u8; ratum::header::HEADER_V2_SIZE],
+) -> Option<Vec<u8>> {
     let coinbase = job.full_coinbase(coinbase_id, pot)?;
     let empty = coinbase_id == COINBASE_SUBSIDY_ONLY;
     let others: Vec<Vec<u8>> =
@@ -16,15 +41,12 @@ pub fn assemble(job: &Job, coinbase_id: u8, pot: u8, header: &[u8; 164]) -> Opti
     Some(ratum::bitcoin::serialize_block(header, &coinbase, &others))
 }
 
-/// Submit to one node; `true` when the node accepted it.
-pub fn submit_to(node: &rpc::Client, what: &str, block: &[u8], hash_hex: &str) -> bool {
+fn submit_to(node: &rpc::Client, what: &str, block: &[u8], hash_hex: &str) -> bool {
     let accepted = match node.submit_block(block) {
         Ok(None) => {
             info!("Block {hash_hex} submitted to {what} successfully!");
             true
         }
-        // "duplicate" is the node's response to the second of two submissions of one block
-        // (the C gateway's submitblock thread and its inline call overlap the same way).
         Ok(Some(reason)) if reason == "duplicate" => {
             info!("Block {hash_hex} already known to {what}");
             true
@@ -45,17 +67,10 @@ pub fn submit_to(node: &rpc::Client, what: &str, block: &[u8], hash_hex: &str) -
     accepted
 }
 
-/// The C gateway's submitblock thread: submit to the node again on its own connection, then
-/// to every extra node, without holding up the stratum thread that found the block. The
-/// template thread is notified when the node accepts it.
-pub fn submit_redundant(
-    node: rpc::Client,
-    extras: Vec<rpc::Client>,
-    block: std::sync::Arc<Vec<u8>>,
-    hash_hex: String,
-    notify: std::sync::Arc<crate::template::Notify>,
-) {
-    let spawned = std::thread::Builder::new().name("submitblock".into()).spawn(move || {
+fn spawn_redundant(server: &Server, block: Arc<Vec<u8>>, hash_hex: &str) {
+    let (node, extras) = (server.node.clone(), server.extra_nodes.clone());
+    let (notify, hash_hex) = (Arc::clone(&server.notify), hash_hex.to_string());
+    let spawned = ratum::thread::try_spawn("submitblock", move || {
         if submit_to(&node, "upstream node (redundant)", &block, &hash_hex) {
             notify.raise_for(&hash_hex);
         }
@@ -68,8 +83,6 @@ pub fn submit_redundant(
     }
 }
 
-/// A client for an extra submission URL: `http://host[:port]` or `https://host[:port]`,
-/// optionally with `user:pass@` before the host, the forms the C gateway hands to curl.
 pub fn extra_client(url: &str) -> Option<rpc::Client> {
     let (scheme, rest) = url.split_once("://")?;
     if scheme != "http" && scheme != "https" {
@@ -82,24 +95,26 @@ pub fn extra_client(url: &str) -> Option<rpc::Client> {
         }
         None => ("", "", rest),
     };
-    // Without a port, the scheme's, as curl applies for the C gateway.
-    let (authority, path) = host.split_once('/').map_or((host, ""), |(a, p)| (a, p));
+    let (authority, path) = match host.split_once('/') {
+        Some((authority, path)) => (authority, format!("/{path}")),
+        None => (host, String::new()),
+    };
     if authority.is_empty() {
         return None;
     }
     let has_port = authority.rsplit_once(']').map_or(authority, |(_, after)| after).contains(':');
-    let port = if has_port {
-        String::new()
-    } else if scheme == "https" {
-        ":443".to_string()
-    } else {
-        ":80".to_string()
+    let port = match (has_port, scheme) {
+        (true, _) => String::new(),
+        (false, "https") => format!(":{HTTPS_PORT}"),
+        (false, _) => format!(":{HTTP_PORT}"),
     };
-    let slash = if path.is_empty() && !host.contains('/') { "" } else { "/" };
-    rpc::Client::new(&format!("{scheme}://{authority}{port}{slash}{path}"), user, pass).ok()
+    rpc::Client::new(&format!("{scheme}://{authority}{port}{path}"), user, pass).ok()
 }
 
-pub fn save_to_dir(dir: &str, hash_hex: &str, block: &[u8]) {
+const HTTP_PORT: u16 = 80;
+const HTTPS_PORT: u16 = 443;
+
+fn save_to_dir(dir: &str, hash_hex: &str, block: &[u8]) {
     let path = format!("{dir}/datum_submitblock_{hash_hex}.json");
     let body = serde_json::json!({
         "jsonrpc": "1.0", "id": hash_hex, "method": "submitblock", "params": [hex::encode(block)]

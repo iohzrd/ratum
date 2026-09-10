@@ -1,22 +1,31 @@
-/// The largest value the header's 22-bit length field can hold.
-pub const MAX_CMD_LEN: u32 = (1 << 22) - 1;
-/// The gateway's `DATUM_PROTOCOL_MAX_CMD_DATA_SIZE`, one larger than the largest length the
-/// 22-bit field holds.
-pub const MAX_CMD_DATA_SIZE: u32 = 1 << 22;
+pub const HEADER_LEN: usize = size_of::<u32>();
+
+const CMD_LEN_BITS: u32 = 22;
+pub const MAX_CMD_LEN: u32 = (1 << CMD_LEN_BITS) - 1;
+pub const MAX_CMD_DATA_SIZE: u32 = 1 << CMD_LEN_BITS;
 pub const INITIAL_HELLO_KEY: u32 = 0xDC87_1829;
 pub const NONCE_LEN: usize = 24;
-/// The byte the gateway writes as a structure terminator. In the hello it follows the user
-/// agent's NUL and precedes `nk` and the pad; in the config it follows a 0x00.
+const WORD: usize = size_of::<u32>();
+const NONCE_SEED_AT: usize = 7;
+const NONCE_STEP: u32 = 42;
+const SENDER_MASK: u32 = 0x5757_5757;
 pub const STRUCT_END: u8 = 0xFE;
 
 pub mod cmd {
     pub const HELLO_OR_PING: u8 = 1;
     pub const HANDSHAKE_RESPONSE: u8 = 2;
     pub const MINING: u8 = 5;
-    /// Bulk framing (version 3 protocol): DBF fragments client to server, DBA acks back.
     pub const BULK: u8 = 6;
     pub const INFO: u8 = 7;
 }
+
+const RESERVED_SHIFT: u32 = CMD_LEN_BITS;
+const RESERVED_MASK: u32 = 0x3;
+const SIGNED_BIT: u32 = 24;
+const ENCRYPTED_PUBKEY_BIT: u32 = 25;
+const ENCRYPTED_CHANNEL_BIT: u32 = 26;
+const PROTO_CMD_SHIFT: u32 = 27;
+const PROTO_CMD_MASK: u32 = 0x1f;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Header {
@@ -29,25 +38,25 @@ pub struct Header {
 }
 
 impl Header {
-    pub fn to_bytes(self) -> [u8; 4] {
+    pub fn to_bytes(self) -> [u8; HEADER_LEN] {
         let v = (self.cmd_len & MAX_CMD_LEN)
-            | ((self.reserved as u32 & 0x3) << 22)
-            | ((self.is_signed as u32) << 24)
-            | ((self.is_encrypted_pubkey as u32) << 25)
-            | ((self.is_encrypted_channel as u32) << 26)
-            | ((self.proto_cmd as u32 & 0x1f) << 27);
+            | ((u32::from(self.reserved) & RESERVED_MASK) << RESERVED_SHIFT)
+            | (u32::from(self.is_signed) << SIGNED_BIT)
+            | (u32::from(self.is_encrypted_pubkey) << ENCRYPTED_PUBKEY_BIT)
+            | (u32::from(self.is_encrypted_channel) << ENCRYPTED_CHANNEL_BIT)
+            | ((u32::from(self.proto_cmd) & PROTO_CMD_MASK) << PROTO_CMD_SHIFT);
         v.to_le_bytes()
     }
 
-    pub fn from_bytes(b: [u8; 4]) -> Self {
+    pub fn from_bytes(b: [u8; HEADER_LEN]) -> Self {
         let v = u32::from_le_bytes(b);
-        Header {
+        Self {
             cmd_len: v & MAX_CMD_LEN,
-            reserved: ((v >> 22) & 0x3) as u8,
-            is_signed: v & (1 << 24) != 0,
-            is_encrypted_pubkey: v & (1 << 25) != 0,
-            is_encrypted_channel: v & (1 << 26) != 0,
-            proto_cmd: ((v >> 27) & 0x1f) as u8,
+            reserved: ((v >> RESERVED_SHIFT) & RESERVED_MASK) as u8,
+            is_signed: v & (1 << SIGNED_BIT) != 0,
+            is_encrypted_pubkey: v & (1 << ENCRYPTED_PUBKEY_BIT) != 0,
+            is_encrypted_channel: v & (1 << ENCRYPTED_CHANNEL_BIT) != 0,
+            proto_cmd: ((v >> PROTO_CMD_SHIFT) & PROTO_CMD_MASK) as u8,
         }
     }
 }
@@ -70,8 +79,6 @@ pub fn feedback(i: u32) -> u32 {
     h
 }
 
-/// The gateway's "header feedback" XOR key for frame headers: `datum_header_xor_feedback`
-/// advances it once per frame and `datum_xor_header_key` applies it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KeyRatchet {
     key: u32,
@@ -79,25 +86,20 @@ pub struct KeyRatchet {
 
 impl KeyRatchet {
     pub fn new(key: u32) -> Self {
-        KeyRatchet { key }
+        Self { key }
     }
 
     pub fn hello() -> Self {
-        KeyRatchet::new(INITIAL_HELLO_KEY)
+        Self::new(INITIAL_HELLO_KEY)
     }
 
-    pub fn key(self) -> u32 {
-        self.key
-    }
-
-    /// XOR the header with the current key, then advance the key.
-    pub fn mask(&mut self, h: Header) -> [u8; 4] {
+    pub fn mask(&mut self, h: Header) -> [u8; HEADER_LEN] {
         let v = u32::from_le_bytes(h.to_bytes()) ^ self.key;
         self.key = feedback(self.key);
         v.to_le_bytes()
     }
 
-    pub fn unmask(&mut self, b: [u8; 4]) -> Header {
+    pub fn unmask(&mut self, b: [u8; HEADER_LEN]) -> Header {
         let v = u32::from_le_bytes(b) ^ self.key;
         self.key = feedback(self.key);
         Header::from_bytes(v.to_le_bytes())
@@ -111,10 +113,8 @@ pub struct HeaderKeys {
 }
 
 impl HeaderKeys {
-    /// The gateway's sending and receiving keys, named here by absolute direction
-    /// (`datum_protocol.c`, where they are set from `nk` and `~nk`).
     pub fn from_nk(nk: u32) -> Self {
-        HeaderKeys { client_to_server: feedback(nk), server_to_client: feedback(!nk) }
+        Self { client_to_server: feedback(nk), server_to_client: feedback(!nk) }
     }
 }
 
@@ -125,30 +125,28 @@ pub struct SessionNonces {
 }
 
 impl SessionNonces {
-    /// The offsets and the 42 are the gateway's, transcribed rather than derived; the
-    /// `session_nonces_match_c` test below checks this loop against the C-derived vectors.
     pub fn derive(nk: u32, session_pk_ed25519: &[u8; 32]) -> Self {
         let mut receiver = [0u8; NONCE_LEN];
         let mut sender = [0u8; NONCE_LEN];
-        let mut n = nk.wrapping_sub(42);
-        n ^= u32::from_le_bytes(session_pk_ed25519[7..11].try_into().unwrap());
-        for j in (0..NONCE_LEN).step_by(4) {
-            let r = feedback(n.wrapping_sub(42));
-            receiver[j..j + 4].copy_from_slice(&r.to_le_bytes());
-            sender[j..j + 4].copy_from_slice(&(r ^ 0x5757_5757).to_le_bytes());
+        let seed: [u8; WORD] =
+            session_pk_ed25519[NONCE_SEED_AT..NONCE_SEED_AT + WORD].try_into().expect("WORD bytes");
+        let mut n = nk.wrapping_sub(NONCE_STEP) ^ u32::from_le_bytes(seed);
+        let sender_words = sender.as_chunks_mut::<WORD>().0.iter_mut();
+        for (rx, tx) in receiver.as_chunks_mut::<WORD>().0.iter_mut().zip(sender_words) {
+            let r = feedback(n.wrapping_sub(NONCE_STEP));
+            *rx = r.to_le_bytes();
+            *tx = (r ^ SENDER_MASK).to_le_bytes();
             n = !r;
         }
-        SessionNonces { client_receiver: receiver, client_sender: sender }
+        Self { client_receiver: receiver, client_sender: sender }
     }
 }
 
-/// Counts up in 32-bit words, least significant word first, carrying only when one wraps to
-/// zero; this matches the gateway's host-order `uint32_t` increment on little-endian hosts.
 pub fn increment_nonce(nonce: &mut [u8; NONCE_LEN]) {
-    for j in (0..NONCE_LEN).step_by(4) {
-        let w = u32::from_le_bytes(nonce[j..j + 4].try_into().unwrap()).wrapping_add(1);
-        nonce[j..j + 4].copy_from_slice(&w.to_le_bytes());
-        if w != 0 {
+    for word in nonce.as_chunks_mut::<WORD>().0 {
+        let raised = u32::from_le_bytes(*word).wrapping_add(1);
+        *word = raised.to_le_bytes();
+        if raised != 0 {
             return;
         }
     }
@@ -288,6 +286,7 @@ mod tests {
             };
             assert_eq!(rx.unmask(tx.mask(h)), h);
         }
-        assert_eq!(tx.key(), rx.key());
+        let last = Header { cmd_len: 4095, proto_cmd: 31, ..Default::default() };
+        assert_eq!(rx.unmask(tx.mask(last)), last);
     }
 }

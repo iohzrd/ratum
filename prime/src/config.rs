@@ -1,83 +1,40 @@
-//! The pool's configuration file: settings whose names are the command line's without their
-//! leading dashes, so there is one vocabulary rather than two.
-//!
-//! ```toml
-//! # the node this pool watches and relays to
-//! rpc = "http://127.0.0.1:8332"
-//! rpc-user = "ratum"
-//!
-//! # the smallest share difficulty credited, a power of two
-//! min-diff = 16384
-//! motd = "RATUM Prime"
-//! ```
-//!
-//! TOML because this is a Rust program, and because settings that determine where money goes
-//! need comments beside them.
-//!
-//! The settings are typed, so a `min-diff` of `"soon"` is refused at the line it is on
-//! rather than several steps later, and an unknown name is refused with the list of known
-//! ones. The command line is parsed separately (by clap); a setting given in both places
-//! takes the command line's value, and `main` applies each default and validates each meaning.
-
-/// Declares the file's settings once. Each field is optional so its absence in the file is
-/// distinguishable from its default, which lets the command line override it. The kebab-case
-/// names match the command-line flags, so there is one vocabulary rather than two.
-macro_rules! settings {
-    ($($(#[$doc:meta])* $name:ident : $ty:ty),* $(,)?) => {
-        #[derive(Debug, Default, PartialEq, serde::Deserialize)]
-        #[serde(deny_unknown_fields, rename_all = "kebab-case")]
-        pub struct Config {
-            $($(#[$doc])* pub $name: Option<$ty>,)*
-        }
-
-        impl Config {
-            /// Whether the file holds a secret, and so whether its permissions matter.
-            pub fn holds_a_secret(&self) -> bool {
-                self.rpc_pass.is_some()
-            }
-
-            /// The command-line flag each setting stands for, `--kebab-name`. The clap parser
-            /// must accept every one, or a setting written in a file has no way to be given on
-            /// the command line; the `pool_cli` test `every_file_setting_is_a_clap_flag` walks
-            /// this list and checks that.
-            pub fn flags() -> Vec<String> {
-                vec![$(format!("--{}", stringify!($name).replace('_', "-")),)*]
-            }
-        }
-    };
+#[derive(Debug, Default, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Config {
+    pub listen: Option<String>,
+    pub stats_listen: Option<String>,
+    pub advertise_address: Option<String>,
+    pub public_gateway: Option<String>,
+    pub data_dir: Option<String>,
+    pub key: Option<String>,
+    pub motd: Option<String>,
+    pub allow_agent: Option<String>,
+    pub require_split: Option<bool>,
+    pub require_v3: Option<bool>,
+    pub abw_reveal_after: Option<u64>,
+    pub min_diff: Option<u64>,
+    pub max_connections: Option<usize>,
+    pub payout_address: Option<String>,
+    pub payout_script: Option<String>,
+    pub coinbase_tag: Option<String>,
+    pub prime_id: Option<u32>,
+    pub ledger: Option<String>,
+    pub ledger_keep: Option<usize>,
+    pub window: Option<f64>,
+    pub window_floor: Option<u128>,
+    pub min_payout: Option<u64>,
+    pub fee_bps: Option<u16>,
+    pub rpc: Option<String>,
+    pub rpc_user: Option<String>,
+    pub rpc_pass: Option<String>,
+    pub rpc_cookie: Option<String>,
+    pub poll: Option<f64>,
 }
 
-// `config` is deliberately absent: a configuration file cannot name another one, and
-// `deny_unknown_fields` is what rejects it.
-settings! {
-    listen: String,
-    stats_listen: String,
-    advertise_address: String,
-    public_gateway: String,
-    data_dir: String,
-    key: String,
-    motd: String,
-    allow_agent: String,
-    require_split: bool,
-    require_v3: bool,
-    abw_reveal_after: u64,
-    min_diff: u64,
-    max_connections: usize,
-    payout_address: String,
-    payout_script: String,
-    coinbase_tag: String,
-    prime_id: u32,
-    ledger: String,
-    ledger_keep: usize,
-    window: f64,
-    window_floor: u128,
-    min_payout: u64,
-    fee_bps: u16,
-    rpc: String,
-    rpc_user: String,
-    rpc_pass: String,
-    rpc_cookie: String,
-    poll: f64,
+impl Config {
+    pub fn holds_a_secret(&self) -> bool {
+        self.rpc_pass.is_some()
+    }
 }
 
 pub fn parse(text: &str) -> Result<Config, toml::de::Error> {
@@ -103,7 +60,6 @@ mod tests {
         assert_eq!(parse("# only a comment\n").unwrap(), Config::default());
     }
 
-    /// The reason for TOML: a file an operator edits once can carry comments.
     #[test]
     fn a_setting_may_be_annotated() {
         let c =
@@ -112,8 +68,6 @@ mod tests {
         assert_eq!(c.min_diff, Some(16384));
     }
 
-    /// The point of typing them: caught here rather than several steps later, with the bad
-    /// value and its line.
     #[test]
     fn a_value_of_the_wrong_type_is_refused_where_it_is() {
         let e = parse("motd = \"fine\"\nmin-diff = \"soon\"\n").unwrap_err().to_string();
@@ -121,8 +75,6 @@ mod tests {
         assert!(e.contains("line 2"), "{e}");
     }
 
-    /// A name the pool does not have is caught here rather than several steps later, and
-    /// the ones it does have are listed.
     #[test]
     fn a_name_the_pool_does_not_have_is_refused() {
         let e = parse("min-dif = 1\n").unwrap_err().to_string();
@@ -130,7 +82,6 @@ mod tests {
         assert!(e.contains("min-diff"), "the ones it does have are named: {e}");
     }
 
-    /// A configuration file cannot name another one, and the same check rejects it.
     #[test]
     fn a_configuration_file_cannot_name_another_one() {
         let e = parse("config = \"/etc/other.toml\"\n").unwrap_err().to_string();

@@ -1,3 +1,4 @@
+use ratum::datum::share::{self, EXTRANONCE_SIZE_V2, SIA_FIELD_SIZE};
 use ratum::header::blake2b_256;
 use ratum::target;
 use std::io::{BufRead, BufReader, Write};
@@ -6,25 +7,26 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 const HEADER_LEN: usize = 80;
-const EXTRANONCE_LEN: usize = 16;
+const HEADER_PREVBLOCK_HIDDEN_AT: usize = 0;
+const HEADER_NONCE_AT: usize = 32;
+const HEADER_NTIME_AT: usize = HEADER_NONCE_AT + SIA_FIELD_SIZE;
+const HEADER_ROOT_AT: usize = HEADER_NTIME_AT + SIA_FIELD_SIZE;
+const EXTRANONCE_LEN: usize = EXTRANONCE_SIZE_V2;
+const SUBMIT_ID_BASE: u64 = 100;
+const WORK_ROOT_LEAF_PREFIX: u8 = 0x00;
 
 #[derive(Clone)]
 struct Job {
     job_id: String,
-    /// The notify's prevhash parameter: for a version 2 job this is the gateway's
-    /// prevblock_hidden, not the previous block hash.
     prevhash: [u8; 32],
     coinb1: Vec<u8>,
     coinb2: Vec<u8>,
-    ntime: [u8; 8],
+    ntime: [u8; SIA_FIELD_SIZE],
     ntime_hex: String,
 }
 
-/// What the reader thread has received from the gateway. `generation` counts the jobs it has
-/// recorded; the mining threads compare it against the one they started on and stop when it
-/// changes, so that a search is abandoned as soon as the work it is based on is superseded.
 #[derive(Default)]
-struct Shared {
+struct Work {
     extranonce1: Vec<u8>,
     extranonce2_size: usize,
     difficulty: f64,
@@ -33,9 +35,15 @@ struct Shared {
     closed: bool,
 }
 
+impl Work {
+    fn has_work_after(&self, last_generation: u64) -> bool {
+        self.generation > last_generation && self.job.is_some() && self.extranonce2_size != 0
+    }
+}
+
 fn leaf(coinb1: &[u8], extranonce: &[u8], coinb2: &[u8]) -> [u8; 32] {
     let mut buf = Vec::with_capacity(1 + coinb1.len() + extranonce.len() + coinb2.len());
-    buf.push(0x00);
+    buf.push(WORK_ROOT_LEAF_PREFIX);
     buf.extend_from_slice(coinb1);
     buf.extend_from_slice(extranonce);
     buf.extend_from_slice(coinb2);
@@ -54,20 +62,17 @@ fn mine(
     generation: &AtomicU64,
     job_generation: u64,
 ) -> Outcome {
-    // The search is abandoned as soon as the job it is based on is superseded.
     let superseded = || generation.load(Ordering::Relaxed) != job_generation;
-    match ratum::nonce::search(header, 32, blake2b_256, target, superseded) {
+    match ratum::nonce::search(header, HEADER_NONCE_AT, blake2b_256, target, superseded) {
         Some(nonce) => Outcome::Found(nonce),
         None if generation.load(Ordering::SeqCst) != job_generation => Outcome::Superseded,
         None => Outcome::Exhausted,
     }
 }
 
-/// Reads the gateway's messages and records the latest job. Runs for as long as the
-/// connection is open, so that a job arriving while the miner is hashing is read at once.
 fn read_messages(
     stream: TcpStream,
-    state: Arc<(Mutex<Shared>, Condvar)>,
+    state: Arc<(Mutex<Work>, Condvar)>,
     generation: Arc<AtomicU64>,
 ) {
     let (lock, waiting) = &*state;
@@ -119,7 +124,7 @@ fn read_messages(
                 let ntime_hex = p[7].as_str().unwrap_or_default().to_string();
                 let ntime_raw = hex::decode(&ntime_hex).unwrap_or_default();
                 let (Ok(prevhash), Ok(ntime)) =
-                    (<[u8; 32]>::try_from(prev), <[u8; 8]>::try_from(ntime_raw))
+                    (<[u8; 32]>::try_from(prev), <[u8; SIA_FIELD_SIZE]>::try_from(ntime_raw))
                 else {
                     println!("!! notify has a {}-char ntime or a bad prevhash", ntime_hex.len());
                     continue;
@@ -132,7 +137,7 @@ fn read_messages(
                     ntime,
                     ntime_hex,
                 };
-                let branches = p[4].as_array().map_or(0, |a| a.len());
+                let branches = p[4].as_array().map_or(0, Vec::len);
                 println!(
                     "job {} prev={} coinb1={}B coinb2={}B branches={branches}",
                     job.job_id,
@@ -152,7 +157,9 @@ fn read_messages(
                 waiting.notify_all();
             }
             _ => {
-                if v["id"].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0) > 100 {
+                if v["id"].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0)
+                    > SUBMIT_ID_BASE
+                {
                     println!("submit response: {}", line.trim());
                 }
             }
@@ -174,8 +181,7 @@ fn main() -> std::io::Result<()> {
     writeln!(w, r#"{{"id":"2","method":"mining.authorize","params":["{user}","x"]}}"#)?;
     w.flush()?;
 
-    let state =
-        Arc::new((Mutex::new(Shared { difficulty: 1.0, ..Shared::default() }), Condvar::new()));
+    let state = Arc::new((Mutex::new(Work { difficulty: 1.0, ..Work::default() }), Condvar::new()));
     let generation = Arc::new(AtomicU64::new(0));
     let reader = {
         let state = Arc::clone(&state);
@@ -184,18 +190,13 @@ fn main() -> std::io::Result<()> {
     };
 
     let (lock, waiting) = &*state;
-    let mut submitted = 0;
+    let mut submitted = 0u64;
     let mut last_generation = 0u64;
 
     loop {
-        // Wait for a job newer than the one last mined, and for the extranonce1 and
-        // extranonce2_size the subscribe response carries, without which the coinbase cannot be
-        // assembled.
         let (job, difficulty, extranonce1, extranonce2_size, job_generation) = {
             let mut s = lock.lock().expect("state");
-            while !s.closed
-                && !(s.generation > last_generation && s.job.is_some() && s.extranonce2_size != 0)
-            {
+            while !s.closed && !s.has_work_after(last_generation) {
                 s = waiting.wait(s).expect("state");
             }
             if s.closed {
@@ -217,12 +218,10 @@ fn main() -> std::io::Result<()> {
         let hash1 = leaf(&job.coinb1, &extranonce, &job.coinb2);
 
         let mut header = [0u8; HEADER_LEN];
-        header[0..32].copy_from_slice(&job.prevhash);
-        header[40..48].copy_from_slice(&job.ntime);
-        header[48..80].copy_from_slice(&hash1);
+        header[HEADER_PREVBLOCK_HIDDEN_AT..HEADER_NONCE_AT].copy_from_slice(&job.prevhash);
+        header[HEADER_NTIME_AT..HEADER_ROOT_AT].copy_from_slice(&job.ntime);
+        header[HEADER_ROOT_AT..].copy_from_slice(&hash1);
 
-        // pdiff, as the gateway checks it (`get_target_from_diff`), not Stratum.md's bdiff-1
-        // target.
         let t = target::target_for_difficulty(difficulty);
         println!("mining job {} at difficulty {difficulty}...", job.job_id);
         let started = std::time::Instant::now();
@@ -231,15 +230,14 @@ fn main() -> std::io::Result<()> {
                 let secs = started.elapsed().as_secs_f64();
                 println!(
                     "found nonce {nonce:#010x} in {secs:.1}s ({:.0} MH/s)",
-                    (nonce as f64 / secs) / 1e6
+                    (f64::from(nonce) / secs) / 1e6
                 );
-                let mut nonce_field = [0u8; 8];
-                nonce_field[0..4].copy_from_slice(&nonce.to_le_bytes());
+                let nonce_field = share::sia_field(nonce, 0);
                 submitted += 1;
                 writeln!(
                     w,
                     r#"{{"id":"{}","method":"mining.submit","params":["{}","{}","{}","{}","{}"]}}"#,
-                    100 + submitted,
+                    SUBMIT_ID_BASE + submitted,
                     user,
                     job.job_id,
                     hex::encode(&extranonce2),

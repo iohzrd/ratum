@@ -1,13 +1,13 @@
 use crate::cursor::{Cursor, Truncated};
+use crate::datum::codes::wire_codes;
+use bytes::BufMut as _;
 
-pub use super::messages::client_subcmd::VALIDATION;
+use super::messages::client_subcmd::VALIDATION;
 
 pub mod request {
     pub const SHORT_TXN_LIST: u8 = 0x10;
     pub const TXNS: u8 = 0x11;
-    /// The template's transactions without the coinbase transaction.
     pub const BLOCK_TXNS: u8 = 0x12;
-    /// version 3 protocol: upload a proposal parent the pool's node does not have.
     pub const PARENT_FETCH: u8 = 0x14;
 }
 
@@ -18,58 +18,33 @@ pub mod response {
     pub const PARENT_FETCH: u8 = 0x94;
 }
 
-pub use super::framing::STRUCT_END;
+use super::framing::STRUCT_END;
 pub const JOB_INDEX_INVALID: u8 = 0xFF;
 pub const MAX_SHORT_LIST_TXNS: u16 = 16383;
-pub const MAX_TXN_SIZE: usize = 0xff_ffff;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Status {
-    Ok,
-    JobEmpty,
-    NoTemplate,
-    TooManyTxns,
-    BadJobIndex,
-    BadRequest,
-    Unknown(u8),
-}
-
-impl Status {
-    pub fn from_byte(b: u8) -> Self {
-        match b {
-            0x01 => Status::Ok,
-            0xF0 => Status::JobEmpty,
-            0xF1 => Status::NoTemplate,
-            0xF2 => Status::TooManyTxns,
-            0xF3 => Status::BadJobIndex,
-            0xF4 => Status::BadRequest,
-            other => Status::Unknown(other),
-        }
+wire_codes! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Status: u8 {
+        Ok = 0x01,
+        JobEmpty = 0xF0,
+        NoTemplate = 0xF1,
+        TooManyTxns = 0xF2,
+        BadJobIndex = 0xF3,
+        BadRequest = 0xF4,
     }
-
-    pub fn to_byte(self) -> u8 {
-        match self {
-            Status::Ok => 0x01,
-            Status::JobEmpty => 0xF0,
-            Status::NoTemplate => 0xF1,
-            Status::TooManyTxns => 0xF2,
-            Status::BadJobIndex => 0xF3,
-            Status::BadRequest => 0xF4,
-            Status::Unknown(b) => b,
-        }
-    }
+    unknown Unknown;
 }
 
 impl std::fmt::Display for Status {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Status::Ok => write!(f, "ok"),
-            Status::JobEmpty => write!(f, "job slot empty"),
-            Status::NoTemplate => write!(f, "no block template"),
-            Status::TooManyTxns => write!(f, "too many transactions for a short list"),
-            Status::BadJobIndex => write!(f, "bad job index"),
-            Status::BadRequest => write!(f, "bad transaction request"),
-            Status::Unknown(b) => write!(f, "unknown status {b:#04x}"),
+            Self::Ok => write!(f, "ok"),
+            Self::JobEmpty => write!(f, "job slot empty"),
+            Self::NoTemplate => write!(f, "no block template"),
+            Self::TooManyTxns => write!(f, "too many transactions for a short list"),
+            Self::BadJobIndex => write!(f, "bad job index"),
+            Self::BadRequest => write!(f, "bad transaction request"),
+            Self::Unknown(b) => write!(f, "unknown status {b:#04x}"),
         }
     }
 }
@@ -90,79 +65,31 @@ pub enum Error {
 
 impl From<Truncated> for Error {
     fn from(t: Truncated) -> Self {
-        Error::Truncated(t.0)
+        Self::Truncated(t.0)
     }
 }
 
-pub fn request_short_txn_list(job_index: u8) -> Vec<u8> {
-    vec![VALIDATION, request::SHORT_TXN_LIST, job_index]
-}
-
-pub fn request_txns(job_index: u8, indices: &[u16]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(5 + indices.len() * 2);
-    out.push(VALIDATION);
-    out.push(request::TXNS);
-    out.push(job_index);
-    out.extend_from_slice(&(indices.len() as u16).to_le_bytes());
-    for i in indices {
-        out.extend_from_slice(&i.to_le_bytes());
-    }
-    out
-}
+pub const SELECTOR_AT: usize = 1;
+pub const JOB_INDEX_AT: usize = 2;
+pub const REQUEST_HEADER_LEN: usize = JOB_INDEX_AT + 1;
+pub const PARENT_FETCH_REQUEST_LEN: usize = REQUEST_HEADER_LEN + crate::bitcoin::HASH_SIZE;
 
 pub fn request_block_txns(job_index: u8) -> Vec<u8> {
     vec![VALIDATION, request::BLOCK_TXNS, job_index]
 }
 
-/// version 3 protocol. The C handler requires this exact 35-byte plaintext: unlike the other
-/// validation requests it rejects any trailing padding. `parent_hash` is in internal byte
-/// order, as the job context's prev hash is sent.
-pub fn request_parent_fetch(job_index: u8, parent_hash: &[u8; 32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(35);
-    out.push(VALIDATION);
-    out.push(request::PARENT_FETCH);
-    out.push(job_index);
-    out.extend_from_slice(parent_hash);
-    out
-}
-
-/// `DATUM_PARENT_FETCH_STATUS_*`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ParentStatus {
-    Success,
-    JobMismatch,
-    Busy,
-    Unavailable,
-    RpcFailed,
-    Unknown(u8),
-}
-
-impl ParentStatus {
-    pub fn from_byte(b: u8) -> Self {
-        match b {
-            0x01 => ParentStatus::Success,
-            0xF0 => ParentStatus::JobMismatch,
-            0xF6 => ParentStatus::Busy,
-            0xF7 => ParentStatus::Unavailable,
-            0xF8 => ParentStatus::RpcFailed,
-            other => ParentStatus::Unknown(other),
-        }
+wire_codes! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum ParentStatus: u8 {
+        Success = 0x01,
+        JobMismatch = 0xF0,
+        Busy = 0xF6,
+        Unavailable = 0xF7,
+        RpcFailed = 0xF8,
     }
-
-    pub fn to_byte(self) -> u8 {
-        match self {
-            ParentStatus::Success => 0x01,
-            ParentStatus::JobMismatch => 0xF0,
-            ParentStatus::Busy => 0xF6,
-            ParentStatus::Unavailable => 0xF7,
-            ParentStatus::RpcFailed => 0xF8,
-            ParentStatus::Unknown(b) => b,
-        }
-    }
+    unknown Unknown;
 }
 
-/// The `0x50 0x94` reply: the raw serialized parent block, or an error status with an
-/// empty block. The C gateway pads neither form.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParentFetchReply {
     pub job_index: u8,
@@ -171,31 +98,24 @@ pub struct ParentFetchReply {
     pub block: Vec<u8>,
 }
 
+pub const PARENT_FETCH_REPLY_OVERHEAD: usize =
+    (REQUEST_HEADER_LEN + 1) + crate::bitcoin::HASH_SIZE + size_of::<u32>() + 1;
+
+pub const MAX_PARENT_FETCH_BLOCK: usize =
+    super::framing::MAX_CMD_DATA_SIZE as usize - (PARENT_FETCH_REPLY_OVERHEAD + 1);
+
 impl ParentFetchReply {
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(42 + self.block.len());
-        out.push(VALIDATION);
-        out.push(response::PARENT_FETCH);
-        out.push(self.job_index);
-        out.push(self.status.to_byte());
-        out.extend_from_slice(&self.parent_hash);
-        out.extend_from_slice(&(self.block.len() as u32).to_le_bytes());
-        out.extend_from_slice(&self.block);
-        out.push(STRUCT_END);
+        let mut out = Vec::with_capacity(PARENT_FETCH_REPLY_OVERHEAD + self.block.len());
+        out.put_u8(VALIDATION);
+        out.put_u8(response::PARENT_FETCH);
+        out.put_u8(self.job_index);
+        out.put_u8(self.status.code());
+        out.put_slice(&self.parent_hash);
+        out.put_u32_le(self.block.len() as u32);
+        out.put_slice(&self.block);
+        out.put_u8(STRUCT_END);
         out
-    }
-
-    pub fn decode(data: &[u8]) -> Result<Self, Error> {
-        let mut c = body_of(data, response::PARENT_FETCH)?;
-        let job_index = c.u8("job index")?;
-        let status = ParentStatus::from_byte(c.u8("status")?);
-        let parent_hash: [u8; 32] = c.arr("parent hash")?;
-        let size = c.u32("block size")? as usize;
-        let block = c.take(size, "block").map_err(|_| Error::BadTxnSize)?.to_vec();
-        if c.u8("terminator")? != STRUCT_END {
-            return Err(Error::MissingTerminator);
-        }
-        Ok(ParentFetchReply { job_index, status, parent_hash, block })
     }
 }
 
@@ -208,91 +128,42 @@ pub struct ShortTxnList {
     pub crosscheck: Option<[u8; 32]>,
 }
 
+pub const SHORT_ID_SIZE: usize = size_of::<u32>() + size_of::<u16>();
+const SHORT_ID_MASK: u64 = (1u64 << (8 * SHORT_ID_SIZE)) - 1;
+
 pub const CROSSCHECK_SEED: [u8; 32] = [
     0xA3, 0x4F, 0xC1, 0x9C, 0x5E, 0x88, 0x76, 0x12, 0x0A, 0x79, 0x3E, 0xF1, 0x6C, 0x93, 0x54, 0xAF,
     0xB8, 0x1D, 0xE8, 0x5A, 0x20, 0xC7, 0x94, 0x38, 0x6F, 0xA1, 0x02, 0xD9, 0x4A, 0x7B, 0xF0, 0x11,
 ];
 
 impl ShortTxnList {
-    pub fn decode(data: &[u8]) -> Result<Self, Error> {
-        let mut c = body_of(data, response::SHORT_TXN_LIST)?;
-        let job_index = c.u8("job index")?;
-        let status = Status::from_byte(c.u8("status")?);
-        if status != Status::Ok {
-            return Ok(ShortTxnList {
-                job_index,
-                status,
-                txn_count: 0,
-                short_ids: Vec::new(),
-                crosscheck: None,
-            });
-        }
-        let txn_count = c.u16("txn count")?;
-        if txn_count == 0 {
-            return Ok(ShortTxnList {
-                job_index,
-                status,
-                txn_count: 0,
-                short_ids: Vec::new(),
-                crosscheck: None,
-            });
-        }
-        let ids = c.take(txn_count as usize * 6, "short ids")?;
-        let short_ids = ids
-            .as_chunks::<6>()
-            .0
-            .iter()
-            .map(|c| {
-                let low = u32::from_le_bytes(c[..4].try_into().unwrap());
-                let high = u16::from_le_bytes(c[4..].try_into().unwrap());
-                u64::from(low) | (u64::from(high) << 32)
-            })
-            .collect();
-        let crosscheck: [u8; 32] = c.arr("crosscheck")?;
-        if c.u8("terminator")? != STRUCT_END {
-            return Err(Error::MissingTerminator);
-        }
-        Ok(ShortTxnList { job_index, status, txn_count, short_ids, crosscheck: Some(crosscheck) })
+    pub fn empty(job_index: u8, status: Status) -> Self {
+        Self { job_index, status, txn_count: 0, short_ids: Vec::new(), crosscheck: None }
     }
 
     pub fn encode(&self) -> Vec<u8> {
         let mut out =
-            vec![VALIDATION, response::SHORT_TXN_LIST, self.job_index, self.status.to_byte()];
+            vec![VALIDATION, response::SHORT_TXN_LIST, self.job_index, self.status.code()];
         if self.status != Status::Ok {
             return out;
         }
-        out.extend_from_slice(&self.txn_count.to_le_bytes());
+        out.put_u16_le(self.txn_count);
         if self.txn_count == 0 {
             return out;
         }
         for id in &self.short_ids {
-            out.extend_from_slice(&(*id as u32).to_le_bytes());
-            out.extend_from_slice(&(((*id >> 32) & 0xffff) as u16).to_le_bytes());
+            out.put_slice(&id.to_le_bytes()[..SHORT_ID_SIZE]);
         }
         if let Some(x) = self.crosscheck {
-            out.extend_from_slice(&x);
+            out.put_slice(&x);
         }
-        out.push(STRUCT_END);
+        out.put_u8(STRUCT_END);
         out
-    }
-
-    /// Whether the list names exactly `hashes`: the transactions' witness hashes (GBT `hash`,
-    /// the gateway's `hash_bin`), not their txids, in internal byte order.
-    pub fn matches(&self, hashes: &[[u8; 32]], key: &[u8; 16]) -> bool {
-        if self.status != Status::Ok || self.txn_count as usize != hashes.len() {
-            return false;
-        }
-        if hashes.is_empty() {
-            return self.short_ids.is_empty() && self.crosscheck.is_none();
-        }
-        let expected: Vec<u64> = hashes.iter().map(|h| short_id(h, key)).collect();
-        self.short_ids == expected && self.crosscheck == Some(crosscheck(hashes))
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TxnBundle {
-    /// The response selector, 0x91 or 0x92.
     pub selector: u8,
     pub job_index: u8,
     pub status: Status,
@@ -300,20 +171,22 @@ pub struct TxnBundle {
 }
 
 impl TxnBundle {
+    pub fn empty(selector: u8, job_index: u8, status: Status) -> Self {
+        Self { selector, job_index, status, txns: Vec::new() }
+    }
+
     pub fn decode(data: &[u8], selector: u8) -> Result<Self, Error> {
         let mut c = body_of(data, selector)?;
         let job_index = c.u8("job index")?;
-        let status = Status::from_byte(c.u8("status")?);
+        let status = Status::from_code(c.u8("status")?);
         if status != Status::Ok {
-            return Ok(TxnBundle { selector, job_index, status, txns: Vec::new() });
+            return Ok(Self::empty(selector, job_index, status));
         }
         let stated = usize::from(c.u16("txn count")?);
 
         let mut txns = Vec::with_capacity(stated.min(1024));
         for _ in 0..stated {
-            let size = c.take(3, "txn size")?;
-            let len = usize::from(u16::from_le_bytes(size[..2].try_into().unwrap()))
-                | (usize::from(size[2]) << 16);
+            let len = decode_txn_size(&mut c)?;
             let tx = c.take(len, "txn").map_err(|_| Error::BadTxnSize)?;
             txns.push(tx.to_vec());
         }
@@ -323,26 +196,36 @@ impl TxnBundle {
         if c.u8("terminator")? != STRUCT_END {
             return Err(Error::MissingTerminator);
         }
-        Ok(TxnBundle { selector, job_index, status, txns })
+        Ok(Self { selector, job_index, status, txns })
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = vec![VALIDATION, self.selector, self.job_index, self.status.to_byte()];
+        let mut out = vec![VALIDATION, self.selector, self.job_index, self.status.code()];
         if self.status != Status::Ok {
             return out;
         }
-        out.extend_from_slice(&(self.txns.len() as u16).to_le_bytes());
+        out.put_u16_le(self.txns.len() as u16);
         for tx in &self.txns {
-            out.extend_from_slice(&(tx.len() as u16).to_le_bytes());
-            out.push((tx.len() >> 16) as u8);
-            out.extend_from_slice(tx);
+            encode_txn_size(&mut out, tx.len());
+            out.put_slice(tx);
         }
-        out.push(STRUCT_END);
+        out.put_u8(STRUCT_END);
         out
     }
 }
 
-/// A cursor past the optional 0x50 prefix and the selector, which must be `want`.
+const TXN_SIZE_LEN: usize = 3;
+
+fn decode_txn_size(c: &mut Cursor<'_>) -> Result<usize, Error> {
+    let b: [u8; TXN_SIZE_LEN] = c.arr("txn size")?;
+    Ok(usize::from(u16::from_le_bytes([b[0], b[1]])) | (usize::from(b[2]) << 16))
+}
+
+fn encode_txn_size(out: &mut Vec<u8>, len: usize) {
+    out.put_u16_le(len as u16);
+    out.put_u8((len >> 16) as u8);
+}
+
 fn body_of(data: &[u8], want: u8) -> Result<Cursor<'_>, Error> {
     let mut c = Cursor::new(data);
     c.skip_if(VALIDATION);
@@ -353,8 +236,6 @@ fn body_of(data: &[u8], want: u8) -> Result<Cursor<'_>, Error> {
     Ok(c)
 }
 
-/// The first 16 bytes of the two ed25519 public signing keys XORed together, then every byte
-/// XORed with 0x55 (`datum_protocol.c`). Both ends derive it, so neither sends it.
 pub fn short_id_key(gateway_pk: &[u8; 32], pool_pk: &[u8; 32]) -> [u8; 16] {
     let mut key = [0u8; 16];
     for (j, k) in key.iter_mut().enumerate() {
@@ -363,13 +244,10 @@ pub fn short_id_key(gateway_pk: &[u8; 32], pool_pk: &[u8; 32]) -> [u8; 16] {
     key
 }
 
-/// The low 48 bits of the siphash, serialized as a u32 then a u16.
 pub fn short_id(hash: &[u8; 32], key: &[u8; 16]) -> u64 {
-    siphash24(key, hash) & 0x0000_ffff_ffff_ffff
+    siphash24(key, hash) & SHORT_ID_MASK
 }
 
-/// Every hash (the transactions' witness hashes, as in `matches`) XORed into a fixed seed, so
-/// both ends compare a whole list in one 32-byte comparison.
 pub fn crosscheck(hashes: &[[u8; 32]]) -> [u8; 32] {
     let mut x = CROSSCHECK_SEED;
     for h in hashes {
@@ -381,8 +259,8 @@ pub fn crosscheck(hashes: &[[u8; 32]]) -> [u8; 32] {
 }
 
 pub fn siphash24(key: &[u8; 16], data: &[u8]) -> u64 {
-    let k0 = u64::from_le_bytes(key[..8].try_into().unwrap());
-    let k1 = u64::from_le_bytes(key[8..].try_into().unwrap());
+    let [k0, k1] = key.as_chunks::<8>().0 else { unreachable!("16 bytes hold two words") };
+    let (k0, k1) = (u64::from_le_bytes(*k0), u64::from_le_bytes(*k1));
     let mut v0 = k0 ^ 0x736f_6d65_7073_6575;
     let mut v1 = k1 ^ 0x646f_7261_6e64_6f6d;
     let mut v2 = k0 ^ 0x6c79_6765_6e65_7261;
@@ -483,15 +361,12 @@ mod tests {
 
     #[test]
     fn request_layouts() {
-        assert_eq!(request_short_txn_list(3), vec![0x50, 0x10, 3]);
-        assert_eq!(request_block_txns(7), vec![0x50, 0x12, 7]);
-        let r = request_txns(2, &[0, 5, 300]);
-        assert_eq!(&r[..3], &[0x50, 0x11, 2]);
-        assert_eq!(&r[3..5], &3u16.to_le_bytes());
-        assert_eq!(&r[5..7], &0u16.to_le_bytes());
-        assert_eq!(&r[7..9], &5u16.to_le_bytes());
-        assert_eq!(&r[9..11], &300u16.to_le_bytes());
-        assert_eq!(r.len(), 11);
+        let r = request_block_txns(7);
+        assert_eq!(r, vec![0x50, 0x12, 7]);
+        assert_eq!(r[SELECTOR_AT], request::BLOCK_TXNS);
+        assert_eq!(r[JOB_INDEX_AT], 7);
+        assert_eq!(r.len(), REQUEST_HEADER_LEN);
+        assert_eq!(PARENT_FETCH_REQUEST_LEN, REQUEST_HEADER_LEN + 32);
     }
 
     fn sample_list() -> ShortTxnList {
@@ -506,19 +381,22 @@ mod tests {
     }
 
     #[test]
-    fn short_list_roundtrips_and_ignores_padding() {
+    fn short_list_encodes_at_the_c_offsets() {
         let l = sample_list();
         let bytes = l.encode();
-        assert_eq!(bytes.len(), 4 + 2 + 18 + 32 + 1);
-        assert_eq!(ShortTxnList::decode(&bytes).unwrap(), l);
-        let mut padded = bytes.clone();
-        padded.extend_from_slice(&[0x5a; 77]);
-        assert_eq!(ShortTxnList::decode(&padded).unwrap(), l);
-        assert_eq!(ShortTxnList::decode(&bytes[1..]).unwrap(), l);
+        assert_eq!(bytes.len(), 4 + 2 + 3 * SHORT_ID_SIZE + 32 + 1);
+        assert_eq!(&bytes[..4], &[0x50, response::SHORT_TXN_LIST, 4, Status::Ok.code()]);
+        assert_eq!(&bytes[4..6], &3u16.to_le_bytes());
+        for (i, id) in l.short_ids.iter().enumerate() {
+            let at = 6 + i * SHORT_ID_SIZE;
+            assert_eq!(&bytes[at..at + SHORT_ID_SIZE], &id.to_le_bytes()[..SHORT_ID_SIZE]);
+        }
+        assert_eq!(&bytes[24..56], &l.crosscheck.unwrap());
+        assert_eq!(bytes[56], STRUCT_END);
     }
 
     #[test]
-    fn short_list_accepts_the_shapes_without_a_terminator() {
+    fn short_list_encodes_the_shapes_without_a_terminator() {
         let empty = ShortTxnList {
             job_index: 1,
             status: Status::Ok,
@@ -526,9 +404,7 @@ mod tests {
             short_ids: vec![],
             crosscheck: None,
         };
-        let bytes = empty.encode();
-        assert_eq!(bytes, vec![0x50, 0x90, 1, 0x01, 0x00, 0x00]);
-        assert_eq!(ShortTxnList::decode(&bytes).unwrap(), empty);
+        assert_eq!(empty.encode(), vec![0x50, 0x90, 1, 0x01, 0x00, 0x00]);
 
         for status in
             [Status::JobEmpty, Status::NoTemplate, Status::TooManyTxns, Status::BadJobIndex]
@@ -540,54 +416,8 @@ mod tests {
                 short_ids: vec![],
                 crosscheck: None,
             };
-            let bytes = e.encode();
-            assert_eq!(bytes.len(), 4);
-            assert_eq!(ShortTxnList::decode(&bytes).unwrap(), e);
+            assert_eq!(e.encode(), vec![0x50, 0x90, JOB_INDEX_INVALID, status.code()]);
         }
-    }
-
-    #[test]
-    fn short_list_matches_the_pools_own_template() {
-        let hashes = [ramp(0), ramp(0x20), ramp(0x40)];
-        let l = sample_list();
-        assert!(l.matches(&hashes, &KEY));
-
-        let other = [ramp(0), ramp(0x20), ramp(0x60)];
-        assert!(!l.matches(&other, &KEY));
-        let reordered = [ramp(0x20), ramp(0), ramp(0x40)];
-        assert!(!l.matches(&reordered, &KEY));
-        assert!(!l.matches(&hashes[..2], &KEY));
-        assert!(!l.matches(&hashes, &[0u8; 16]));
-
-        let mut altered = l.clone();
-        altered.crosscheck = Some([0u8; 32]);
-        assert!(!altered.matches(&hashes, &KEY));
-
-        let empty = ShortTxnList {
-            job_index: 0,
-            status: Status::Ok,
-            txn_count: 0,
-            short_ids: vec![],
-            crosscheck: None,
-        };
-        assert!(empty.matches(&[], &KEY));
-    }
-
-    #[test]
-    fn short_list_rejects_malformed_messages() {
-        let bytes = sample_list().encode();
-        for cut in [1, 3, 5, 10, bytes.len() - 1] {
-            assert!(ShortTxnList::decode(&bytes[..cut]).is_err(), "should fail at {cut}");
-        }
-        let mut no_end = bytes.clone();
-        let n = no_end.len();
-        no_end[n - 1] = 0x00;
-        assert_eq!(ShortTxnList::decode(&no_end), Err(Error::MissingTerminator));
-
-        assert_eq!(
-            ShortTxnList::decode(&[0x50, 0x91, 0, 0x01]),
-            Err(Error::WrongMessage { want: 0x90, got: 0x91 })
-        );
     }
 
     fn sample_bundle(selector: u8) -> TxnBundle {

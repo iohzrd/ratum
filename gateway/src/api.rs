@@ -1,70 +1,45 @@
-//! The HTTP interfaces: the admin port (`api.listen_port`) serves `status.html` at `/`,
-//! which renders `/stats.json` in the browser as the pool's stats page does, plus `/login`,
-//! `/cmd`, `/NOTIFY` and the settings page `/config` (`config.html`, filled from
-//! `/config.json`; a POST to `/config` saves through `config::apply`); the password-less
-//! miner lookup is on `api.miner_listen_port`. `/login`, `/cmd` and the client rows of
-//! `/stats.json` require `api.admin_password` over HTTP Basic authentication, and are
-//! refused while none is configured, as the C gateway's `datum_api_check_admin_password_only`
-//! refuses them; the status itself is public, as the C gateway's is. The settings page
-//! requires a password to be set at all, and saving requires `api.modify_conf` too.
+mod snapshot;
 
-use crate::stratum::{ClientStats, Server};
+use crate::stratum::Server;
+use base64::Engine as _;
 use log::{info, warn};
 use ratum::http::{self, Reply};
 use serde_json::{Value, json};
-use std::collections::VecDeque;
+use std::io::Read as _;
 use std::sync::{Arc, LazyLock, Mutex};
-use tiny_http::{Header, Method, Request, Response};
+use tiny_http::{Method, Request};
 
-static INDEX_HTML: LazyLock<String> =
-    LazyLock::new(|| ratum::web::assemble(include_str!("status.html")));
-static MINER_HTML: LazyLock<String> =
-    LazyLock::new(|| ratum::web::assemble(include_str!("miner.html")));
-static CONFIG_HTML: LazyLock<String> =
-    LazyLock::new(|| ratum::web::assemble(include_str!("config.html")));
+const CSS: &str = include_str!("page.css");
+const JS: &str = include_str!("page.js");
+
+fn assemble(page: &str) -> String {
+    page.replace("<!--shared-css-->", &format!("<style>\n{CSS}</style>"))
+        .replace("<!--shared-js-->", &format!("<script>\n{JS}</script>"))
+}
+
+static INDEX_HTML: LazyLock<String> = LazyLock::new(|| assemble(include_str!("status.html")));
+static CONFIG_HTML: LazyLock<String> = LazyLock::new(|| assemble(include_str!("config.html")));
 
 pub struct Context {
     pub server: Arc<Server>,
-    pub template_status: Arc<Mutex<crate::template::Status>>,
+    pub template_error: Arc<crate::template::LastError>,
     pub started: std::time::Instant,
-    /// A random token every `/cmd` form carries and `/cmd` requires, so a request a
-    /// browser replays the admin credentials on from another site does not act (the C
-    /// gateway's `api_csrf_token`).
     pub csrf: String,
-    /// The configuration file the settings page edits (`-c`).
     pub config_path: String,
-    /// The gateway-hashrate history the status page charts: one `(unix, hashes per
-    /// second)` sample per `HISTORY_INTERVAL_SECS`, a day kept, from a thread `start`
-    /// spawns. It begins with the process, so a restart shows as a gap.
-    pub history: Mutex<VecDeque<(u64, f64)>>,
+    pub history: Mutex<ratum::hashrate::History>,
 }
 
-const HISTORY_INTERVAL_SECS: u64 = 60;
-const HISTORY_CAP: usize = 24 * 60;
-
-fn unix_now() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
-}
-
-/// Record the hashrate the summary reports now.
 fn sample_hashrate(ctx: &Context) {
-    let hs = ctx.server.summary().hashrate_ths * 1e12;
-    let mut history = ratum::lock(&ctx.history);
-    history.push_back((unix_now(), hs));
-    while history.len() > HISTORY_CAP {
-        history.pop_front();
-    }
+    let hs = ctx.server.summary().hashrate_ths * ratum::HASHES_PER_TERAHASH;
+    ratum::hashrate::push_sample(&mut ratum::lock(&ctx.history), ratum::unix_now(), hs);
 }
 
-/// A random token for `Context::csrf`.
+const CSRF_TOKEN_BYTES: usize = 16;
+
 pub fn csrf_token() -> String {
-    let mut b = [0u8; 16];
-    dryoc::rng::copy_randombytes(&mut b);
-    hex::encode(b)
+    hex::encode(ratum::rand::bytes::<CSRF_TOKEN_BYTES>())
 }
 
-/// Equality in time that depends on the lengths and not on where the strings differ
-/// (`datum_secure_strequals`).
 fn secure_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
     let mut acc = a.len() ^ b.len();
@@ -74,30 +49,13 @@ fn secure_eq(a: &str, b: &str) -> bool {
     acc == 0
 }
 
-fn duration_text(d: std::time::Duration) -> String {
-    let s = d.as_secs();
-    format!(
-        "{} days, {} hours, {} minutes, {} seconds",
-        s / 86400,
-        (s % 86400) / 3600,
-        (s % 3600) / 60,
-        s % 60
-    )
-}
-
 fn authorized(ctx: &Context, req: &Request) -> bool {
     let password = &ctx.server.config.api.admin_password;
-    // As the C gateway: with no admin password configured, no request is authorized. An empty
-    // password must not mean an empty check.
     if password.is_empty() {
         return false;
     }
-    let Some(h) = req.headers().iter().find(|h| h.field.equiv("Authorization")) else {
-        return false;
-    };
-    let value = h.value.as_str();
+    let Some(value) = http::header_value(req, "Authorization") else { return false };
     let Some(b64) = value.strip_prefix("Basic ") else { return false };
-    use base64::Engine as _;
     let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(b64.trim()) else {
         return false;
     };
@@ -110,280 +68,62 @@ fn forbidden(why: &str) -> Reply {
 }
 
 fn unauthorized() -> Reply {
-    Response::from_string("This action requires admin access.").with_status_code(401).with_header(
-        Header::from_bytes("WWW-Authenticate", "Basic realm=\"DATUM Gateway\"").unwrap(),
-    )
+    http::text(401, "This action requires admin access.")
+        .with_header(http::header("WWW-Authenticate", "Basic realm=\"DATUM Gateway\""))
 }
 
 fn redirect(to: &str) -> Reply {
-    Response::from_string("")
-        .with_status_code(302)
-        .with_header(Header::from_bytes("Location", to).unwrap())
+    http::text(302, "").with_header(http::header("Location", to))
 }
 
-fn seconds_ago(t: Option<std::time::Instant>) -> f64 {
-    t.map_or(-1.0, |t| t.elapsed().as_secs_f64())
-}
+const MAX_BODY_BYTES: u64 = 1 << 20;
 
-fn pool_host_json(cfg: &crate::config::Config) -> Value {
-    if cfg.datum.pool_host.is_empty() {
-        Value::Null
-    } else {
-        json!(format!("{}:{}", cfg.datum.pool_host, cfg.datum.pool_port))
-    }
-}
-
-/// `datum.pool_url`, or null when it is not set.
-fn pool_url_json(cfg: &crate::config::Config) -> Value {
-    if cfg.datum.pool_url.is_empty() { Value::Null } else { json!(cfg.datum.pool_url) }
-}
-
-/// One client's row. `identity` adds who it is (the admin's `/stats.json`); the miner
-/// lookup reports the counters alone.
-fn client_json(cfg: &crate::config::Config, c: &ClientStats, identity: bool) -> Value {
-    let mut v = json!({
-        "subscribed_seconds": seconds_ago(c.subscribed_at),
-        "last_accepted_seconds": seconds_ago(c.last_accepted),
-        "vardiff": c.current_diff,
-        "accepted_diff": c.accepted.diff,
-        "accepted_count": c.accepted.count,
-        "rejected_diff": c.rejected.diff,
-        "rejected_count": c.rejected.count,
-        "fee_diff": c.fee.diff,
-        "fee_count": c.fee.count,
-        "hashrate_ths": c.hashrate_ths(),
-    });
-    if identity {
-        let o = v.as_object_mut().expect("an object");
-        o.insert("id".into(), json!(c.unique_id));
-        o.insert("remote".into(), json!(c.remote));
-        o.insert("username".into(), json!(c.username));
-        o.insert(
-            "unpayable".into(),
-            json!(
-                cfg.stratum.require_address_username
-                    && !crate::address::username_is_payable(&c.username)
-            ),
-        );
-        o.insert("useragent".into(), json!(c.useragent));
-        o.insert("subscribed".into(), json!(c.subscribed));
-    }
-    v
-}
-
-/// The status snapshot. `with_clients` adds the per-connection rows, which need the admin
-/// password when one is set.
-fn status_json(ctx: &Context, with_clients: bool) -> Value {
-    let server = &ctx.server;
-    let cfg = &server.config;
-    let datum_stats = ratum::lock(&server.datum.stats).clone();
-    let pool = server.datum.pool_config();
-    let template_error = ratum::lock(&ctx.template_status).error.clone();
-    let current = server.current_job();
-    let status = if let Some(e) = &template_error {
-        format!("ERROR: {e}")
-    } else if cfg.datum.pool_host.is_empty() {
-        "Non-Pooled Mode".to_string()
-    } else if current.is_none() {
-        "Initialising...".to_string()
-    } else if server.datum.is_active() {
-        "Connected and Ready".to_string()
-    } else if cfg.datum.pooled_mining_only {
-        "Not Ready".to_string()
-    } else {
-        // A pool is configured but not connected, and pooled_mining_only is off: the
-        // gateway serves work that pays mining.pool_address, as the C gateway does.
-        "Non-Pooled Mode (pool unreachable)".to_string()
-    };
-    let job = current.as_ref().map(|j| {
-        json!({
-            "job_id": j.job_id,
-            "global_index": j.global_index,
-            "created_seconds_ago": j.created.elapsed().as_secs_f64(),
-            "height": j.template.height,
-            "value_btc": j.template.coinbase_value as f64 / 1e8,
-            "previous_block": j.template.prev_hash_hex,
-            "target": j.template.target_hex,
-            "witness_commitment": hex::encode(&j.template.witness_commitment),
-            "difficulty": ratum::target::difficulty_from_bits(j.template.nbits),
-            "version": format!("{:08x}", j.template.version),
-            "bits": j.template.bits,
-            "curtime": j.template.curtime,
-            "mintime": j.template.mintime,
-            "sizelimit": j.template.sizelimit,
-            "weightlimit": j.template.weightlimit,
-            "sigoplimit": j.template.sigoplimit,
-            "txn_count": j.template.txns.len(),
-            "txn_total_size": j.template.totals.size,
-            "txn_total_weight": j.template.totals.weight,
-            "txn_total_sigops": j.template.totals.sigops,
-            "is_datum_job": j.is_datum_job,
-            "coinbaser_outputs": j.coinbaser_outputs.len(),
-        })
-    });
-    let coinbaser = current.as_ref().map(|j| {
-        j.payout_rows()
-            .iter()
-            .map(|r| {
-                json!({
-                    "value_btc": r.value as f64 / 1e8,
-                    "address": crate::address::output_script_to_display(&r.script),
-                    "remainder": r.remainder,
-                })
-            })
-            .collect::<Vec<_>>()
-    });
-    let clients = with_clients.then(|| {
-        server.client_stats().iter().map(|c| client_json(cfg, c, true)).collect::<Vec<_>>()
-    });
-    let summary = server.summary();
-    json!({
-        "version": ratum::VERSION,
-        "status": status,
-        "uptime": duration_text(ctx.started.elapsed()),
-        "uptime_seconds": ctx.started.elapsed().as_secs(),
-        "work_update_seconds": cfg.bitcoind.work_update_seconds,
-        "stale_window_seconds": cfg.stale_window().as_secs(),
-        "hashrate": {
-            "interval_seconds": HISTORY_INTERVAL_SECS,
-            "history": ratum::lock(&ctx.history)
-                .iter()
-                .map(|(at, hs)| json!([at, hs.round()]))
-                .collect::<Vec<_>>(),
-        },
-        "shares_accepted": datum_stats.accepted.json(),
-        "shares_rejected": datum_stats.rejected.json(),
-        "pool_host": pool_host_json(cfg),
-        "pool_url": pool_url_json(cfg),
-        "pool_pubkey": cfg.datum.pool_pubkey,
-        "pool_tag": pool.as_ref().map_or(cfg.mining.coinbase_tag_primary.clone(), |p| p.coinbase_tag.clone()),
-        "secondary_tag": cfg.mining.coinbase_tag_secondary,
-        "pool_min_diff": pool.as_ref().map(|p| p.min_difficulty),
-        "pool_motd": datum_stats.motd,
-        "gateway_fee_bps": cfg.datum.gateway_fee_bps,
-        "gateway_fee_address": if cfg.datum.gateway_fee_bps > 0 { json!(cfg.fee_address()) } else { Value::Null },
-        "gateway_fee_collected": ratum::lock(&server.fee).json(),
-        "stratum": {
-            "listening": server.listening.load(std::sync::atomic::Ordering::Relaxed),
-            "connections": summary.connections,
-            "subscriptions": summary.subscribed,
-            "hashrate_ths": summary.hashrate_ths,
-        },
-        "job": job,
-        "coinbaser": coinbaser,
-        "clients": clients,
-        "csrf": if with_clients { json!(ctx.csrf) } else { Value::Null },
-    })
-}
-
-/// The counters summed over the connections one address has.
-#[derive(Default)]
-struct Totals {
-    accepted: crate::tally::Tally,
-    rejected: crate::tally::Tally,
-    fee: crate::tally::Tally,
-    hashrate_ths: f64,
-}
-
-impl Totals {
-    fn add(&mut self, c: &ClientStats) {
-        self.accepted.count += c.accepted.count;
-        self.accepted.diff += c.accepted.diff;
-        self.rejected.count += c.rejected.count;
-        self.rejected.diff += c.rejected.diff;
-        self.fee.count += c.fee.count;
-        self.fee.diff += c.fee.diff;
-        self.hashrate_ths += c.hashrate_ths().unwrap_or(0.0);
-    }
-}
-
-fn miner_lookup_json(ctx: &Context, addr: Option<&str>) -> Value {
-    let cfg = &ctx.server.config;
-    let valid = addr.filter(|a| a.len() < 128 && crate::address::is_valid(a));
-    let clients = valid.map_or_else(Vec::new, |a| {
-        ctx.server.client_stats_where(|c| {
-            c.subscribed && crate::address::username_address(&c.username) == a
-        })
-    });
-    let mut totals = Totals::default();
-    let connections: Vec<Value> = clients
-        .iter()
-        .map(|c| {
-            totals.add(c);
-            let mut v = client_json(cfg, c, false);
-            // The lookup reports the subscription as the connection's age.
-            if let Some(o) = v.as_object_mut()
-                && let Some(s) = o.remove("subscribed_seconds")
-            {
-                o.insert(
-                    "connected_seconds".into(),
-                    if s.as_f64() == Some(-1.0) { json!(0.0) } else { s },
-                );
-            }
-            v
-        })
-        .collect();
-    json!({
-        "address": valid,
-        "fee_bps": cfg.datum.gateway_fee_bps,
-        "fee_address": if cfg.datum.gateway_fee_bps > 0 { cfg.fee_address() } else { "" },
-        "connection_count": connections.len(),
-        "connections": connections,
-        "accepted_diff": totals.accepted.diff,
-        "accepted_count": totals.accepted.count,
-        "rejected_diff": totals.rejected.diff,
-        "rejected_count": totals.rejected.count,
-        "fee_diff": totals.fee.diff,
-        "fee_count": totals.fee.count,
-        "accepted_under_address_diff": totals.accepted.diff.saturating_sub(totals.fee.diff),
-        "hashrate_ths": totals.hashrate_ths,
-        "stratum_port": cfg.stratum.listen_port,
-        "require_address_username": cfg.stratum.require_address_username,
-        "pool_host": pool_host_json(cfg),
-        "pool_url": pool_url_json(cfg),
-    })
-}
-
-/// The POST body, at most a megabyte.
 fn read_body(req: &mut Request) -> String {
     let mut body = String::new();
-    let _ = req.as_reader().take(1 << 20).read_to_string(&mut body);
+    let _ = req.as_reader().take(MAX_BODY_BYTES).read_to_string(&mut body);
     body
 }
 
-/// A JSON reply with a status code.
 fn json_status(code: u16, v: Value) -> Reply {
     http::json(v).with_status_code(code)
 }
 
-/// The settings page and its data: refused without a password to require, as the C
-/// gateway's `/config` is, since the page shows the node credentials' user and URL.
-fn settings_access(ctx: &Context, req: &Request) -> Result<(), Reply> {
+fn admin_access(ctx: &Context, req: &Request, without_password: &str) -> Result<(), Reply> {
     if ctx.server.config.api.admin_password.is_empty() {
-        Err(forbidden("The settings page requires api.admin_password to be set."))
-    } else if !authorized(ctx, req) {
-        Err(unauthorized())
-    } else {
+        Err(forbidden(without_password))
+    } else if authorized(ctx, req) {
         Ok(())
+    } else {
+        Err(unauthorized())
     }
 }
 
-/// `/config.json`: the form's values, whether saving is allowed, and the form token.
+fn settings_access(ctx: &Context, req: &Request) -> Result<(), Reply> {
+    admin_access(ctx, req, "The settings page requires api.admin_password to be set.")
+}
+
+fn with_fields(mut base: Value, fields: impl IntoIterator<Item = (&'static str, Value)>) -> Value {
+    let o = base.as_object_mut().expect("a JSON object");
+    o.extend(fields.into_iter().map(|(k, v)| (k.to_string(), v)));
+    base
+}
+
 fn settings_json(ctx: &Context) -> Value {
     let cfg = &ctx.server.config;
     let doc = std::fs::read_to_string(&ctx.config_path)
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
         .unwrap_or(Value::Null);
-    let mut v = crate::config::form_values(cfg, &doc);
-    let o = v.as_object_mut().expect("an object");
-    o.insert("editable".into(), json!(cfg.api.modify_conf));
-    o.insert("config_path".into(), json!(ctx.config_path));
-    o.insert("csrf".into(), json!(ctx.csrf));
-    v
+    with_fields(
+        crate::settings::form_values(cfg, &doc),
+        [
+            ("editable", json!(cfg.api.modify_conf)),
+            ("config_path", json!(ctx.config_path)),
+            ("csrf", json!(ctx.csrf)),
+        ],
+    )
 }
 
-/// A POST to `/config`: the reply, and whether the process restarts once it is sent.
 fn save_settings(ctx: &Context, body: &str) -> (Reply, bool) {
     let form = http::pairs(body);
     let errors = |code, errors: Vec<String>| {
@@ -396,10 +136,10 @@ fn save_settings(ctx: &Context, body: &str) -> (Reply, bool) {
         Ok(t) => t,
         Err(e) => return errors(500, vec![format!("could not read {}: {e}", ctx.config_path)]),
     };
-    match crate::config::apply(&ctx.server.config, &text, &form) {
+    match crate::settings::apply(&ctx.server.config, &text, &form) {
         Err(e) => errors(400, e),
         Ok(None) => (http::json(json!({"ok": true, "restart": false})), false),
-        Ok(Some(new_text)) => match crate::config::write_file(&ctx.config_path, &new_text) {
+        Ok(Some(new_text)) => match crate::settings::write_file(&ctx.config_path, &new_text) {
             Ok(()) => {
                 info!("Wrote the new configuration to {}", ctx.config_path);
                 (http::json(json!({"ok": true, "restart": true})), true)
@@ -412,6 +152,35 @@ fn save_settings(ctx: &Context, body: &str) -> (Reply, bool) {
     }
 }
 
+fn post_settings(ctx: &Context, req: &mut Request) -> (Reply, bool) {
+    if !ctx.server.config.api.modify_conf {
+        return (forbidden("Saving settings requires api.modify_conf to be set."), false);
+    }
+    if let Err(reply) = settings_access(ctx, req) {
+        return (reply, false);
+    }
+    let body = read_body(req);
+    save_settings(ctx, &body)
+}
+
+fn post_command(ctx: &Context, req: &mut Request) -> Reply {
+    if let Err(reply) = admin_access(ctx, req, "Commands require api.admin_password to be set.") {
+        return reply;
+    }
+    let body = read_body(req);
+    if !http::param(&body, "csrf").is_some_and(|t| secure_eq(&t, &ctx.csrf)) {
+        return forbidden("Missing or stale form token.");
+    }
+    if let Some(id) = http::param(&body, "kill_client").and_then(|v| v.parse::<u64>().ok()) {
+        if ctx.server.kill_client(id) {
+            info!("API kill request for client {id}");
+        }
+    } else if http::param(&body, "empty_thread").is_some() {
+        ctx.server.shutdown_all();
+    }
+    redirect("/")
+}
+
 fn serve_admin(ctx: &Context, mut req: Request) {
     let (path, query) = http::path_and_query(&req);
     let method = req.method().clone();
@@ -419,18 +188,18 @@ fn serve_admin(ctx: &Context, mut req: Request) {
     let response = match (method, path.as_str()) {
         (Method::Get, "/") => {
             if http::param(&query, "format").as_deref() == Some("json") {
-                http::json(status_json(ctx, authorized(ctx, &req)))
+                http::json(snapshot::status_json(ctx, authorized(ctx, &req)))
             } else {
                 http::html(INDEX_HTML.clone())
             }
         }
-        (Method::Get, "/stats.json") => http::json(status_json(ctx, authorized(ctx, &req))),
+        (Method::Get, "/stats.json") => {
+            http::json(snapshot::status_json(ctx, authorized(ctx, &req)))
+        }
         (Method::Get | Method::Post, "/NOTIFY") => {
             ctx.server.notify.raise();
             http::html("OK".to_string())
         }
-        // The browser prompts for the admin password on the 401; the status page's client
-        // rows then come with the credentials it replays.
         (Method::Get, "/login") => {
             if authorized(ctx, &req) {
                 redirect("/")
@@ -447,54 +216,19 @@ fn serve_admin(ctx: &Context, mut req: Request) {
             Err(reply) => reply,
         },
         (Method::Post, "/config") => {
-            if !ctx.server.config.api.modify_conf {
-                forbidden("Saving settings requires api.modify_conf to be set.")
-            } else {
-                match settings_access(ctx, &req) {
-                    Ok(()) => {
-                        let body = read_body(&mut req);
-                        let (reply, r) = save_settings(ctx, &body);
-                        restart = r;
-                        reply
-                    }
-                    Err(reply) => reply,
-                }
-            }
+            let (reply, r) = post_settings(ctx, &mut req);
+            restart = r;
+            reply
         }
-        (Method::Post, "/cmd") => {
-            // As in C: no admin password, no commands; and the form's token must match.
-            if ctx.server.config.api.admin_password.is_empty() {
-                forbidden("Commands require api.admin_password to be set.")
-            } else if !authorized(ctx, &req) {
-                unauthorized()
-            } else {
-                let body = read_body(&mut req);
-                if !http::param(&body, "csrf").is_some_and(|t| secure_eq(&t, &ctx.csrf)) {
-                    forbidden("Missing or stale form token.")
-                } else {
-                    if let Some(id) =
-                        http::param(&body, "kill_client").and_then(|v| v.parse::<u64>().ok())
-                    {
-                        if ctx.server.kill_client(id) {
-                            info!("API kill request for client {id}");
-                        }
-                    } else if http::param(&body, "empty_thread").is_some() {
-                        ctx.server.shutdown_all();
-                    }
-                    redirect("/")
-                }
-            }
-        }
+        (Method::Post, "/cmd") => post_command(ctx, &mut req),
         (Method::Get | Method::Post, _) => http::not_found(),
         _ => http::method_not_allowed(),
     };
     let _ = req.respond(response);
     if restart {
-        crate::config::restart();
+        crate::settings::restart();
     }
 }
-
-use std::io::Read as _;
 
 fn serve_miner(ctx: &Context, req: Request) {
     let (path, query) = http::path_and_query(&req);
@@ -502,16 +236,13 @@ fn serve_miner(ctx: &Context, req: Request) {
         http::method_not_allowed()
     } else if path != "/" {
         http::not_found()
-    } else if http::param(&query, "format").as_deref() == Some("json") {
-        let addr = http::param(&query, "addr");
-        http::json(miner_lookup_json(ctx, addr.as_deref()))
     } else {
-        http::html(MINER_HTML.clone())
+        let addr = http::param(&query, "addr");
+        http::json(snapshot::miner_lookup_json(ctx, addr.as_deref()))
     };
     let _ = req.respond(response);
 }
 
-/// Bind on `addr`, or on every address when it is empty, as the stratum listener does.
 fn bind(what: &str, addr: &str, port: u16) -> Option<tiny_http::Server> {
     match http::bind(addr, port) {
         Ok(s) => Some(s),
@@ -528,17 +259,8 @@ pub fn start(ctx: Arc<Context>) {
         info!("No API port configured. API disabled.");
     } else if let Some(server) = bind("API", &cfg.api.listen_addr, cfg.api.listen_port) {
         info!("API listening on port {}", cfg.api.listen_port);
-        sample_hashrate(&ctx);
         let sampler = Arc::clone(&ctx);
-        std::thread::Builder::new()
-            .name("api-sampler".into())
-            .spawn(move || {
-                loop {
-                    std::thread::sleep(std::time::Duration::from_secs(HISTORY_INTERVAL_SECS));
-                    sample_hashrate(&sampler);
-                }
-            })
-            .expect("api sampler thread");
+        ratum::hashrate::sample_periodically("api-sampler", move || sample_hashrate(&sampler));
         let ctx = Arc::clone(&ctx);
         http::serve("api", server, move |req| serve_admin(&ctx, req));
     }
@@ -562,13 +284,5 @@ mod tests {
         assert!(!secure_eq("abc", "ab"));
         assert!(!secure_eq("", "a"));
         assert!(secure_eq("", ""));
-    }
-
-    #[test]
-    fn uptime_text() {
-        assert_eq!(
-            duration_text(std::time::Duration::from_secs(90061)),
-            "1 days, 1 hours, 1 minutes, 1 seconds"
-        );
     }
 }

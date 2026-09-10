@@ -1,15 +1,5 @@
-//! The byte cursor the crate's variable-length wire decoders read through: `bytes::Buf` for
-//! the buffer mechanics, wrapped so each read names its field. The fixed-size 164-byte
-//! header record in `header.rs` is the exception: its length is checked once up front, so it
-//! is read and written by its own infallible pair rather than through this fallible cursor.
-//!
-//! Each format module maps [`Truncated`] into its own error type with a `From` impl, so a
-//! decoder reads its fields in order with `?` and the error names the field the input
-//! ended inside, which `Buf`'s own `TryGetError` does not carry.
-
 use bytes::Buf as _;
 
-/// The input ended inside the named field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Truncated(pub &'static str);
 
@@ -27,7 +17,6 @@ impl<'a> Cursor<'a> {
         self.full.len() - self.rest.len()
     }
 
-    /// What has not been read yet, without advancing.
     pub fn rest(&self) -> &'a [u8] {
         self.rest
     }
@@ -36,7 +25,7 @@ impl<'a> Cursor<'a> {
         self.rest.is_empty()
     }
 
-    pub fn peek(&self) -> Option<u8> {
+    fn peek(&self) -> Option<u8> {
         self.rest.first().copied()
     }
 
@@ -44,8 +33,6 @@ impl<'a> Cursor<'a> {
         Some((*self.rest.first()?, *self.rest.get(1)?))
     }
 
-    /// Advance past `byte` if it is next. Decoders use this for the optional leading
-    /// command byte a payload may or may not still carry.
     pub fn skip_if(&mut self, byte: u8) -> bool {
         if self.peek() == Some(byte) {
             self.rest.advance(1);
@@ -72,8 +59,6 @@ impl<'a> Cursor<'a> {
         Ok(self.take(N, what)?.try_into().expect("N bytes"))
     }
 
-    // try_get_* does not advance on failure, so a short read leaves the cursor where it
-    // was, the same contract take() keeps.
     pub fn u8(&mut self, what: &'static str) -> Result<u8, Truncated> {
         self.rest.try_get_u8().map_err(|_| Truncated(what))
     }
@@ -113,7 +98,6 @@ mod tests {
     fn a_short_read_names_the_field() {
         let mut c = Cursor::new(&[0x01, 0x02]);
         assert_eq!(c.u32("nonce"), Err(Truncated("nonce")));
-        // A failed read does not advance, so the two bytes are still there.
         assert_eq!(c.u16("half").unwrap(), 0x0201);
     }
 

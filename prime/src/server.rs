@@ -1,6 +1,3 @@
-//! The pool's shared state: what every connection reads, and the thread that reads the
-//! node's tip and block template for all of them.
-
 use crate::abw::AbwManager;
 use log::{debug, error, info, warn};
 use mio::Waker;
@@ -8,49 +5,26 @@ use ratum::bitcoin::output_script_size_is_valid;
 use ratum::datum::handshake::KeyPairs;
 use ratum::datum::messages::{self, CoinbaseOutput};
 use ratum::{lock, rpc};
+use ratum_prime::bounded::BoundedMap;
 use ratum_prime::ledger::{Ledger, OwedBlock};
 use ratum_prime::verify::{PoolPolicy, ReplayGuard, Splits};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
-/// What the node watcher maintains and every other thread reads, shared as one
-/// `Arc<NodeView>` between the watcher and `Server`.
+#[derive(Default)]
 pub(crate) struct NodeView {
     pub(crate) tip: Mutex<Option<rpc::Tip>>,
     pub(crate) coinbase_value: Mutex<Option<u64>>,
-    /// The compact target of the block the node would build on its tip, `None` until a
-    /// template is read and again whenever one cannot be. A connection refuses a job
-    /// claiming an easier network target than this, so an ordinary share cannot be
-    /// presented as a block.
     pub(crate) next_bits: Mutex<Option<u32>>,
-    /// The tip changes the watcher observed: `(height, unix seconds first seen)`, oldest
-    /// first, capped at `TIP_HISTORY_CAP` entries. The stats interface derives the observed
-    /// block spacing (and from it the retarget estimate) from the span between the first
-    /// and last entries. A reorg can repeat or lower a height; the reader guards against
-    /// that.
     pub(crate) tip_history: Mutex<VecDeque<(u32, u64)>>,
-    /// One waker per open connection, called when the watcher observes a new tip or a new
-    /// target: each connection thread then sends its blocknotify without waiting for its
-    /// next timed check. A connection adds its waker when it starts serving and removes it
-    /// when it closes.
     wakers: Mutex<Vec<Arc<Waker>>>,
 }
 
 pub(crate) const TIP_HISTORY_CAP: usize = 64;
 
 impl NodeView {
-    pub(crate) fn new() -> Self {
-        NodeView {
-            tip: Mutex::new(None),
-            coinbase_value: Mutex::new(None),
-            next_bits: Mutex::new(None),
-            tip_history: Mutex::new(VecDeque::new()),
-            wakers: Mutex::new(Vec::new()),
-        }
-    }
-
     pub(crate) fn add_waker(&self, waker: &Arc<Waker>) {
         lock(&self.wakers).push(Arc::clone(waker));
     }
@@ -59,13 +33,61 @@ impl NodeView {
         lock(&self.wakers).retain(|w| !Arc::ptr_eq(w, waker));
     }
 
-    /// Wake every connection thread out of `Poll::poll`. A failed write to a waker only
-    /// delays that thread until its next timed check, so it is logged and not propagated.
+    fn record_tip(&self, t: &rpc::Tip) {
+        info!(
+            "node tip: height {} difficulty {} {} (chain {})",
+            t.height,
+            t.difficulty,
+            ratum::header::u256_to_display_hex(&t.hash),
+            t.chain.name()
+        );
+        let mut history = lock(&self.tip_history);
+        history.push_back((t.height, ratum::unix_now()));
+        while history.len() > TIP_HISTORY_CAP {
+            history.pop_front();
+        }
+    }
+
     fn wake_connections(&self) {
         for w in lock(&self.wakers).iter() {
             if let Err(e) = w.wake() {
                 debug!("could not wake a gateway connection thread: {e}");
             }
+        }
+    }
+}
+
+fn exit_on_wrong_chain(t: &rpc::Tip, expected: Option<rpc::Chain>) {
+    let Some(expected) = expected else { return };
+    if t.chain == expected {
+        return;
+    }
+    error!(
+        "the node is on chain {} but this pool started on chain {} and its ledger holds {} \
+         shares; exiting rather than credit shares of one chain to the ledger of another",
+        t.chain.name(),
+        expected.name(),
+        expected.name()
+    );
+    std::process::exit(1);
+}
+
+fn refresh_next_block(node: &rpc::Client, view: &NodeView) -> bool {
+    match node.next_block() {
+        Ok(n) => {
+            info!(
+                "node template: the next coinbase may pay {} sats at bits {:#010x}",
+                n.coinbase_value, n.bits
+            );
+            *lock(&view.coinbase_value) = Some(n.coinbase_value);
+            *lock(&view.next_bits) = Some(n.bits);
+            true
+        }
+        Err(e) => {
+            warn!("could not read a template: {e}");
+            *lock(&view.coinbase_value) = None;
+            *lock(&view.next_bits) = None;
+            false
         }
     }
 }
@@ -77,73 +99,23 @@ pub(crate) fn watch_node(
     expected_chain: Option<rpc::Chain>,
 ) {
     let mut last: Option<[u8; 32]> = None;
-    // Whether the template for the current tip has been read. A template read can fail
-    // transiently (the node briefly out of sync right after a block), and until it succeeds
-    // the pool has no network target, so the job-target check and the coinbaser value
-    // check are disabled. Retry it every iteration rather than only on the next tip change.
     let mut have_template = false;
     let mut wait_for_blocks = true;
     loop {
         let height = match node.tip() {
             Ok(t) => {
-                // The ledger is named after and stamped with the chain the pool started on;
-                // a node moved to another chain under a running pool would have its shares
-                // credited to that ledger, so stop instead.
-                match expected_chain {
-                    Some(expected) if t.chain != expected => {
-                        error!(
-                            "the node is on chain {} but this pool started on chain {} and \
-                             its ledger holds {} shares; exiting rather than credit shares \
-                             of one chain to the ledger of another",
-                            t.chain.name(),
-                            expected.name(),
-                            expected.name()
-                        );
-                        std::process::exit(1);
-                    }
-                    _ => {}
-                }
+                exit_on_wrong_chain(&t, expected_chain);
                 let tip_changed = last != Some(t.hash);
                 let previous_bits = *lock(&view.next_bits);
                 if tip_changed {
-                    let mut display = t.hash;
-                    display.reverse();
-                    info!(
-                        "node tip: height {} difficulty {} {} (chain {})",
-                        t.height,
-                        t.difficulty,
-                        hex::encode(display),
-                        t.chain.name()
-                    );
+                    view.record_tip(&t);
                     last = Some(t.hash);
                     have_template = false;
-                    let mut history = lock(&view.tip_history);
-                    history.push_back((t.height, unix_now()));
-                    while history.len() > TIP_HISTORY_CAP {
-                        history.pop_front();
-                    }
                 }
                 if !have_template {
-                    match node.next_block() {
-                        Ok(n) => {
-                            info!(
-                                "node template: the next coinbase may pay {} sats at bits {:#010x}",
-                                n.coinbase_value, n.bits
-                            );
-                            *lock(&view.coinbase_value) = Some(n.coinbase_value);
-                            *lock(&view.next_bits) = Some(n.bits);
-                            have_template = true;
-                        }
-                        Err(e) => {
-                            warn!("could not read a template: {e}");
-                            *lock(&view.coinbase_value) = None;
-                            *lock(&view.next_bits) = None;
-                        }
-                    }
+                    have_template = refresh_next_block(&node, &view);
                 }
                 *lock(&view.tip) = Some(t);
-                // What every connection's poll waits for: without this each would notice
-                // the new tip at its next timed check and serve the old one until then.
                 if tip_changed || *lock(&view.next_bits) != previous_bits {
                     view.wake_connections();
                 }
@@ -190,16 +162,9 @@ pub(crate) fn watch_node(
 pub(crate) struct Server {
     pub(crate) pool_keys: KeyPairs,
     pub(crate) motd: String,
-    /// User-agent prefixes a hello must match; empty accepts every agent (`--allow-agent`).
     pub(crate) allowed_agents: Vec<String>,
-    /// Refuse a hello without the DRS extension (`--require-v3`): only version 3 gateways
-    /// connect, so every session is under an ABW assignment and no client can withhold
-    /// blocks selectively. Off serves both generations.
     pub(crate) require_v3: bool,
-    /// Closed version 3 sessions a gateway may resume; see `SavedSession`.
     pub(crate) sessions: Mutex<SessionStore>,
-    /// How long after a version 3 session's ABW slot is retired its key is revealed
-    /// (`--abw-reveal-after`); see `crate::abw`.
     pub(crate) abw_reveal_after: Duration,
     pub(crate) node: rpc::Client,
     pub(crate) node_view: Arc<NodeView>,
@@ -207,41 +172,21 @@ pub(crate) struct Server {
     pub(crate) ledger: Mutex<Ledger>,
     pub(crate) resolver: Mutex<Resolver>,
     pub(crate) payout: PayoutPolicy,
-    /// What every connection's verifier checks shares against. Connection-invariant, so it
-    /// is built once at startup and cloned per connection.
     pub(crate) policy: PoolPolicy,
-    /// The encoded 0x99 config every connection is sent, built once from the same policy.
     pub(crate) config_payload: Vec<u8>,
-    /// The count of open connections, bounded by `max_connections`.
     pub(crate) open_connections: AtomicUsize,
     pub(crate) max_connections: usize,
-    /// The port a gateway connects to (the `--listen` port), reported by the stats interface
-    /// so the page can show how to reach the pool.
     pub(crate) datum_port: u16,
-    /// The host, or `host:port`, gateways should use to reach the pool (`--advertise-address`).
-    /// `None` falls back to the address the stats page was reached on. The stats interface only
-    /// displays it.
     pub(crate) advertise: Option<String>,
-    /// URL of a gateway open to miners who do not run their own (`--public-gateway`), with a
-    /// scheme. `None` shows nothing. The stats interface only displays it.
     pub(crate) public_gateway: Option<String>,
 }
 
-/// How long a closed version 3 session can be resumed.
 pub(crate) const SESSION_KEEP: Duration = Duration::from_secs(3600);
-/// The most closed sessions kept; past it the oldest is evicted, and its resume declined.
 pub(crate) const MAX_SAVED_SESSIONS: usize = 4096;
 
-/// A closed version 3 session, kept so the gateway's next hello can resume it: the token it
-/// must present and the ABW slots it mined under. The C gateway keeps its slot table and
-/// retained proofs across a reconnect and replays its unanswered shares once the resume is
-/// accepted, so the slots' keys must be the ones those shares were mined under.
 pub(crate) struct SavedSession {
     pub(crate) state: SessionState,
     pub(crate) saved_at: Instant,
-    /// When the connection that held the session was accepted. A connection the pool has
-    /// not yet found dead (its peer gone without a close) can outlive the connection that
-    /// replaced it; `SessionStore::save` keeps the entry of the later connection.
     pub(crate) held_since: Instant,
 }
 
@@ -251,60 +196,30 @@ impl SavedSession {
     }
 }
 
-/// The saved sessions by the gateway's long-term signing key, which the hello that resumes
-/// one is signed with.
-#[derive(Default)]
-pub(crate) struct SessionStore {
-    map: HashMap<[u8; 32], SavedSession>,
-    /// Insertion order, for eviction.
-    order: VecDeque<[u8; 32]>,
+pub(crate) struct SessionStore(BoundedMap<[u8; 32], SavedSession>);
+
+impl Default for SessionStore {
+    fn default() -> Self {
+        Self(BoundedMap::new(MAX_SAVED_SESSIONS))
+    }
 }
 
 impl SessionStore {
-    /// Save `session` under `key`, unless the entry there came from a connection accepted
-    /// later than the one that held `session`. The entries past `SESSION_KEEP` are removed
-    /// first, so an expired session holds its splits no longer than a hello could resume it.
     pub(crate) fn save(&mut self, key: [u8; 32], session: SavedSession) {
-        self.prune_expired(session.saved_at);
-        if self.map.get(&key).is_some_and(|kept| kept.held_since > session.held_since) {
+        let saved_at = session.saved_at;
+        self.0.retain(|_, s| !s.expired(saved_at));
+        if self.0.get(&key).is_some_and(|kept| kept.held_since > session.held_since) {
             return;
         }
-        if self.map.insert(key, session).is_some() {
-            self.order.retain(|k| *k != key);
-        }
-        self.order.push_back(key);
-        while self.map.len() > MAX_SAVED_SESSIONS {
-            match self.order.pop_front() {
-                Some(oldest) => {
-                    self.map.remove(&oldest);
-                }
-                None => break,
-            }
-        }
+        self.0.insert(key, session);
     }
 
     pub(crate) fn take(&mut self, key: &[u8; 32]) -> Option<SavedSession> {
-        let session = self.map.remove(key)?;
-        self.order.retain(|k| k != key);
-        Some(session)
-    }
-
-    /// Remove the entries no hello can resume any more.
-    fn prune_expired(&mut self, now: Instant) {
-        self.map.retain(|_, s| !s.expired(now));
-        let map = &self.map;
-        self.order.retain(|k| map.contains_key(k));
-    }
-
-    #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
-        self.map.len()
+        self.0.remove(key)
     }
 }
 
 impl Server {
-    /// The v3 config a version 3 session is sent in place of `config_payload`: `token`
-    /// names the session, and bulk framing is advertised.
     pub(crate) fn config_payload_v3(&self, token: &messages::ResumeToken) -> Vec<u8> {
         messages::ClientConfigV3 {
             payout_script: self.policy.payout_script.clone(),
@@ -319,10 +234,6 @@ impl Server {
         .expect("the v1 config from the same policy encoded at startup")
     }
 
-    /// Continue the saved session a version 3 hello presents the token of, or start one.
-    /// The entry saved under the gateway's key is consumed either way; it continues only
-    /// when it has not expired and its token is the one presented. Returns the session's
-    /// state (`AbwManager::resumed` when continued) and whether it was resumed.
     pub(crate) fn resume_or_start(
         &self,
         client_key: [u8; 32],
@@ -348,22 +259,13 @@ impl Server {
     }
 }
 
-/// The state of a version 3 session that outlives its connection: what a resumed
-/// connection continues with, and what `SavedSession` keeps meanwhile.
 pub(crate) struct SessionState {
-    /// The token the session is configured with and a hello resuming it presents.
     pub(crate) token: messages::ResumeToken,
     pub(crate) abw: AbwManager,
-    /// The splits the session dictated, by coinbaser id: the gateway's replayed shares and
-    /// its shares on the jobs it still holds pay them, and `check_outputs` refuses any
-    /// other output.
     pub(crate) splits: Splits,
-    /// The last coinbaser id sent, continued so a resumed session's next split does not
-    /// take an id a held job still names.
     pub(crate) coinbaser_id: u8,
 }
 
-/// Decrements `open_connections` when the connection's thread ends.
 pub(crate) struct OpenConnectionGuard(pub(crate) Arc<Server>);
 
 impl Drop for OpenConnectionGuard {
@@ -372,13 +274,6 @@ impl Drop for OpenConnectionGuard {
     }
 }
 
-/// `fee_bps` is the operator fee in basis points (hundredths of a percent), 0 to 100, so at
-/// most 1% (`main` refuses more). The pool receives it: `value - fee` is split among the
-/// miners, and the gateway pays the fee to the pool's payout script as the coinbase remainder,
-/// by the same mechanism as the pool's fallback residue (an address that does not resolve, a
-/// script too long to pay, an empty window, or a split that could not be encoded). `fee_bps`
-/// is 0 by default, so nothing is withheld and `Ledger::split` divides the whole coinbase
-/// value to the satoshi.
 #[derive(Clone, Copy)]
 pub(crate) struct PayoutPolicy {
     pub(crate) min_payout: u64,
@@ -388,96 +283,66 @@ pub(crate) struct PayoutPolicy {
 }
 
 impl PayoutPolicy {
-    /// The operator fee taken from a coinbase value of `value` sats: `fee_bps` hundredths of a
-    /// percent, rounded down so the operator never takes more than the exact rate.
     pub(crate) fn fee_on(&self, value: u64) -> u64 {
-        (u128::from(value) * u128::from(self.fee_bps) / 10_000) as u64
+        (u128::from(value) * u128::from(self.fee_bps) / u128::from(ratum::BASIS_POINTS_PER_UNIT))
+            as u64
     }
 
-    /// The sats the split divides among the miners: `value` minus the operator fee.
     pub(crate) fn miners_share(&self, value: u64) -> u64 {
         value - self.fee_on(value)
     }
 }
 
-/// The split of a coinbase value of `value` sats after the operator fee. The one
-/// computation `dictated_outputs`, `owed_for_block` and the stats snapshot share, so a
-/// change to the fee or split parameters reaches all three.
 pub(crate) fn split_after_fee(l: &Ledger, payout: &PayoutPolicy, value: u64) -> Vec<(String, u64)> {
     l.split(payout.miners_share(value), payout.min_payout, messages::MAX_COINBASER_OUTPUTS)
 }
 
-pub(crate) fn unix_now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
-}
-
 pub(crate) struct Resolver {
-    scripts: HashMap<String, Result<Vec<u8>, Unpayable>>,
-    order: std::collections::VecDeque<String>,
+    scripts: BoundedMap<String, Result<Vec<u8>, Unpayable>>,
 }
 
 const MAX_CACHED_ADDRESSES: usize = 1 << 16;
 
-/// Why an identity cannot be paid a coinbase output. Determined by the node, so it does not
-/// change until the identity does, and is cached with the identity.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Unpayable {
-    /// `validateaddress` reports the identity is not a valid address.
     NotAnAddress,
-    /// A valid address the node returned no `scriptPubKey` for.
     NoScript,
-    /// Longer than a coinbase output may be (`output_script_size_is_valid`).
     ScriptTooLong(usize),
 }
 
 impl std::fmt::Display for Unpayable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Unpayable::NotAnAddress => write!(f, "not a valid address"),
-            Unpayable::NoScript => write!(f, "an address the node returns no script for"),
-            Unpayable::ScriptTooLong(n) => {
+            Self::NotAnAddress => write!(f, "not a valid address"),
+            Self::NoScript => write!(f, "an address the node returns no script for"),
+            Self::ScriptTooLong(n) => {
                 write!(f, "over the coinbase output limit ({n} bytes)")
             }
         }
     }
 }
 
-/// Whether an identity can be paid a coinbase output.
 pub(crate) enum Payability {
     Script(Vec<u8>),
     Unpayable(Unpayable),
-    /// The node could not be asked. Distinct from `Unpayable` so an RPC failure does not make
-    /// the pool refuse an identity that is valid: the caller treats it as payable.
     Unknown,
 }
 
 impl Resolver {
     pub(crate) fn new() -> Self {
-        Resolver { scripts: HashMap::new(), order: std::collections::VecDeque::new() }
+        Self { scripts: BoundedMap::new(MAX_CACHED_ADDRESSES) }
     }
 
-    fn insert(&mut self, address: &str, script: Result<Vec<u8>, Unpayable>) {
-        if self.scripts.insert(address.to_string(), script).is_none() {
-            self.order.push_back(address.to_string());
-        }
-        while self.order.len() > MAX_CACHED_ADDRESSES {
-            if let Some(old) = self.order.pop_front() {
-                self.scripts.remove(&old);
-            }
-        }
+    fn remember(&mut self, address: &str, script: Result<Vec<u8>, Unpayable>) {
+        self.scripts.insert(address.to_string(), script);
     }
 
-    /// The cached answer for `address`, without asking the node. The stats interface reads
-    /// through this so an unauthenticated HTTP request cannot make the pool call the node.
     pub(crate) fn cached(cache: &Mutex<Self>, address: &str) -> Option<Result<Vec<u8>, Unpayable>> {
         lock(cache).scripts.get(address).cloned()
     }
 
-    /// Resolve `address` through `validateaddress`, from the cache when it has been resolved
-    /// before. A determinate answer (a script, or a reason it cannot be paid) is cached; an
-    /// RPC failure is not, so the next call asks again.
     pub(crate) fn payability(cache: &Mutex<Self>, node: &rpc::Client, address: &str) -> Payability {
-        if let Some(known) = Resolver::cached(cache, address) {
+        if let Some(known) = Self::cached(cache, address) {
             return known.into();
         }
         let resolved = match resolve_address(node, address) {
@@ -490,7 +355,7 @@ impl Resolver {
         if let Err(why) = &resolved {
             warn!("payout address {address:?} cannot be paid: {why}");
         }
-        lock(cache).insert(address, resolved.clone());
+        lock(cache).remember(address, resolved.clone());
         resolved.into()
     }
 }
@@ -498,15 +363,12 @@ impl Resolver {
 impl From<Result<Vec<u8>, Unpayable>> for Payability {
     fn from(r: Result<Vec<u8>, Unpayable>) -> Self {
         match r {
-            Ok(script) => Payability::Script(script),
-            Err(why) => Payability::Unpayable(why),
+            Ok(script) => Self::Script(script),
+            Err(why) => Self::Unpayable(why),
         }
     }
 }
 
-/// Sort what the node returned for an address into a payable script or a reason it cannot be
-/// paid. The output-size limit is applied here, at resolution, so the share path, the split
-/// and the stats interface all read one answer per identity.
 fn classify(resolved: Resolved) -> Result<Vec<u8>, Unpayable> {
     match resolved {
         Resolved::Script(script) if !output_script_size_is_valid(&script) => {
@@ -518,12 +380,9 @@ fn classify(resolved: Resolved) -> Result<Vec<u8>, Unpayable> {
     }
 }
 
-/// What the node's `validateaddress` returns for `address`.
 pub(crate) enum Resolved {
     Script(Vec<u8>),
-    /// The node reports the address as not valid.
     Invalid,
-    /// Valid, but the node returned no script for it.
     NoScript,
 }
 
@@ -538,56 +397,43 @@ pub(crate) fn resolve_address(node: &rpc::Client, address: &str) -> Result<Resol
     })
 }
 
+fn payable_entries(
+    server: &Server,
+    split: Vec<(String, u64)>,
+    left_out: &str,
+) -> Vec<(String, u64, Vec<u8>)> {
+    let mut kept = Vec::with_capacity(split.len());
+    for (identity, sats) in split {
+        match Resolver::payability(&server.resolver, &server.node, &identity) {
+            Payability::Script(script) => kept.push((identity, sats, script)),
+            Payability::Unpayable(why) => warn!(
+                "      {identity} cannot be paid ({why}); its {sats} sats are left out of \
+                 {left_out} and stay with the pool"
+            ),
+            Payability::Unknown => warn!(
+                "      {identity} could not be resolved; its {sats} sats are left out of \
+                 {left_out} and stay with the pool"
+            ),
+        }
+    }
+    kept
+}
+
 pub(crate) fn dictated_outputs(
     server: &Server,
     value: u64,
 ) -> (Vec<(String, CoinbaseOutput)>, usize, u128) {
-    let node = &server.node;
-    // The pool receives the operator fee; what remains is split among the miners. The gateway
-    // pays the fee to the pool's payout script as the coinbase remainder (the value minus these
-    // dictated outputs), so no output is dictated for it here.
     let (split, shares, work) = {
         let l = lock(&server.ledger);
         (split_after_fee(&l, &server.payout, value), l.len(), l.total_work())
     };
-    let mut outputs = Vec::with_capacity(split.len());
-    for (identity, amount) in split {
-        // An identity is resolved on the share that first credits it, so all of these are
-        // cached and this loop makes no RPC call in the ordinary case. Anything but a script
-        // (the node is unreachable, or the identity was credited before this check existed
-        // and is not payable) leaves its amount out of the dictated outputs, and the gateway
-        // pays that amount to the pool's payout script as part of the remainder.
-        match Resolver::payability(&server.resolver, node, &identity) {
-            Payability::Script(script) => {
-                outputs.push((identity, CoinbaseOutput { value: amount, script }))
-            }
-            Payability::Unpayable(why) => warn!(
-                "      {identity} cannot be paid ({why}); paying the other outputs and \
-                 leaving this identity's amount to the pool"
-            ),
-            Payability::Unknown => warn!(
-                "      {identity} could not be resolved; paying the other outputs and \
-                 leaving this identity's amount to the pool"
-            ),
-        }
-    }
+    let outputs = payable_entries(server, split, "the dictated outputs")
+        .into_iter()
+        .map(|(identity, value, script)| (identity, CoinbaseOutput { value, script }))
+        .collect();
     (outputs, shares, work)
 }
 
-/// `dictated_outputs` without the identities: the outputs the coinbaser response carries.
-#[cfg(test)]
-pub(crate) fn coinbaser_outputs(server: &Server, value: u64) -> (Vec<CoinbaseOutput>, usize, u128) {
-    let (dictated, shares, work) = dictated_outputs(server, value);
-    (dictated.into_iter().map(|(_, o)| o).collect(), shares, work)
-}
-
-/// What the pool owes the window for a block whose coinbase paid it nothing: the split a
-/// coinbaser for `value` would have dictated at this moment, minus the operator fee, which
-/// the pool keeps on any block. An identity a coinbaser would not have paid (no resolvable
-/// script) is left out under the same rule as `coinbaser_outputs`, and its amount stays
-/// with the pool. `None` when nothing is owed (an empty window, amounts the minimum payout
-/// removes entirely, or no payable identity). The caller records the result with
-/// `Ledger::record_owed`; this only computes it.
 pub(crate) fn owed_for_block(
     server: &Server,
     height: u32,
@@ -596,22 +442,10 @@ pub(crate) fn owed_for_block(
     at: u64,
 ) -> Option<OwedBlock> {
     let split = split_after_fee(&lock(&server.ledger), &server.payout, value);
-    let mut entries = Vec::with_capacity(split.len());
-    for (identity, sats) in split {
-        // Cached from the share that first credited the identity, so no RPC call in the
-        // ordinary case; see the matching rule in `coinbaser_outputs`.
-        match Resolver::payability(&server.resolver, &server.node, &identity) {
-            Payability::Script(_) => entries.push((identity, sats)),
-            Payability::Unpayable(why) => warn!(
-                "      {identity} cannot be paid ({why}); its {sats} sats are left out of \
-                 the owed record and stay with the pool"
-            ),
-            Payability::Unknown => warn!(
-                "      {identity} could not be resolved; its {sats} sats are left out of \
-                 the owed record and stay with the pool"
-            ),
-        }
-    }
+    let entries: Vec<(String, u64)> = payable_entries(server, split, "the owed record")
+        .into_iter()
+        .map(|(identity, sats, _)| (identity, sats))
+        .collect();
     let total: u64 = entries.iter().map(|(_, sats)| *sats).sum();
     if total == 0 {
         return None;
@@ -622,10 +456,13 @@ pub(crate) fn owed_for_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn coinbaser_outputs(server: &Server, value: u64) -> (Vec<CoinbaseOutput>, usize, u128) {
+        let (dictated, shares, work) = dictated_outputs(server, value);
+        (dictated.into_iter().map(|(_, o)| o).collect(), shares, work)
+    }
     use ratum::datum::messages::ClientConfig;
 
-    /// `payability` returns from its cache before calling the node, so the node client, which
-    /// cannot connect, is never called for an address `resolved` names.
     fn server_with(
         shares: &[(&str, u64)],
         resolved: &[(&str, Result<Vec<u8>, Unpayable>)],
@@ -648,7 +485,7 @@ mod tests {
         }
         let mut resolver = Resolver::new();
         for (address, script) in resolved {
-            resolver.insert(address, script.clone());
+            resolver.remember(address, script.clone());
         }
         let config = ClientConfig {
             payout_script: POOL.to_vec(),
@@ -664,7 +501,7 @@ mod tests {
             sessions: Mutex::new(SessionStore::default()),
             abw_reveal_after: crate::abw::DEFAULT_REVEAL_AFTER,
             node: rpc::Client::new("http://127.0.0.1:1", "u", "p").unwrap(),
-            node_view: Arc::new(NodeView::new()),
+            node_view: Arc::new(NodeView::default()),
             replay: Arc::new(Mutex::new(ReplayGuard::default())),
             ledger: Mutex::new(ledger),
             resolver: Mutex::new(resolver),
@@ -717,12 +554,12 @@ mod tests {
             "the session's splits continue"
         );
         assert_eq!(state.coinbaser_id, 7, "the next split takes id 8");
-        assert_eq!(lock(&server.sessions).len(), 0, "the entry is consumed");
+        assert_eq!(lock(&server.sessions).0.len(), 0, "the entry is consumed");
 
         let (state, resumed) = server.resume_or_start(key, Some(&token), now);
         assert!(!resumed, "a consumed session is not resumed again");
         assert_ne!(state.token, token);
-        assert!(messages::token_matches_prime_id(&state.token, 1));
+        assert_eq!(state.token[..8], 1u64.to_le_bytes());
         assert!(state.splits.is_empty());
         assert_eq!(state.coinbaser_id, 0);
     }
@@ -743,7 +580,7 @@ mod tests {
         let (state, resumed) = server.resume_or_start(key, Some(&other), now);
         assert!(!resumed);
         assert_ne!(state.token, token);
-        assert_eq!(lock(&server.sessions).len(), 0, "a mismatch consumes the entry too");
+        assert_eq!(lock(&server.sessions).0.len(), 0, "a mismatch consumes the entry too");
 
         save(&server, now);
         let (_, resumed) =
@@ -753,7 +590,7 @@ mod tests {
         save(&server, now);
         let (_, resumed) = server.resume_or_start(key, None, now);
         assert!(!resumed, "no token presented");
-        assert_eq!(lock(&server.sessions).len(), 0);
+        assert_eq!(lock(&server.sessions).0.len(), 0);
 
         let (_, resumed) = server.resume_or_start([9u8; 32], Some(&token), now);
         assert!(!resumed, "another gateway's key");
@@ -780,19 +617,18 @@ mod tests {
             let abw = AbwManager::start(now, crate::abw::DEFAULT_REVEAL_AFTER);
             store.save(key, saved(token, abw, now, now));
         }
-        assert_eq!(store.len(), MAX_SAVED_SESSIONS);
+        assert_eq!(store.0.len(), MAX_SAVED_SESSIONS);
         assert!(store.take(&[0u8; 32]).is_none(), "the first entry was evicted");
         let mut last = [0u8; 32];
         last[..8].copy_from_slice(&(MAX_SAVED_SESSIONS as u64).to_le_bytes());
         assert!(store.take(&last).is_some());
-        assert_eq!(store.len(), MAX_SAVED_SESSIONS - 1);
-        // Saving under a key again replaces the entry and moves it to the newest position.
+        assert_eq!(store.0.len(), MAX_SAVED_SESSIONS - 1);
         let mut second = [0u8; 32];
         second[..8].copy_from_slice(&1u64.to_le_bytes());
         let abw = AbwManager::start(now, crate::abw::DEFAULT_REVEAL_AFTER);
         store.save(second, saved(token, abw, now, now));
-        assert_eq!(store.len(), MAX_SAVED_SESSIONS - 1);
-        assert_eq!(store.order.back(), Some(&second));
+        assert_eq!(store.0.len(), MAX_SAVED_SESSIONS - 1);
+        assert_eq!(store.0.order().back(), Some(&second));
     }
 
     #[test]
@@ -805,15 +641,12 @@ mod tests {
         let later = t0 + SESSION_KEEP + Duration::from_secs(1);
         let abw = AbwManager::start(later, crate::abw::DEFAULT_REVEAL_AFTER);
         store.save([2u8; 32], saved(token, abw, later, later));
-        assert_eq!(store.len(), 1, "the expired entry is gone");
+        assert_eq!(store.0.len(), 1, "the expired entry is gone");
         assert!(store.take(&[1u8; 32]).is_none());
         assert!(store.take(&[2u8; 32]).is_some());
-        assert!(store.order.is_empty(), "the eviction order follows the map");
+        assert!(store.0.order().is_empty(), "the eviction order follows the map");
     }
 
-    /// A connection whose peer vanished without a close stays open at the pool until its
-    /// writes fail, so it can end after the connection that replaced it: its save must not
-    /// overwrite the later connection's session.
     #[test]
     fn a_connection_accepted_earlier_does_not_overwrite_a_later_ones_saved_session() {
         let mut store = SessionStore::default();
@@ -833,11 +666,10 @@ mod tests {
             later,
             "the later connection's entry stays"
         );
-        // In the other order the later connection's save replaces the earlier one's.
         store.save(key, session(earlier, t0));
         store.save(key, session(later, t1));
         assert_eq!(store.take(&key).unwrap().state.token, later);
-        assert_eq!(store.len(), 0);
+        assert_eq!(store.0.len(), 0);
     }
 
     #[test]
@@ -854,16 +686,12 @@ mod tests {
             outputs.iter().map(|o| (o.value, o.script.clone())).collect::<Vec<_>>(),
             vec![(750_000, p2wpkh(0xa1)), (250_000, p2wpkh(0xb2))]
         );
-        // Fully allocated, so the gateway has no remainder to pay to the pool.
         assert_eq!(outputs.iter().map(|o| o.value).sum::<u64>(), 1_000_000);
         assert!(outputs.iter().all(|o| o.script != POOL));
     }
 
     #[test]
     fn a_fee_is_deducted_before_the_split_and_left_to_the_pool() {
-        // fee_bps 100 is 1%: 10_000 of 1_000_000 is withheld, and 990_000 is split among the
-        // miners. The dictated outputs total the split, not the value; the gateway pays the
-        // 10_000 difference to the pool's payout script as the coinbase remainder.
         let server = server_with_fee(
             &[("alice", 3), ("bob", 1)],
             &[("alice", Ok(p2wpkh(0xa1))), ("bob", Ok(p2wpkh(0xb2)))],
@@ -877,7 +705,6 @@ mod tests {
         );
         let paid: u64 = outputs.iter().map(|o| o.value).sum();
         assert_eq!(paid, 990_000);
-        // The pool keeps what the split did not distribute.
         assert_eq!(1_000_000 - paid, 10_000);
         assert!(outputs.iter().all(|o| o.script != POOL));
     }
@@ -892,9 +719,7 @@ mod tests {
         };
         assert_eq!(with_bps(0).fee_on(1_000_000), 0, "no fee by default");
         assert_eq!(with_bps(50).fee_on(1_000_000), 5_000, "0.5%");
-        // 100 (1%) is the highest fee `main` accepts.
         assert_eq!(with_bps(100).fee_on(1_000_000), 10_000);
-        // 1% of 1 sat is 0.01 sat, rounded down to 0: the miner keeps it.
         assert_eq!(with_bps(100).fee_on(1), 0);
     }
 
@@ -908,8 +733,6 @@ mod tests {
 
     #[test]
     fn an_address_that_does_not_resolve_leaves_its_amount_to_the_pool() {
-        // Dropped after the split counted its work, so its amount becomes the remainder
-        // the gateway pays to the pool.
         let server = server_with(
             &[("alice", 3), ("nonsense", 1)],
             &[("alice", Ok(p2wpkh(0xa1))), ("nonsense", Err(Unpayable::NotAnAddress))],
@@ -924,9 +747,6 @@ mod tests {
 
     #[test]
     fn a_script_too_long_to_pay_is_left_out_rather_than_sent() {
-        // A coinbase output script may be at most 34 bytes; a longer one builds a block the
-        // network rejects. `classify` applies the limit when the address is resolved, so the
-        // identity is unpayable from that point on rather than being dropped per template.
         let long = vec![0x00; 35];
         assert!(!output_script_size_is_valid(&long));
         assert_eq!(classify(Resolved::Script(long)), Err(Unpayable::ScriptTooLong(35)));
@@ -945,21 +765,16 @@ mod tests {
         assert_eq!(classify(Resolved::Invalid), Err(Unpayable::NotAnAddress));
         assert_eq!(classify(Resolved::NoScript), Err(Unpayable::NoScript));
         assert_eq!(classify(Resolved::Script(p2wpkh(0xa1))), Ok(p2wpkh(0xa1)));
-        // 42 bytes: what validateaddress returns for a future witness version, over the
-        // 34-byte coinbase output limit but under the 64-byte CoinbaserResponse field.
         assert_eq!(classify(Resolved::Script(vec![0x00; 42])), Err(Unpayable::ScriptTooLong(42)));
-        // An OP_RETURN script may be 83 bytes.
-        assert!(classify(Resolved::Script(vec![ratum::bitcoin::OP_RETURN; 83])).is_ok());
+        assert!(classify(Resolved::Script(vec![ratum::bitcoin::opcode::OP_RETURN; 83])).is_ok());
         assert_eq!(
-            classify(Resolved::Script(vec![ratum::bitcoin::OP_RETURN; 84])),
+            classify(Resolved::Script(vec![ratum::bitcoin::opcode::OP_RETURN; 84])),
             Err(Unpayable::ScriptTooLong(84))
         );
     }
 
     #[test]
     fn a_cached_answer_is_returned_without_asking_the_node() {
-        // The node client in these tests cannot connect, so an uncached identity is `Unknown`
-        // rather than unpayable: an RPC failure must not reject an identity that is valid.
         let server = server_with(&[], &[("alice", Ok(p2wpkh(0xa1)))], 0);
         assert!(matches!(
             Resolver::payability(&server.resolver, &server.node, "alice"),
@@ -969,7 +784,6 @@ mod tests {
             Resolver::payability(&server.resolver, &server.node, "unseen"),
             Payability::Unknown
         ));
-        // An unresolvable identity is not cached, so the next call asks the node again.
         assert!(Resolver::cached(&server.resolver, "unseen").is_none());
     }
 
@@ -986,7 +800,6 @@ mod tests {
         assert_eq!(owed.block_hash, [0xbb; 32]);
         assert_eq!(owed.at, 42);
         assert_eq!(owed.settled_at, None);
-        // 1% fee withheld; the identities split the rest as a coinbaser would have.
         assert_eq!(owed.entries, vec![("alice".into(), 742_500), ("bob".into(), 247_500)]);
         assert_eq!(owed.total, 990_000);
     }
@@ -999,8 +812,6 @@ mod tests {
 
     #[test]
     fn the_minimum_is_applied_before_addresses_are_resolved() {
-        // The small miner is removed from the split and its work leaves the denominator, so the
-        // large one takes the whole value, not 999_000.
         let server = server_with(
             &[("large", 999), ("small", 1)],
             &[("large", Ok(p2wpkh(0xa1))), ("small", Ok(p2wpkh(0xb2)))],
@@ -1009,7 +820,6 @@ mod tests {
         let (outputs, shares, _) = coinbaser_outputs(&server, 1_000_000);
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].value, 1_000_000);
-        // Still in the window and counted, but unpaid.
         assert_eq!(shares, 2);
     }
 }

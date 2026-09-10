@@ -1,5 +1,47 @@
 use crate::cursor::{Cursor, Truncated};
+use bytes::BufMut as _;
 use sha2::{Digest, Sha256};
+
+pub mod opcode {
+    pub const OP_0: u8 = 0x00;
+    pub const OP_PUSHDATA1: u8 = 0x4c;
+    pub const OP_PUSHDATA2: u8 = 0x4d;
+    pub const OP_PUSHDATA4: u8 = 0x4e;
+    pub const OP_1: u8 = 0x51;
+    pub const OP_16: u8 = 0x60;
+    pub const OP_RETURN: u8 = 0x6a;
+    pub const OP_DUP: u8 = 0x76;
+    pub const OP_EQUAL: u8 = 0x87;
+    pub const OP_EQUALVERIFY: u8 = 0x88;
+    pub const OP_HASH160: u8 = 0xa9;
+    pub const OP_CHECKSIG: u8 = 0xac;
+    pub const OP_CHECKSIGVERIFY: u8 = 0xad;
+    pub const OP_CHECKMULTISIG: u8 = 0xae;
+    pub const OP_CHECKMULTISIGVERIFY: u8 = 0xaf;
+
+    pub const MAX_DIRECT_PUSH: usize = OP_PUSHDATA1 as usize - 1;
+    pub const MAX_DIRECT_PUSH_OPCODE: u8 = MAX_DIRECT_PUSH as u8;
+
+    pub const OP_N_BASE: u8 = OP_1 - 1;
+}
+
+pub const HASH_SIZE: usize = 32;
+pub const TX_VERSION_SIZE: usize = 4;
+pub const OUTPOINT_SIZE: usize = HASH_SIZE + 4;
+pub const SEQUENCE_SIZE: usize = 4;
+pub const VALUE_SIZE: usize = 8;
+pub const LOCK_TIME_SIZE: usize = 4;
+pub const MIN_OUTPUT_SIZE: usize = VALUE_SIZE + 1;
+const SEGWIT_MARKER_AND_FLAG: (u8, u8) = (0x00, 0x01);
+const SEGWIT_MARKER_AND_FLAG_SIZE: usize = 2;
+pub const WITNESS_SCALE_FACTOR: u64 = 4;
+
+pub const NULL_OUTPOINT_INDEX: [u8; OUTPOINT_SIZE - HASH_SIZE] = [0xff; OUTPOINT_SIZE - HASH_SIZE];
+pub const SEQUENCE_FINAL: [u8; SEQUENCE_SIZE] = [0xff; SEQUENCE_SIZE];
+
+pub const MAX_OUTPUT_SCRIPT_SIZE: usize = 34;
+pub const MAX_OUTPUT_DATA_SIZE: usize = 83;
+pub const MAX_COMPACT_SIZE_LEN: usize = 1 + size_of::<u64>();
 
 pub fn sha256d(data: &[u8]) -> [u8; 32] {
     let first = Sha256::digest(data);
@@ -12,27 +54,20 @@ pub fn reversed(hash: &[u8; 32]) -> [u8; 32] {
     out
 }
 
-/// Hashes the coinbase txid with each stratum merkle branch in turn. `merkle_root_of` builds
-/// a whole tree instead; this walks the one path a miner is given.
 pub fn merkle_root(coinbase_txid: &[u8; 32], branches: &[[u8; 32]]) -> [u8; 32] {
     let mut acc = *coinbase_txid;
-    let mut combined = [0u8; 64];
+    let mut combined = [0u8; 2 * HASH_SIZE];
     for b in branches {
-        combined[..32].copy_from_slice(&acc);
-        combined[32..].copy_from_slice(b);
+        combined[..HASH_SIZE].copy_from_slice(&acc);
+        combined[HASH_SIZE..].copy_from_slice(b);
         acc = sha256d(&combined);
     }
     acc
 }
 
-/// The txid, which commits to the serialization with the witness removed.
 pub fn txid(tx: &[u8]) -> Result<[u8; 32], TxError> {
     let mut c = Cursor::new(tx);
-    c.advance(4, "version")?;
-    let has_witness = matches!(c.peek2(), Some((0x00, 0x01)));
-    if has_witness {
-        c.advance(2, "segwit marker and flag")?;
-    }
+    let (version, has_witness) = read_version_and_marker(&mut c)?;
 
     let body_start = c.pos();
     let inputs = decode_compact_size(&mut c)?;
@@ -40,72 +75,77 @@ pub fn txid(tx: &[u8]) -> Result<[u8; 32], TxError> {
         return Err(TxError::NoInputs);
     }
     for _ in 0..inputs {
-        c.advance(36, "outpoint")?;
+        c.advance(OUTPOINT_SIZE, "outpoint")?;
         let len = decode_compact_size(&mut c)? as usize;
         c.advance(len, "scriptSig")?;
-        c.advance(4, "sequence")?;
+        c.advance(SEQUENCE_SIZE, "sequence")?;
     }
     let outputs = decode_compact_size(&mut c)?;
     for _ in 0..outputs {
-        c.advance(8, "value")?;
+        c.advance(VALUE_SIZE, "value")?;
         let len = decode_compact_size(&mut c)? as usize;
         c.advance(len, "scriptPubKey")?;
     }
     let body_end = c.pos();
 
     if has_witness {
-        for _ in 0..inputs {
-            let items = decode_compact_size(&mut c)?;
-            for _ in 0..items {
-                let len = decode_compact_size(&mut c)? as usize;
-                c.advance(len, "witness item")?;
-            }
-        }
+        skip_witnesses(&mut c, inputs)?;
     }
-    let lock_start = c.pos();
-    c.advance(4, "lock time")?;
-    if !c.at_end() {
-        return Err(TxError::TrailingBytes(tx.len() - c.pos()));
-    }
+    let lock_time = read_lock_time(&mut c, tx.len())?;
 
-    let mut stripped = Vec::with_capacity(8 + (body_end - body_start));
-    stripped.extend_from_slice(&tx[..4]);
-    stripped.extend_from_slice(&tx[body_start..body_end]);
-    stripped.extend_from_slice(&tx[lock_start..lock_start + 4]);
+    let framing = TX_VERSION_SIZE + LOCK_TIME_SIZE;
+    let mut stripped = Vec::with_capacity(framing + (body_end - body_start));
+    stripped.put_u32_le(version);
+    stripped.put_slice(&tx[body_start..body_end]);
+    stripped.put_u32_le(lock_time);
     Ok(sha256d(&stripped))
 }
 
-/// The merkle root of a transaction list, and whether the tree is mutated in the
-/// CVE-2012-2459 sense: two identical hashes were about to be paired, which lets a distinct
-/// transaction list reproduce the same root. A node rejects such a block, so a caller
-/// comparing a reconstructed root against a header must treat a mutated tree as a mismatch.
-/// `None` only when the list is empty.
+fn read_version_and_marker(c: &mut Cursor<'_>) -> Result<(u32, bool), TxError> {
+    let version = c.u32("version")?;
+    let has_witness = c.peek2() == Some(SEGWIT_MARKER_AND_FLAG);
+    if has_witness {
+        c.advance(SEGWIT_MARKER_AND_FLAG_SIZE, "segwit marker and flag")?;
+    }
+    Ok((version, has_witness))
+}
+
+fn skip_witnesses(c: &mut Cursor<'_>, inputs: u64) -> Result<(), TxError> {
+    for _ in 0..inputs {
+        let items = decode_compact_size(c)?;
+        for _ in 0..items {
+            let len = decode_compact_size(c)? as usize;
+            c.advance(len, "witness item")?;
+        }
+    }
+    Ok(())
+}
+
+fn read_lock_time(c: &mut Cursor<'_>, tx_len: usize) -> Result<u32, TxError> {
+    let lock_time = c.u32("lock time")?;
+    if !c.at_end() {
+        return Err(TxError::TrailingBytes(tx_len - c.pos()));
+    }
+    Ok(lock_time)
+}
+
 pub fn merkle_root_of(txids: &[[u8; 32]]) -> Option<([u8; 32], bool)> {
     if txids.is_empty() {
         return None;
     }
     let mut level = txids.to_vec();
-    let mut combined = [0u8; 64];
+    let mut combined = [0u8; 2 * HASH_SIZE];
     let mut mutated = false;
     while level.len() > 1 {
-        // Detect a pair of identical adjacent hashes, before the odd-level duplication below,
-        // exactly as Bitcoin Core's ComputeMerkleRoot does. A trailing odd element is not
-        // examined here: duplicating it is normal tree construction, not a mutation.
-        for pair in level.as_chunks::<2>().0 {
-            if pair[0] == pair[1] {
-                mutated = true;
-                break;
-            }
-        }
-        // An odd level duplicates its last hash before pairing.
+        mutated |= level.as_chunks::<2>().0.iter().any(|[a, b]| a == b);
         if level.len() % 2 == 1 {
             let last = *level.last().expect("non-empty");
             level.push(last);
         }
         let mut next = Vec::with_capacity(level.len() / 2);
-        for pair in level.chunks(2) {
-            combined[..32].copy_from_slice(&pair[0]);
-            combined[32..].copy_from_slice(&pair[1]);
+        for [a, b] in level.as_chunks::<2>().0 {
+            combined[..HASH_SIZE].copy_from_slice(a);
+            combined[HASH_SIZE..].copy_from_slice(b);
             next.push(sha256d(&combined));
         }
         level = next;
@@ -148,27 +188,21 @@ pub enum TxError {
     NoInputs,
 }
 
-impl CoinbaseTx {
-    pub fn total_output_value(&self) -> u64 {
-        self.outputs.iter().fold(0u64, |a, o| a.saturating_add(o.value))
+impl From<Truncated> for TxError {
+    fn from(t: Truncated) -> Self {
+        Self::Truncated(t.0)
     }
 }
 
 pub fn parse_coinbase(tx: &[u8]) -> Result<CoinbaseTx, TxError> {
     let mut c = Cursor::new(tx);
-    let version = c.u32("version")?;
-
-    let mut has_witness = false;
-    if c.peek2() == Some((0x00, 0x01)) {
-        c.advance(2, "segwit marker and flag")?;
-        has_witness = true;
-    }
+    let (version, has_witness) = read_version_and_marker(&mut c)?;
 
     if decode_compact_size(&mut c)? != 1 {
         return Err(TxError::NotCoinbase);
     }
-    let prevout = c.take(36, "outpoint")?;
-    if prevout[..32] != [0u8; 32] || prevout[32..] != [0xffu8; 4] {
+    let prevout = c.take(OUTPOINT_SIZE, "outpoint")?;
+    if prevout[..HASH_SIZE] != [0u8; HASH_SIZE] || prevout[HASH_SIZE..] != NULL_OUTPOINT_INDEX {
         return Err(TxError::InputNotNull);
     }
     let script_len = decode_compact_size(&mut c)? as usize;
@@ -177,8 +211,7 @@ pub fn parse_coinbase(tx: &[u8]) -> Result<CoinbaseTx, TxError> {
     let sequence = c.u32("sequence")?;
 
     let n_out = decode_compact_size(&mut c)? as usize;
-    // Every output starts with nine fixed bytes: an 8-byte value and a 1-byte script length.
-    if n_out.saturating_mul(9) > c.rest().len() {
+    if n_out.saturating_mul(MIN_OUTPUT_SIZE) > c.rest().len() {
         return Err(TxError::LengthOverflow("output count"));
     }
     let mut outputs = Vec::with_capacity(n_out);
@@ -190,16 +223,9 @@ pub fn parse_coinbase(tx: &[u8]) -> Result<CoinbaseTx, TxError> {
     }
 
     if has_witness {
-        let items = decode_compact_size(&mut c)? as usize;
-        for _ in 0..items {
-            let len = decode_compact_size(&mut c)? as usize;
-            c.advance(len, "witness item")?;
-        }
+        skip_witnesses(&mut c, 1)?;
     }
-    let lock_time = c.u32("lock time")?;
-    if !c.at_end() {
-        return Err(TxError::TrailingBytes(tx.len() - c.pos()));
-    }
+    let lock_time = read_lock_time(&mut c, tx.len())?;
 
     Ok(CoinbaseTx {
         version,
@@ -212,139 +238,131 @@ pub fn parse_coinbase(tx: &[u8]) -> Result<CoinbaseTx, TxError> {
     })
 }
 
-pub fn script_pushes(script: &[u8]) -> Vec<(usize, &[u8])> {
-    let mut out = Vec::new();
-    let mut i = 0usize;
-    while i < script.len() {
-        let op = script[i];
-        let (data_at, len) = match op {
-            0x01..=0x4b => (i + 1, op as usize),
-            0x4c => {
-                let Some(&n) = script.get(i + 1) else { break };
-                (i + 2, n as usize)
-            }
-            // A non-pushdata opcode: skip the single byte and keep scanning. A coinbase
-            // scriptSig begins with the BIP34 height, which Bitcoin Core serializes as a
-            // lone OP_1..OP_16 opcode for heights 1..16 (`CScript() << nHeight`), not a
-            // data push, so the coinbase tag and uid pushes that follow it must still be
-            // found. On mainnet the fork height is far above 16 and encodes as a data push,
-            // so this path is reached only for low heights (regtest from genesis).
-            _ => {
-                i += 1;
-                continue;
-            }
-        };
-        let Some(data) = script.get(data_at..data_at + len) else { break };
-        out.push((data_at, data));
-        i = data_at + len;
-    }
-    out
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScriptOp<'a> {
+    pub opcode: u8,
+    pub push: Option<(usize, &'a [u8])>,
 }
 
-/// Whether a coinbase output script is within the node's output-size limit.
-///
-/// `Consensus::CheckOutputSizes` (Knots `src/consensus/tx_verify.cpp`): empty skipped, at
-/// most `MAX_OUTPUT_SCRIPT_SIZE` (34) bytes, or `MAX_OUTPUT_DATA_SIZE` (83) beginning
-/// OP_RETURN. The node applies it to the generation transaction of every block RDTS is
-/// active for: from `Blake2bHeight` until the parent's median time past reaches
-/// `RdtsExpiryTime` (`ConnectBlock`, on the `reduced_data` rule the template reports).
-/// Knots 29.4.1 removed the versionbits deployment `DEPLOYMENT_REDUCED_DATA` this used to
-/// depend on. The pool applies the limit to every block rather than tracking the expiry: it
-/// never builds a block the rule would invalidate, at the cost of paying an oversized
-/// identity's amount to the pool payout script after the expiry as well.
-///
-/// The gateway's `addr_2_output_script` cannot exceed 34, but RATUM resolves addresses
-/// through `validateaddress`, which returns up to 42 bytes for a future witness version:
-/// over the limit, under the 64-byte cap `CoinbaserResponse` applies.
-pub fn output_script_size_is_valid(script: &[u8]) -> bool {
-    const MAX_OUTPUT_SCRIPT_SIZE: usize = 34;
-    const MAX_OUTPUT_DATA_SIZE: usize = 83;
+pub fn script_ops(script: &[u8]) -> impl Iterator<Item = ScriptOp<'_>> {
+    ScriptOps { script, at: 0 }
+}
 
-    // Skipped before the first byte is read, as CheckOutputSizes does.
+struct ScriptOps<'a> {
+    script: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Iterator for ScriptOps<'a> {
+    type Item = ScriptOp<'a>;
+
+    fn next(&mut self) -> Option<ScriptOp<'a>> {
+        let opcode = *self.script.get(self.at)?;
+        let length_bytes = match opcode {
+            0x01..=opcode::MAX_DIRECT_PUSH_OPCODE => 0,
+            opcode::OP_PUSHDATA1 => 1,
+            opcode::OP_PUSHDATA2 => 2,
+            opcode::OP_PUSHDATA4 => 4,
+            _ => {
+                self.at += 1;
+                return Some(ScriptOp { opcode, push: None });
+            }
+        };
+        let after_opcode = self.at + 1;
+        let (data_at, len) = if length_bytes == 0 {
+            (after_opcode, usize::from(opcode))
+        } else {
+            let field = self.script.get(after_opcode..after_opcode + length_bytes)?;
+            let len = field.iter().rev().fold(0usize, |n, b| (n << 8) | usize::from(*b));
+            (after_opcode + length_bytes, len)
+        };
+        let end = data_at.checked_add(len)?;
+        let data = self.script.get(data_at..end)?;
+        self.at = end;
+        Some(ScriptOp { opcode, push: Some((data_at, data)) })
+    }
+}
+
+pub fn script_pushes(script: &[u8]) -> Vec<(usize, &[u8])> {
+    script_ops(script).filter_map(|op| op.push).collect()
+}
+
+pub fn output_script_size_is_valid(script: &[u8]) -> bool {
     if script.is_empty() {
         return true;
     }
-    let limit = if script[0] == OP_RETURN { MAX_OUTPUT_DATA_SIZE } else { MAX_OUTPUT_SCRIPT_SIZE };
+    let limit =
+        if script[0] == opcode::OP_RETURN { MAX_OUTPUT_DATA_SIZE } else { MAX_OUTPUT_SCRIPT_SIZE };
     script.len() <= limit
 }
 
-pub const OP_RETURN: u8 = 0x6a;
-
-impl From<Truncated> for TxError {
-    fn from(t: Truncated) -> Self {
-        TxError::Truncated(t.0)
-    }
-}
+const COMPACT_SIZE_U16_TAG: u8 = 0xfd;
+const COMPACT_SIZE_U32_TAG: u8 = 0xfe;
+const COMPACT_SIZE_U64_TAG: u8 = 0xff;
+const COMPACT_SIZE_MAX_1: u64 = COMPACT_SIZE_U16_TAG as u64 - 1;
+const COMPACT_SIZE_MAX_2: u64 = u16::MAX as u64;
+const COMPACT_SIZE_MAX_4: u64 = u32::MAX as u64;
 
 fn decode_compact_size(c: &mut Cursor<'_>) -> Result<u64, TxError> {
     let first = c.u8("compact size")?;
-    let v = match first {
-        0xfd => u64::from(c.u16("compact size")?),
-        0xfe => u64::from(c.u32("compact size")?),
-        0xff => c.u64("compact size")?,
-        n => u64::from(n),
+    let (v, minimum) = match first {
+        COMPACT_SIZE_U16_TAG => (u64::from(c.u16("compact size")?), COMPACT_SIZE_MAX_1 + 1),
+        COMPACT_SIZE_U32_TAG => (u64::from(c.u32("compact size")?), COMPACT_SIZE_MAX_2 + 1),
+        COMPACT_SIZE_U64_TAG => (c.u64("compact size")?, COMPACT_SIZE_MAX_4 + 1),
+        n => (u64::from(n), 0),
     };
-    let minimal = match first {
-        0xfd => v >= 0xfd,
-        0xfe => v > 0xffff,
-        0xff => v > 0xffff_ffff,
-        _ => true,
-    };
-    if !minimal {
+    if v < minimum {
         return Err(TxError::BadCompactSize);
     }
     Ok(v)
 }
 
-/// Encode a CompactSize. The inverse of `decode_compact_size`; the block serializer uses it for
-/// the transaction count.
 pub fn encode_compact_size(n: u64) -> Vec<u8> {
+    let mut v = Vec::with_capacity(MAX_COMPACT_SIZE_LEN);
     match n {
-        0..=0xfc => vec![n as u8],
-        0xfd..=0xffff => {
-            let mut v = vec![0xfd];
-            v.extend_from_slice(&(n as u16).to_le_bytes());
-            v
+        0..=COMPACT_SIZE_MAX_1 => v.put_u8(n as u8),
+        _ if n <= COMPACT_SIZE_MAX_2 => {
+            v.put_u8(COMPACT_SIZE_U16_TAG);
+            v.put_u16_le(n as u16);
         }
-        0x1_0000..=0xffff_ffff => {
-            let mut v = vec![0xfe];
-            v.extend_from_slice(&(n as u32).to_le_bytes());
-            v
+        _ if n <= COMPACT_SIZE_MAX_4 => {
+            v.put_u8(COMPACT_SIZE_U32_TAG);
+            v.put_u32_le(n as u32);
         }
         _ => {
-            let mut v = vec![0xff];
-            v.extend_from_slice(&n.to_le_bytes());
-            v
+            v.put_u8(COMPACT_SIZE_U64_TAG);
+            v.put_u64_le(n);
         }
     }
-}
-
-/// A script data push: a direct push for up to 75 bytes, `OP_PUSHDATA1` up to 255.
-pub fn encode_push(data: &[u8]) -> Vec<u8> {
-    debug_assert!(data.len() <= 255);
-    let mut out =
-        if data.len() <= 75 { vec![data.len() as u8] } else { vec![0x4c, data.len() as u8] };
-    out.extend_from_slice(data);
-    out
-}
-
-/// A serialized transaction output: the value, the script length, the script.
-pub fn encode_output(value: u64, script: &[u8]) -> Vec<u8> {
-    let mut v = value.to_le_bytes().to_vec();
-    v.extend_from_slice(&encode_compact_size(script.len() as u64));
-    v.extend_from_slice(script);
     v
 }
 
-/// Serialize a block for `submitblock`: the header, the transaction count, then the coinbase
-/// followed by the rest of the transactions in order.
+pub fn encode_push(data: &[u8]) -> Vec<u8> {
+    debug_assert!(u8::try_from(data.len()).is_ok());
+    let mut out = Vec::with_capacity(2 + data.len());
+    if data.len() > opcode::MAX_DIRECT_PUSH {
+        out.put_u8(opcode::OP_PUSHDATA1);
+    }
+    out.put_u8(data.len() as u8);
+    out.put_slice(data);
+    out
+}
+
+pub fn encode_output(value: u64, script: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(VALUE_SIZE + MAX_COMPACT_SIZE_LEN + script.len());
+    v.put_u64_le(value);
+    v.put_slice(&encode_compact_size(script.len() as u64));
+    v.put_slice(script);
+    v
+}
+
 pub fn serialize_block(header: &[u8], coinbase: &[u8], other_txns: &[Vec<u8>]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(header.len() + coinbase.len() + 16);
-    out.extend_from_slice(header);
-    out.extend_from_slice(&encode_compact_size(other_txns.len() as u64 + 1));
-    out.extend_from_slice(coinbase);
+    let mut out = Vec::with_capacity(header.len() + coinbase.len() + MAX_COMPACT_SIZE_LEN);
+    out.put_slice(header);
+    out.put_slice(&encode_compact_size(other_txns.len() as u64 + 1));
+    out.put_slice(coinbase);
     for tx in other_txns {
-        out.extend_from_slice(tx);
+        out.put_slice(tx);
     }
     out
 }
@@ -443,13 +461,8 @@ mod tests {
         assert_eq!(super::merkle_root_of(&[]), None);
     }
 
-    /// CVE-2012-2459: a transaction list with the last pair duplicated hashes to the same root
-    /// as the list without the duplication, so a distinct list can produce the committed root.
-    /// The mutation flag distinguishes them, so the caller does not treat it as a match.
     #[test]
     fn a_duplicated_leaf_pair_is_flagged_as_mutated() {
-        // Core's example (merkle.cpp) is six leaves [1,2,3,4,5,6] vs [1,2,3,4,5,6,5,6]. This
-        // test uses three: [a,b,c] hashes like [a,b,c,c]; the mutated list is [a,b,c,c].
         let a = [1u8; 32];
         let b = [2u8; 32];
         let c = [3u8; 32];
@@ -520,7 +533,7 @@ mod tests {
         assert_eq!(cb.outputs[0].value, 50_0000_0000);
         assert_eq!(cb.outputs[0].script.len(), 67);
         assert_eq!(cb.lock_time, 0);
-        assert_eq!(cb.total_output_value(), 50_0000_0000);
+        assert_eq!(cb.outputs.iter().map(|o| o.value).sum::<u64>(), 50_0000_0000);
     }
 
     #[test]
@@ -569,7 +582,7 @@ mod tests {
         assert!(output_script_size_is_valid(&[0xab; 34]));
         assert!(!output_script_size_is_valid(&[0xab; 35]));
 
-        let mut data = vec![OP_RETURN];
+        let mut data = vec![opcode::OP_RETURN];
         data.extend_from_slice(&[0xcd; 82]);
         assert_eq!(data.len(), 83);
         assert!(output_script_size_is_valid(&data));
@@ -581,14 +594,10 @@ mod tests {
 
     #[test]
     fn every_address_type_fits_but_a_future_witness_program_need_not() {
-        // P2WPKH, P2SH, P2PKH, P2TR.
         for len in [22usize, 23, 25, 34] {
             assert!(output_script_size_is_valid(&vec![0x00; len]), "{len} bytes");
         }
 
-        // validateaddress resolves a future witness version to WitnessUnknown and returns
-        // its scriptPubKey: OP_2 plus a 40-byte push, over the limit but under the
-        // coinbaser's cap, so no other check rejects it.
         let mut witness_unknown = vec![0x52, 40];
         witness_unknown.extend_from_slice(&[0xef; 40]);
         assert_eq!(witness_unknown.len(), 42);
@@ -609,16 +618,12 @@ mod tests {
 
     #[test]
     fn skips_non_pushdata_opcodes_such_as_a_low_bip34_height() {
-        // A coinbase scriptSig for height 6 begins with OP_6 (0x56), a lone opcode, then
-        // the coinbase tag and uid data pushes. The scanner must step over the opcode rather
-        // than stop at it, or the pool cannot find its tag (RejectReason::MissingPoolTag).
         let script = [0x56, 0x03, b'a', b'b', b'c', 0x02, b'd', b'e'];
         let pushes = script_pushes(&script);
         assert_eq!(pushes.len(), 2);
         assert_eq!(pushes[0], (2, &b"abc"[..]));
         assert_eq!(pushes[1], (6, &b"de"[..]));
 
-        // An opcode between pushes is stepped over too, not treated as an end.
         let with_gap = [0x56, 0x01, b'x', 0x51, 0x01, b'y'];
         assert_eq!(script_pushes(&with_gap), vec![(2, &b"x"[..]), (5, &b"y"[..])]);
     }

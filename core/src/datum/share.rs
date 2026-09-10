@@ -1,57 +1,31 @@
 use crate::cursor::{Cursor, Truncated};
 use crate::header::HeaderV2;
+use bytes::BufMut as _;
 
-pub use super::messages::client_subcmd::SUBMIT_POW;
+use super::messages::client_subcmd::SUBMIT_POW;
 pub const SECTION_JOB: u8 = 0x01;
 pub const SECTION_COINBASE: u8 = 0x02;
 pub const SECTION_BLAKE2B: u8 = 0x03;
-/// version 3 protocol: the one-byte anti-block-withholding assignment slot (wire 0..15). The C
-/// gateway emits it between the BLAKE2b section and the job section and refuses to build a
-/// submit without an assignment.
 pub const SECTION_ABW_SLOT: u8 = 0x05;
-/// Sub-field markers inside the BLAKE2b section.
 pub const BLAKE2B_ALGORITHM: u8 = 0x01;
 pub const BLAKE2B_TIME: u8 = 0x04;
-/// Bit 3 of the flags byte: the C gateway sets `DATUM_POW_FLAG_BLAKE2B` on every submit.
-/// The decoder reads bits 0 to 2 only.
+pub const FLAG_IS_BLOCK: u8 = 0x01;
+pub const FLAG_SUBSIDY_ONLY: u8 = 0x02;
+pub const FLAG_QUICKDIFF: u8 = 0x04;
 pub const FLAG_BLAKE2B: u8 = 0x08;
-/// Bit 0 of the first reserved byte of the submit-POW message: set when the header's
-/// `FLAG_USE_TIME_OFFSET` (m_flags bit 2) is set; the header bit itself is not sent. The
-/// reserved bytes are where a header flag the pool needs goes; the ASIC profile is not sent
-/// at all, because profile 0 is the only one either end produces.
 pub const RESERVED_USE_TIME_OFFSET: u8 = 0x01;
-pub use super::framing::STRUCT_END;
-/// The extranonce bytes a share carries: extranonce1 then extranonce2.
-///
-/// The header's extranonce is a 16-byte field (`m_extranonce`) whose leading four bytes are
-/// zero: the gateway's extranonce1 is eight bytes (`DATUM_HEADER_V2_EXTRANONCE1_SIZE`): four
-/// zero bytes (`DATUM_HEADER_V2_EXTRANONCE_PAD`) then the four-byte session id. The share
-/// sends the twelve that vary, in the field the upstream DATUM format sizes for them, and the
-/// pool restores the padding.
+use super::framing::STRUCT_END;
 pub const EXTRANONCE_SIZE: usize = 12;
-/// The header field the twelve are restored into (`DATUM_HEADER_V2_EXTRANONCE_SIZE`).
 pub const EXTRANONCE_SIZE_V2: usize = 16;
-/// How many leading bytes of that field the gateway holds at zero.
 pub const EXTRANONCE_V2_PAD: usize = EXTRANONCE_SIZE_V2 - EXTRANONCE_SIZE;
-/// The coinbase index for subsidy-only work: the gateway's literal 255 (a comment in
-/// `datum_stratum.h`; no named constant).
+pub const EXTRANONCE1_SIZE: usize = EXTRANONCE_V2_PAD + size_of::<u32>();
+pub const EXTRANONCE2_SIZE: usize = EXTRANONCE_SIZE_V2 - EXTRANONCE1_SIZE;
+pub const SIA_FIELD_SIZE: usize = 2 * size_of::<u32>();
+pub const SIA_FIELD_HALF: usize = size_of::<u32>();
+pub const RESERVED_SIZE: usize = 4;
 pub const COINBASE_ID_SUBSIDY_ONLY: u8 = 0xFF;
 pub const MAX_JOBS: usize = 256;
-/// The most bytes one coinbase section (`coinb1` plus `coinb2`: the transaction less the
-/// `EXTRANONCE_SIZE` bytes the extranonce fills) may hold. The pool refuses a larger one
-/// (`CoinbaseTooLarge`) and the gateway sizes its coinbase under it. The outputs a coinbaser
-/// response dictates encode in at most `MAX_COINBASER_BLOB` bytes, each as in a transaction
-/// (value, one length byte, the script), and the rest of the transaction is at most 332
-/// bytes: 124 of framing (the version, the input count, the null outpoint, the scriptSig
-/// length, the three-byte header of the extranonce push, the twelve extranonce bytes, the
-/// sequence, a three-byte output count, the pool output's value and script length, the
-/// 47-byte witness commitment output, the lock time), a scriptSig of at most 100 bytes, a
-/// payout script of at most `MAX_PAYOUT_SCRIPT` (83), and the 25-byte OP_RETURN output the
-/// extranonce moves to when the scriptSig has no room; the section omits the twelve
-/// extranonce bytes, and 1024 rounds the rest up. The C gateway's
-/// `MAX_COINBASE_TXN_SIZE_BYTES` is 16 960; the wire allows 64 KiB per half.
 pub const MAX_COINBASE_SECTION_BYTES: usize = crate::datum::messages::MAX_COINBASER_BLOB + 1024;
-/// The gateway's `merklebranches_bin[24][32]`.
 pub const MAX_MERKLE_BRANCHES: usize = 24;
 pub const MAX_USERNAME: usize = 384;
 
@@ -69,22 +43,19 @@ pub enum Error {
     UnknownSection(u8),
     #[error("malformed BLAKE2b section")]
     BadBlake2bSection,
-    /// The share carries no 0x03 section: the upstream (SHA256d) DATUM format, which this
-    /// pool does not verify.
     #[error("no BLAKE2b section")]
     MissingBlake2bSection,
 }
 
 impl From<Truncated> for Error {
     fn from(t: Truncated) -> Self {
-        Error::Truncated(t.0)
+        Self::Truncated(t.0)
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JobSection {
     pub prev_hash: [u8; 32],
-    /// The index of the PoT byte in the coinbase transaction (the gateway's `target_pot_index`).
     pub target_byte_index: u16,
     pub nbits: [u8; 4],
     pub coinbaser_id: u8,
@@ -107,37 +78,20 @@ pub struct CoinbaseSection {
 impl CoinbaseSection {
     pub fn assemble(&self, extranonce: &[u8]) -> Vec<u8> {
         let mut tx = Vec::with_capacity(self.coinb1.len() + extranonce.len() + self.coinb2.len());
-        tx.extend_from_slice(&self.coinb1);
-        tx.extend_from_slice(extranonce);
-        tx.extend_from_slice(&self.coinb2);
+        tx.put_slice(&self.coinb1);
+        tx.put_slice(extranonce);
+        tx.put_slice(&self.coinb2);
         tx
     }
 }
 
-/// What the mining hardware controls, as `mining.submit` sent it.
-///
-/// The pool builds the header from this and the installed job (the 0x01 and 0x02 sections
-/// the gateway sent) rather than receiving one, so every field the mining hardware does not
-/// set is taken from the job and the pool's policy, and a share cannot supply a different
-/// value for one. `sia_ntime` and `sia_nonce` are the raw eight-byte stratum fields,
-/// spliced rather than parsed; in ASIC profile 0 they carry four header fields:
-///
-/// ```text
-/// sia_nonce = nNonce (4, LE) || m_nonce2 (4, LE)
-/// sia_ntime = m_time_offset (4, LE) || m_nonce3 (4, LE)
-/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Blake2bSection {
-    pub sia_ntime: [u8; 8],
-    pub sia_nonce: [u8; 8],
-    /// The job's time, as the header's time field serializes it (Knots `GetTimeOnWire`); the
-    /// block time is this plus `m_time_offset` when the time-offset flag is set. The hardware
-    /// never changes it.
+    pub sia_ntime: [u8; SIA_FIELD_SIZE],
+    pub sia_nonce: [u8; SIA_FIELD_SIZE],
     pub time_on_wire: u32,
 }
 
-/// The 16-byte header field the share's twelve bytes restore into: the four the gateway
-/// holds at zero, then what it sent.
 pub fn header_extranonce(extranonce: &[u8]) -> Option<[u8; EXTRANONCE_SIZE_V2]> {
     if extranonce.len() != EXTRANONCE_SIZE {
         return None;
@@ -147,8 +101,6 @@ pub fn header_extranonce(extranonce: &[u8]) -> Option<[u8; EXTRANONCE_SIZE_V2]> 
     Some(out)
 }
 
-/// The twelve bytes a share sends for a header's 16-byte extranonce field: `None` when the
-/// four the gateway holds at zero are not zero. The inverse of `header_extranonce`.
 pub fn share_extranonce(field: &[u8; EXTRANONCE_SIZE_V2]) -> Option<Vec<u8>> {
     if field[..EXTRANONCE_V2_PAD] != [0u8; EXTRANONCE_V2_PAD] {
         return None;
@@ -156,39 +108,153 @@ pub fn share_extranonce(field: &[u8; EXTRANONCE_SIZE_V2]) -> Option<Vec<u8>> {
     Some(field[EXTRANONCE_V2_PAD..].to_vec())
 }
 
+pub fn sia_field(low: u32, high: u32) -> [u8; SIA_FIELD_SIZE] {
+    let mut f = [0u8; SIA_FIELD_SIZE];
+    let mut w = &mut f[..];
+    w.put_u32_le(low);
+    w.put_u32_le(high);
+    f
+}
+
+pub fn sia_halves(field: &[u8; SIA_FIELD_SIZE]) -> (u32, u32) {
+    let (low, high) = field.split_at(SIA_FIELD_HALF);
+    let le32 = |b: &[u8]| u32::from_le_bytes(b.try_into().expect("four bytes"));
+    (le32(low), le32(high))
+}
+
 impl Blake2bSection {
-    /// The section for a header in ASIC profile 0: the four nonce and time fields spliced
-    /// into the two eight-byte Sia fields, and the time as the header serializes it. The
-    /// inverse of `nonce_fields`, `time_fields` and `HeaderV2::time_on_wire`.
     pub fn from_header(h: &HeaderV2) -> Self {
-        let mut sia_nonce = [0u8; 8];
-        sia_nonce[..4].copy_from_slice(&h.nonce.to_le_bytes());
-        sia_nonce[4..].copy_from_slice(&h.nonce2.to_le_bytes());
-        let mut sia_ntime = [0u8; 8];
-        sia_ntime[..4].copy_from_slice(&h.time_offset.to_le_bytes());
-        sia_ntime[4..].copy_from_slice(&h.nonce3.to_le_bytes());
-        Blake2bSection { sia_ntime, sia_nonce, time_on_wire: h.time_on_wire() }
+        Self {
+            sia_ntime: sia_field(h.time_offset, h.nonce3),
+            sia_nonce: sia_field(h.nonce, h.nonce2),
+            time_on_wire: h.time_on_wire(),
+        }
     }
 
-    /// `nNonce` and `m_nonce2`, in that order.
     pub fn nonce_fields(&self) -> (u32, u32) {
-        (le32(&self.sia_nonce[..4]), le32(&self.sia_nonce[4..]))
+        sia_halves(&self.sia_nonce)
     }
 
-    /// `m_time_offset` and `m_nonce3`, in that order.
     pub fn time_fields(&self) -> (u32, u32) {
-        (le32(&self.sia_ntime[..4]), le32(&self.sia_ntime[4..]))
+        sia_halves(&self.sia_ntime)
     }
 }
 
-fn le32(b: &[u8]) -> u32 {
-    u32::from_le_bytes(b.try_into().expect("four bytes"))
+fn decode_job_section(r: &mut Cursor<'_>) -> Result<JobSection, Error> {
+    let prev_hash: [u8; 32] = r.arr("prev hash")?;
+    let target_byte_index = r.u16("target byte index")?;
+    let nbits: [u8; 4] = r.arr("nbits")?;
+    let coinbaser_id = r.u8("coinbaser id")?;
+    let height = r.u32("height")?;
+    let coinbase_value = r.u64("coinbase value")?;
+    let txn_count = r.u32("txn count")?;
+    let txn_total_weight = r.u32("txn weight")?;
+    let txn_total_size = r.u32("txn size")?;
+    let txn_total_sigops = r.u32("txn sigops")?;
+    let n = r.u8("merkle count")?;
+    if n as usize > MAX_MERKLE_BRANCHES {
+        return Err(Error::BadMerkleCount(n));
+    }
+    let mut merkle_branches = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        merkle_branches.push(r.arr("merkle branch")?);
+    }
+    Ok(JobSection {
+        prev_hash,
+        target_byte_index,
+        nbits,
+        coinbaser_id,
+        height,
+        coinbase_value,
+        txn_count,
+        txn_total_weight,
+        txn_total_size,
+        txn_total_sigops,
+        merkle_branches,
+    })
 }
 
-/// A share as the gateway submits it (0x27). The fixed fields are the upstream DATUM
-/// layout; `ntime`, `nonce` and `version` are carried in it but the header the pool builds
-/// takes its time and nonces from `blake2b` (the 0x03 section, which every share must carry)
-/// and its version from `version` with the v2 flag stripped.
+fn encode_job_section(out: &mut Vec<u8>, j: &JobSection) {
+    out.put_u8(SECTION_JOB);
+    out.put_slice(&j.prev_hash);
+    out.put_u16_le(j.target_byte_index);
+    out.put_slice(&j.nbits);
+    out.put_u8(j.coinbaser_id);
+    out.put_u32_le(j.height);
+    out.put_u64_le(j.coinbase_value);
+    out.put_u32_le(j.txn_count);
+    out.put_u32_le(j.txn_total_weight);
+    out.put_u32_le(j.txn_total_size);
+    out.put_u32_le(j.txn_total_sigops);
+    out.put_u8(j.merkle_branches.len() as u8);
+    for b in &j.merkle_branches {
+        out.put_slice(b);
+    }
+}
+
+fn decode_coinbase_section(r: &mut Cursor<'_>) -> Result<CoinbaseSection, Error> {
+    let coinbase_id = r.u8("coinbase section id")?;
+    let len1 = r.u16("coinb1 len")? as usize;
+    let len2 = r.u16("coinb2 len")? as usize;
+    let coinb1 = r.take(len1, "coinb1")?.to_vec();
+    let coinb2 = r.take(len2, "coinb2")?.to_vec();
+    Ok(CoinbaseSection { coinbase_id, coinb1, coinb2 })
+}
+
+fn encode_coinbase_section(out: &mut Vec<u8>, c: &CoinbaseSection) {
+    out.put_u8(SECTION_COINBASE);
+    out.put_u8(c.coinbase_id);
+    out.put_u16_le(c.coinb1.len() as u16);
+    out.put_u16_le(c.coinb2.len() as u16);
+    out.put_slice(&c.coinb1);
+    out.put_slice(&c.coinb2);
+}
+
+fn decode_blake2b_section(r: &mut Cursor<'_>) -> Result<Blake2bSection, Error> {
+    if r.u8("algorithm")? != BLAKE2B_ALGORITHM {
+        return Err(Error::BadBlake2bSection);
+    }
+    let sia_ntime: [u8; SIA_FIELD_SIZE] = r.arr("sia ntime")?;
+    let sia_nonce: [u8; SIA_FIELD_SIZE] = r.arr("sia nonce")?;
+    if r.u8("time marker")? != BLAKE2B_TIME {
+        return Err(Error::BadBlake2bSection);
+    }
+    let time_on_wire = r.u32("time on wire")?;
+    Ok(Blake2bSection { sia_ntime, sia_nonce, time_on_wire })
+}
+
+fn encode_blake2b_section(out: &mut Vec<u8>, b: &Blake2bSection) {
+    out.put_u8(SECTION_BLAKE2B);
+    out.put_u8(BLAKE2B_ALGORITHM);
+    out.put_slice(&b.sia_ntime);
+    out.put_slice(&b.sia_nonce);
+    out.put_u8(BLAKE2B_TIME);
+    out.put_u32_le(b.time_on_wire);
+}
+
+struct Prefix {
+    job_id: u8,
+    coinbase_id: u8,
+    flags: u8,
+    target_byte: u8,
+    ntime: u32,
+    nonce: u32,
+}
+
+impl Prefix {
+    fn read(r: &mut Cursor<'_>) -> Result<Self, Truncated> {
+        r.skip_if(SUBMIT_POW);
+        Ok(Self {
+            job_id: r.u8("job id")?,
+            coinbase_id: r.u8("coinbase id")?,
+            flags: r.u8("flags")?,
+            target_byte: r.u8("target byte")?,
+            ntime: r.u32("ntime")?,
+            nonce: r.u32("nonce")?,
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PowSubmit {
     pub job_id: u8,
@@ -197,65 +263,36 @@ pub struct PowSubmit {
     pub subsidy_only: bool,
     pub quickdiff: bool,
     pub target_byte: u8,
-    /// The upstream format's 32-bit time field; the gateway writes the low half of the
-    /// BLAKE2b section's eight-byte time field, `blake2b.time_fields().0` (the C
-    /// `(uint32_t)pow->ntime`).
     pub ntime: u32,
-    /// The upstream format's nonce field; the gateway writes the header's `nNonce`, which
-    /// `blake2b.sia_nonce` also carries.
     pub nonce: u32,
     pub version: u32,
     pub extranonce: Vec<u8>,
     pub username: String,
-    /// The header's time-offset selector, carried in the reserved bytes. Set, the block time
-    /// is the job time plus `m_time_offset`; clear, `m_time_offset` is an additional nonce
-    /// field and the block time is the job time.
     pub use_time_offset: bool,
     pub job: Option<JobSection>,
     pub coinbase: Option<CoinbaseSection>,
     pub blake2b: Blake2bSection,
-    /// The ABW assignment slot; mandatory on version 3 sessions, absent on v1.
     pub abw_slot: Option<u8>,
 }
 
 impl PowSubmit {
-    /// The target byte index this share claims: its own job section's when it carries
-    /// one, otherwise the installed `job`'s.
     pub fn target_byte_index_of(&self, job: &JobSection) -> u16 {
         self.job.as_ref().map_or(job.target_byte_index, |j| j.target_byte_index)
     }
 
     pub fn difficulty(&self) -> u64 {
-        // Masked because this is also called on shares that have not been checked yet,
-        // where `verify::reconstruct` rejects a target byte of 64 or more.
-        1u64 << (self.target_byte & 63)
+        crate::target::diff_for_pot(self.target_byte)
     }
 
-    /// The job id, target byte and nonce from the message's fixed prefix, for the response
-    /// to a share that does not decode: the gateway retires the share's replay entry by
-    /// them, and would replay it on every reconnect otherwise. `None` when the message is
-    /// shorter than the prefix.
     pub fn prefix(data: &[u8]) -> Option<(u8, u8, u32)> {
-        let mut r = Cursor::new(data);
-        r.skip_if(SUBMIT_POW);
-        let job_id = r.u8("job id").ok()?;
-        r.u8("coinbase id").ok()?;
-        r.u8("flags").ok()?;
-        let target_byte = r.u8("target byte").ok()?;
-        r.u32("ntime").ok()?;
-        let nonce = r.u32("nonce").ok()?;
-        Some((job_id, target_byte, nonce))
+        let p = Prefix::read(&mut Cursor::new(data)).ok()?;
+        Some((p.job_id, p.target_byte, p.nonce))
     }
 
     pub fn decode(data: &[u8]) -> Result<Self, Error> {
         let mut r = Cursor::new(data);
-        r.skip_if(SUBMIT_POW);
-        let job_id = r.u8("job id")?;
-        let coinbase_id = r.u8("coinbase id")?;
-        let flags = r.u8("flags")?;
-        let target_byte = r.u8("target byte")?;
-        let ntime = r.u32("ntime")?;
-        let nonce = r.u32("nonce")?;
+        let Prefix { job_id, coinbase_id, flags, target_byte, ntime, nonce } =
+            Prefix::read(&mut r)?;
         let version = r.u32("version")?;
         let en_size = r.u8("extranonce size")?;
         if en_size as usize != EXTRANONCE_SIZE {
@@ -268,8 +305,7 @@ impl PowSubmit {
             rest.iter().take(MAX_USERNAME + 1).position(|&b| b == 0).ok_or(Error::BadUsername)?;
         let username = String::from_utf8_lossy(&rest[..nul]).into_owned();
         r.advance(nul + 1, "username")?;
-        // Four bytes the gateway reserves. Bit 0 of the first is the time-offset selector.
-        let reserved = r.take(4, "reserved")?;
+        let reserved = r.take(RESERVED_SIZE, "reserved")?;
         let use_time_offset = reserved[0] & RESERVED_USE_TIME_OFFSET != 0;
 
         let mut job = None;
@@ -279,73 +315,21 @@ impl PowSubmit {
         loop {
             match r.u8("section marker")? {
                 STRUCT_END => break,
-                SECTION_JOB => {
-                    let prev_hash: [u8; 32] = r.arr("prev hash")?;
-                    let target_byte_index = r.u16("target byte index")?;
-                    let nbits: [u8; 4] = r.arr("nbits")?;
-                    let coinbaser_id = r.u8("coinbaser id")?;
-                    let height = r.u32("height")?;
-                    let coinbase_value = r.u64("coinbase value")?;
-                    let txn_count = r.u32("txn count")?;
-                    let txn_total_weight = r.u32("txn weight")?;
-                    let txn_total_size = r.u32("txn size")?;
-                    let txn_total_sigops = r.u32("txn sigops")?;
-                    let n = r.u8("merkle count")?;
-                    if n as usize > MAX_MERKLE_BRANCHES {
-                        return Err(Error::BadMerkleCount(n));
-                    }
-                    let mut merkle_branches = Vec::with_capacity(n as usize);
-                    for _ in 0..n {
-                        merkle_branches.push(r.arr("merkle branch")?);
-                    }
-                    job = Some(JobSection {
-                        prev_hash,
-                        target_byte_index,
-                        nbits,
-                        coinbaser_id,
-                        height,
-                        coinbase_value,
-                        txn_count,
-                        txn_total_weight,
-                        txn_total_size,
-                        txn_total_sigops,
-                        merkle_branches,
-                    });
-                }
-                SECTION_COINBASE => {
-                    let coinbase_id = r.u8("coinbase section id")?;
-                    let len1 = r.u16("coinb1 len")? as usize;
-                    let len2 = r.u16("coinb2 len")? as usize;
-                    let coinb1 = r.take(len1, "coinb1")?.to_vec();
-                    let coinb2 = r.take(len2, "coinb2")?.to_vec();
-                    coinbase = Some(CoinbaseSection { coinbase_id, coinb1, coinb2 });
-                }
-                SECTION_ABW_SLOT => {
-                    abw_slot = Some(r.u8("abw slot")?);
-                }
-                SECTION_BLAKE2B => {
-                    if r.u8("algorithm")? != BLAKE2B_ALGORITHM {
-                        return Err(Error::BadBlake2bSection);
-                    }
-                    let sia_ntime: [u8; 8] = r.arr("sia ntime")?;
-                    let sia_nonce: [u8; 8] = r.arr("sia nonce")?;
-                    if r.u8("time marker")? != BLAKE2B_TIME {
-                        return Err(Error::BadBlake2bSection);
-                    }
-                    let time_on_wire = r.u32("time on wire")?;
-                    blake2b = Some(Blake2bSection { sia_ntime, sia_nonce, time_on_wire });
-                }
+                SECTION_JOB => job = Some(decode_job_section(&mut r)?),
+                SECTION_COINBASE => coinbase = Some(decode_coinbase_section(&mut r)?),
+                SECTION_ABW_SLOT => abw_slot = Some(r.u8("abw slot")?),
+                SECTION_BLAKE2B => blake2b = Some(decode_blake2b_section(&mut r)?),
                 other => return Err(Error::UnknownSection(other)),
             }
         }
         let blake2b = blake2b.ok_or(Error::MissingBlake2bSection)?;
 
-        Ok(PowSubmit {
+        Ok(Self {
             job_id,
             coinbase_id,
-            is_block: flags & 1 != 0,
-            subsidy_only: flags & 2 != 0,
-            quickdiff: flags & 4 != 0,
+            is_block: flags & FLAG_IS_BLOCK != 0,
+            subsidy_only: flags & FLAG_SUBSIDY_ONLY != 0,
+            quickdiff: flags & FLAG_QUICKDIFF != 0,
             target_byte,
             ntime,
             nonce,
@@ -362,65 +346,41 @@ impl PowSubmit {
 
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(64);
-        out.push(SUBMIT_POW);
-        out.push(self.job_id);
-        out.push(self.coinbase_id);
-        out.push(
-            (self.is_block as u8)
-                | ((self.subsidy_only as u8) << 1)
-                | ((self.quickdiff as u8) << 2)
+        out.put_u8(SUBMIT_POW);
+        out.put_u8(self.job_id);
+        out.put_u8(self.coinbase_id);
+        let flag = |set: bool, bit: u8| if set { bit } else { 0 };
+        out.put_u8(
+            flag(self.is_block, FLAG_IS_BLOCK)
+                | flag(self.subsidy_only, FLAG_SUBSIDY_ONLY)
+                | flag(self.quickdiff, FLAG_QUICKDIFF)
                 | FLAG_BLAKE2B,
         );
-        out.push(self.target_byte);
-        out.extend_from_slice(&self.ntime.to_le_bytes());
-        out.extend_from_slice(&self.nonce.to_le_bytes());
-        out.extend_from_slice(&self.version.to_le_bytes());
-        out.push(self.extranonce.len() as u8);
-        out.extend_from_slice(&self.extranonce);
-        out.extend_from_slice(self.username.as_bytes());
-        out.push(0);
-        let mut reserved = [0u8; 4];
+        out.put_u8(self.target_byte);
+        out.put_u32_le(self.ntime);
+        out.put_u32_le(self.nonce);
+        out.put_u32_le(self.version);
+        out.put_u8(self.extranonce.len() as u8);
+        out.put_slice(&self.extranonce);
+        out.put_slice(self.username.as_bytes());
+        out.put_u8(0);
+        let mut reserved = [0u8; RESERVED_SIZE];
         if self.use_time_offset {
             reserved[0] |= RESERVED_USE_TIME_OFFSET;
         }
-        out.extend_from_slice(&reserved);
+        out.put_slice(&reserved);
         if let Some(j) = &self.job {
-            out.push(SECTION_JOB);
-            out.extend_from_slice(&j.prev_hash);
-            out.extend_from_slice(&j.target_byte_index.to_le_bytes());
-            out.extend_from_slice(&j.nbits);
-            out.push(j.coinbaser_id);
-            out.extend_from_slice(&j.height.to_le_bytes());
-            out.extend_from_slice(&j.coinbase_value.to_le_bytes());
-            out.extend_from_slice(&j.txn_count.to_le_bytes());
-            out.extend_from_slice(&j.txn_total_weight.to_le_bytes());
-            out.extend_from_slice(&j.txn_total_size.to_le_bytes());
-            out.extend_from_slice(&j.txn_total_sigops.to_le_bytes());
-            out.push(j.merkle_branches.len() as u8);
-            for b in &j.merkle_branches {
-                out.extend_from_slice(b);
-            }
+            encode_job_section(&mut out, j);
         }
         if let Some(c) = &self.coinbase {
-            out.push(SECTION_COINBASE);
-            out.push(c.coinbase_id);
-            out.extend_from_slice(&(c.coinb1.len() as u16).to_le_bytes());
-            out.extend_from_slice(&(c.coinb2.len() as u16).to_le_bytes());
-            out.extend_from_slice(&c.coinb1);
-            out.extend_from_slice(&c.coinb2);
+            encode_coinbase_section(&mut out, c);
         }
-        let b = &self.blake2b;
-        out.push(SECTION_BLAKE2B);
-        out.push(BLAKE2B_ALGORITHM);
-        out.extend_from_slice(&b.sia_ntime);
-        out.extend_from_slice(&b.sia_nonce);
-        out.push(BLAKE2B_TIME);
-        out.extend_from_slice(&b.time_on_wire.to_le_bytes());
+        encode_blake2b_section(&mut out, &self.blake2b);
         if let Some(slot) = self.abw_slot {
-            out.push(SECTION_ABW_SLOT);
-            out.push(slot);
+            out.put_u8(SECTION_ABW_SLOT);
+            out.put_u8(slot);
         }
-        out.push(STRUCT_END);
+        out.put_u8(STRUCT_END);
         out
     }
 }
@@ -515,8 +475,6 @@ mod tests {
         assert_eq!(bytes[54 + 23], STRUCT_END);
     }
 
-    /// A share in the upstream format, without the 0x03 section, is refused: the pool builds
-    /// no SHA256d header.
     #[test]
     fn a_share_without_the_blake2b_section_is_refused() {
         let bytes = minimal().encode();
@@ -525,15 +483,12 @@ mod tests {
         assert_eq!(PowSubmit::decode(&upstream), Err(Error::MissingBlake2bSection));
     }
 
-    /// The section is a fixed 23 bytes. Asserted here because both ends hardcode these
-    /// offsets, and because it is the format the gateway fork emits (`datum_protocol.c`, the 0x03
-    /// section).
     #[test]
     fn blake2b_section_layout_is_exact() {
         let mut s = minimal();
         s.extranonce = vec![0x33; EXTRANONCE_SIZE];
         let bytes = s.encode();
-        let at = bytes.len() - 24; // the section, then the 0xFE terminator
+        let at = bytes.len() - 24;
         assert_eq!(bytes[bytes.len() - 1], STRUCT_END);
         let sec = &bytes[at..bytes.len() - 1];
         assert_eq!(sec.len(), 23);
@@ -545,7 +500,6 @@ mod tests {
         assert_eq!(&sec[19..23], &0x6543_2100u32.to_le_bytes());
         assert_eq!(PowSubmit::decode(&bytes).unwrap(), s);
 
-        // The one header flag the pool needs is carried in the reserved bytes instead.
         s.use_time_offset = true;
         let bytes = s.encode();
         assert_eq!(bytes[at - 4] & RESERVED_USE_TIME_OFFSET, RESERVED_USE_TIME_OFFSET);
@@ -555,7 +509,6 @@ mod tests {
     #[test]
     fn the_prefix_of_a_share_that_does_not_decode_is_still_read() {
         let bytes = minimal().encode();
-        // Cut inside the BLAKE2b section, past the prefix, username and reserved bytes.
         let mut truncated = bytes.clone();
         truncated.truncate(56);
         assert!(matches!(PowSubmit::decode(&truncated), Err(Error::Truncated(_))));
@@ -564,10 +517,6 @@ mod tests {
         assert_eq!(PowSubmit::prefix(&bytes[..13]), Some((3, 14, 0xdead_beef)));
     }
 
-    /// The 142-byte message `datum_pow_recycled_protocol_job_test` (CONVOYMining
-    /// datum_gateway, `datum_protocol_tests.c`) asserts offsets in, assembled here in the C
-    /// section order 0x03 0x05 0x01 0x02 (`encode` writes 0x01 0x02 0x03 0x05; the decoder
-    /// takes either order).
     #[test]
     fn decodes_the_c_gateways_section_order_at_its_offsets() {
         let mut msg = vec![SUBMIT_POW, 0, 2, FLAG_BLAKE2B, 1];
@@ -621,13 +570,10 @@ mod tests {
         );
         let cb = s.coinbase.as_ref().unwrap();
         assert_eq!((cb.coinbase_id, &cb.coinb1[..], &cb.coinb2[..]), (2, &[0xc0][..], &[0xd0][..]));
-        // The message's u32 time and nonce are the low halves of the section's u64 fields.
         assert_eq!(s.ntime, s.blake2b.time_fields().0);
         assert_eq!(s.nonce, s.blake2b.nonce_fields().0);
     }
 
-    /// The four header fields the two eight-byte Sia fields carry, in the order profile 0 lays
-    /// out.
     #[test]
     fn the_sia_fields_split_into_four_header_fields() {
         let b = Blake2bSection {
@@ -661,7 +607,6 @@ mod tests {
         let mut bytes = minimal().encode();
         bytes[17] = 8;
         assert_eq!(PowSubmit::decode(&bytes), Err(Error::BadExtranonceSize(8)));
-        // Twelve is the only size: the header's 16-byte field less the four zero bytes.
         for n in [0u8, 8, 11, 13, 16, 255] {
             let mut bytes = minimal().encode();
             bytes[17] = n;
@@ -669,8 +614,6 @@ mod tests {
         }
     }
 
-    /// The pool restores the four bytes the gateway holds at zero, so what the header
-    /// commits to is the twelve sent, with the four zero bytes in front of them.
     #[test]
     fn the_header_extranonce_is_the_twelve_left_padded() {
         let twelve: Vec<u8> = (1..=12u8).collect();

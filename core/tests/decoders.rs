@@ -1,20 +1,13 @@
-//! Every decoder in the crate, fed what an adversarial or faulty peer would send.
-//!
-//! Two properties are checked for each one: it never panics, whatever the bytes, and
-//! whatever it does accept it reproduces byte for byte when re-encoded. Both matter for a
-//! pool that decodes attacker-controlled input on a thread of its own.
-
 use ratum::bitcoin;
 use ratum::datum::messages::{
     ClientConfig, CoinbaseOutput, CoinbaserRequest, CoinbaserResponse, RejectReason, ShareResponse,
     ShareVerdict,
 };
 use ratum::datum::share::{Blake2bSection, CoinbaseSection, JobSection, PowSubmit};
-use ratum::datum::validation::{self, ShortTxnList, Status, TxnBundle};
+use ratum::datum::validation::{self, Status, TxnBundle};
 use ratum::header::{self, HeaderV2};
 use ratum::target;
 
-/// xorshift64*, so a failure can be reproduced from the seed printed with it.
 struct Rng(u64);
 
 impl Rng {
@@ -43,14 +36,12 @@ impl Rng {
     }
 }
 
-/// Run every decoder over one blob. None may panic; each must return.
 fn feed_everything(blob: &[u8]) {
     let _ = PowSubmit::decode(blob);
     let _ = ClientConfig::decode(blob);
     let _ = CoinbaserRequest::decode(blob);
     let _ = CoinbaserResponse::decode(blob);
     let _ = ShareResponse::decode(blob);
-    let _ = ShortTxnList::decode(blob);
     let _ = TxnBundle::decode(blob, validation::response::TXNS);
     let _ = TxnBundle::decode(blob, validation::response::BLOCK_TXNS);
     let _ = HeaderV2::deserialize(blob);
@@ -81,8 +72,6 @@ fn no_decoder_panics_on_random_bytes() {
 
 #[test]
 fn no_decoder_panics_on_a_valid_selector_followed_by_random_bytes() {
-    // A valid selector, then random bytes. This executes more of each decoder's parse path
-    // than uniformly random bytes do.
     let selectors: [u8; 10] = [0x27, 0x99, 0x10, 0x11, 0x8f, 0x50, 0x90, 0x91, 0x92, 0xfe];
     let mut rng = Rng::new(0xABCD_EF01_2345_6789);
     for _ in 0..4_000 {
@@ -94,8 +83,6 @@ fn no_decoder_panics_on_a_valid_selector_followed_by_random_bytes() {
         }
         let tail = rng.below(300);
         blob.extend(rng.bytes(tail));
-        // Lengths near the limits are where a decoder is most likely to read past the end of the
-        // input.
         if rng.bool() && blob.len() > 6 {
             let at = 2 + rng.below(blob.len() - 4);
             let pick = rng.below(6);
@@ -107,12 +94,6 @@ fn no_decoder_panics_on_a_valid_selector_followed_by_random_bytes() {
     }
 }
 
-/// Every prefix of a valid message, and every single-bit change to one, must be either
-/// refused or decoded to a value whose encoding is a fixed point.
-///
-/// Equality with the damaged input is not required (a non-UTF-8 tag returns replacement
-/// characters, a non-"ok" validation message carries nothing after the status), but a
-/// value must never re-encode to something the decoder then reads differently.
 fn truncations_and_flips(valid: &[u8], decode_encode: impl Fn(&[u8]) -> Option<Vec<u8>>) {
     assert_eq!(
         decode_encode(valid).as_deref(),
@@ -209,20 +190,6 @@ fn shares_round_trip_whatever_their_fields() {
 }
 
 #[test]
-fn a_share_carries_its_blake2b_section_intact() {
-    let mut rng = Rng::new(0x0102_0304_0506_0708);
-    for _ in 0..200 {
-        let mut share = random_share(&mut rng);
-        if let Some(cb) = &mut share.coinbase {
-            cb.coinbase_id = share.coinbase_id;
-        }
-        let bytes = share.encode();
-        let back = PowSubmit::decode(&bytes).expect("a share must decode");
-        assert_eq!(back.blake2b, share.blake2b);
-    }
-}
-
-#[test]
 fn a_damaged_share_is_refused_or_reproduces_itself() {
     let mut rng = Rng::new(7);
     let mut share = random_share(&mut rng);
@@ -266,17 +233,6 @@ fn a_damaged_coinbaser_response_is_refused_or_reproduces_itself() {
 
 #[test]
 fn a_damaged_validation_message_is_refused_or_reproduces_itself() {
-    let list = ShortTxnList {
-        job_index: 4,
-        status: Status::Ok,
-        txn_count: 3,
-        short_ids: vec![1, 2, 3],
-        crosscheck: Some([0x5a; 32]),
-    };
-    truncations_and_flips(&list.encode(), |bytes| {
-        ShortTxnList::decode(bytes).ok().map(|l| l.encode())
-    });
-
     let bundle = TxnBundle {
         selector: validation::response::BLOCK_TXNS,
         job_index: 6,
@@ -334,7 +290,7 @@ fn the_version_2_flag_is_not_part_of_the_version() {
     let serialized = header.serialize();
     assert_eq!(&serialized[..4], &(header::V2_FLAG | 0x2000_0000).to_le_bytes());
 
-    header.version = i32::MIN; // the flag bit, set in the version itself
+    header.version = i32::MIN;
     let round_tripped = HeaderV2::deserialize(&header.serialize()).expect("still a v2 header");
     assert_eq!(round_tripped.version, 0, "the flag bit is stripped, not carried");
 
@@ -348,23 +304,21 @@ fn hashing_never_panics_on_a_header_that_deserialized() {
     let mut rng = Rng::new(0x2222_3333_4444_5555);
     for _ in 0..300 {
         let mut raw = rng.bytes(header::HEADER_V2_SIZE);
-        raw[3] |= 0x80; // set the version 2 flag so the header deserializes
+        raw[3] |= 0x80;
         let header = HeaderV2::deserialize(&raw).expect("deserializes");
-        let components = header.hash_components();
-        assert_eq!(
-            components.asic_input.len(),
-            header::ASIC_INPUT_LEN[header.asic_profile() as usize]
-        );
-        assert_eq!(components.result, header.hash_components().result, "hashing is deterministic");
-        let mut reversed = header.pow_hash();
-        reversed.reverse();
-        assert_eq!(reversed, components.result);
+        let pre = header.precompute();
+        let asic_input = header.asic_input_with(&pre.hash1, &pre.h2);
+        assert_eq!(asic_input.len(), header::ASIC_INPUT_LEN[header.asic_profile() as usize]);
+        let (pow, block) = header.pow_and_block_hash();
+        assert_eq!((pow, block), header.pow_and_block_hash(), "hashing is deterministic");
+        assert_eq!(header::blake2b_256(&asic_input), pow);
+        let masked: Vec<u8> = pow.iter().zip(pre.mask).map(|(b, m)| b ^ m).collect();
+        assert_eq!(masked, block);
     }
 }
 
 #[test]
 fn a_coinbase_that_parses_reports_its_script_sig_offset_output_total_and_txid() {
-    // A coinbase the parser accepts must have its scriptSig at the offset it reports.
     let mut rng = Rng::new(0x9999_8888_7777_6666);
     for _ in 0..200 {
         let script_len = rng.below(100) + 1;
@@ -384,7 +338,7 @@ fn a_coinbase_that_parses_reports_its_script_sig_offset_output_total_and_txid() 
         let parsed = bitcoin::parse_coinbase(&tx).expect("a coinbase we built must parse");
         assert_eq!(parsed.script_sig, script);
         assert_eq!(&tx[parsed.script_sig_offset..][..script_len], &script[..]);
-        assert_eq!(parsed.total_output_value(), 5_000_000_000);
+        assert_eq!(parsed.outputs.iter().map(|o| o.value).sum::<u64>(), 5_000_000_000);
         assert_eq!(bitcoin::txid(&tx).expect("txid"), bitcoin::sha256d(&tx));
     }
 }
@@ -403,8 +357,6 @@ fn compact_targets_that_decode_are_within_range() {
             }
         }
     }
-    // The exponent bound is exact: 34 is the largest exponent Knots's SetCompact decodes without
-    // overflow for this mantissa.
     assert!(target::bits_to_target(0x2200_00ff).is_some());
     assert!(target::bits_to_target(0x2300_0001).is_none());
 }

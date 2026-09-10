@@ -1,20 +1,9 @@
-//! The log sinks the `logger` configuration section describes: the console (stdout, or
-//! stderr with `log_to_stderr`) and a file, each with its own level, every record stamped
-//! with a millisecond UTC time and, with `log_calling_function`, the module it came from.
-//! `RUST_LOG` names a level that replaces the console's. The file is held open for the
-//! process's life, so rotate it with logrotate's `copytruncate`.
-//!
-//! The logger holds no lock: `&File` implements `Write`, and stdout and stderr lock
-//! themselves for the length of one `write_all`, so each sink writes a record whole.
-
 use log::{Level, LevelFilter, Log, Metadata, Record};
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// The C gateway's levels: 0 all, 1 debug, 2 info, 3 warn, 4 error, 5 fatal. Rust has no
-/// level above error, so 5 keeps errors; anything higher turns the sink off.
 fn level_of(n: u8) -> LevelFilter {
     match n {
         0 => LevelFilter::Trace,
@@ -32,48 +21,47 @@ enum Output {
     File(File),
 }
 
-/// One destination and the most verbose level it takes.
 struct Sink {
     output: Output,
     level: LevelFilter,
 }
 
 impl Sink {
-    /// A write that fails has nowhere to be reported, so its error is discarded.
-    fn write(&self, line: &[u8]) {
+    fn on_stream(&self, f: impl FnOnce(&mut dyn Write) -> std::io::Result<()>) {
         let _ = match &self.output {
-            Output::Stdout => std::io::stdout().write_all(line),
-            Output::Stderr => std::io::stderr().write_all(line),
-            Output::File(f) => (&*f).write_all(line),
+            Output::Stdout => f(&mut std::io::stdout().lock()),
+            Output::Stderr => f(&mut std::io::stderr().lock()),
+            Output::File(file) => f(&mut &*file),
         };
     }
 
+    fn write(&self, line: &[u8]) {
+        self.on_stream(|w| w.write_all(line));
+    }
+
     fn flush(&self) {
-        let _ = match &self.output {
-            Output::Stdout => std::io::stdout().flush(),
-            Output::Stderr => std::io::stderr().flush(),
-            Output::File(f) => (&*f).flush(),
-        };
+        self.on_stream(|w| w.flush());
     }
 }
 
 pub struct Logger {
     sinks: Vec<Sink>,
-    /// The most verbose of the sinks' levels: a record above it goes nowhere.
     max: LevelFilter,
     calling_function: bool,
 }
 
-/// `YYYY-MM-DD HH:MM:SS.mmm` for `secs` since the Unix epoch, in UTC, by the civil-from-days
-/// conversion of the epoch day.
+const DAYS_TO_UNIX_EPOCH: i64 = 719_468;
+const DAYS_PER_ERA: i64 = 146_097;
+const YEARS_PER_ERA: i64 = 400;
+
 fn format_time(secs: u64, millis: u32) -> String {
-    let days = (secs / 86400) as i64;
-    let sod = secs % 86400;
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
+    let days = (secs / ratum::SECS_PER_DAY) as i64;
+    let sod = secs % ratum::SECS_PER_DAY;
+    let z = days + DAYS_TO_UNIX_EPOCH;
+    let era = z.div_euclid(DAYS_PER_ERA);
+    let doe = z.rem_euclid(DAYS_PER_ERA);
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
+    let y = yoe + era * YEARS_PER_ERA;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
     let d = doy - (153 * mp + 2) / 5 + 1;
@@ -81,9 +69,9 @@ fn format_time(secs: u64, millis: u32) -> String {
     let y = if m <= 2 { y + 1 } else { y };
     format!(
         "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}.{millis:03}",
-        sod / 3600,
-        (sod % 3600) / 60,
-        sod % 60
+        sod / ratum::SECS_PER_HOUR,
+        (sod % ratum::SECS_PER_HOUR) / ratum::SECS_PER_MINUTE,
+        sod % ratum::SECS_PER_MINUTE
     )
 }
 
@@ -93,8 +81,6 @@ fn now() -> String {
 }
 
 impl Logger {
-    /// The line a record is written as: the time, the level, the module when
-    /// `log_calling_function` is set, the message, a newline.
     fn line(&self, r: &Record) -> String {
         let mut line = String::with_capacity(96);
         let _ = write!(line, "{} {:<5} ", now(), r.level());
@@ -128,9 +114,7 @@ impl Log for Logger {
     }
 }
 
-/// The logger the configuration describes and what could not be applied, to log once it is
-/// installed. `Err` names a log file that cannot be opened.
-fn build(cfg: &crate::config::Logger) -> Result<(Logger, Vec<(Level, String)>), String> {
+fn build(cfg: &crate::config::Logging) -> Result<(Logger, Vec<(Level, String)>), String> {
     let mut notes = Vec::new();
     let mut sinks = Vec::with_capacity(2);
 
@@ -161,10 +145,7 @@ fn build(cfg: &crate::config::Logger) -> Result<(Logger, Vec<(Level, String)>), 
     Ok((Logger { sinks, max, calling_function: cfg.log_calling_function }, notes))
 }
 
-/// Install the logger. `Err` is the reason it could not be built, which is fatal (as in the
-/// C gateway: a log file that cannot be written is a deployment error, not a condition to
-/// run without); `Ok` carries what could not be applied, to log once it is installed.
-pub fn init(cfg: &crate::config::Logger) -> Result<Vec<(Level, String)>, String> {
+pub fn init(cfg: &crate::config::Logging) -> Result<Vec<(Level, String)>, String> {
     let (logger, notes) = build(cfg)?;
     let max = logger.max;
     if log::set_boxed_logger(Box::new(logger)).is_ok() {
@@ -193,7 +174,6 @@ mod tests {
         assert_eq!(format_time(4_102_444_799, 999), "2099-12-31 23:59:59.999");
     }
 
-    /// What a file sink at `Info` writes for one record.
     fn written(level: Level, target: &str, msg: &str) -> String {
         let path = std::env::temp_dir()
             .join(format!("ratum-logger-{}-{level}-{target}", std::process::id()));

@@ -1,41 +1,34 @@
-//! A stratum job: one template with its coinbases, merkle branches, and the version 2 header
-//! commitments a miner receives. Built by `Builder`, which holds the counters a job's
-//! identifiers come from.
-
 use crate::coinbase::{self, Coinbase};
 use crate::config::Config;
 use crate::template::Template;
+use ratum::bitcoin::HASH_SIZE;
 use ratum::datum::messages::{CoinbaseOutput, CoinbaserResponse};
-use ratum::datum::share::EXTRANONCE_SIZE;
+use ratum::datum::share::{
+    self, EXTRANONCE_SIZE, EXTRANONCE_SIZE_V2, MAX_MERKLE_BRANCHES, SIA_FIELD_HALF,
+};
 use ratum::header::{self, HeaderV2};
 use ratum::target::{self, Target};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
-pub use ratum::datum::share::{COINBASE_ID_SUBSIDY_ONLY as COINBASE_SUBSIDY_ONLY, MAX_JOBS};
+pub use ratum::datum::share::{
+    COINBASE_ID_SUBSIDY_ONLY as COINBASE_SUBSIDY_ONLY, MAX_JOBS, SIA_FIELD_SIZE,
+};
 pub const JOB_INDEX_XOR: u16 = 0xC0DE;
+const ENPREFIX_XOR: u16 = 0xB10C;
 
-/// The pool's 0x99 configuration, as the jobs are built from it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PoolConfig {
     pub payout_script: Vec<u8>,
-    /// u64 for the version 3 protocol; a version 1 config fills the low 32 bits.
     pub prime_id: u64,
     pub coinbase_tag: String,
     pub min_difficulty: u64,
-    /// True when the config came from a version 3 message: the coinbase carries the 8-byte
-    /// prime-id push and the session runs anti-block-withholding unless `abw_disabled`.
     pub protocol_v3: bool,
-    /// The pool sent `CONFIG_FLAG_ABW_DISABLED`: it runs without anti-block-withholding, so
-    /// pooled work is built with the null key and the gateway classifies blocks itself.
     pub abw_disabled: bool,
 }
 
-/// The active anti-block-withholding assignment: the wire slot and the pool's key
-/// commitment. The gateway builds every header to commit to `key_hash`, without ever
-/// holding the key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Abw {
     pub slot: u8,
@@ -43,38 +36,25 @@ pub struct Abw {
 }
 
 pub struct Job {
-    /// Counts every job built; its low byte is the ring index.
     pub serial: u64,
     pub global_index: u8,
-    /// The 14 hex characters a notify's job id begins with.
     pub job_id: String,
     pub datum_slot: u8,
     pub template: Arc<Template>,
-    /// The 64-bit job time as eight little-endian bytes, hex: the notify's `ntime`.
     pub ntime_hex: String,
     pub block_target: Target,
     pub prevblock_hidden: [u8; 32],
     pub merkle_branches: Vec<[u8; 32]>,
-    pub target_pot_index: usize,
-    /// The coinbase pooled work commits to: every dictated output that fits the template's room
-    /// (`coinbase_set`), then the remainder to the pool script. Named by
-    /// `coinbase::COINBASE_POOLED`.
     pub pooled: Coinbase,
     pub subsidy_only: Coinbase,
     pub coinbaser_id: u8,
     pub coinbaser_outputs: Vec<CoinbaseOutput>,
     pub pool_addr_script: Vec<u8>,
     pub is_datum_job: bool,
-    /// The anti-block-withholding assignment this job commits to (version 3 protocol). `None`
-    /// for a version 1 or solo job, whose headers use a zero XOR key. When set, the header
-    /// commitments include `key_hash` and the PoT-derived clear bits, and shares carry the
-    /// slot; the gateway cannot classify a block on such a job and never submits one.
     pub abw: Option<Abw>,
     pub is_new_block: bool,
     pub created: Instant,
     pub stale_prevblock: AtomicBool,
-    /// `commitment` by `(coinbase id, PoT byte)`: the same pair is requested by every
-    /// connection at that difficulty, on every notify and every share.
     commitments: Mutex<HashMap<(u8, u8), Commitment>>,
 }
 
@@ -85,8 +65,6 @@ pub struct Commitment {
     pub txcount: u16,
 }
 
-/// One output of the generation transaction as the API reports it: the pool's split, then
-/// the remainder to the pool script.
 pub struct PayoutRow {
     pub value: u64,
     pub script: Vec<u8>,
@@ -94,25 +72,21 @@ pub struct PayoutRow {
 }
 
 impl Job {
-    /// The coinbase an id names: the subsidy-only one for `COINBASE_SUBSIDY_ONLY`, the pooled
-    /// one for any other. The id carries no size class (see `coinbase::COINBASE_POOLED`);
-    /// the stratum layer accepts only the pooled id on a share.
-    pub fn coinbase(&self, id: u8) -> Option<&Coinbase> {
-        if id == COINBASE_SUBSIDY_ONLY { Some(&self.subsidy_only) } else { Some(&self.pooled) }
+    pub fn coinbase(&self, id: u8) -> &Coinbase {
+        if id == COINBASE_SUBSIDY_ONLY { &self.subsidy_only } else { &self.pooled }
     }
 
     pub fn is_stale_prevblock(&self) -> bool {
         self.stale_prevblock.load(Ordering::Relaxed)
     }
 
-    /// The transaction a share commits to: the coinbase with the PoT byte written in.
     pub fn full_coinbase(&self, id: u8, pot: u8) -> Option<Vec<u8>> {
-        let mut tx = self.coinbase(id)?.assemble(&[0u8; EXTRANONCE_SIZE]);
-        *tx.get_mut(self.target_pot_index)? = pot;
+        let coinbase = self.coinbase(id);
+        let mut tx = coinbase.assemble(&[0u8; EXTRANONCE_SIZE]);
+        *tx.get_mut(coinbase.pot_index)? = pot;
         Some(tx)
     }
 
-    /// The header fields the job fixes, before the miner's.
     fn header_base(&self, merkle_root: [u8; 32], txcount: u16, pot: u8) -> HeaderV2 {
         HeaderV2 {
             version: self.template.version as i32,
@@ -122,36 +96,21 @@ impl Job {
             bits: self.template.nbits,
             txcount,
             height: self.template.height as i32,
-            // Under an ABW assignment the header commits to the clear bits for this share's
-            // difficulty; the key itself stays zero, since the gateway never holds it.
             xor_key_mask_clear_bits: self.abw.map_or(0, |_| ratum::datum::abw::clear_bits(pot)),
             ..Default::default()
         }
     }
 
-    /// H2, the commitment the miner receives, computed with the ABW key hash when this job
-    /// carries an assignment (the gateway commits to the pool's key without holding it) and
-    /// from the header's own zero key otherwise.
-    fn header_h2(&self, h: &HeaderV2) -> [u8; 32] {
+    fn precompute(&self, h: &HeaderV2) -> header::Precomputed {
         match self.abw {
-            Some(a) => h.precompute_with_key_hash(a.key_hash).h2,
-            None => h.precompute().h2,
+            Some(a) => h.precompute_with_key_hash(a.key_hash),
+            None => h.precompute(),
         }
     }
 
-    /// The proof-of-work hash a share is checked against. Under an ABW assignment this is the
-    /// raw (unmasked) hash the miner computed: the gateway cannot apply the pool's mask, and
-    /// the raw hash's top `32 + PoT` bits, which the share check reads, are what the mask
-    /// leaves clear. Without an assignment it is the final hash (the mask is the identity).
     pub fn share_pow_hash(&self, h: &HeaderV2) -> [u8; 32] {
-        match self.abw {
-            Some(a) => {
-                let pre = h.precompute_with_key_hash(a.key_hash);
-                let input = h.asic_input_with(&pre.hash1, &pre.h2);
-                ratum::header::blake2b_256(&input)
-            }
-            None => h.hash_components().result,
-        }
+        let pre = self.precompute(h);
+        header::blake2b_256(&h.asic_input_with(&pre.hash1, &pre.h2))
     }
 
     pub fn commitment(&self, id: u8, pot: u8) -> Option<Commitment> {
@@ -165,33 +124,27 @@ impl Job {
         let merkle_root = ratum::bitcoin::merkle_root(&cb_hash, branches);
         let txcount = if subsidy_only { 1 } else { self.template.txns.len() as u16 + 1 };
         let base = self.header_base(merkle_root, txcount, pot);
-        let h2 = self.header_h2(&base);
-        let c = Commitment { merkle_root, h2, txcount };
+        let c = Commitment { merkle_root, h2: self.precompute(&base).h2, txcount };
         ratum::lock(&self.commitments).insert((id, pot), c.clone());
         Some(c)
     }
 
-    /// The header a share names, from the fields the miner set.
     pub fn header(
         &self,
         id: u8,
         pot: u8,
-        extranonce: [u8; 16],
-        sia_nonce: [u8; 8],
-        sia_ntime: [u8; 8],
+        extranonce: [u8; EXTRANONCE_SIZE_V2],
+        sia_nonce: [u8; SIA_FIELD_SIZE],
+        sia_ntime: [u8; SIA_FIELD_SIZE],
     ) -> Option<HeaderV2> {
         let c = self.commitment(id, pot)?;
         let mut h = self.header_base(c.merkle_root, c.txcount, pot);
         h.extranonce = extranonce;
-        h.nonce = u32::from_le_bytes(sia_nonce[..4].try_into().unwrap());
-        h.nonce2 = u32::from_le_bytes(sia_nonce[4..].try_into().unwrap());
-        h.time_offset = u32::from_le_bytes(sia_ntime[..4].try_into().unwrap());
-        h.nonce3 = u32::from_le_bytes(sia_ntime[4..].try_into().unwrap());
+        (h.nonce, h.nonce2) = share::sia_halves(&sia_nonce);
+        (h.time_offset, h.nonce3) = share::sia_halves(&sia_ntime);
         Some(h)
     }
 
-    /// What the generation transaction pays: the coinbaser's outputs, then the remainder to
-    /// the pool script when they do not take the whole value.
     pub fn payout_rows(&self) -> Vec<PayoutRow> {
         let mut rows: Vec<PayoutRow> = self
             .coinbaser_outputs
@@ -210,8 +163,6 @@ impl Job {
     }
 }
 
-/// The merkle branches of the coinbase's path, from the other transactions' txids, with the
-/// odd-level duplication of Bitcoin's tree.
 pub fn merkle_branches(txids: &[[u8; 32]]) -> Vec<[u8; 32]> {
     if txids.is_empty() {
         return Vec::new();
@@ -220,19 +171,19 @@ pub fn merkle_branches(txids: &[[u8; 32]]) -> Vec<[u8; 32]> {
     level.push(None);
     level.extend(txids.iter().map(|t| Some(*t)));
     let mut branches = Vec::new();
-    let mut combined = [0u8; 64];
+    let mut combined = [0u8; 2 * HASH_SIZE];
     while level.len() > 1 {
         branches.push(level[1].expect("a sibling on the coinbase path is known"));
         if level.len() % 2 == 1 {
-            let last = *level.last().unwrap();
+            let last = *level.last().expect("non-empty");
             level.push(last);
         }
         let mut next = Vec::with_capacity(level.len() / 2);
-        for pair in level.chunks(2) {
-            match (pair[0], pair[1]) {
-                (Some(a), Some(b)) => {
-                    combined[..32].copy_from_slice(&a);
-                    combined[32..].copy_from_slice(&b);
+        for pair in level.as_chunks::<2>().0 {
+            match pair {
+                [Some(a), Some(b)] => {
+                    combined[..HASH_SIZE].copy_from_slice(a);
+                    combined[HASH_SIZE..].copy_from_slice(b);
                     next.push(Some(ratum::bitcoin::sha256d(&combined)));
                 }
                 _ => next.push(None),
@@ -243,26 +194,22 @@ pub fn merkle_branches(txids: &[[u8; 32]]) -> Vec<[u8; 32]> {
     branches
 }
 
-/// Why a job could not be built. The first two hold for every template until the pool's
-/// configuration or the file changes; the others are the template's.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum BuildError {
     #[error("pool payout script of {0} bytes")]
     PayoutScriptSize(usize),
     #[error("{0}")]
     Tagging(String),
-    #[error("{0} merkle branches; the protocol carries at most 24")]
+    #[error("{0} merkle branches; the protocol carries at most {max}",
+            max = MAX_MERKLE_BRANCHES)]
     TooManyBranches(usize),
     #[error("the template's bits do not decode")]
     BadBits,
 }
 
-/// The two coinbases of a job and what they share.
 struct CoinbaseSet {
     pooled: Coinbase,
     subsidy_only: Coinbase,
-    target_pot_index: usize,
-    /// The coinbaser outputs the pooled coinbase includes.
     included: Vec<CoinbaseOutput>,
 }
 
@@ -275,12 +222,9 @@ pub struct Builder {
 
 impl Builder {
     pub fn new(config: Arc<Config>) -> Self {
-        Builder { serial: 0, enprefix: 0, datum_slot: 0, config }
+        Self { serial: 0, enprefix: 0, datum_slot: 0, config }
     }
 
-    /// Build a job. `pool` is the connected pool's configuration, `coinbaser` its split for
-    /// this template. `new_block` marks the first job on a new tip, which carries the
-    /// subsidy-only coinbase for the empty work sent while the full one is built.
     pub fn build(
         &mut self,
         template: Arc<Template>,
@@ -293,7 +237,7 @@ impl Builder {
         let serial = self.serial;
         self.serial += 1;
         let global_index = (serial % MAX_JOBS as u64) as u8;
-        let enprefix = self.enprefix ^ 0xB10C;
+        let enprefix = self.enprefix ^ ENPREFIX_XOR;
         self.enprefix = self.enprefix.wrapping_add(1);
         let slots = c.datum.protocol_job_slots as u32;
         let datum_slot = self.datum_slot;
@@ -303,17 +247,17 @@ impl Builder {
             Some(p) => (p.payout_script.clone(), p.prime_id, p.coinbase_tag.as_str()),
             None => (c.pool_output_script.clone(), 0, c.mining.coinbase_tag_primary.as_str()),
         };
-        if pool_addr_script.is_empty() || pool_addr_script.len() > 64 {
+        if pool_addr_script.is_empty()
+            || pool_addr_script.len() > ratum::datum::messages::MAX_OUTPUT_SCRIPT
+        {
             return Err(BuildError::PayoutScriptSize(pool_addr_script.len()));
         }
         let (script, pot_in_script) = coinbase::script_sig(&coinbase::Tagging {
             height: template.height,
             tag_primary,
             tag_secondary: &c.mining.coinbase_tag_secondary,
-            unique_id: (c.mining.coinbase_unique_id & 0xffff) as u16,
+            unique_id: (c.mining.coinbase_unique_id & u32::from(u16::MAX)) as u16,
             prime_id,
-            // The version 3 protocol pushes the 8-byte prime id whether or not the pool runs
-            // ABW (`datum_coinbaser.c` writes all eight bytes).
             wide_prime: pool.is_some_and(|p| p.protocol_v3),
             datum_active: pool.is_some(),
         })
@@ -324,10 +268,10 @@ impl Builder {
 
         let txids: Vec<[u8; 32]> = template.txns.iter().map(|t| t.txid).collect();
         let merkle_branches = merkle_branches(&txids);
-        if merkle_branches.len() > ratum::datum::share::MAX_MERKLE_BRANCHES {
+        if merkle_branches.len() > MAX_MERKLE_BRANCHES {
             return Err(BuildError::TooManyBranches(merkle_branches.len()));
         }
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()) as u32;
+        let now = ratum::unix_now() as u32;
         let job_id =
             format!("{now:08x}{global_index:02x}{:04x}", u16::from(global_index) ^ JOB_INDEX_XOR);
         Ok(Job {
@@ -339,7 +283,6 @@ impl Builder {
             block_target: target::bits_to_target(template.nbits).ok_or(BuildError::BadBits)?,
             prevblock_hidden: header::prevblock_hidden(&template.prev_hash),
             merkle_branches,
-            target_pot_index: set.target_pot_index,
             pooled: set.pooled,
             subsidy_only: set.subsidy_only,
             coinbaser_id,
@@ -356,8 +299,6 @@ impl Builder {
     }
 }
 
-/// The coinbaser's id and outputs, less any output script over the `reduced_data` limit when
-/// the template enforces it.
 fn filter_coinbaser(
     template: &Template,
     coinbaser: Option<CoinbaserResponse>,
@@ -376,12 +317,6 @@ fn filter_coinbaser(
     (r.coinbaser_id, kept)
 }
 
-/// The subsidy-only coinbase and the pooled one, with the PoT byte at one offset in both.
-/// The pooled coinbase includes every dictated output the template's room allows
-/// (`coinbase::output_budget`) within the block's sigop limit: under the version 2 header
-/// the mining machine never receives the coinbase, so nothing else bounds it (the C gateway
-/// also built one per SHA256d-era size class, and served each miner the largest its
-/// firmware took).
 fn coinbase_set(
     template: &Template,
     script: &[u8],
@@ -390,7 +325,7 @@ fn coinbase_set(
     pool_script: &[u8],
     outputs: &[CoinbaseOutput],
 ) -> CoinbaseSet {
-    let params = |outs, budget, sigops, subsidy_only| coinbase::Params {
+    let spec = |outs, budget, sigops, subsidy_only| coinbase::Spec {
         script_sig: script,
         pot_index_in_script: pot_in_script,
         enprefix,
@@ -404,37 +339,25 @@ fn coinbase_set(
         outputs: outs,
         output_budget: budget,
         sigop_budget: sigops,
-        force_op_return_extranonce: false,
     };
-    let (subsidy_only, target_pot_index, _) = coinbase::build(&params(&[], 0, 0, true));
-    // The transaction's bytes around the outputs: 124 of framing (the version, the input
-    // with its null outpoint, scriptSig length, 15-byte extranonce push and sequence, a
-    // three-byte output count, the pool output's value and script length, the 47-byte
-    // witness commitment output and the lock time), the scriptSig, the pool script, and the
-    // OP_RETURN output that holds the extranonce placeholder when the scriptSig has no room
-    // for it (25 bytes, less the 15 the scriptSig no longer holds). The output count is one
-    // byte up to 252 outputs; counted at three so the budget never exceeds the room. The C
-    // gateway counts 119 and never fills the room, its size classes being far smaller.
-    let fixed = 124 + pool_script.len() + script.len() + if script.len() > 85 { 10 } else { 0 };
+    let (subsidy_only, _) = coinbase::build(&spec(&[], 0, 0, true));
+    let fixed =
+        coinbase::fixed_bytes(script.len(), pool_script.len(), template.witness_commitment.len());
     let budget = if outputs.is_empty() { 0 } else { coinbase::output_budget(fixed, template) };
-    // The sigop cost the block has left after its transactions and the pool script's output.
     let sigops = template
         .sigoplimit
         .saturating_sub(u64::from(template.totals.sigops))
         .saturating_sub(coinbase::output_sigop_cost(pool_script));
-    let (pooled, pot, included) = coinbase::build(&params(outputs, budget, sigops, false));
-    debug_assert_eq!(pot, target_pot_index);
-    CoinbaseSet { pooled, subsidy_only, target_pot_index, included }
+    let (pooled, included) = coinbase::build(&spec(outputs, budget, sigops, false));
+    debug_assert_eq!(pooled.pot_index, subsidy_only.pot_index);
+    CoinbaseSet { pooled, subsidy_only, included }
 }
 
-/// What a stratum job id names: the 14-character job id, the job's global index, and the
-/// suffix and prefix the notify added.
-///
-/// ```text
-/// {job_id}{cb:02x}      a standard job, with the coinbase class the miner is served
-/// Q{job_id}{cb:02x}     a quick-raise job, whose difficulty the connection keeps apart
-/// N{job_id}ff           new-block empty work, on the subsidy-only coinbase
-/// ```
+pub const JOB_ID_TIME_CHARS: usize = 8;
+const JOB_ID_CHARS: usize = 14;
+const JOB_ID_INDEX_AT: std::ops::Range<usize> = 10..JOB_ID_CHARS;
+const NOTIFY_ID_CHARS: usize = JOB_ID_CHARS + 2;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct JobRef {
     pub global_index: u8,
@@ -443,55 +366,51 @@ pub struct JobRef {
     pub coinbase: u8,
 }
 
+const QUICKDIFF_PREFIX: char = 'Q';
+const EMPTY_PREFIX: char = 'N';
+
 impl JobRef {
-    /// The id `mining.notify` carries for `job`.
-    pub fn notify_id(&self, job: &Job) -> String {
+    pub fn notify_id(self, job: &Job) -> String {
         let cb = self.coinbase;
         if self.quickdiff {
-            format!("Q{}{cb:02x}", job.job_id)
+            format!("{QUICKDIFF_PREFIX}{}{cb:02x}", job.job_id)
         } else if self.empty {
-            format!("N{}ff", job.job_id)
+            format!("{EMPTY_PREFIX}{}{COINBASE_SUBSIDY_ONLY:02x}", job.job_id)
         } else {
             format!("{}{cb:02x}", job.job_id)
         }
     }
 
-    /// Parse the id a `mining.submit` names; also the 14-character job id it carries.
-    pub fn parse(s: &str) -> Option<(JobRef, &str)> {
+    pub fn parse(s: &str) -> Option<(Self, &str)> {
+        const PREFIXED: usize = NOTIFY_ID_CHARS + 1;
         let (quickdiff, empty, rest) = match s.len() {
-            16 => (false, false, s),
-            17 if s.starts_with('Q') => (true, false, &s[1..]),
-            17 if s.starts_with('N') => (false, true, &s[1..]),
+            NOTIFY_ID_CHARS => (false, false, s),
+            PREFIXED if s.starts_with(QUICKDIFF_PREFIX) => (true, false, &s[1..]),
+            PREFIXED if s.starts_with(EMPTY_PREFIX) => (false, true, &s[1..]),
             _ => return None,
         };
-        let job_id = &rest[..14];
+        let job_id = rest.get(..JOB_ID_CHARS)?;
         let global_index = global_index_of(job_id)?;
-        let coinbase = u8::from_str_radix(&rest[14..16], 16).ok()?;
+        let coinbase = u8::from_str_radix(rest.get(JOB_ID_CHARS..NOTIFY_ID_CHARS)?, 16).ok()?;
         if empty && coinbase != COINBASE_SUBSIDY_ONLY {
             return None;
         }
-        Some((JobRef { global_index, quickdiff, empty, coinbase }, job_id))
+        Some((Self { global_index, quickdiff, empty, coinbase }, job_id))
     }
 }
 
-/// The stratum job id's global index: characters 10..14 of the 14-character id, XORed.
 pub fn global_index_of(job_id: &str) -> Option<u8> {
-    let raw = u16::from_str_radix(job_id.get(10..14)?, 16).ok()?;
+    let raw = u16::from_str_radix(job_id.get(JOB_ID_INDEX_AT)?, 16).ok()?;
     let idx = raw ^ JOB_INDEX_XOR;
     if idx as usize >= MAX_JOBS { None } else { Some(idx as u8) }
 }
 
-/// An eight-byte Sia stratum field: sixteen hex characters, or eight for a 32-bit value the
-/// miner sent alone, which fills the low four bytes.
-pub fn parse_sia_field(s: &str) -> Option<[u8; 8]> {
+pub fn parse_sia_field(s: &str) -> Option<[u8; SIA_FIELD_SIZE]> {
+    const HEX_CHARS: usize = 2 * SIA_FIELD_SIZE;
+    const NARROW_HEX_CHARS: usize = 2 * SIA_FIELD_HALF;
     match s.len() {
-        16 => hex::decode(s).ok()?.try_into().ok(),
-        8 => {
-            let v = u32::from_str_radix(s, 16).ok()?;
-            let mut out = [0u8; 8];
-            out[..4].copy_from_slice(&v.to_le_bytes());
-            Some(out)
-        }
+        HEX_CHARS => hex::decode(s).ok()?.try_into().ok(),
+        NARROW_HEX_CHARS => Some(share::sia_field(u32::from_str_radix(s, 16).ok()?, 0)),
         _ => None,
     }
 }
@@ -541,9 +460,6 @@ mod tests {
         assert_eq!(JobRef::parse("6625a3d53cc0e2"), None);
     }
 
-    /// The pooled coinbase includes every dictated output the template has room for: the
-    /// version 2 header sends the miner none of it, so no size class bounds the count. The
-    /// room is the block's weight (four units a byte) and sigop limits less its transactions.
     #[test]
     fn the_pooled_coinbase_includes_every_dictated_output_the_block_has_room_for() {
         use crate::template::tests::{config, template};
@@ -569,7 +485,6 @@ mod tests {
                 .unwrap()
         };
 
-        // Room for all 120, more than the 17 the C gateway's default class holds.
         let mut roomy = template();
         roomy.sizelimit = 4_000_000;
         roomy.weightlimit = 4_000_000;
@@ -578,12 +493,9 @@ mod tests {
         assert_eq!(job.coinbaser_outputs.len(), 120);
         let tx = job.pooled.assemble(&[0u8; EXTRANONCE_SIZE]);
         let parsed = ratum::bitcoin::parse_coinbase(&tx).unwrap();
-        // The 120 dictated outputs, the remainder to the pool script, the witness commitment.
         assert_eq!(parsed.outputs.len(), 122);
-        assert!(job.coinbase(coinbase::COINBASE_POOLED).is_some());
+        assert_eq!(job.coinbase(coinbase::COINBASE_POOLED), &job.pooled);
 
-        // A block its transactions nearly fill: the coinbase shrinks to the weight left, four
-        // units a byte, and the split's last outputs are left out.
         let mut tight = roomy.clone();
         let weight_used = u64::from(tight.totals.weight) + 340 + 336 + 36;
         tight.weightlimit = weight_used + 4 * 700;
@@ -593,7 +505,6 @@ mod tests {
         let tx = job.pooled.assemble(&[0u8; EXTRANONCE_SIZE]);
         assert!(tx.len() <= 700 + 15, "the coinbase fits the room: {} bytes", tx.len());
 
-        // The sigop limit: a legacy output costs four, a segwit output none.
         let mut legacy: Vec<CoinbaseOutput> = (0..30u8)
             .map(|i| {
                 let mut s = vec![0x76, 0xa9, 0x14];
@@ -609,11 +520,6 @@ mod tests {
         assert_eq!(job.coinbaser_outputs.len(), 11, "ten legacy outputs and the segwit one");
     }
 
-    /// A split at the coinbaser response's limits (512 outputs of 64-byte scripts, more than
-    /// its blob carries) on a block with room builds a section under the pool's limit
-    /// (`MAX_COINBASE_SECTION_BYTES`, which `Verifier::resolve` refuses past), with the
-    /// longest scriptSig the tags allow; a split of 512 taproot outputs, the largest a
-    /// response carries whole, is included whole.
     #[test]
     fn the_pooled_coinbase_stays_under_the_pools_section_limit() {
         use crate::template::tests::{config, template};
@@ -666,11 +572,6 @@ mod tests {
         assert!(section(&job) <= MAX_COINBASE_SECTION_BYTES, "{} bytes", section(&job));
     }
 
-    /// A coinbase built to the room a template leaves keeps the block under its weight limit:
-    /// the header (164 bytes), the transaction count (three bytes in a block of 253 or more
-    /// transactions), the coinbase with the 36-byte witness the node adds, and the
-    /// transactions. Checked for every room from one output's worth to past 252 outputs, the
-    /// point the output count takes three bytes, with taproot and P2WPKH splits.
     #[test]
     fn a_coinbase_built_to_the_room_keeps_the_block_under_the_weight_limit() {
         use crate::template::tests::{config, template};
