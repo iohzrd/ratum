@@ -4,6 +4,7 @@ use crate::server::{Resolved, resolve_address};
 use log::warn;
 use ratum::bitcoin::opcode::OP_RETURN;
 use ratum::bitcoin::output_script_size_is_valid;
+use ratum::datum::messages::MAX_COINBASE_TAG;
 use ratum::rpc;
 use ratum_prime::config::Config;
 use std::path::PathBuf;
@@ -16,7 +17,6 @@ const DEFAULT_MIN_DIFFICULTY: u64 = 16384;
 const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 const DEFAULT_LISTEN: &str = "0.0.0.0:28915";
 const DEFAULT_MOTD: &str = "RATUM Prime";
-const DEFAULT_COINBASE_TAG: &str = "RATUM";
 const DEFAULT_WINDOW_MULTIPLE: f64 = 8.0;
 
 pub(crate) struct Settings {
@@ -90,11 +90,11 @@ impl Settings {
                 |n| *n > 0,
             ),
             payout,
-            coinbase_tag: cli::resolve_str(
+            coinbase_tag: coinbase_tag(cli::resolve_str(
                 c.coinbase_tag.clone(),
                 f.coinbase_tag,
-                DEFAULT_COINBASE_TAG,
-            ),
+                "",
+            )),
             prime_id: cli::resolve(
                 c.prime_id,
                 f.prime_id,
@@ -147,6 +147,17 @@ impl Settings {
     pub(crate) fn connect_node(&self) -> std::io::Result<rpc::Client> {
         self.node.connect()
     }
+}
+
+fn coinbase_tag(tag: String) -> String {
+    if tag.len() > MAX_COINBASE_TAG {
+        fatal!(
+            "--coinbase-tag must be at most {MAX_COINBASE_TAG} bytes, not {}; it is pushed into \
+             every pooled coinbase's scriptSig ahead of the miner's secondary tag",
+            tag.len()
+        );
+    }
+    tag
 }
 
 fn agent_prefixes(list: &str) -> Vec<String> {

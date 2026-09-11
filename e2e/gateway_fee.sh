@@ -93,6 +93,7 @@ RUST_LOG="${RUST_LOG:-debug}" \
     --data-dir "$WORK/pool" \
     --rpc "http://127.0.0.1:$RPC_PORT" --rpc-user ratum --rpc-pass ratumtest \
     --payout-address "$POOL_ADDRESS" \
+    --coinbase-tag RATUM \
     --min-diff 1 --min-payout "$MIN_PAYOUT" --poll 1 --window-floor "$WINDOW_FLOOR" \
     > "$WORK/pool.log" 2>&1 &
 POOL_PID=$!

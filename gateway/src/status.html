@@ -115,14 +115,15 @@ poll(() => "stats.json", s => {
   const good = s.status === "Connected and Ready" || s.status === "Non-Pooled Mode";
   st.textContent = s.status;
   st.className = "chain " + (bad ? "bad" : good ? "good" : "stale");
-  const tags = `${esc(s.pool_tag)}${s.secondary_tag ? " / " + esc(s.secondary_tag) : ""}`;
+  const tags = [s.pool_tag, s.secondary_tag].filter(t => t).map(esc).join(" / ");
+  const tagged = tags ? " · tag " + tags : "";
   const host = s.pool_url
     ? `<a href="${esc(s.pool_url)}" target="_blank" rel="noopener">${esc(s.pool_host)}</a>`
     : esc(s.pool_host);
   const motd = s.pool_motd && s.pool_motd !== "RATUM Prime" ? " · " + esc(s.pool_motd) : "";
   document.getElementById("pool").innerHTML = s.pool_host
-    ? `${host} · tag ${tags}${motd}`
-    : `non-pooled: every block pays the gateway's address · tag ${tags}`;
+    ? `${host}${tagged}${motd}`
+    : `non-pooled: every block pays the gateway's address${tagged}`;
   document.getElementById("version").textContent = s.version || "";
   document.getElementById("login").style.display = s.clients == null ? "" : "none";
 

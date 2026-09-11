@@ -128,8 +128,8 @@ impl Default for Mining {
     fn default() -> Self {
         Self {
             pool_address: String::new(),
-            coinbase_tag_primary: "DATUM Gateway".into(),
-            coinbase_tag_secondary: "DATUM User".into(),
+            coinbase_tag_primary: String::new(),
+            coinbase_tag_secondary: String::new(),
             coinbase_unique_id: 4242,
             save_submitblocks_dir: String::new(),
         }

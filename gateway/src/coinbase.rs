@@ -288,6 +288,15 @@ mod tests {
         t.tag_secondary = "";
         let (s, _) = script_sig(&t).unwrap();
         assert_eq!(ratum::bitcoin::script_pushes(&s)[1].1, b"RATUM\x00");
+
+        // The configured defaults: neither tag set. The push holds the terminator alone, and
+        // the uid push the pool looks for keeps its place as the third push.
+        t.tag_primary = "";
+        let (s, pot) = script_sig(&t).unwrap();
+        let pushes = ratum::bitcoin::script_pushes(&s);
+        assert_eq!(pushes.len(), 3);
+        assert_eq!(pushes[1].1, b"\x00");
+        assert_eq!(pushes[2].0, pot);
     }
 
     #[test]
