@@ -7,6 +7,8 @@ use ratum::datum::messages::share::PowSubmit;
 use std::io;
 use std::time::{Duration, Instant};
 
+pub(super) const REPLAY_GRACE: Duration = Duration::from_secs(10);
+
 impl Connection<'_> {
     pub(super) fn abw(&self) -> Option<&AbwSlotState> {
         self.v3.as_ref().map(|v| &v.abw)
@@ -79,6 +81,9 @@ impl Connection<'_> {
     }
 
     pub(super) fn rotate_abw(&mut self, why: &str) -> io::Result<()> {
+        if self.opened_at.elapsed() < REPLAY_GRACE {
+            return Ok(());
+        }
         let Some(Rotation { reveals, notice }) = self.with_abw(|abw| abw.rotate(Instant::now()))
         else {
             return Ok(());
@@ -91,7 +96,10 @@ impl Connection<'_> {
 
     pub(super) fn send_due_reveals(&mut self) -> io::Result<()> {
         let now = Instant::now();
-        if !self.abw().is_some_and(|abw| abw.reveal_due(now)) || !self.socket_drained()? {
+        if self.opened_at.elapsed() < REPLAY_GRACE
+            || !self.abw().is_some_and(|abw| abw.reveal_due(now))
+            || !self.socket_drained()?
+        {
             return Ok(());
         }
         let reveals = self.with_abw(|abw| abw.reveals_due(now)).unwrap_or_default();

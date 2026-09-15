@@ -73,8 +73,9 @@ impl Server {
             && !saved.expired(now)
             && saved.state.token == *presented
         {
+            let closed_at = saved.saved_at;
             let mut state = saved.state;
-            state.abw.resumed(now);
+            state.abw.resume(closed_at);
             return StartedSession { state, resumed: true };
         }
         let state = SessionState {

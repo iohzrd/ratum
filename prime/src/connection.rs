@@ -233,7 +233,7 @@ impl Connection<'_> {
     fn until_next_action(&self) -> Duration {
         let mut due = self.last_send_at + KEEPALIVE_INTERVAL;
         if let Some(next) = self.abw().map(AbwSlotState::next_due) {
-            due = due.min(next);
+            due = due.min(next.max(self.opened_at + assignments::REPLAY_GRACE));
         }
         due.saturating_duration_since(Instant::now())
     }

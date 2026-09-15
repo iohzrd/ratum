@@ -229,10 +229,15 @@ covers the C default window only). A share on a revealed slot is
 refused (its key is public) but still rebuilt with that key for its exact reference and its
 receipt. When the connection closes the pool keeps the session for an hour under the
 gateway's signing key, so a gateway that reconnects with its resume token continues the same
-slots and the shares it replays verify; the reveals it may not have received are sent again
-once the delay has passed from the resume, after its replayed shares are answered. A pool
-restart declines every resume. Every share that is a block by the node's target or by its
-job's own `nbits` (the measure of the gateway's reveal audit) gets a receipt, relayed or not.
+slots and the shares it replays verify. A resume does not postpone a reveal: its delay runs
+from the retirement, or from the close of the connection the slot was retired on, since a
+gateway that did not receive the rotation notice can build work on that slot until that
+connection ends. The reveals it may not have received are sent again on the next connection.
+Every reveal, and every rotation, waits for the first 10 seconds of a connection to pass and
+for its socket to hold no unread data, so the shares the gateway replays when it is
+configured are answered first. A pool restart declines every resume. Every share that is a
+block by the node's target or by its job's own `nbits` (the measure of the gateway's reveal
+audit) gets a receipt, relayed or not.
 
 ### Ledger and window
 

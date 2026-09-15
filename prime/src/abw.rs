@@ -14,8 +14,9 @@ const MAX_TIP_ROTATIONS_PER_REVEAL: u32 = 4;
 #[derive(Clone, Copy, Debug)]
 struct Retired {
     slot: u8,
-    retired_at: Instant,
+    reveal_at: Instant,
     reveal_sent: bool,
+    retired_on_open_connection: bool,
 }
 
 pub struct PendingReveal {
@@ -78,18 +79,25 @@ impl AbwSlotState {
         out
     }
 
-    pub fn resumed(&mut self, now: Instant) {
+    pub fn resume(&mut self, closed_at: Instant) {
         for r in &mut self.retired {
-            r.retired_at = now;
+            if r.retired_on_open_connection {
+                r.reveal_at = closed_at + self.reveal_after;
+                r.retired_on_open_connection = false;
+            }
         }
         for slot in 0..abw::ASSIGNMENT_SLOTS {
             if self.revealed[slot as usize].is_some()
                 && !self.retired.iter().any(|r| r.slot == slot)
             {
-                self.retired.push(Retired { slot, retired_at: now, reveal_sent: true });
+                self.retired.push(Retired {
+                    slot,
+                    reveal_at: closed_at,
+                    reveal_sent: true,
+                    retired_on_open_connection: false,
+                });
             }
         }
-        self.activated_at = now;
     }
 
     fn reveal(&mut self, r: Retired) -> PendingReveal {
@@ -109,23 +117,15 @@ impl AbwSlotState {
 
     pub fn next_due(&self) -> Instant {
         let rotation = self.activated_at + ROTATE_AFTER;
-        self.retired
-            .iter()
-            .map(|r| r.retired_at + self.reveal_after)
-            .min()
-            .map_or(rotation, |reveal| rotation.min(reveal))
+        self.retired.iter().map(|r| r.reveal_at).min().map_or(rotation, |r| rotation.min(r))
     }
 
     pub fn reveal_due(&self, now: Instant) -> bool {
-        self.retired.iter().any(|r| now.duration_since(r.retired_at) >= self.reveal_after)
+        self.retired.iter().any(|r| now >= r.reveal_at)
     }
 
     pub fn reveals_due(&mut self, now: Instant) -> Vec<PendingReveal> {
-        let reveal_after = self.reveal_after;
-        let due: Vec<Retired> = self
-            .retired
-            .extract_if(.., |r| now.duration_since(r.retired_at) >= reveal_after)
-            .collect();
+        let due: Vec<Retired> = self.retired.extract_if(.., |r| now >= r.reveal_at).collect();
         due.into_iter().map(|r| self.reveal(r)).collect()
     }
 
@@ -137,7 +137,12 @@ impl AbwSlotState {
             let r = self.retired.remove(pos);
             reveals.push(self.reveal(r));
         }
-        self.retired.push(Retired { slot: old, retired_at: now, reveal_sent: false });
+        self.retired.push(Retired {
+            slot: old,
+            reveal_at: now + self.reveal_after,
+            reveal_sent: false,
+            retired_on_open_connection: true,
+        });
         self.seed(next);
         self.shares_since_activation = 0;
         self.activated_at = now;
@@ -285,7 +290,7 @@ mod tests {
     }
 
     #[test]
-    fn a_resume_answers_replays_before_any_reveal_and_sends_the_reveals_again() {
+    fn a_resume_keeps_each_reveal_time_and_resends_what_the_gateway_may_have_missed() {
         let now = Instant::now();
         let mut abw = AbwSlotState::start(now, AFTER);
         let key0 = abw.keys().seeded[0].unwrap();
@@ -295,23 +300,48 @@ mod tests {
         assert_eq!(abw.reveals_due(t1).len(), 1, "slot 0 revealed; the gateway may miss it");
         abw.rotate(t1);
         assert_eq!(abw.active, 2);
-        let t2 = t1 + Duration::from_secs(170);
-        abw.resumed(t2);
+        let closed_at = t1 + Duration::from_secs(170);
+        abw.resume(closed_at);
         assert_eq!(abw.retired.iter().map(|r| r.slot).collect::<Vec<u8>>(), [1, 0]);
-        assert!(abw.reveals_due(t2 + Duration::from_secs(10)).is_empty(), "retired anew");
         assert_eq!(decoded_notices(&abw), [(1, false), (2, true)], "seeded slots only");
         assert_eq!(abw.keys().seeded[1], Some(key1));
         assert_eq!(abw.keys().revealed[0], Some(key0));
         assert!(abw.keys().seeded[0].is_none());
 
-        let reveals = abw.reveals_due(t2 + AFTER);
-        assert_eq!(decoded_reveals(&reveals), [(1, key1), (0, key0)]);
-        assert_eq!(reveals.iter().map(|r| r.resend).collect::<Vec<_>>(), [false, true]);
+        let reveals = abw.reveals_due(closed_at);
+        assert_eq!(decoded_reveals(&reveals), [(0, key0)], "a sent reveal is resent at once");
+        assert!(reveals[0].resend);
+        assert!(!abw.reveal_due(closed_at + AFTER - Duration::from_secs(1)));
+
+        let reveals = abw.reveals_due(closed_at + AFTER);
+        assert_eq!(decoded_reveals(&reveals), [(1, key1)], "slot 1 waits from the close");
+        assert!(!reveals[0].resend);
         assert_eq!(abw.keys().revealed[0], Some(key0), "kept until the slot is seeded again");
         assert_eq!(abw.keys().revealed[1], Some(key1));
         assert!(abw.retired.iter().map(|r| r.slot).collect::<Vec<u8>>().is_empty());
-        assert_eq!(abw.rotation_due(t2 + ROTATE_AFTER - Duration::from_secs(1)), None);
-        assert_eq!(abw.rotation_due(t2 + ROTATE_AFTER), Some("slot age"));
+        assert_eq!(abw.rotation_due(t1 + ROTATE_AFTER - Duration::from_secs(1)), None);
+        assert_eq!(
+            abw.rotation_due(t1 + ROTATE_AFTER),
+            Some("slot age"),
+            "a resume does not restart the slot age"
+        );
+    }
+
+    #[test]
+    fn resuming_again_and_again_does_not_postpone_a_reveal() {
+        let now = Instant::now();
+        let mut abw = AbwSlotState::start(now, AFTER);
+        abw.rotate(now);
+        let first_close = now + Duration::from_secs(30);
+        let mut closed_at = first_close;
+        for _ in 0..10 {
+            abw.resume(closed_at);
+            closed_at += Duration::from_secs(60);
+        }
+        assert!(!abw.reveal_due(first_close + AFTER - Duration::from_secs(1)));
+        assert!(abw.reveal_due(first_close + AFTER), "the delay runs from the first close");
+        let reveals = abw.reveals_due(first_close + AFTER);
+        assert_eq!(reveals.iter().map(|r| r.slot).collect::<Vec<u8>>(), [0]);
     }
 
     #[test]
