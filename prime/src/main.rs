@@ -192,7 +192,7 @@ fn main() -> io::Result<()> {
     }
     let (ledger, records) = ledger::open_share_ledger(
         ledger_location.file_for(chain)?.as_deref(),
-        s.ledger_keep,
+        s.ledger_keep_shares,
         chain.map(rpc::Chain::name),
         ledger,
     )?;

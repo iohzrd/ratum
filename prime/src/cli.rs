@@ -66,7 +66,7 @@ pub struct Options {
     #[arg(long)]
     pub ledger: Option<String>,
     #[arg(long)]
-    pub ledger_keep: Option<usize>,
+    pub ledger_keep_shares: Option<u64>,
     #[arg(long)]
     pub window: Option<f64>,
     #[arg(long)]

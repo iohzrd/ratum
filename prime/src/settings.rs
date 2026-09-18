@@ -44,7 +44,7 @@ pub struct Settings {
     pub abw_reveal_after: Duration,
     pub max_connections: usize,
     pub ledger_path: Option<String>,
-    pub ledger_keep: Option<usize>,
+    pub ledger_keep_shares: Option<u64>,
     pub poll: Duration,
 }
 
@@ -77,7 +77,12 @@ pub fn resolve(o: &Options) -> Result<Resolved, String> {
             |n| *n > 0,
         )?,
         ledger_path: o.ledger.clone(),
-        ledger_keep: valid(o.ledger_keep, "--ledger-keep", "at least 1", |n| *n >= 1)?,
+        ledger_keep_shares: valid(
+            o.ledger_keep_shares,
+            "--ledger-keep-shares",
+            "at least 1",
+            |n| *n >= 1,
+        )?,
         poll: poll_interval(o.poll)?,
     };
     let window = WindowRule {
@@ -372,7 +377,10 @@ mod tests {
         );
         refused(Options { poll: Some(0.0), ..Default::default() }, "--poll");
         refused(Options { max_connections: Some(0), ..Default::default() }, "--max-connections");
-        refused(Options { ledger_keep: Some(0), ..Default::default() }, "--ledger-keep");
+        refused(
+            Options { ledger_keep_shares: Some(0), ..Default::default() },
+            "--ledger-keep-shares",
+        );
         refused(Options { window: Some(f64::NAN), ..Default::default() }, "--window");
     }
 

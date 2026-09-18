@@ -260,7 +260,12 @@ audit) gets a receipt, relayed or not.
 
 Every accepted share is written to a [redb](https://github.com/cberner/redb) database before
 it is credited: `--ledger` names the file, `--data-dir` puts `<chain>.redb` inside, with
-neither the window is in memory only. `--ledger-keep <n>` keeps the newest `n × 2^20` shares.
+neither the window is in memory only. `--ledger-keep-shares <n>` keeps the newest `n` shares
+on disk and removes the rest as each share is recorded; unset keeps every one, which is what
+TIDES specifies, since a rising network difficulty widens the window over shares that had
+left it. The window reads itself back from these rows, so retention never removes a share the
+window holds however small `n` is: the file cannot be bounded below what the payout set needs,
+and `n` is a request that this floor overrides.
 A ledger is stamped with the node's chain and refused on another chain.
 
 A payout is measured over the most recent shares whose difficulties sum to `--window` times
@@ -269,16 +274,30 @@ activation height Knots resets the target to the previous target shifted left by
 `Blake2bTargetShift` bits (22 on mainnet, 20 elsewhere), so set `--window-floor` to hold
 the intended span of work and keep the whole ledger across the fork.
 
-The window holds at most `2^20` shares whatever their difficulties sum to, which bounds it
-to roughly 150 MiB. That count covers `--window` times the network difficulty while the
-difficulty stays under `2^20 ÷ --window` times the average assigned share difficulty:
-`2^31` at a window of 8 and the default `--min-diff` of 16384, and higher as vardiff
-assigns more than the floor. The BLAKE2b chain starts at the pre-fork difficulty divided by
-`2^Blake2bTargetShift`, near `2^25` on mainnet, so the count has room at first. Past that
-ceiling the window ends at the newest `2^20` shares and spans less work than `--window`
-asks for, which raises payout variance; the pool warns the first time it trims on the
-count. Raise `--min-diff` and the gateways' `stratum.vardiff_min` (both 16384 by default)
-to lift the ceiling.
+The window holds at most `2^22` shares whatever their difficulties sum to. The window is a
+work target and how many shares that is depends on their difficulty, so a count bound is the
+only memory guarantee that does not depend on an assigned difficulty being reasonable. It is
+not a limit to run against: what keeps the count below it is `--min-diff`, since the window
+requires at most `--window × network difficulty ÷ --min-diff` shares. At a window of 8 and
+the default `--min-diff` of 16384 the count stays under `2^22` while the network difficulty
+is under `2^33`, and higher as vardiff assigns more than the floor. In memory a share costs
+about 160 bytes in the window and another 100 in the set of accepted hashes (measured at 2
+million shares), so the bound corresponds to about 1 GiB, beside redb's page cache, which
+holds the pages the window occupies; on disk a share is 119 bytes, 0.47 GiB at the bound. The
+bound is sized for a 4 GiB host. `--min-diff` determines how much of it is used: at `2^33` on
+a window of 8 the window is at its bound, while the same `--min-diff` at the present mainnet
+difficulty holds the window and hash set under 450 MiB. Reading a 2.2 million share window
+back from the store at startup, and again each time a difficulty increase widens it, measures
+265 ms.
+
+Reaching the count bound ends the window at the newest `2^22` shares, spanning less work than
+`--window` specifies, which raises payout variance; the pool warns the first time it trims on
+the count, and `/stats.json` reports `window.count_capped` beside `window.max_shares` for as
+long as it does. The correction is to raise `--min-diff` and the gateways'
+`stratum.vardiff_min` (both 16384 by default) so the window requires fewer shares to span the
+same work: each doubling of the floor halves the count required. The smallest miner served
+sets the other end of that range: at a floor of 8192 a 1 TH/s miner submits a share every 35
+seconds, and at 16384 every 70.
 
 ### The split
 
@@ -373,7 +392,10 @@ same string), an approximate hashrate (accepted-share difficulty over the last 1
 at 2^32 hashes per difficulty unit, for the pool and per miner) and each miner's share of the
 window with `payable`, `unpayable_reason`, `tag` (the secondary coinbase tag of the
 miner's newest share in the window, the gateway's `mining.coinbase_tag_secondary`),
-and `own_gateway_work`; `public_gateway_fee` (null unless `--public-gateway-fee-bps` is set)
+and `own_gateway_work`; the window carries `work` against `target_work`, the `shares` it
+holds against the `max_shares` it may hold, and `count_capped`, true while the count bound
+rather than `target_work` is what ends it, so a reader can tell a window still filling from
+one that has stopped short; `public_gateway_fee` (null unless `--public-gateway-fee-bps` is set)
 carries the rates, the tag, the public-gateway work, the fee work, the work reassigned, the
 own-gateway work it is divided over, and what the fee work and the reassigned work are worth
 in sats at the current split. Every accepted block is recorded in the ledger's `blocks` table

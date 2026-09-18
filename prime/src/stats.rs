@@ -247,6 +247,10 @@ struct LedgerView {
     total_work: u128,
     target_work: u128,
     shares: usize,
+    max_shares: usize,
+    /// Whether the count bound, not `target_work`, is what ends the window. The window then
+    /// spans less work than the policy asks for and never reaches `target_work`.
+    count_capped: bool,
     /// Most work first, as `Ledger::identities` orders them.
     miners: Vec<MinerRow>,
     owed: Vec<OwedBlock>,
@@ -299,6 +303,8 @@ impl LedgerView {
             total_work: l.total_work(),
             target_work: l.window(),
             shares: l.len(),
+            max_shares: l.max_shares(),
+            count_capped: l.count_capped(),
             miners,
             window_multiple: l.window_rule().multiple,
             split_policy: l.split_policy().clone(),
@@ -386,6 +392,8 @@ fn snapshot(server: &Server, history: &Mutex<HashrateHistory>) -> Value {
             "work": l.total_work.to_string(),
             "target_work": l.target_work.to_string(),
             "shares": l.shares,
+            "max_shares": l.max_shares,
+            "count_capped": l.count_capped,
             "operator_fee_sats": operator_fee,
             "miners": miners,
         },
@@ -409,6 +417,37 @@ fn snapshot(server: &Server, history: &Mutex<HashrateHistory>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fixtures::{ALICE, hash, server_with, share};
+
+    /// The window figures a reader uses to distinguish a window still filling from one that
+    /// has reached its share count bound.
+    #[test]
+    fn the_window_reports_its_share_count_against_the_bound_it_stops_at() {
+        const CAP: usize = 8;
+        let server = server_with(&[], 0);
+        let history = Mutex::new(HashrateHistory::default());
+
+        lock(&server.ledger).set_max_shares(CAP);
+        for i in 0..4u64 {
+            lock(&server.ledger).record(share(1_000 + i, ALICE, 16, hash(i), "")).unwrap();
+        }
+        let window = snapshot(&server, &history)["window"].clone();
+        assert_eq!(window["shares"], json!(4));
+        assert_eq!(window["max_shares"], json!(CAP));
+        assert_eq!(window["count_capped"], json!(false), "still filling towards the target");
+
+        for i in 4..(CAP as u64 + 4) {
+            lock(&server.ledger).record(share(1_000 + i, ALICE, 16, hash(i), "")).unwrap();
+        }
+        let window = snapshot(&server, &history)["window"].clone();
+        assert_eq!(window["shares"], json!(CAP));
+        assert_eq!(window["count_capped"], json!(true), "the count bound ends the window");
+        assert_eq!(
+            window["work"],
+            json!((CAP as u128 * 16).to_string()),
+            "which is less work than the target, and no further share adds to it"
+        );
+    }
 
     fn block(n: u8, cumulative_work: u128, network_difficulty: f64) -> FoundBlock {
         FoundBlock {

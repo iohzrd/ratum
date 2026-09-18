@@ -2,7 +2,7 @@
 //! the ledger serves and the running total of credited work.
 
 use super::db::{DbResult as _, NAME_SEPARATOR, create_database, split_at_separator, write};
-use super::{MAX_SHARES, ReadBack, SHARES_PER_KEEP_UNIT, Share};
+use super::{ReadBack, Share};
 use bytes::BufMut as _;
 use ratum::bitcoin::HASH_SIZE;
 use ratum::reader::ByteReader;
@@ -59,7 +59,8 @@ pub(super) struct Store {
 }
 
 impl Store {
-    pub(super) fn open(path: &Path, keep: Option<usize>, chain: Option<&str>) -> io::Result<Self> {
+    /// `keep` is the shares to retain on disk, or none to retain every one.
+    pub(super) fn open(path: &Path, keep: Option<u64>, chain: Option<&str>) -> io::Result<Self> {
         let db = create_database(path)?;
         let w = db.begin_write().db()?;
         let mut stamped = false;
@@ -101,8 +102,7 @@ impl Store {
             let shares = r.open_table(SHARES).db()?;
             shares.last().db()?.map_or(0, |(k, _)| k.value() + 1)
         };
-        let retain = keep.map(|k| (k.max(1) as u64).saturating_mul(SHARES_PER_KEEP_UNIT));
-        Ok(Self { db, next_seq, retain_bound: retain, cumulative_work, stamped })
+        Ok(Self { db, next_seq, retain_bound: keep, cumulative_work, stamped })
     }
 
     pub(super) fn database(&self) -> Arc<Database> {
@@ -124,7 +124,14 @@ impl Store {
         Ok(())
     }
 
-    pub(super) fn read_back(&self, window: u128) -> io::Result<(Vec<Share>, ReadBack)> {
+    /// The newest shares whose difficulties reach `window`, oldest first, and at most
+    /// `max_shares` of them: the ledger discards anything past its own count bound, so
+    /// reading further would only be trimmed again.
+    pub(super) fn read_back(
+        &self,
+        window: u128,
+        max_shares: usize,
+    ) -> io::Result<(Vec<Share>, ReadBack)> {
         let r = self.db.begin_read().db()?;
         let shares = r.open_table(SHARES).db()?;
         let mut collected = Vec::new();
@@ -133,7 +140,7 @@ impl Store {
         let mut iter = shares.iter().db()?;
         let mut hit_count_cap = false;
         while work < window {
-            if collected.len() >= MAX_SHARES {
+            if collected.len() >= max_shares {
                 hit_count_cap = true;
                 break;
             }
@@ -152,8 +159,14 @@ impl Store {
         Ok((collected, read_back))
     }
 
-    pub(super) fn retain(&self) -> io::Result<usize> {
-        let Some(retain) = self.retain_bound else { return Ok(0) };
+    /// Removes the oldest rows past what `--ledger-keep-shares` asks to retain, never
+    /// dropping below `floor`, the shares the window holds. The window reads itself back from
+    /// these rows, so retention below it would shrink the payout set the next time a rising
+    /// network difficulty widens the window. Disk cannot be bounded below what the window
+    /// needs, so the configured figure is a request and this floor overrides it.
+    pub(super) fn retain(&self, floor: u64) -> io::Result<usize> {
+        let Some(configured) = self.retain_bound else { return Ok(0) };
+        let retain = configured.max(floor);
         let count = {
             let r = self.db.begin_read().db()?;
             r.open_table(SHARES).db()?.len().db()?
@@ -241,6 +254,7 @@ mod tests {
         let scratch = Scratch::new("retain");
         let mut store = Store::open(&scratch.join("regtest.redb"), None, None).unwrap();
         store.retain_bound = Some(5);
+        let floor = 0;
         for i in 0..12u64 {
             let share = Share {
                 accepted_at: i,
@@ -250,7 +264,7 @@ mod tests {
                 tag_secondary: String::new(),
             };
             store.insert(&share, 16 * (i + 1) as u128).unwrap();
-            store.retain().unwrap();
+            store.retain(floor).unwrap();
         }
         let dumped = dump(&*store.db).unwrap();
         assert_eq!(dumped.len(), 5, "only the five most recent are retained");

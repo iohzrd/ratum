@@ -18,8 +18,16 @@ use std::io;
 use std::path::{Path, PathBuf};
 use store::Store;
 
-pub const MAX_SHARES: usize = 1 << 20;
-pub const SHARES_PER_KEEP_UNIT: u64 = MAX_SHARES as u64;
+/// The most shares the window holds whatever their difficulties sum to. The window is a work
+/// target, and how many shares that is depends on their difficulty, so a count bound is the
+/// only memory guarantee that does not depend on an assigned difficulty being reasonable. The
+/// pool is not meant to reach it in normal operation: `--min-diff` is what keeps the count
+/// below it, since the window requires at most `--window` times the network difficulty divided
+/// by `--min-diff` shares. Reaching this bound ends the window at the newest `MAX_SHARES`
+/// shares, spanning less work than `--window` specifies. At about 260 bytes of memory per
+/// share across the window and the accepted-hash set, `2^22` keeps both near 1 GiB, which a
+/// 4 GiB host can hold beside redb's page cache and the operating system.
+pub const MAX_SHARES: usize = 1 << 22;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Share {
@@ -78,6 +86,8 @@ pub struct Ledger {
     window: u128,
     store: Option<Store>,
     cumulative_work: u128,
+    /// `MAX_SHARES` outside tests, which exercise the bound at a size they can reach.
+    max_shares: usize,
     count_capped: bool,
 }
 
@@ -95,6 +105,7 @@ impl Ledger {
             total_work: 0,
             store: None,
             cumulative_work: 0,
+            max_shares: MAX_SHARES,
             count_capped: false,
         }
     }
@@ -102,7 +113,7 @@ impl Ledger {
     /// Reads the store's share window back into this empty ledger, which records every later
     /// share to the store.
     fn attach(&mut self, store: Store) -> io::Result<ReadBack> {
-        let (shares, mut read_back) = store.read_back(self.window)?;
+        let (shares, mut read_back) = store.read_back(self.window, self.max_shares)?;
         read_back.stamped = store.stamped;
         self.fill(shares);
         self.cumulative_work = store.cumulative_work;
@@ -132,7 +143,7 @@ impl Ledger {
     fn refill(&mut self) -> usize {
         let before = self.shares.len();
         let (shares, read_back) = match self.store.as_ref() {
-            Some(store) => match store.read_back(self.window) {
+            Some(store) => match store.read_back(self.window, self.max_shares) {
                 Ok(v) => v,
                 Err(e) => {
                     warn!("could not re-read the ledger to widen the share window: {e}");
@@ -144,7 +155,7 @@ impl Ledger {
         if read_back.truncated {
             warn!(
                 "the wider share window exceeds the retained ledger; work older than \
-                 that is not credited (raise --ledger-keep to keep it)"
+                 that is not credited (raise --ledger-keep-shares to keep it)"
             );
         }
         self.fill(shares);
@@ -182,6 +193,23 @@ impl Ledger {
         self.total_work
     }
 
+    pub fn max_shares(&self) -> usize {
+        self.max_shares
+    }
+
+    /// Whether the newest `max_shares` shares hold less work than the window, so the count
+    /// bound, not the work the window asks for, is what ends the payout set.
+    pub fn count_capped(&self) -> bool {
+        self.count_capped
+    }
+
+    /// Exercises the count bound at a size a test can reach.
+    #[cfg(test)]
+    pub fn set_max_shares(&mut self, max_shares: usize) {
+        self.max_shares = max_shares.max(1);
+        self.trim();
+    }
+
     pub fn len(&self) -> usize {
         self.shares.len()
     }
@@ -195,7 +223,7 @@ impl Ledger {
         self.shares.iter().map(|s| &s.block_hash)
     }
 
-    /// Records the share and returns how many stored shares `--ledger-keep` retention
+    /// Records the share and returns how many stored shares `--ledger-keep-shares` retention
     /// removed. A duplicate is refused before it reaches the ledger (`accounting::claim`).
     pub fn record(&mut self, share: Share) -> io::Result<usize> {
         let cumulative_work = self.cumulative_work + u128::from(share.difficulty);
@@ -206,7 +234,7 @@ impl Ledger {
         self.push(share);
         self.trim();
         let Some(store) = &self.store else { return Ok(0) };
-        Ok(store.retain().unwrap_or_else(|e| {
+        Ok(store.retain(self.shares.len() as u64).unwrap_or_else(|e| {
             warn!("ledger retention failed; the share is recorded ({e})");
             0
         }))
@@ -266,16 +294,17 @@ impl Ledger {
             self.drop_oldest();
         }
         let mut count_trimmed = false;
-        while self.shares.len() > MAX_SHARES {
+        while self.shares.len() > self.max_shares {
             self.drop_oldest();
             count_trimmed = true;
         }
         if count_trimmed && !self.count_capped {
             warn!(
-                "the share window is capped at {MAX_SHARES} shares, which hold less work than \
-                 the configured window times network difficulty; miners are paid over the \
-                 newest {MAX_SHARES} shares. Raise the assigned share difficulty to cover the \
-                 intended span."
+                "the share window is capped at {0} shares, which hold less work than the \
+                 configured window times network difficulty; miners are paid over the newest \
+                 {0} shares. Raise --min-diff so the window requires fewer shares to span \
+                 the configured work.",
+                self.max_shares
             );
         }
         self.count_capped = count_trimmed;
@@ -385,7 +414,7 @@ pub fn dump_file(path: &Path) -> io::Result<Vec<Share>> {
 /// no path, `ledger` stays file-less.
 pub fn open_share_ledger(
     path: Option<&Path>,
-    keep: Option<usize>,
+    keep: Option<u64>,
     chain_name: Option<&str>,
     mut ledger: Ledger,
 ) -> io::Result<(Ledger, BlockRecords)> {
@@ -412,7 +441,7 @@ pub fn open_share_ledger(
     if read_back.truncated {
         warn!(
             "the share window exceeds the retained ledger in {}: older work is not credited \
-             (raise --ledger-keep to keep it)",
+             (raise --ledger-keep-shares to keep it)",
             path.display()
         );
     }
@@ -424,8 +453,8 @@ pub fn open_share_ledger(
     );
     match keep {
         Some(n) => info!(
-            "keeping at most {} of the most recent shares in {}",
-            n as u64 * SHARES_PER_KEEP_UNIT,
+            "keeping at most {n} of the most recent shares in {}, and never fewer than the \
+             window holds",
             path.display()
         ),
         None => info!("every share in {} is kept", path.display()),

@@ -171,13 +171,33 @@ fn large_values_do_not_overflow() {
 
 #[test]
 fn a_window_of_u128_max_still_caps_the_share_count() {
+    const CAP: usize = 64;
     let mut l = fixed(u128::MAX);
-    for i in 0..(MAX_SHARES + 50) {
+    l.set_max_shares(CAP);
+    for i in 0..(CAP + 50) {
         l.record(share(i as u64, "a", 1, hash(i as u64), "")).unwrap();
     }
-    assert_eq!(l.len(), MAX_SHARES);
-    assert_eq!(l.total_work(), MAX_SHARES as u128);
-    assert_eq!(work_by_identity(&l), vec![identity_work("a", MAX_SHARES as u128)]);
+    assert_eq!(l.len(), CAP);
+    assert_eq!(l.total_work(), CAP as u128);
+    assert_eq!(work_by_identity(&l), vec![identity_work("a", CAP as u128)]);
+    assert!(l.count_capped(), "the count bound, not the window, ends the payout set");
+    assert_eq!(l.shares.back().unwrap().accepted_at, (CAP + 49) as u64, "the newest are kept");
+}
+
+#[test]
+fn the_count_bound_defaults_to_max_shares() {
+    assert_eq!(fixed(u128::MAX).max_shares(), MAX_SHARES);
+}
+
+#[test]
+fn a_window_within_the_count_bound_is_not_capped() {
+    let mut l = fixed(1_000);
+    l.set_max_shares(64);
+    for i in 0..40u64 {
+        l.record(share(i, "a", 1, hash(i), "")).unwrap();
+    }
+    assert!(!l.count_capped(), "the work target is what the window is still filling towards");
+    assert_eq!(l.len(), 40);
 }
 
 #[test]
@@ -225,7 +245,7 @@ fn the_split_takes_the_operator_fee_and_the_minimum_from_the_policy() {
 fn open_file(
     path: &Path,
     window: u128,
-    keep: Option<usize>,
+    keep: Option<u64>,
     chain: Option<&str>,
 ) -> io::Result<(Ledger, ReadBack)> {
     let mut l = fixed(window);
@@ -233,7 +253,7 @@ fn open_file(
     Ok((l, read_back))
 }
 
-fn open(scratch: &Scratch, window: u128, keep: Option<usize>) -> (Ledger, ReadBack) {
+fn open(scratch: &Scratch, window: u128, keep: Option<u64>) -> (Ledger, ReadBack) {
     open_file(&scratch.join("regtest.redb"), window, keep, Some("regtest")).unwrap()
 }
 
@@ -606,6 +626,35 @@ fn widening_the_window_re_reads_shares_from_the_store() {
         vec![identity_work("bob", 32), identity_work("alice", 16), identity_work("carol", 8)]
     );
     assert_eq!(l.block_hashes().copied().collect::<Vec<_>>(), vec![hash(1), hash(2), hash(3)]);
+}
+
+/// Disk cannot be bounded below what the window needs, since the window reads itself back
+/// from these rows: `--ledger-keep-shares` is a request and the window is the floor.
+#[test]
+fn retention_never_removes_a_share_the_window_holds() {
+    let scratch = Scratch::new("retain-floor");
+    let (mut l, _) = open(&scratch, 1_000_000, Some(2));
+    for i in 0..10u64 {
+        l.record(share(i, "alice", 16, hash(i), "")).unwrap();
+    }
+    assert_eq!(l.len(), 10, "the window holds every share, well past the two asked for");
+    drop(l);
+    let dumped = dump_file(&scratch.join("regtest.redb")).unwrap();
+    assert_eq!(dumped.len(), 10, "so every one is still on disk to read back");
+}
+
+#[test]
+fn retention_removes_what_is_past_the_window_and_the_configured_count() {
+    let scratch = Scratch::new("retain-past-window");
+    let (mut l, _) = open(&scratch, 32, Some(3));
+    for i in 0..10u64 {
+        l.record(share(i, "alice", 16, hash(i), "")).unwrap();
+    }
+    assert_eq!(l.len(), 2, "a window of 32 work holds two shares of 16");
+    drop(l);
+    let dumped = dump_file(&scratch.join("regtest.redb")).unwrap();
+    assert_eq!(dumped.len(), 3, "the configured count, which is above the window's two");
+    assert_eq!(dumped.first().unwrap().accepted_at, 7, "the newest three");
 }
 
 #[test]
