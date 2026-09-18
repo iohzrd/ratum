@@ -1,15 +1,29 @@
 //! Every decoder against random and damaged input. Each message type is encoded, then a byte is
-//! flipped or the message is cut, and the decoder must either refuse it or decode it into something
-//! that re-encodes to the same bytes. No input may panic.
+//! flipped or the message is cut, and the decoder must either refuse it or decode it into
+//! something whose encoding is a fixed point: decoding those bytes again and re-encoding gives
+//! the same bytes. The re-encoding need not equal the damaged input, since a decoder may read a
+//! damaged message as a shorter or different valid one. A decoder with no encoder must refuse
+//! or decode each damaged input. No input may panic.
 
 use ratum::bitcoin;
+use ratum::bitcoin::transaction::CoinbaseTx;
+use ratum::datum::bulk::Fragment;
+use ratum::datum::client::ClientChannel;
+use ratum::datum::coinbase::{self, ScriptSigInputs};
+use ratum::datum::framing::{self, FrameHeader, HeaderKeyRatchet};
+use ratum::datum::handshake::{ProtocolVersion, RESUME_TOKEN_LEN};
+use ratum::datum::keys::KeyPairs;
+use ratum::datum::messages::abw::{self, AssignmentNotice, CandidateRef, Reveal};
 use ratum::datum::messages::coinbaser::{CoinbaserRequest, CoinbaserResponse};
 use ratum::datum::messages::config::ClientConfig;
+use ratum::datum::messages::migration::MigrationRequest;
 use ratum::datum::messages::share::{Blake2bSection, CoinbaseSection, JobSection, PowSubmit};
 use ratum::datum::messages::share_response::{RejectReason, ShareResponse, ShareVerdict};
 use ratum::datum::messages::validation::{self, TxnList, TxnListStatus};
+use ratum::datum::server;
 use ratum::header::{self, BlockHeaderV2};
 use ratum::target;
+use std::sync::OnceLock;
 
 struct Rng(u64);
 
@@ -39,6 +53,42 @@ impl Rng {
     }
 }
 
+/// The pool key pair every hello below is sealed to, generated once.
+fn pool_keys() -> &'static KeyPairs {
+    static KEYS: OnceLock<KeyPairs> = OnceLock::new();
+    KEYS.get_or_init(KeyPairs::generate)
+}
+
+/// The length of the masked header before every frame's body.
+const FRAME_HEADER_LEN: usize = 4;
+
+/// The header a hello arrives under: signed, sealed to the pool's key, command 1.
+fn hello_header(cmd_len: usize) -> FrameHeader {
+    FrameHeader {
+        cmd_len: cmd_len as u32,
+        is_signed: true,
+        is_encrypted_pubkey: true,
+        proto_cmd: framing::cmd::HELLO_OR_PING,
+        ..Default::default()
+    }
+}
+
+/// Where `coinbase_with_script_sig` places the scriptSig in the transaction.
+const SCRIPT_SIG_OFFSET: usize = 42;
+
+/// A coinbase whose scriptSig is `script_sig`, as `parse_coinbase` would return it.
+fn coinbase_with_script_sig(script_sig: &[u8]) -> CoinbaseTx {
+    CoinbaseTx {
+        version: 1,
+        script_sig_offset: SCRIPT_SIG_OFFSET,
+        script_sig: script_sig.to_vec(),
+        sequence: u32::MAX,
+        outputs: Vec::new(),
+        lock_time: 0,
+        has_witness: false,
+    }
+}
+
 fn feed_everything(blob: &[u8]) {
     let _ = PowSubmit::decode(blob);
     let _ = ClientConfig::decode(blob);
@@ -47,6 +97,20 @@ fn feed_everything(blob: &[u8]) {
     let _ = ShareResponse::decode(blob);
     let _ = TxnList::decode(blob, validation::response::TXNS);
     let _ = TxnList::decode(blob, validation::response::BLOCK_TXNS);
+    let _ = AssignmentNotice::decode(blob);
+    for selector in [abw::subcmd::CANDIDATE_RECEIPT, abw::subcmd::CANDIDATE_RELEASE] {
+        let _ = CandidateRef::decode_candidate(blob, selector);
+    }
+    let _ = Reveal::decode(blob);
+    let _ = MigrationRequest::decode(blob);
+    let _ = Fragment::decode(blob);
+    let _ = server::open_hello(hello_header(blob.len()), blob, pool_keys());
+    let tx = coinbase_with_script_sig(blob);
+    for prime_id in [0, 1, 0xdead_beef, u64::MAX] {
+        for tag in ["", "RATUM"] {
+            let _ = coinbase::parse_script_sig(&tx, prime_id, tag);
+        }
+    }
     let _ = BlockHeaderV2::deserialize(blob);
     let _ = bitcoin::transaction::parse_coinbase(blob);
     let _ = bitcoin::transaction::txid(blob);
@@ -80,11 +144,15 @@ fn no_decoder_panics_on_random_bytes() {
 
 #[test]
 fn no_decoder_panics_on_a_valid_selector_followed_by_random_bytes() {
-    let selectors: [u8; 10] = [0x27, 0x99, 0x10, 0x11, 0x8f, 0x50, 0x90, 0x91, 0x92, 0xfe];
+    let selectors: [u8; 16] = [
+        0x27, 0x99, 0x10, 0x11, 0x8f, 0x50, 0x90, 0x91, 0x92, 0xfe, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8,
+        0xa9,
+    ];
     let mut rng = Rng::new(0xABCD_EF01_2345_6789);
     for _ in 0..4_000 {
         let pick = rng.below(selectors.len());
-        let mut blob = vec![selectors[pick]];
+        let mut blob = if rng.below(8) == 0 { b"DBF\x01".to_vec() } else { Vec::new() };
+        blob.push(selectors[pick]);
         if rng.bool() {
             let pick = rng.below(selectors.len());
             blob.push(selectors[pick]);
@@ -102,37 +170,43 @@ fn no_decoder_panics_on_a_valid_selector_followed_by_random_bytes() {
     }
 }
 
+/// Every prefix of `valid`, 2000 single bit flips at random positions, and every byte replaced
+/// by each of a few boundary values, each with what was done to it.
+fn damaged(valid: &[u8]) -> Vec<(&'static str, Vec<u8>)> {
+    let mut out: Vec<(&'static str, Vec<u8>)> =
+        (0..valid.len()).map(|cut| ("a prefix", valid[..cut].to_vec())).collect();
+    let mut rng = Rng::new(0x1122_3344_5566_7788);
+    for _ in 0..2_000 {
+        let mut flipped = valid.to_vec();
+        let at = rng.below(flipped.len());
+        flipped[at] ^= 1 << rng.below(8);
+        out.push(("a bit flip", flipped));
+    }
+    for at in 0..valid.len() {
+        for byte in [0x00u8, 0x01, 0x7f, 0x80, 0xfd, 0xfe, 0xff] {
+            let mut replaced = valid.to_vec();
+            replaced[at] = byte;
+            out.push(("a replaced byte", replaced));
+        }
+    }
+    out
+}
+
+/// `valid` must decode and re-encode to itself; every damaged form of it must be refused or
+/// decode to a message whose encoding is a fixed point of decoding and re-encoding.
 fn truncations_and_flips(valid: &[u8], decode_encode: impl Fn(&[u8]) -> Option<Vec<u8>>) {
     assert_eq!(
         decode_encode(valid).as_deref(),
         Some(valid),
         "the undamaged message must re-encode to itself"
     );
-    let stable = |bytes: &[u8], what: &str| {
-        if let Some(re) = decode_encode(bytes) {
+    for (what, bytes) in damaged(valid) {
+        if let Some(re) = decode_encode(&bytes) {
             assert_eq!(
                 decode_encode(&re).as_deref(),
                 Some(re.as_slice()),
-                "{what}: re-encoding is not stable"
+                "{what}: the re-encoding is not a fixed point"
             );
-        }
-    };
-
-    for cut in 0..valid.len() {
-        stable(&valid[..cut], "a prefix");
-    }
-    let mut rng = Rng::new(0x1122_3344_5566_7788);
-    for _ in 0..2_000 {
-        let mut damaged = valid.to_vec();
-        let at = rng.below(damaged.len());
-        damaged[at] ^= 1 << rng.below(8);
-        stable(&damaged, "a bit flip");
-    }
-    for at in 0..valid.len() {
-        for byte in [0x00u8, 0x01, 0x7f, 0x80, 0xfd, 0xfe, 0xff] {
-            let mut damaged = valid.to_vec();
-            damaged[at] = byte;
-            stable(&damaged, "a replaced byte");
         }
     }
 }
@@ -364,13 +438,146 @@ fn compact_targets_that_decode_are_within_range() {
         let bits = rng.next() as u32;
         if let Some(target) = target::bits_to_target(bits) {
             assert_eq!(bits & 0x0080_0000, 0, "a negative target must not decode");
-            let difficulty = target::difficulty_from_bits(bits);
-            if target.iter().any(|&b| b != 0) {
-                let d = difficulty.expect("a non-zero target has a difficulty");
-                assert!(d > 0.0 && d.is_finite(), "difficulty {d} for bits {bits:#010x}");
-            }
+            assert!(target.iter().any(|&b| b != 0), "a zero target must not decode: {bits:#010x}");
+            let d = target::difficulty_from_bits(bits).expect("a decoded target has a difficulty");
+            assert!(d > 0.0 && d.is_finite(), "difficulty {d} for bits {bits:#010x}");
+        } else {
+            assert_eq!(target::difficulty_from_bits(bits), None, "{bits:#010x}");
         }
     }
     assert!(target::bits_to_target(0x2200_00ff).is_some());
     assert!(target::bits_to_target(0x2300_0001).is_none());
+    assert!(target::bits_to_target(0x1d00_0000).is_none(), "a zero mantissa");
+}
+
+#[test]
+fn a_damaged_assignment_notice_is_refused_or_reproduces_itself() {
+    for active in [false, true] {
+        let notice = AssignmentNotice { active, slot: 11, key_hash: [0x5a; 32] };
+        truncations_and_flips(&notice.encode(), |bytes| {
+            AssignmentNotice::decode(bytes).ok().map(|n| n.encode())
+        });
+    }
+}
+
+#[test]
+fn a_damaged_candidate_reference_is_refused_or_reproduces_itself() {
+    let candidate = CandidateRef { slot: 3, raw_pow_hash_le: [0xc3; 32] };
+    for selector in [abw::subcmd::CANDIDATE_RECEIPT, abw::subcmd::CANDIDATE_RELEASE] {
+        truncations_and_flips(&candidate.encode_candidate(selector), |bytes| {
+            CandidateRef::decode_candidate(bytes, selector)
+                .ok()
+                .map(|c| c.encode_candidate(selector))
+        });
+    }
+}
+
+#[test]
+fn a_damaged_reveal_is_refused_or_reproduces_itself() {
+    let reveal = Reveal { slot: 15, xor_key: [0x9e; 16] };
+    truncations_and_flips(&reveal.encode(), |bytes| Reveal::decode(bytes).ok().map(|r| r.encode()));
+}
+
+#[test]
+fn a_damaged_migration_request_is_refused_or_decoded() {
+    const HOST: &[u8] = b"pool.example.io";
+    let pubkey = KeyPairs::generate().public();
+    let mut redirect = vec![0xa4, 0x00, 0x00];
+    redirect.extend_from_slice(&(HOST.len() as u16).to_le_bytes());
+    redirect.extend_from_slice(HOST);
+    redirect.extend_from_slice(&23334u16.to_le_bytes());
+    redirect.extend_from_slice(&pubkey.to_bytes());
+    redirect.push(0xfe);
+    let return_home = [0xa4, 0x00, 0x01, 0xfe];
+    match MigrationRequest::decode(&redirect).expect("a redirect we built decodes") {
+        MigrationRequest::Redirect(t) => {
+            assert_eq!((t.host.as_bytes(), t.port, t.pubkey), (HOST, 23334, pubkey));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(MigrationRequest::decode(&return_home), Ok(MigrationRequest::ReturnHome));
+    for valid in [&redirect[..], &return_home[..]] {
+        for (_, bytes) in damaged(valid) {
+            let _ = MigrationRequest::decode(&bytes);
+        }
+    }
+}
+
+#[test]
+fn a_damaged_bulk_fragment_is_refused_or_decoded_within_its_bounds() {
+    const HEADER_LEN: usize = 4 + 3 * 4;
+    let mut valid = b"DBF\x01".to_vec();
+    for field in [7u32, 40_000, 16_384] {
+        valid.extend_from_slice(&field.to_le_bytes());
+    }
+    valid.extend_from_slice(&[0x33; 300]);
+    let fragment = Fragment::decode(&valid).expect("a fragment we built decodes");
+    assert_eq!((fragment.id, fragment.total_size, fragment.offset), (7, 40_000, 16_384));
+    assert_eq!(fragment.data, &[0x33; 300][..]);
+    for (what, bytes) in damaged(&valid) {
+        if let Ok(f) = Fragment::decode(&bytes) {
+            assert!(!f.data.is_empty() && f.data.len() <= 16 * 1024, "{what}");
+            assert_eq!(
+                f.data,
+                &bytes[HEADER_LEN..],
+                "{what}: the data is every byte after the header"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_damaged_hello_is_refused_without_panicking() {
+    let pool = pool_keys();
+    let mut client = ClientChannel::with_key_pairs(KeyPairs::generate(), KeyPairs::generate(), 77);
+    let resume = Some([0x42; RESUME_TOKEN_LEN]);
+    let wire = client.hello(&pool.box_pk, "v0.1/decoders", ProtocolVersion::V3 { resume });
+    let header = HeaderKeyRatchet::initial().unmask(wire[..FRAME_HEADER_LEN].try_into().unwrap());
+    let payload = &wire[FRAME_HEADER_LEN..];
+    assert_eq!(header, hello_header(payload.len()));
+    let hello = server::open_hello(header, payload, pool).expect("the hello we built opens");
+    assert_eq!((hello.user_agent.as_str(), hello.nk), ("v0.1/decoders", 77));
+    assert_eq!(hello.protocol_version, ProtocolVersion::V3 { resume });
+    for (what, bytes) in damaged(payload).into_iter().filter(|(_, b)| b != payload) {
+        assert!(
+            server::open_hello(hello_header(bytes.len()), &bytes, pool).is_err(),
+            "{what}: a sealed hello altered after sealing must not open"
+        );
+    }
+    for other in [
+        FrameHeader { is_signed: false, ..header },
+        FrameHeader { is_encrypted_pubkey: false, ..header },
+        FrameHeader { is_encrypted_channel: true, ..header },
+        FrameHeader { proto_cmd: framing::cmd::MINING, ..header },
+    ] {
+        assert!(server::open_hello(other, payload, pool).is_err(), "{other:?}");
+    }
+}
+
+#[test]
+fn a_damaged_script_sig_is_refused_or_parsed_without_panicking() {
+    let inputs = ScriptSigInputs {
+        height: 961_866,
+        tag_primary: "RATUM",
+        tag_secondary: "garage",
+        unique_id: 0x1234,
+        prime_id: 0xdead_beef,
+        wide_prime: true,
+        datum_active: true,
+    };
+    let (script, target_byte_index) = coinbase::script_sig(&inputs).expect("the tags fit");
+    let tx = coinbase_with_script_sig(&script);
+    let parsed =
+        coinbase::parse_script_sig(&tx, 0xdead_beef, "RATUM").expect("the scriptSig we built");
+    assert_eq!(parsed.tag_secondary, "garage");
+    assert_eq!(parsed.target_byte_index, SCRIPT_SIG_OFFSET + target_byte_index);
+    for (what, bytes) in damaged(&script) {
+        let tx = coinbase_with_script_sig(&bytes);
+        for (prime_id, tag) in [(0xdead_beef, "RATUM"), (0xdead_beef, ""), (0, "")] {
+            if let Some(p) = coinbase::parse_script_sig(&tx, prime_id, tag) {
+                let at = p.target_byte_index - SCRIPT_SIG_OFFSET;
+                assert!(at < bytes.len(), "{what}: the target byte index is inside the scriptSig");
+            }
+        }
+    }
 }

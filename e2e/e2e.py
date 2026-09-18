@@ -508,17 +508,45 @@ def cpu_spans(parts: int) -> list[str]:
     return [f"{lo}-{max(lo, hi - 1)}" for lo, hi in zip(bounds, bounds[1:])]
 
 
+# A coinbase output is spendable 100 blocks after its own (COINBASE_MATURITY).
+COINBASE_MATURITY = 100
+
+
+def fill_mempool(stack: Stack, count: int) -> None:
+    """Puts `count` wallet transactions in the node's mempool, so the templates the gateway
+    builds carry transactions: the pool then requests each job's transactions, checks them
+    against the job's merkle branches, and relays the block with them. The node mines the
+    blocks that mature a coinbase for the wallet to spend."""
+    step(f"putting {count} transaction(s) in the mempool")
+    stack.cli("createwallet", "e2e")
+    funding = stack.cli("-rpcwallet=e2e", "getnewaddress")
+    stack.cli("generatetoaddress", str(COINBASE_MATURITY + 1), funding)
+    # A regtest node has no fee estimate, so each send names its fee rate (sat/vB).
+    for _ in range(count):
+        stack.cli(
+            "-rpcwallet=e2e", "-named", "sendtoaddress", f"address={MINER_ADDRESS}",
+            "amount=0.001", "fee_rate=2",
+        )
+    held = len(stack.cli_json("getrawmempool"))
+    if held != count:
+        fail(f"the mempool holds {held} transaction(s), not {count}")
+
+
 def full_stack(stack: Stack, a: argparse.Namespace) -> None:
     """Mines the first post-activation block through one gateway and one miner: the gateway
     accepts what the pool dictates, and a share the pool verifies is a block the node
     accepts. With --protocol-version 3 (the default, as in the gateway) the gateway sends
     the DRS hello and version 3 config and mines under the pool's anti-block-withholding
-    assignment, which the pool submits blocks for."""
+    assignment, which the pool submits blocks for. With --mempool-txns the pooled block
+    carries that many transactions, which the pool obtains from the gateway and relays."""
     stack.require_tools()
     stack.build_release()
     stack.start_node()
     stack.mine_through_activation()
-    target = ACTIVATION_HEIGHT + a.blocks
+    if a.mempool_txns:
+        fill_mempool(stack, a.mempool_txns)
+    first_pooled = stack.height() + 1
+    target = stack.height() + a.blocks
 
     step(f"starting ratum-prime on port {stack.pool_port}")
     stack.start_pool(*a.prime_args.split())
@@ -551,6 +579,20 @@ def full_stack(stack: Stack, a: argparse.Namespace) -> None:
     accepted = len(stack.acceptances())
     if accepted == 0:
         fail("the pool accepted no shares")
+    if a.mempool_txns:
+        # The first pooled block takes the mempool's transactions; later ones may carry none.
+        carried = sum(
+            len(stack.cli_json("getblock", stack.cli("getblockhash", str(h)))["tx"]) - 1
+            for h in range(first_pooled, target + 1)
+        )
+        if carried < a.mempool_txns:
+            fail(
+                f"the pooled blocks carry {carried} transaction(s) besides their coinbases, "
+                f"not the {a.mempool_txns} put in the mempool"
+            )
+        if "requested the transactions of job" not in log:
+            fail("the pool never requested a job's transactions")
+        print(f"transactions in the pooled blocks besides their coinbases: {carried}")
 
     step(
         f"passed: height {target} is {block_hash}: a 164-byte header mined through the stack "
@@ -812,6 +854,9 @@ def main() -> int:
     fs.add_argument("--timeout", type=float, default=900, help="seconds to wait for the block")
     fs.add_argument("--blocks", type=int, default=1, help="pooled blocks to mine past the activation")
     fs.add_argument("--protocol-version", type=int, choices=(1, 3), default=3)
+    fs.add_argument("--mempool-txns", type=int, default=0,
+                    help="wallet transactions to put in the mempool before mining, so the "
+                    "pooled block carries them")
     fs.add_argument("--gateway-pool-address", default=MINER_ADDRESS,
                     help="the gateway's mining.pool_address; the C gateway decodes bc1/tb1 only")
     fs.add_argument("--prime-args", default="",

@@ -189,6 +189,7 @@ pub struct BlockLimits {
 
 impl BlockLimits {
     /// Limits no coinbase reaches, so `MAX_COINBASE_SECTION_LEN` alone bounds the outputs.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) const UNLIMITED: Self =
         Self { sizelimit: u64::MAX, weightlimit: u64::MAX, txn_total_size: 0, txn_total_weight: 0 };
 }

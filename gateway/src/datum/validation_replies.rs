@@ -132,17 +132,34 @@ fn txn_list(lookup: Result<Arc<Job>, SlotLookupFailure>, plain: &[u8], all: bool
     };
     let txns = &job.template.txns;
     let ids = if all { Some((0..txns.len()).collect()) } else { requested_ids(plain, txns.len()) };
-    match ids {
-        Some(ids) => TxnList {
-            selector,
-            job_index: job.slot,
-            status: TxnListStatus::Ok,
-            txns: ids.iter().map(|&i| txns[i].raw.clone()).collect(),
-        },
-        None => TxnList::empty(selector, job.slot, TxnListStatus::BadRequest),
+    let Some(ids) = ids else {
+        return TxnList::empty(selector, job.slot, TxnListStatus::BadRequest);
+    };
+    let reply_bytes: usize =
+        ids.iter().map(|&i| validation::TXN_SIZE_LEN + txns[i].raw.len()).sum();
+    if reply_bytes > validation::MAX_TXN_LIST_TXN_BYTES {
+        warn!(
+            "the {} transactions the pool requested of job {} take {reply_bytes} bytes, over \
+             the {} one frame carries; answering too-many-transactions",
+            ids.len(),
+            job.slot,
+            validation::MAX_TXN_LIST_TXN_BYTES
+        );
+        return TxnList::empty(selector, job.slot, TxnListStatus::TooManyTxns);
+    }
+    TxnList {
+        selector,
+        job_index: job.slot,
+        status: TxnListStatus::Ok,
+        txns: ids.iter().map(|&i| txns[i].raw.clone()).collect(),
     }
 }
 
+/// The indexes a request for named transactions (0x11) lists, or none when the request is
+/// malformed: no index, more than the template holds, an index past its end, or an index
+/// listed twice. The C gateway accepts a repeated index and copies the transaction once per
+/// listing, which lets one request of 16-bit indexes ask for the largest transaction up to
+/// `txn_count` times.
 fn requested_ids(plain: &[u8], txn_count: usize) -> Option<Vec<usize>> {
     let mut c = ratum::reader::ByteReader::new(plain.get(validation::REQUEST_HEADER_LEN..)?);
     let count = usize::from(c.u16("index count").ok()?);
@@ -157,5 +174,35 @@ fn requested_ids(plain: &[u8], txn_count: usize) -> Option<Vec<usize>> {
         .iter()
         .map(|b| usize::from(u16::from_le_bytes(*b)))
         .collect();
-    ids.iter().all(|&i| i < txn_count).then_some(ids)
+    let mut listed = vec![false; txn_count];
+    for &i in &ids {
+        if std::mem::replace(listed.get_mut(i)?, true) {
+            return None;
+        }
+    }
+    Some(ids)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(ids: &[u16]) -> Vec<u8> {
+        let mut plain = vec![validation::SUBCMD, validation::request::TXNS, 0];
+        plain.extend_from_slice(&(ids.len() as u16).to_le_bytes());
+        for id in ids {
+            plain.extend_from_slice(&id.to_le_bytes());
+        }
+        plain
+    }
+
+    #[test]
+    fn a_request_listing_an_index_twice_or_past_the_end_is_refused() {
+        assert_eq!(requested_ids(&request(&[2, 0, 1]), 3), Some(vec![2, 0, 1]));
+        assert_eq!(requested_ids(&request(&[1, 1]), 3), None, "a repeated index");
+        assert_eq!(requested_ids(&request(&[0, 1, 0]), 3), None);
+        assert_eq!(requested_ids(&request(&[3]), 3), None, "past the end");
+        assert_eq!(requested_ids(&request(&[]), 3), None, "no index");
+        assert_eq!(requested_ids(&request(&[0, 1, 2, 0]), 3), None, "more than the template holds");
+    }
 }

@@ -8,10 +8,55 @@ use ratum::datum::messages::share::{
 };
 use ratum::datum::messages::share_response::RejectReason;
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 pub(super) const MAX_COINBASE_TYPES: u8 = 6;
 pub(super) const TIP_GRACE_SECS: u64 = 1;
 pub(super) const MAX_RECENT_TIPS: usize = 3;
+
+/// How long a job whose parent the pool's node has not reported is kept. A gateway whose node
+/// is ahead of the pool's builds on a block the pool reads within seconds; a job whose parent
+/// the node never reports builds on a block that is not the node's, and is evicted so its
+/// sections are released.
+pub(super) const UNSEEN_PARENT_SECS: u64 = 120;
+
+/// The pow hashes of the shares that installed sections, held per connection.
+pub(super) const MAX_INSTALLING_SHARES: usize = 4096;
+
+/// The node's verdicts one job keeps, one per coinbase its shares were rebuilt on. A gateway
+/// sends at most `MAX_COINBASE_TYPES` coinbases a job; past this the verdicts are cleared and
+/// the next share of each coinbase is validated again.
+const MAX_BLOCK_CHECKS: usize = 64;
+
+/// The transactions of a job, which the pool holds to validate the job's block with the node
+/// and to relay a block found on it.
+#[derive(Clone, Debug)]
+pub enum JobTxns {
+    /// Not requested: no share on the job has needed them, or the job has none.
+    Unrequested,
+    /// Requested from the gateway; the connection holds the request's deadline.
+    Requested,
+    /// Received and checked against the job's merkle branches.
+    Held(Arc<[Arc<[u8]>]>),
+    /// Not delivered, or not the job's: every share on the job is refused for the reason.
+    Refused(RejectReason),
+}
+
+/// The node's verdict on a job's block with one coinbase (`getblocktemplate` proposal mode).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockCheck {
+    /// Valid with the header version given; a share with another version outside the rolled
+    /// bits is refused.
+    Valid {
+        version: u32,
+    },
+    Invalid(RejectReason),
+    /// The node did not answer; its shares are refused, and the block is proposed again by a
+    /// share arriving at or after `retry_at` (unix seconds).
+    Unavailable {
+        retry_at: u64,
+    },
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ReplacedTip {
@@ -25,11 +70,21 @@ pub(super) struct JobState {
     coinbases: HashMap<u8, CoinbaseSection>,
     parent_seen: bool,
     pub(super) evicted: bool,
+    installed_at: u64,
+    generation: u64,
+    txns: JobTxns,
+    checks: HashMap<[u8; 32], BlockCheck>,
 }
 
 impl JobState {
     fn coinbase_bytes(&self) -> usize {
         self.coinbases.values().map(coinbase_bytes).sum()
+    }
+
+    fn evict(&mut self) {
+        self.evicted = true;
+        self.txns = JobTxns::Unrequested;
+        self.checks.clear();
     }
 }
 
@@ -64,7 +119,7 @@ impl Verifier<'_> {
         }
         self.tip = tip;
         if tip.is_some() {
-            self.evict_jobs_off_recent_tips();
+            self.evict_jobs_off_recent_tips(now);
         }
     }
 
@@ -72,7 +127,14 @@ impl Verifier<'_> {
         parent_is_kept(self.tip, &self.recent_tips, prev_hash)
     }
 
-    fn evict_jobs_off_recent_tips(&mut self) {
+    /// Whether `prev_hash` is a tip replaced recently enough to be among those kept.
+    pub(super) fn recent_tip(&self, prev_hash: [u8; 32]) -> bool {
+        self.recent_tips.iter().any(|t| t.hash == prev_hash)
+    }
+
+    /// Evicts the jobs whose parent was the tip and no longer is, and the jobs whose parent
+    /// the node has not reported within `UNSEEN_PARENT_SECS` of their installation.
+    fn evict_jobs_off_recent_tips(&mut self, now: u64) {
         let Self { jobs, tip, recent_tips, .. } = self;
         for slot in jobs.iter_mut().flatten() {
             if slot.evicted {
@@ -80,9 +142,67 @@ impl Verifier<'_> {
             }
             if parent_is_kept(*tip, recent_tips, slot.job.prev_hash) {
                 slot.parent_seen = true;
-            } else if slot.parent_seen {
-                slot.evicted = true;
+            } else if slot.parent_seen || now.saturating_sub(slot.installed_at) > UNSEEN_PARENT_SECS
+            {
+                slot.evict();
             }
+        }
+    }
+
+    /// The generation of the job installed in the share's slot, when it is the job the share
+    /// was rebuilt on: the job section the share carries, or, carrying none, the slot's.
+    pub(super) fn installed_generation(&self, s: &PowSubmit) -> Option<u64> {
+        let st = self.jobs[s.job_id as usize].as_ref()?;
+        s.job.as_ref().is_none_or(|job| *job == st.job).then_some(st.generation)
+    }
+
+    fn live_job(&self, job_id: u8, generation: u64) -> Option<&JobState> {
+        self.jobs[usize::from(job_id)]
+            .as_ref()
+            .filter(|st| st.generation == generation && !st.evicted)
+    }
+
+    fn live_job_mut(&mut self, job_id: u8, generation: u64) -> Option<&mut JobState> {
+        self.jobs[usize::from(job_id)]
+            .as_mut()
+            .filter(|st| st.generation == generation && !st.evicted)
+    }
+
+    /// The job of `generation` in slot `job_id`, while it is installed there and not evicted.
+    pub fn job(&self, job_id: u8, generation: u64) -> Option<&JobSection> {
+        self.live_job(job_id, generation).map(|st| &st.job)
+    }
+
+    pub fn job_txns(&self, job_id: u8, generation: u64) -> Option<&JobTxns> {
+        self.live_job(job_id, generation).map(|st| &st.txns)
+    }
+
+    /// Sets the job's transactions; false when the job is no longer installed.
+    pub fn set_job_txns(&mut self, job_id: u8, generation: u64, txns: JobTxns) -> bool {
+        self.live_job_mut(job_id, generation).map(|st| st.txns = txns).is_some()
+    }
+
+    pub fn block_check(
+        &self,
+        job_id: u8,
+        generation: u64,
+        digest: &[u8; 32],
+    ) -> Option<BlockCheck> {
+        self.live_job(job_id, generation)?.checks.get(digest).copied()
+    }
+
+    pub fn record_block_check(
+        &mut self,
+        job_id: u8,
+        generation: u64,
+        digest: [u8; 32],
+        check: BlockCheck,
+    ) {
+        if let Some(st) = self.live_job_mut(job_id, generation) {
+            if st.checks.len() >= MAX_BLOCK_CHECKS {
+                st.checks.clear();
+            }
+            st.checks.insert(digest, check);
         }
     }
 
@@ -151,10 +271,22 @@ impl Verifier<'_> {
     /// Installs the share's job and coinbase sections into its slot. A new job releases
     /// the slot's coinbases; a coinbase replaces the one of its id. The projected total of
     /// installed coinbase bytes must stay under the cap, or nothing is installed.
-    pub(super) fn install_sections(&mut self, s: &PowSubmit) -> Result<(), RejectReason> {
+    pub(super) fn install_sections(
+        &mut self,
+        s: &PowSubmit,
+        raw_pow_hash: [u8; 32],
+        now: u64,
+    ) -> Result<(), RejectReason> {
         let idx = s.job_id as usize;
         let new_job = self.brings_new_job(s);
         let slot = self.jobs[idx].as_ref();
+        let new_coinbase = s.coinbase.as_ref().is_some_and(|cb| {
+            new_job || slot.and_then(|st| st.coinbases.get(&cb.coinbase_id)) != Some(cb)
+        });
+        let changes_slot = new_job || new_coinbase;
+        if changes_slot && self.installed_by.contains(&raw_pow_hash) {
+            return Err(RejectReason::DuplicateWork);
+        }
         let released = if new_job { slot.map_or(0, JobState::coinbase_bytes) } else { 0 };
         let replaced = match &s.coinbase {
             Some(cb) if !new_job => {
@@ -169,11 +301,17 @@ impl Verifier<'_> {
         }
         if new_job {
             let job = s.job.as_ref().expect("new_job requires a job section");
+            let generation = self.next_generation;
+            self.next_generation += 1;
             self.jobs[idx] = Some(JobState {
                 job: job.clone(),
                 coinbases: HashMap::new(),
                 parent_seen: self.parent_kept(job.prev_hash),
                 evicted: false,
+                installed_at: now,
+                generation,
+                txns: JobTxns::Unrequested,
+                checks: HashMap::new(),
             });
         }
         if let Some(cb) = &s.coinbase {
@@ -181,6 +319,12 @@ impl Verifier<'_> {
             state.coinbases.insert(cb.coinbase_id, cb.clone());
         }
         self.installed_coinbase_bytes = projected;
+        if changes_slot {
+            self.installed_by.insert(raw_pow_hash);
+        }
+        if self.tip.is_some() {
+            self.evict_jobs_off_recent_tips(now);
+        }
         Ok(())
     }
 }

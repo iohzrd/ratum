@@ -241,3 +241,62 @@ fn the_network_target_check_needs_a_tip_match_and_a_template() {
     v.set_next_bits(None);
     assert!(v.checked(&s, None, NOW).is_ok(), "no template means no target check");
 }
+
+fn template(prev_hash: [u8; 32], bits: [u8; 4], height: u32, mintime: u64) -> rpc::TemplateSummary {
+    rpc::TemplateSummary {
+        prev_hash,
+        height,
+        coinbase_value: COINBASE_VALUE,
+        bits: u32::from_le_bytes(bits),
+        mintime,
+    }
+}
+
+#[test]
+fn a_job_on_the_templates_parent_carries_its_bits_height_and_a_time_past_its_mintime() {
+    let (mut v, s) = setup();
+    let job = s.job.clone().unwrap();
+    v.set_template(Some(template(job.prev_hash, NBITS, job.height, NOW - 60)));
+    assert!(v.rebuild_checked_ignoring_target(&s, None, NOW).is_ok());
+
+    v.set_template(Some(template(job.prev_hash, HARD_NBITS, job.height, NOW - 60)));
+    assert_eq!(
+        v.rebuild_checked_ignoring_target(&s, None, NOW),
+        Err(RejectReason::BadTarget),
+        "bits harder than the template's are refused as well as easier ones"
+    );
+
+    v.set_template(Some(template(job.prev_hash, NBITS, job.height + 1, NOW - 60)));
+    assert_eq!(
+        v.rebuild_checked_ignoring_target(&s, None, NOW),
+        Err(RejectReason::HeaderFieldMismatch)
+    );
+
+    v.set_template(Some(template(job.prev_hash, NBITS, job.height, NOW + 1)));
+    assert_eq!(
+        v.rebuild_checked_ignoring_target(&s, None, NOW),
+        Err(RejectReason::BadNtime),
+        "a time at or before the parent's median time past"
+    );
+
+    v.set_template(Some(template([0x11; 32], HARD_NBITS, job.height + 5, NOW + 1)));
+    assert!(
+        v.rebuild_checked_ignoring_target(&s, None, NOW).is_ok(),
+        "a template on another parent says nothing of the job"
+    );
+}
+
+#[test]
+fn a_testnet_job_may_carry_bits_other_than_the_templates() {
+    let testnet = SharePolicy { chain: Some(rpc::Chain::Testnet4), ..policy() };
+    let (cb, target_byte_index) = coinbase_sections(&testnet, &split().outputs);
+    let mut v = Verifier::new(&testnet);
+    record(&mut v, &split(), &[], NOW);
+    let s = share_on(job_section(target_byte_index), cb);
+    let job = s.job.clone().unwrap();
+    v.set_template(Some(template(job.prev_hash, HARD_NBITS, job.height, NOW - 60)));
+    assert!(
+        v.rebuild_checked_ignoring_target(&s, None, NOW).is_ok(),
+        "a block far enough past its parent may carry the minimum difficulty there"
+    );
+}

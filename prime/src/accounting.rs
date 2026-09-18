@@ -11,7 +11,7 @@ use crate::verify::{NTIME_WINDOW_SECS, RebuiltShare, Refusal};
 use log::{debug, error, info, warn};
 use ratum::datum::messages::share_response::RejectReason;
 use ratum::lock;
-use ratum::username::address_of;
+use ratum::username::identity_of;
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
@@ -151,7 +151,7 @@ pub fn credit_share(
 ) -> io::Result<()> {
     let share = Share {
         accepted_at: now,
-        identity: address_of(username).to_string(),
+        identity: identity_of(username).into_owned(),
         difficulty: rebuilt.difficulty,
         block_hash: rebuilt.block_hash,
         tag_secondary: rebuilt.tag_secondary.clone(),
@@ -226,17 +226,25 @@ fn record_found_block(
     rebuilt: &RebuiltShare,
     now: u64,
 ) {
-    let network_difficulty = server.node_state.tip().map_or(0.0, |t| t.difficulty);
+    // The difficulty of the block being mined, which the window is sized to (`node.rs`
+    // `window_difficulty`), so luck divides the work between two blocks by the difficulty of
+    // the later one. The tip's, its parent's, only before the node's first answer sized it.
+    let (window_difficulty, cumulative_work) = {
+        let l = lock(&server.ledger);
+        (l.network_difficulty(), l.cumulative_work())
+    };
+    let network_difficulty =
+        window_difficulty.or_else(|| server.node_state.tip().map(|t| t.difficulty)).unwrap_or(0.0);
     let block = FoundBlock {
         found_at: now,
         height: rebuilt.height,
         block_hash: rebuilt.block_hash,
         paid_to_split: rebuilt.paid_to_split,
         paid_to_pool: rebuilt.paid_to_pool,
-        finder: address_of(username).to_string(),
+        finder: identity_of(username).into_owned(),
         tag_secondary: rebuilt.tag_secondary.clone(),
         network_difficulty,
-        cumulative_work: lock(&server.ledger).cumulative_work(),
+        cumulative_work,
     };
     if let Err(e) = lock(&server.records).record_block(block) {
         error!(
@@ -339,6 +347,9 @@ mod tests {
             paid_to_pool,
             unpaid_outputs,
             tag_secondary: "garage".into(),
+            version: 0x2000_0000,
+            coinbase_digest: [0; 32],
+            job_generation: Some(1),
         }
     }
 
@@ -359,6 +370,38 @@ mod tests {
         assert_eq!((found.finder.as_str(), found.tag_secondary.as_str()), ("carol", "garage"));
         assert_eq!((found.paid_to_split, found.paid_to_pool, found.found_at), (900, 100, 42));
         assert!(records.owed().is_empty());
+    }
+
+    #[test]
+    fn a_found_block_records_the_difficulty_the_window_is_sized_to_not_the_tips() {
+        let server = server();
+        lock(&server.ledger).set_network_difficulty(123.5);
+        record_block(&server, PEER, "alice", &block(900, 100, Vec::new()), 42);
+        let recorded = lock(&server.records).blocks()[0].network_difficulty;
+        assert_eq!(recorded, 123.5, "the block being mined, from the template's bits");
+
+        let never_sized = server_with(&[(ALICE, 1)], 0);
+        record_block(&never_sized, PEER, "alice", &block(900, 100, Vec::new()), 42);
+        assert_eq!(
+            lock(&never_sized.records).blocks()[0].network_difficulty,
+            0.0,
+            "neither a sized window nor a tip read"
+        );
+    }
+
+    #[test]
+    fn an_uppercase_bech32_username_is_credited_to_the_lowercase_identity() {
+        let server = server_with(&[], 0);
+        let upper = ALICE.to_ascii_uppercase();
+        let rebuilt = |n: u8| RebuiltShare { block_hash: [n; 32], ..block(900, 100, Vec::new()) };
+        credit_share(&server, PEER, &format!("{upper}.rig1"), &rebuilt(1), 42).unwrap();
+        credit_share(&server, PEER, &format!("{ALICE}.rig2"), &rebuilt(2), 43).unwrap();
+        let identities: Vec<String> =
+            lock(&server.ledger).identities().into_iter().map(|(id, _)| id).collect();
+        assert_eq!(identities, [ALICE], "one identity, checked once against the minimum");
+        assert_eq!(lock(&server.ledger).total_work(), 2);
+        record_block(&server, PEER, &upper, &rebuilt(3), 44);
+        assert_eq!(lock(&server.records).blocks()[0].finder, ALICE);
     }
 
     #[test]

@@ -6,15 +6,14 @@ use crate::ledger::blocks::{ConfirmationReading, FoundBlock, OwedBlock};
 use crate::ledger::split::{Payout, PublicGatewayFeeWork, SplitPolicy};
 use crate::payout;
 use crate::server::Server;
-use log::warn;
 use ratum::hashrate::{self, HashrateHistory};
-use ratum::{http, lock};
+use ratum::http::{self, Method, Reply, Request};
+use ratum::lock;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use tiny_http::{Method, Request, Server as HttpServer};
 
 const HASHRATE_SPAN_SECS: u64 = 10 * ratum::SECS_PER_MINUTE;
 
@@ -61,8 +60,8 @@ fn luck(blocks: &[FoundBlock]) -> Luck {
 }
 
 pub fn spawn(server: Arc<Server>, listen: &str) -> Result<SocketAddr, String> {
-    let http = HttpServer::http(listen).map_err(|e| e.to_string())?;
-    let addr = http.server_addr().to_ip().ok_or("no socket address")?;
+    let http = http::Server::http(listen).map_err(|e| e.to_string())?;
+    let addr = http.local_addr().map_err(|e| e.to_string())?;
     let history = Arc::new(Mutex::new(match &server.settings.hashrate_path {
         Some(path) => HashrateHistory::in_file(path.clone()),
         None => HashrateHistory::default(),
@@ -71,26 +70,19 @@ pub fn spawn(server: Arc<Server>, listen: &str) -> Result<SocketAddr, String> {
     hashrate::sample_every("stats-sampler", Arc::clone(&history), move || {
         pool_hashes_per_second(&sampled)
     });
-    http::serve("stats", http, move |request| {
-        if let Err(e) = handle(&server, &history, request) {
-            warn!("stats: could not send a response: {e}");
-        }
-    });
+    // The interface serves GET only, so a request carrying a body is refused.
+    http::serve("stats", http, 0, move |request| handle(&server, &history, &request));
     Ok(addr)
 }
 
-fn handle(
-    server: &Server,
-    history: &Mutex<HashrateHistory>,
-    request: Request,
-) -> std::io::Result<()> {
-    if *request.method() != Method::Get {
-        return request.respond(http::method_not_allowed());
+fn handle(server: &Server, history: &Mutex<HashrateHistory>, request: &Request) -> Reply {
+    if request.method != Method::Get {
+        return http::method_not_allowed();
     }
-    let (path, _) = http::path_and_query(&request);
+    let (path, _) = http::path_and_query(request);
     match path.as_str() {
-        "/stats.json" => request.respond(http::noindex(http::json(snapshot(server, history)))),
-        _ => request.respond(http::not_found()),
+        "/stats.json" => http::noindex(http::json(snapshot(server, history))),
+        _ => http::not_found(),
     }
 }
 
@@ -125,12 +117,18 @@ fn network_json(
     })
 }
 
+/// What `confirmations` shows for a block the node answered it stores no block for: the count
+/// the node answers for a block off its best chain, since the best chain does not hold it
+/// either, in place of the value the ledger stores for it.
+const NOT_STORED_SHOWN_AS: i64 = -1;
+
 fn confirmations_json(
     state: Option<&ConfirmationReading>,
     height: u32,
     tip_height: Option<u32>,
 ) -> Value {
     match (state, tip_height) {
+        (Some(s), _) if !s.node_stores_block() => json!(NOT_STORED_SHOWN_AS),
         (Some(s), _) if !s.on_best_chain() => json!(s.confirmations),
         (_, Some(tip)) if tip >= height => json!(i64::from(tip) - i64::from(height) + 1),
         (Some(s), _) => json!(s.confirmations),
@@ -488,6 +486,15 @@ mod tests {
         assert_eq!(confirmations_json(Some(&read(100)), 971_765, Some(972_091)), json!(327));
         assert_eq!(confirmations_json(Some(&read(100)), 971_765, None), json!(100));
         assert_eq!(confirmations_json(Some(&read(-1)), 971_765, Some(972_091)), json!(-1));
+        assert_eq!(
+            confirmations_json(
+                Some(&read(ConfirmationReading::NOT_STORED)),
+                971_765,
+                Some(972_091)
+            ),
+            json!(-1),
+            "a block the node does not store is shown off the best chain"
+        );
         assert_eq!(confirmations_json(None, 971_765, None), Value::Null);
         assert_eq!(
             confirmations_json(Some(&read(3)), 971_765, Some(971_760)),

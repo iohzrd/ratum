@@ -19,6 +19,9 @@ pub const MAX_TARGET_EXPONENT: u8 = (u64::BITS - 1) as u8;
 
 pub const DIFF1_TARGET: Target = target_for_exponent(0);
 
+/// The target `bits` encodes, or none where consensus `DeriveTarget` refuses it: the sign bit
+/// set, a mantissa that overflows 256 bits, or a target of zero (a zero mantissa, or one whose
+/// bytes a small size shifts out entirely). The proof-of-work limit is not checked here.
 pub fn bits_to_target(bits: u32) -> Option<Target> {
     if bits & COMPACT_TARGET_SIGN_BIT != 0 {
         return None;
@@ -36,7 +39,7 @@ pub fn bits_to_target(bits: u32) -> Option<Target> {
             _ => return None,
         }
     }
-    Some(t)
+    t.iter().any(|&b| b != 0).then_some(t)
 }
 
 pub fn meets_target(hash: &[u8; 32], target: &Target) -> bool {
@@ -183,6 +186,17 @@ mod tests {
         assert_eq!(bits_to_target(0x2200ffff), None);
         assert_eq!(bits_to_target(0x23000001), None);
         assert_eq!(bits_to_target(0x23000000), None, "exponent 35 is refused, mantissa 0 included");
+    }
+
+    #[test]
+    fn a_zero_target_is_refused_as_derive_target_refuses_it() {
+        for bits in [0x0000_0000, 0x1d00_0000, 0x2000_0000, 0x2200_0000, 0x0100_3456, 0x0200_00ff] {
+            assert_eq!(bits_to_target(bits), None, "{bits:#010x} encodes a target of zero");
+            assert_eq!(difficulty_from_bits(bits), None, "{bits:#010x}");
+        }
+        let t = bits_to_target(0x0112_0000).expect("size 1 keeps the mantissa's first byte");
+        assert_eq!(t[31], 0x12);
+        assert!(t[..31].iter().all(|&b| b == 0));
     }
 
     #[test]

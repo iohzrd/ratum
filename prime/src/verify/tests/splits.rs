@@ -233,3 +233,55 @@ fn ignores_zero_value_outputs() {
     assert_eq!((paid_to_split, paid_to_pool), (0, COINBASE_VALUE));
     assert!(unpaid_outputs.is_empty(), "nothing was dictated, so nothing was left out");
 }
+
+#[test]
+fn a_split_named_by_a_job_on_another_parent_or_worth_more_than_its_coinbase_is_refused() {
+    let (mut v, s) = setup();
+    record(&mut v, &split(), NAMES, NOW);
+    assert!(v.rebuild_checked_ignoring_target(&s, None, NOW).is_ok(), "the split's own job");
+
+    let (mut v, s) = setup();
+    let larger = CoinbaserResponse { value: COINBASE_VALUE * 2, ..split() };
+    record(&mut v, &larger, NAMES, NOW);
+    assert_eq!(
+        v.rebuild_checked_ignoring_target(&s, None, NOW),
+        Err(RejectReason::BadCoinbaserId),
+        "dictated for twice the coinbase, its outputs pay the identities kept twice their part"
+    );
+
+    let (mut v, s) = setup();
+    let smaller = CoinbaserResponse { value: COINBASE_VALUE - 1, ..split() };
+    record(&mut v, &smaller, NAMES, NOW);
+    assert!(
+        v.rebuild_checked_ignoring_target(&s, None, NOW).is_ok(),
+        "a split of less than the coinbase leaves the rest to the pool's script"
+    );
+
+    let (mut v, s) = setup();
+    let outputs: Vec<DictatedOutput> = Vec::new();
+    v.record_dictated(1, COINBASE_VALUE, [0x11; 32], outputs, NOW);
+    assert_eq!(
+        v.rebuild_checked_ignoring_target(&s, None, NOW),
+        Err(RejectReason::BadCoinbaserId),
+        "a split dictated for another parent"
+    );
+}
+
+#[test]
+fn a_session_keeps_its_newest_splits_and_shares_outputs_that_repeat() {
+    let mut splits = DictatedSplits::default();
+    let outputs =
+        || vec![DictatedOutput { payout: payout("alice", 5), script_pubkey: p2wpkh(0x01) }];
+    for id in 1..=100u8 {
+        splits.record(id, 5, [0x5a; 32], outputs(), NOW);
+    }
+    assert_eq!(splits.len(), MAX_SPLITS);
+    assert!(splits.get(100 - MAX_SPLITS as u8).is_none(), "the oldest was dropped");
+    let (a, b) = (splits.get(99).unwrap(), splits.get(100).unwrap());
+    assert!(Arc::ptr_eq(&a.outputs, &b.outputs), "consecutive equal outputs are held once");
+
+    splits.record(101, 5, [0x11; 32], outputs(), NOW);
+    splits.retain_prev(|prev| *prev == [0x11; 32]);
+    assert_eq!(splits.len(), 1);
+    assert!(splits.get(101).is_some());
+}

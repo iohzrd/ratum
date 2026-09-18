@@ -1,7 +1,7 @@
 //! The blocks the pool accepted, what their coinbases left owed to miners, and the node's last
 //! confirmation reading of each.
 
-use super::db::{DbResult as _, NAME_SEPARATOR, create_database, split_at_separator, write};
+use super::db::{DbResult as _, NAME_SEPARATOR, open_database, split_at_separator, write};
 use super::split::Payout;
 use bytes::BufMut as _;
 use log::warn;
@@ -39,6 +39,8 @@ impl OwedBlock {
     }
 }
 
+/// The node's answer for one block at `checked_at`: its `getblockheader` confirmation count,
+/// or `NOT_STORED` when the node stores no block under the hash.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConfirmationReading {
     pub checked_at: u64,
@@ -46,8 +48,19 @@ pub struct ConfirmationReading {
 }
 
 impl ConfirmationReading {
+    /// The count recorded when the node answers that it stores no block under the hash. The
+    /// node answers -1 for a block it stores off its best chain and never a count this low, so
+    /// the two stay distinct in the stored row, whose layout is unchanged. Negative, so
+    /// `on_best_chain` is false for it.
+    pub const NOT_STORED: i64 = i64::MIN;
+
     pub fn on_best_chain(&self) -> bool {
         ratum::rpc::on_best_chain(self.confirmations)
+    }
+
+    /// Whether the node stored the block when it was read: false for `NOT_STORED`.
+    pub fn node_stores_block(&self) -> bool {
+        self.confirmations != Self::NOT_STORED
     }
 }
 
@@ -75,9 +88,19 @@ pub struct BlockRecords {
     confirmations: HashMap<[u8; HASH_SIZE], ConfirmationReading>,
 }
 
+/// What `BlockRecords::void_block` removed: the block's record and its owed record, either
+/// absent when there was none.
+#[derive(Debug, Default, PartialEq)]
+pub struct Voided {
+    pub block: Option<FoundBlock>,
+    pub owed: Option<OwedBlock>,
+}
+
 impl BlockRecords {
+    /// The records in the ledger file at `path`, which must exist: a ledger command reads a
+    /// ledger the pool wrote and never creates one.
     pub fn open_file(path: &Path) -> io::Result<Self> {
-        Self::open(create_database(path)?)
+        Self::open(Arc::new(open_database(path)?))
     }
 
     pub(super) fn open(db: Arc<Database>) -> io::Result<Self> {
@@ -117,19 +140,6 @@ impl BlockRecords {
         let Some(db) = &self.db else { return Ok(()) };
         write(db, |w| {
             w.open_table(table).db()?.insert(key, value).db()?;
-            Ok(())
-        })
-    }
-
-    /// Removes one row, or returns without writing for a ledger with no file.
-    fn delete(
-        &self,
-        table: TableDefinition<'static, &'static [u8], &'static [u8]>,
-        key: &[u8],
-    ) -> io::Result<()> {
-        let Some(db) = &self.db else { return Ok(()) };
-        write(db, |w| {
-            w.open_table(table).db()?.remove(key).db()?;
             Ok(())
         })
     }
@@ -182,12 +192,29 @@ impl BlockRecords {
         Ok(Some(owed))
     }
 
-    pub fn void_owed(&mut self, hash: &[u8; 32]) -> io::Result<Option<OwedBlock>> {
-        let Some(index) = self.owed.iter().position(|o| o.block_hash == *hash) else {
-            return Ok(None);
-        };
-        self.delete(OWED, hash)?;
-        Ok(Some(self.owed.remove(index)))
+    /// Removes the block's record, its owed record and its confirmation reading in one write,
+    /// whichever of them exist, and returns the two records it removed. A block off the best
+    /// chain whose coinbase paid its split in full has no owed record, and is removed here so it
+    /// is neither counted in luck nor read from the node again.
+    pub fn void_block(&mut self, hash: &[u8; HASH_SIZE]) -> io::Result<Voided> {
+        let block = self.blocks.iter().position(|b| b.block_hash == *hash);
+        let owed = self.owed.iter().position(|o| o.block_hash == *hash);
+        if block.is_none() && owed.is_none() && !self.confirmations.contains_key(hash) {
+            return Ok(Voided::default());
+        }
+        if let Some(db) = &self.db {
+            write(db, |w| {
+                for table in [BLOCKS, OWED, CHAIN_STATE] {
+                    w.open_table(table).db()?.remove(hash.as_slice()).db()?;
+                }
+                Ok(())
+            })?;
+        }
+        self.confirmations.remove(hash);
+        Ok(Voided {
+            block: block.map(|i| self.blocks.remove(i)),
+            owed: owed.map(|i| self.owed.remove(i)),
+        })
     }
 
     fn write_owed(&self, owed: &OwedBlock) -> io::Result<()> {
@@ -320,9 +347,11 @@ fn unpack_confirmations(
 mod tests {
     use super::*;
     use crate::fixtures::{Scratch, found, hash, owed, payout};
+    use crate::ledger::db::create_database;
 
+    /// The records in the scratch ledger, created on the first call.
     fn open(scratch: &Scratch) -> BlockRecords {
-        BlockRecords::open_file(&scratch.join("regtest.redb")).unwrap()
+        BlockRecords::open(create_database(&scratch.join("regtest.redb")).unwrap()).unwrap()
     }
 
     #[test]
@@ -447,10 +476,11 @@ mod tests {
             let mut r = open(&scratch);
             r.record_owed(owed(1, None)).unwrap();
             r.record_owed(owed(2, None)).unwrap();
-            let voided = r.void_owed(&owed(1, None).block_hash).unwrap().unwrap();
-            assert_eq!(voided.total(), 300 + 1);
+            let voided = r.void_block(&owed(1, None).block_hash).unwrap();
+            assert_eq!(voided.owed.unwrap().total(), 300 + 1);
+            assert_eq!(voided.block, None, "no block record under that hash");
             assert_eq!(r.owed().len(), 1);
-            assert!(r.void_owed(&owed(1, None).block_hash).unwrap().is_none());
+            assert_eq!(r.void_block(&owed(1, None).block_hash).unwrap(), Voided::default());
         }
         let r = open(&scratch);
         assert_eq!(r.owed().len(), 1, "the removal is durable");
@@ -458,8 +488,63 @@ mod tests {
 
         let mut fileless = BlockRecords::default();
         fileless.record_owed(owed(3, None)).unwrap();
-        assert!(fileless.void_owed(&owed(3, None).block_hash).unwrap().is_some());
+        assert!(fileless.void_block(&owed(3, None).block_hash).unwrap().owed.is_some());
         assert!(fileless.owed().is_empty());
+    }
+
+    /// An orphan whose coinbase paid its split in full has a block record and no owed record;
+    /// voiding it removes the block, its reading and nothing of any other block.
+    #[test]
+    fn voiding_a_block_removes_its_record_its_owed_record_and_its_reading_durably() {
+        let scratch = Scratch::new("void-block");
+        let orphan = ConfirmationReading { checked_at: 7, confirmations: -1 };
+        let fully_paid = found(1, 16);
+        let with_owed = found(2, 32);
+        let owed_for = |b: &FoundBlock| OwedBlock { block_hash: b.block_hash, ..owed(2, None) };
+        {
+            let mut r = open(&scratch);
+            for b in [&fully_paid, &with_owed, &found(3, 48)] {
+                r.record_block(b.clone()).unwrap();
+                r.record_confirmations(b.block_hash, orphan).unwrap();
+            }
+            r.record_owed(owed_for(&with_owed)).unwrap();
+
+            let voided = r.void_block(&fully_paid.block_hash).unwrap();
+            assert_eq!(voided, Voided { block: Some(fully_paid.clone()), owed: None });
+            let voided = r.void_block(&with_owed.block_hash).unwrap();
+            assert_eq!(voided.block, Some(with_owed.clone()));
+            assert_eq!(voided.owed, Some(owed_for(&with_owed)));
+        }
+        let r = open(&scratch);
+        assert_eq!(r.blocks(), &[found(3, 48)], "the removals are durable");
+        assert!(r.owed().is_empty());
+        assert_eq!(r.confirmations(&fully_paid.block_hash), None, "the reading went with it");
+        assert_eq!(r.confirmations(&with_owed.block_hash), None);
+        assert_eq!(r.confirmations(&found(3, 48).block_hash), Some(orphan));
+    }
+
+    #[test]
+    fn a_ledger_command_opens_an_existing_file_and_never_creates_one() {
+        let scratch = Scratch::new("open-existing");
+        let missing = scratch.join("missing.redb");
+        assert!(BlockRecords::open_file(&missing).is_err());
+        assert!(!missing.exists(), "no file is left behind");
+        drop(open(&scratch));
+        let r = BlockRecords::open_file(&scratch.join("regtest.redb")).unwrap();
+        assert!(r.blocks().is_empty());
+    }
+
+    #[test]
+    fn a_reading_that_the_node_stores_no_block_is_off_the_best_chain_and_survives_a_reopen() {
+        let scratch = Scratch::new("not-stored");
+        let not_stored =
+            ConfirmationReading { checked_at: 9, confirmations: ConfirmationReading::NOT_STORED };
+        assert!(!not_stored.on_best_chain());
+        assert!(!not_stored.node_stores_block());
+        let orphan = ConfirmationReading { checked_at: 9, confirmations: -1 };
+        assert!(orphan.node_stores_block(), "the node stores a block off its best chain");
+        open(&scratch).record_confirmations(hash(1), not_stored).unwrap();
+        assert_eq!(open(&scratch).confirmations(&hash(1)), Some(not_stored));
     }
 
     #[test]

@@ -195,7 +195,20 @@ impl TxnList {
     }
 }
 
-const TXN_SIZE_LEN: usize = 3;
+/// The bytes of the size before each transaction of a transaction list reply.
+pub const TXN_SIZE_LEN: usize = 3;
+
+/// The bytes of a transaction list reply outside its transactions: the subcommand, selector,
+/// job index and status, the two-byte count, and the terminator.
+const TXN_LIST_REPLY_OVERHEAD: usize = (REQUEST_HEADER_LEN + 1) + size_of::<u16>() + 1;
+
+/// The most bytes the transactions of one transaction list reply may take, each counted with
+/// its `TXN_SIZE_LEN`-byte size: the largest plaintext a channel frame carries, less the
+/// reply's other bytes and the most pad the gateway appends to a mining message. A reply with
+/// more cannot be sent in one frame.
+pub const MAX_TXN_LIST_TXN_BYTES: usize = crate::datum::channel::MAX_PLAINTEXT_LEN
+    - TXN_LIST_REPLY_OVERHEAD
+    - crate::datum::framing::MAX_MINING_PAD_LEN;
 
 fn decode_txn_size(c: &mut ByteReader<'_>) -> Result<usize, Error> {
     let b: [u8; TXN_SIZE_LEN] = c.arr("txn size")?;
@@ -368,6 +381,20 @@ mod tests {
         let bytes = b.encode();
         assert_eq!(&bytes[6..9], &[0x45, 0x23, 0x01]);
         assert_eq!(TxnList::decode(&bytes, response::BLOCK_TXNS).unwrap(), b);
+    }
+
+    #[test]
+    fn a_txn_list_at_its_byte_bound_fills_a_frame_with_the_largest_pad() {
+        let at_bound = TxnList {
+            selector: response::TXNS,
+            job_index: 0,
+            status: TxnListStatus::Ok,
+            txns: vec![vec![0x11; MAX_TXN_LIST_TXN_BYTES - TXN_SIZE_LEN]],
+        };
+        assert_eq!(
+            at_bound.encode().len() + crate::datum::framing::MAX_MINING_PAD_LEN,
+            crate::datum::channel::MAX_PLAINTEXT_LEN
+        );
     }
 
     #[test]

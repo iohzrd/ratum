@@ -127,13 +127,19 @@ pub(crate) fn decode_compact_size(c: &mut ByteReader<'_>) -> Result<u64, transac
     Ok(v)
 }
 
-pub fn serialize_block(header: &[u8], coinbase: &[u8], other_txns: &[Vec<u8>]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(header.len() + coinbase.len() + MAX_COMPACT_SIZE_LEN);
+pub fn serialize_block<T: AsRef<[u8]>>(
+    header: &[u8],
+    coinbase: &[u8],
+    other_txns: &[T],
+) -> Vec<u8> {
+    let txns_len: usize = other_txns.iter().map(|tx| tx.as_ref().len()).sum();
+    let mut out =
+        Vec::with_capacity(header.len() + MAX_COMPACT_SIZE_LEN + coinbase.len() + txns_len);
     out.put_slice(header);
     out.put_slice(&encode_compact_size(other_txns.len() as u64 + 1));
     out.put_slice(coinbase);
     for tx in other_txns {
-        out.put_slice(tx);
+        out.put_slice(tx.as_ref());
     }
     out
 }
@@ -156,7 +162,7 @@ mod tests {
     fn serializes_a_coinbase_only_block() {
         let header = [0xaa; 164];
         let coinbase = vec![0xbb; 100];
-        let block = serialize_block(&header, &coinbase, &[]);
+        let block = serialize_block::<Vec<u8>>(&header, &coinbase, &[]);
         assert_eq!(block.len(), 164 + 1 + 100);
         assert_eq!(&block[..164], &header);
         assert_eq!(block[164], 1);

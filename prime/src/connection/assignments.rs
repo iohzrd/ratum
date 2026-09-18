@@ -24,11 +24,11 @@ impl Connection<'_> {
 
     pub(super) fn notify_tip_change(&mut self) -> io::Result<()> {
         let (tip, template) = self.server.node_state.tip_and_template();
-        let (current, next_bits) = (tip.map(|t| t.hash), template.map(|t| t.bits));
+        let current = tip.map(|t| t.hash);
         if current != self.verifier.tip() {
             let tip_replaced = self.verifier.tip().is_some();
             self.verifier.set_tip(current, ratum::unix_now());
-            self.verifier.set_next_bits(next_bits);
+            self.verifier.set_template(template);
             if current.is_some() {
                 if tip_replaced {
                     self.rotate_on_tip()?;
@@ -36,7 +36,7 @@ impl Connection<'_> {
                 self.send_mining(&BLOCKNOTIFY_MESSAGE, false)?;
                 debug!("[{}]   <- blocknotify (new tip)", self.peer);
             }
-        } else if self.verifier.set_next_bits(next_bits) {
+        } else if self.verifier.set_template(template) {
             debug!("[{}]   next target set for the current tip", self.peer);
         }
         Ok(())
@@ -52,9 +52,16 @@ impl Connection<'_> {
             return Ok(());
         }
         match v3.abw.rotation_due(now) {
-            Some(why) => self.rotate_abw(why),
-            None => Ok(()),
+            Some(why) if self.may_rotate_or_reveal()? => self.rotate_abw(why),
+            _ => Ok(()),
         }
+    }
+
+    /// Whether a rotation or a reveal may be sent now: every share received has been
+    /// answered, so none is held for its job's transactions and the socket holds no unread
+    /// frame. A reveal then follows the answers to every share mined on the slot it discloses.
+    pub(super) fn may_rotate_or_reveal(&mut self) -> io::Result<bool> {
+        Ok(self.held.is_empty() && self.socket_drained()?)
     }
 
     fn send_reveals(&mut self, reveals: &[PendingReveal], rotating: bool) -> io::Result<()> {
@@ -88,7 +95,7 @@ impl Connection<'_> {
 
     pub(super) fn send_due_reveals(&mut self) -> io::Result<()> {
         let now = Instant::now();
-        if !self.abw().is_some_and(|abw| abw.reveal_due(now)) || !self.socket_drained()? {
+        if !self.abw().is_some_and(|abw| abw.reveal_due(now)) || !self.may_rotate_or_reveal()? {
             return Ok(());
         }
         let Some(v3) = &mut self.v3 else { return Ok(()) };

@@ -126,15 +126,24 @@ impl Session<'_> {
             );
             return Ok(());
         }
-        if let Some(a) = job.abw
-            && !self.gateway.pool.session().abw.holds(a)
-        {
-            warn!(
-                "share on ABW slot {} whose commitment this session does not hold (revealed, \
-                 or seeded anew after a reconnect); not sent",
-                a.slot
-            );
-            return Ok(());
+        if let Some(a) = job.abw {
+            let mut session = self.gateway.pool.session();
+            if !session.abw.holds(a) {
+                match session.abw_unheld.occurred(Instant::now()) {
+                    Some(1) => warn!(
+                        "share on ABW slot {} whose commitment this session does not hold \
+                         (revealed, or seeded anew after a reconnect); not sent",
+                        a.slot
+                    ),
+                    Some(n) => warn!(
+                        "{n} shares on ABW commitments this session does not hold not sent \
+                         since the last report (the latest on slot {})",
+                        a.slot
+                    ),
+                    None => {}
+                }
+                return Ok(());
+            }
         }
         let h = &share.header;
         let Some(extranonce) = share::share_extranonce(&h.extranonce) else {

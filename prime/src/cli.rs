@@ -56,6 +56,8 @@ pub struct Options {
     #[arg(long)]
     pub max_connections: Option<usize>,
     #[arg(long)]
+    pub max_connections_per_ip: Option<usize>,
+    #[arg(long)]
     pub payout_address: Option<String>,
     #[arg(long)]
     pub payout_script: Option<String>,

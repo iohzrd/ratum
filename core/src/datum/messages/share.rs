@@ -451,16 +451,18 @@ impl PowSubmit {
             reserved[0] |= RESERVED_USE_TIME_OFFSET;
         }
         out.put_slice(&reserved);
+        // The C gateway's section order: BLAKE2b, the ABW slot, then the job and coinbase
+        // sections the pool has not yet received. `decode` takes the sections in any order.
+        encode_blake2b_section(&mut out, &self.blake2b);
+        if let Some(slot) = self.abw_slot {
+            out.put_u8(SECTION_ABW_SLOT);
+            out.put_u8(slot);
+        }
         if let Some(j) = &self.job {
             encode_job_section(&mut out, j);
         }
         if let Some(c) = &self.coinbase {
             encode_coinbase_section(&mut out, c);
-        }
-        encode_blake2b_section(&mut out, &self.blake2b);
-        if let Some(slot) = self.abw_slot {
-            out.put_u8(SECTION_ABW_SLOT);
-            out.put_u8(slot);
         }
         out.put_u8(STRUCT_END);
         out
@@ -659,6 +661,29 @@ mod tests {
         assert_eq!((cb.coinbase_id, &cb.coinb1[..], &cb.coinb2[..]), (2, &[0xc0][..], &[0xd0][..]));
         assert_eq!(s.ntime, s.blake2b.time_fields().0);
         assert_eq!(s.nonce, s.blake2b.nonce_fields().0);
+        assert_eq!(s.encode(), msg, "and encodes the sections in the C gateway's order");
+    }
+
+    /// The encoder writes the C gateway's order; the decoder also takes the order this
+    /// encoder wrote before it (job, coinbase, BLAKE2b, ABW slot).
+    #[test]
+    fn the_decoder_takes_the_sections_in_any_order() {
+        let mut s = full();
+        s.abw_slot = Some(9);
+        let bytes = s.encode();
+        let sections_at = bytes.len()
+            - 1
+            - (23 + 2)
+            - (69 + 32 * 3)
+            - (6 + s.coinbase.as_ref().map_or(0, |c| c.coinb1.len() + c.coinb2.len()));
+        assert_eq!(bytes[sections_at], SECTION_BLAKE2B, "the BLAKE2b section comes first");
+        let mut reordered = bytes[..sections_at].to_vec();
+        encode_job_section(&mut reordered, s.job.as_ref().unwrap());
+        encode_coinbase_section(&mut reordered, s.coinbase.as_ref().unwrap());
+        encode_blake2b_section(&mut reordered, &s.blake2b);
+        reordered.extend_from_slice(&[SECTION_ABW_SLOT, 9, STRUCT_END]);
+        assert_eq!(reordered.len(), bytes.len());
+        assert_eq!(PowSubmit::decode(&reordered).unwrap(), s);
     }
 
     #[test]

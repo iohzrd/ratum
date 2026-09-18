@@ -26,7 +26,7 @@ mod watch;
 use clap::Parser;
 use config::Config;
 use gateway::Gateway;
-use log::{error, info};
+use log::{error, info, warn};
 use ratum::datum::keys::{KeyPairs, PublicKeys};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -36,6 +36,14 @@ const GIT_COMMIT: &str = env!("RATUM_GIT_COMMIT");
 
 const POOL_CONNECT_WAIT: Duration = Duration::from_secs(15);
 const POOL_CONNECT_POLL: Duration = Duration::from_millis(250);
+
+/// The descriptors one stratum connection holds: its socket, and the epoll instance and the
+/// eventfd of the poller its thread waits on (`ratum::poll::PolledSocket`).
+const FDS_PER_STRATUM_CLIENT: u64 = 3;
+/// The descriptors counted besides the stratum connections: the stratum and API listeners,
+/// the DATUM connection and its poller, the node connections, the log file and the signal
+/// pipe, with room left over.
+const FDS_BESIDES_STRATUM_CLIENTS: u64 = 64;
 
 #[derive(Parser)]
 #[command(name = "ratum-gateway", version = VERSION, about = "DATUM Gateway for the Bitcoin Knots BLAKE2b hardfork")]
@@ -68,6 +76,25 @@ fn load_config(path: &str) -> Config {
     let text = std::fs::read_to_string(path)
         .unwrap_or_else(|e| fatal(format!("Error reading config file {path}: {e}. Check --help")));
     Config::parse(&text).unwrap_or_else(|e| fatal(format!("Error reading config file: {e}")))
+}
+
+/// Raises the open file limit to the hard limit, logs the limit in force, and warns when it
+/// is under what `stratum.max_clients` connections need.
+fn raise_open_file_limit(max_clients: usize) {
+    let Some((soft, hard)) = ratum::limits::raise_open_file_limit() else { return };
+    info!("Open file limit: {soft} (hard limit {hard})");
+    let needed =
+        FDS_PER_STRATUM_CLIENT.saturating_mul(max_clients as u64) + FDS_BESIDES_STRATUM_CLIENTS;
+    if needed > soft {
+        let fit = soft.saturating_sub(FDS_BESIDES_STRATUM_CLIENTS) / FDS_PER_STRATUM_CLIENT;
+        warn!(
+            "stratum.max_clients is {max_clients}, which needs {needed} open files \
+             ({FDS_PER_STRATUM_CLIENT} per client plus {FDS_BESIDES_STRATUM_CLIENTS}); the open \
+             file limit of {soft} fits {fit} clients, and connections past that fail. Raise \
+             the hard limit (ulimit -Hn, or LimitNOFILE= in a systemd unit) or lower \
+             stratum.max_clients."
+        );
+    }
 }
 
 fn connect_node(config: &Config) -> ratum::rpc::Client {
@@ -113,6 +140,7 @@ fn main() {
         log::log!(note.level, "{}", note.message);
     }
     install_panic_exit();
+    raise_open_file_limit(config.stratum.max_clients);
     let node = connect_node(&config);
     let gateway = Gateway::new(config, node);
     #[cfg(unix)]

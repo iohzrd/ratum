@@ -72,6 +72,11 @@ pub(super) struct Connection {
     /// The `Publication::sequence` last sent, not the `Job::serial`: one job published
     /// under both coinbases must be sent twice.
     sent_sequence: Option<u64>,
+    /// The previous block of the last job notified; none before the first notify. A notify
+    /// on another previous block sets clean_jobs, whatever publication it sends: a
+    /// connection that did not reach its loop while a new tip's empty work was the work
+    /// served sends that tip's pooled work first.
+    notified_prev_hash: Option<[u8; 32]>,
     connected_at: Instant,
     diff_since_window_start: u64,
     window_started_at: Instant,
@@ -115,6 +120,7 @@ impl Connection {
             ),
             job_diffs: vec![None; MAX_JOBS],
             sent_sequence: None,
+            notified_prev_hash: None,
             connected_at: now,
             diff_since_window_start: 0,
             window_started_at: now,
@@ -314,6 +320,8 @@ impl Connection {
         st.subscribed_at = Some(Instant::now());
         drop(st);
         self.vardiff.reset_snapshot(Instant::now());
+        // No previous block has been notified yet, so this notify sets clean_jobs, as the C
+        // gateway's `send_mining_notify(c, true, false, false)` at subscribe does.
         if let Some(published) = self.gateway.jobs.current() {
             self.send_job(&published)?;
         }
@@ -354,10 +362,14 @@ impl Connection {
         Ok(self.reply_result(id, Value::Object(result))?)
     }
 
+    /// Announces difficulty `d` as the C gateway does: `d * 65535 / 65536`, the same target
+    /// relative to the difficulty-1 target stratum firmware divides by
+    /// (`ratum::stratum_difficulty::format`). The share target stays the one `d` names.
     fn send_difficulty(&mut self, d: u64) -> io::Result<()> {
         self.stats().current_diff = d;
         self.send_line(format!(
-            "{{\"id\":null,\"method\":\"mining.set_difficulty\",\"params\":[{d}]}}"
+            "{{\"id\":null,\"method\":\"mining.set_difficulty\",\"params\":[{}]}}",
+            ratum::stratum_difficulty::format(d)
         ))
     }
 
@@ -367,7 +379,11 @@ impl Connection {
         self.notify(&published.job, prefix, prefix == NotifyPrefix::EmptyWork)
     }
 
+    /// Sends a mining.notify of `job`. clean_jobs is `clean`, or true when the job builds on
+    /// a previous block other than the last one this connection notified (or none was).
     fn notify(&mut self, job: &Arc<Job>, prefix: NotifyPrefix, clean: bool) -> io::Result<()> {
+        let prev_hash = job.template.prev_hash;
+        let clean = clean || self.notified_prev_hash != Some(prev_hash);
         let quickdiff = prefix == NotifyPrefix::Quickdiff;
         let floor = if job.is_datum_job { self.gateway.pool.min_difficulty() } else { 0 };
         let NotifyDifficulty { announce, diff } =
@@ -394,6 +410,7 @@ impl Connection {
             target::share_nbits(target_byte),
             job.ntime_hex(),
         );
+        self.notified_prev_hash = Some(prev_hash);
         self.send_line(line)
     }
 }
@@ -530,6 +547,61 @@ mod tests {
         c.gateway.publish(a_job(&c.gateway), CoinbaseKind::Pooled);
         c.subscribe();
         assert_eq!(c.line("mining.notify")["method"], "mining.notify");
+    }
+
+    /// The job of serial `serial` on a template whose previous block is `prev_hash`.
+    fn job_on(gateway: &Gateway, serial: u64, prev_hash: [u8; 32]) -> Arc<Job> {
+        let t = crate::template::Template { prev_hash, ..template() };
+        Arc::new(build(&gateway.config, JobInputs::new(serial, Arc::new(t))).unwrap())
+    }
+
+    fn clean_jobs(notify: &Value) -> bool {
+        notify["params"][8].as_bool().expect("a clean_jobs flag")
+    }
+
+    /// The first notify after mining.subscribe sets clean_jobs, as the C gateway's does,
+    /// though the work served is pooled work that carries no new tip.
+    #[test]
+    fn the_first_notify_after_a_subscription_sets_clean_jobs() {
+        let mut c = Client::connect();
+        c.gateway.publish(a_job(&c.gateway), CoinbaseKind::Pooled);
+        c.subscribe();
+        assert!(clean_jobs(&c.line("mining.notify")));
+    }
+
+    /// clean_jobs follows the previous block the connection last notified, not the kind of
+    /// publication: pooled work on a new tip sets it when the connection never sent that
+    /// tip's empty work (it did not reach its loop while the empty work was the work served),
+    /// and pooled work on the tip already notified does not.
+    #[test]
+    fn a_notify_on_another_previous_block_sets_clean_jobs_whatever_its_prefix() {
+        let mut c = Client::connect();
+        c.subscribe();
+        c.gateway.publish(job_on(&c.gateway, 0, [0; 32]), CoinbaseKind::Pooled);
+        assert!(clean_jobs(&c.line("the first notify")));
+        c.gateway.publish(job_on(&c.gateway, 1, [0; 32]), CoinbaseKind::Pooled);
+        assert!(!clean_jobs(&c.line("pooled work on the same tip")));
+        c.gateway.publish(job_on(&c.gateway, 2, [0x11; 32]), CoinbaseKind::Pooled);
+        let notify = c.line("pooled work on a new tip");
+        assert!(notify["params"][0].as_str().is_some_and(|id| !id.starts_with('N')));
+        assert!(clean_jobs(&notify));
+        c.gateway.publish(job_on(&c.gateway, 3, [0x11; 32]), CoinbaseKind::SubsidyOnly);
+        assert!(clean_jobs(&c.line("empty work")), "empty work sets it on any tip");
+    }
+
+    /// mining.set_difficulty carries the difficulty as the C gateway formats it, 16384 *
+    /// 65535 / 65536 for the default `stratum.vardiff_min`.
+    #[test]
+    fn the_difficulty_is_announced_as_the_c_gateway_formats_it() {
+        let mut c = Client::connect();
+        c.send(r#"{"id":1,"method":"mining.subscribe","params":["tester/1"]}"#);
+        assert_eq!(c.line("subscribe reply")["id"], 1);
+        let mut line = String::new();
+        c.lines.read_line(&mut line).expect("the difficulty");
+        assert_eq!(
+            line,
+            "{\"id\":null,\"method\":\"mining.set_difficulty\",\"params\":[16383.75]}\n"
+        );
     }
 
     #[test]

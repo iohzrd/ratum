@@ -8,7 +8,9 @@ use crate::config::{
     VARDIFF_MIN_RANGE, WORK_UPDATE_SECONDS_RANGE,
 };
 use serde_json::{Value, json};
+use std::net::TcpListener;
 use std::ops::RangeInclusive;
+use std::path::{Path, PathBuf};
 
 struct Field {
     name: &'static str,
@@ -69,12 +71,42 @@ const FIELDS: &[Field] = &[
     field!(stratum.fingerprint_miners, "Fingerprint miners", FieldKind::Bool),
     field!(stratum.require_address_username, "Require an address as the username", FieldKind::Bool),
     field!(bitcoind.work_update_seconds, "Job update interval", int(&WORK_UPDATE_SECONDS_RANGE)),
-    field!(bitcoind.rpcurl, "bitcoind RPC URL", FieldKind::Text),
+    // Shown and compared in its redacted form, so the page never carries the password a
+    // `user:password@` in the URL holds, and a save that returns the redacted form unchanged
+    // keeps the file's value.
+    Field {
+        name: "bitcoind_rpcurl",
+        label: "bitcoind RPC URL",
+        section: "bitcoind",
+        key: "rpcurl",
+        kind: FieldKind::Text,
+        current: |c| json!(redacted_rpcurl(&c.bitcoind.rpcurl)),
+    },
     field!(bitcoind.rpcuser, "bitcoind RPC user", FieldKind::Text),
     field!(bitcoind.rpcpassword, "bitcoind RPC password", FieldKind::Password),
 ];
 
 const OLD_POOL_HOST: &str = "pool_host(old)";
+
+/// What replaces the password of an RPC URL on the settings page.
+const REDACTED: &str = "***";
+
+/// `url` with the password of any `user:password@` it carries replaced by `REDACTED`. The
+/// credentials are found where the node client (`rpc::parse_url`) finds them: before the
+/// last `@` after the scheme, the password after their first `:`.
+fn redacted_rpcurl(url: &str) -> String {
+    let (scheme, rest) = match url.split_once("://") {
+        Some((scheme, rest)) => (&url[..scheme.len() + 3], rest),
+        None => ("", url),
+    };
+    let Some((credentials, host)) = rest.rsplit_once('@') else { return url.to_string() };
+    match credentials.split_once(':') {
+        Some((user, password)) if !password.is_empty() => {
+            format!("{scheme}{user}:{REDACTED}@{host}")
+        }
+        _ => url.to_string(),
+    }
+}
 
 fn shown_pool_host(cfg: &Config, doc: &Value) -> String {
     if !cfg.datum.pool_host.is_empty() {
@@ -320,9 +352,17 @@ pub fn apply(
 
     if let Some(seconds) =
         submitted(form, "bitcoind_work_update_seconds").and_then(|t| t.trim().parse::<u64>().ok())
-        && cfg.datum.protocol_global_timeout < seconds + GLOBAL_TIMEOUT_MARGIN_SECS
     {
-        edit.set("datum", "protocol_global_timeout", json!(seconds + GLOBAL_TIMEOUT_MARGIN_SECS));
+        match seconds.checked_add(GLOBAL_TIMEOUT_MARGIN_SECS) {
+            Some(needed) if cfg.datum.protocol_global_timeout < needed => {
+                edit.set("datum", "protocol_global_timeout", json!(needed));
+            }
+            Some(_) => {}
+            None => edit.errors.push(format!(
+                "Job update interval {seconds} leaves no room for the pool timeout's \
+                 {GLOBAL_TIMEOUT_MARGIN_SECS}-second margin"
+            )),
+        }
     }
 
     let Edit { changed, errors, .. } = edit;
@@ -333,14 +373,70 @@ pub fn apply(
         return Ok(None);
     }
     let text = render(&doc);
-    Config::parse(&text).map_err(|e| vec![e])?;
+    let new = Config::parse(&text).map_err(|e| vec![e])?;
+    check_startup(cfg, &new).map_err(|e| vec![e])?;
     Ok(Some(text))
 }
 
+/// The checks startup makes beyond `Config::parse`, each of which ends the gateway there, so a
+/// saved file that fails one would stop the gateway at the restart the save causes: building
+/// the node client, which reads the cookie file when no rpcuser is set, and binding the
+/// stratum listener, checked here only when its address or port changed, since the running
+/// gateway holds the current one.
+fn check_startup(running: &Config, new: &Config) -> Result<(), String> {
+    let b = &new.bitcoind;
+    let cookie = (!b.rpccookiefile.is_empty()).then(|| PathBuf::from(&b.rpccookiefile));
+    ratum::rpc::Client::new(&b.rpcurl, &b.rpcuser, &b.rpcpassword, cookie)
+        .map_err(|e| format!("bitcoind: {e}"))?;
+    let (was, s) = (&running.stratum, &new.stratum);
+    if (was.listen_addr.as_str(), was.listen_port) != (s.listen_addr.as_str(), s.listen_port) {
+        // The listener is dropped as soon as it is bound.
+        ratum::net::bind_first(&s.listen_addr, s.listen_port, |a: &str| TcpListener::bind(a))
+            .map_err(|e| format!("Stratum port {} cannot be opened: {e}", s.listen_port))?;
+    }
+    Ok(())
+}
+
+/// Replaces the configuration file with `text`. A symlink at `path` is resolved and its target
+/// written, so the link is kept. The text is written to a new file beside the target, created
+/// exclusively after removing anything already at that name (so a link there is never
+/// followed) and, on unix, with the target's permission bits whatever the umask; it is synced,
+/// renamed over the target, and the directory synced so the rename is on disk.
 pub fn write_file(path: &str, text: &str) -> std::io::Result<()> {
-    let tmp = format!("{path}.new");
-    std::fs::write(&tmp, text)?;
-    std::fs::rename(&tmp, path)
+    use std::io::Write as _;
+
+    let target = std::fs::canonicalize(path)?;
+    let dir = target.parent().unwrap_or(Path::new("/")).to_path_buf();
+    let mut tmp_name = target.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(".new");
+    let tmp = dir.join(tmp_name);
+    let permissions = std::fs::metadata(&target)?.permissions();
+    match std::fs::remove_file(&tmp) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        options.mode(permissions.mode() & 0o7777);
+    }
+    let written = options.open(&tmp).and_then(|mut file| {
+        // The mode given at creation is reduced by the umask; this sets it exactly.
+        #[cfg(unix)]
+        file.set_permissions(permissions)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()
+    });
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    std::fs::rename(&tmp, &target)?;
+    #[cfg(unix)]
+    std::fs::File::open(&dir)?.sync_all()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -530,6 +626,98 @@ mod tests {
         let doc: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(doc["bitcoind"]["work_update_seconds"], 100);
         assert_eq!(doc["datum"]["protocol_global_timeout"], 105);
+    }
+
+    #[test]
+    fn an_rpcurl_password_is_redacted_and_the_redacted_form_keeps_the_file_value() {
+        assert_eq!(
+            redacted_rpcurl("http://u:secret@127.0.0.1:8332"),
+            "http://u:***@127.0.0.1:8332"
+        );
+        assert_eq!(redacted_rpcurl("https://u:p:q@a@host/wallet"), "https://u:***@host/wallet");
+        assert_eq!(redacted_rpcurl("http://u@host"), "http://u@host", "no password to hide");
+        assert_eq!(redacted_rpcurl("http://127.0.0.1:8332"), "http://127.0.0.1:8332");
+        assert_eq!(redacted_rpcurl("u:secret@host:8332"), "u:***@host:8332");
+
+        let file = FILE.replace("http://127.0.0.1:18443", "http://rpc:secret@127.0.0.1:18443");
+        let c = Config::parse(&file).unwrap();
+        let shown = form_values(&c, &Value::Null);
+        assert_eq!(shown["bitcoind_rpcurl"], "http://rpc:***@127.0.0.1:18443");
+        let unchanged = form(&[("bitcoind_rpcurl", "http://rpc:***@127.0.0.1:18443")]);
+        assert_eq!(apply(&c, &file, &unchanged).unwrap(), None, "the file's value is kept");
+        let edited = form(&[("bitcoind_rpcurl", "http://rpc:other@127.0.0.1:18443")]);
+        let text = apply(&c, &file, &edited).unwrap().unwrap();
+        let doc: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(doc["bitcoind"]["rpcurl"], "http://rpc:other@127.0.0.1:18443");
+    }
+
+    #[test]
+    fn a_job_interval_too_large_to_add_the_margin_to_is_refused() {
+        let c = cfg();
+        let f = form(&[("bitcoind_work_update_seconds", &u64::MAX.to_string())]);
+        let e = apply(&c, FILE, &f).unwrap_err();
+        assert!(e.iter().any(|e| e.contains("leaves no room")), "{e:?}");
+    }
+
+    #[test]
+    fn a_save_that_would_stop_the_gateway_at_startup_is_refused() {
+        let c = cfg();
+        let e = apply(&c, FILE, &form(&[("bitcoind_rpcurl", "127.0.0.1:18443")])).unwrap_err();
+        assert!(e[0].contains("bitcoind.rpcurl"), "{e:?}");
+
+        let missing = std::env::temp_dir().join(format!("ratum-no-cookie-{}", std::process::id()));
+        let file = FILE.replace(
+            r#""rpcuser": "u""#,
+            &format!(r#""rpcuser": "u", "rpccookiefile": "{}""#, missing.display()),
+        );
+        let c = Config::parse(&file).unwrap();
+        let e = apply(&c, &file, &form(&[("bitcoind_rpcuser", "")])).unwrap_err();
+        assert!(e[0].starts_with("bitcoind:"), "an unreadable cookie file is refused: {e:?}");
+
+        let file =
+            FILE.replace(r#""datum":"#, r#""stratum": {"listen_addr": "127.0.0.1"}, "datum":"#);
+        let c = Config::parse(&file).unwrap();
+        let held = TcpListener::bind("127.0.0.1:0").unwrap();
+        let taken = held.local_addr().unwrap().port().to_string();
+        let e = apply(&c, &file, &form(&[("stratum_listen_port", &taken)])).unwrap_err();
+        assert!(e[0].starts_with(&format!("Stratum port {taken} cannot be opened")), "{e:?}");
+        drop(held);
+        let free = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let text = apply(&c, &file, &form(&[("stratum_listen_port", &free.to_string())]));
+        assert!(text.unwrap().is_some(), "a port that can be bound is written");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writing_keeps_the_mode_and_a_symlink_and_never_follows_a_link_at_the_temporary_name() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let dir = std::env::temp_dir().join(format!("ratum-write-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("gateway.json");
+        std::fs::write(&target, "old").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.join("link.json");
+        symlink(&target, &link).unwrap();
+        let elsewhere = dir.join("elsewhere");
+        std::fs::write(&elsewhere, "untouched").unwrap();
+        symlink(&elsewhere, dir.join("gateway.json.new")).unwrap();
+
+        write_file(link.to_str().unwrap(), "new").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the mode is kept whatever the umask");
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(&elsewhere).unwrap(), "untouched");
+        assert!(!dir.join("gateway.json.new").exists());
+
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        write_file(target.to_str().unwrap(), "newer").unwrap();
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

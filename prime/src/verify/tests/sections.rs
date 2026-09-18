@@ -107,9 +107,15 @@ fn installed_coinbase_sections_are_bounded_per_connection() {
     let per_share = coinbase_bytes(s.coinbase.as_ref().unwrap());
     v.installed_coinbase_bytes_cap = 3 * per_share;
     let on_slot = |job_id: u8| PowSubmit { job_id, ..s.clone() };
+    // One share installs sections once (`one_share_installs_sections_once`); the fixtures have
+    // one solved share, so the record of the shares that installed is cleared between slots.
+    let forget_installing_shares =
+        |v: &mut Verifier| v.installed_by = crate::bounded::BoundedSet::new(1);
     for job_id in 0..3 {
+        forget_installing_shares(&mut v);
         assert!(v.checked(&on_slot(job_id), None, NOW).is_ok());
     }
+    forget_installing_shares(&mut v);
     assert_eq!(v.installed_coinbase_bytes, v.installed_coinbase_bytes_cap);
     assert_eq!(v.checked(&on_slot(3), None, NOW), Err(RejectReason::CoinbaseTooLarge));
     assert!(v.jobs[3].is_none(), "a refused share installs neither section");
@@ -307,4 +313,36 @@ fn a_resent_job_section_keeps_the_coinbases_already_installed() {
     let mut again = s.clone();
     again.coinbase = None;
     assert!(v.checked(&again, None, NOW).is_ok());
+}
+
+#[test]
+fn one_share_installs_sections_once() {
+    let (mut v, s) = setup();
+    v.checked(&s, None, NOW).unwrap();
+    assert!(v.checked(&s, None, NOW).is_ok(), "the same sections again change nothing");
+    let mut elsewhere = s.clone();
+    elsewhere.job_id = 7;
+    assert_eq!(
+        v.checked(&elsewhere, None, NOW),
+        Err(RejectReason::DuplicateWork),
+        "the same work installing its sections in another slot"
+    );
+    assert!(v.jobs[7].is_none());
+    let mut other_id = s.clone();
+    other_id.coinbase_id = 3;
+    other_id.coinbase.as_mut().unwrap().coinbase_id = 3;
+    assert_eq!(v.checked(&other_id, None, NOW), Err(RejectReason::DuplicateWork));
+}
+
+#[test]
+fn a_job_whose_parent_the_node_never_reports_is_evicted() {
+    let (mut v, s) = setup();
+    v.set_tip(Some([0x11; 32]), NOW);
+    v.checked(&s, None, NOW).unwrap();
+    let generation = v.installed_generation(&s).expect("installed");
+    assert!(v.job(s.job_id, generation).is_some());
+    v.set_tip(Some([0x11; 32]), NOW + jobs::UNSEEN_PARENT_SECS);
+    assert!(v.job(s.job_id, generation).is_some(), "kept while the parent may still arrive");
+    v.set_tip(Some([0x12; 32]), NOW + jobs::UNSEEN_PARENT_SECS + 1);
+    assert!(v.job(s.job_id, generation).is_none(), "evicted once it has not in time");
 }

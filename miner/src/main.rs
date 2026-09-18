@@ -6,7 +6,7 @@ use ratum::datum::messages::share::HEADER_EXTRANONCE_SIZE;
 use ratum::header::{
     self, ASIC_INPUT_BODY_LEN, ASIC_INPUT_NONCE_AT, SIA_WORDS_LEN, blake2b_256, sia_words,
 };
-use ratum::target;
+use ratum::{stratum_difficulty, target};
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -104,8 +104,14 @@ fn read_messages(
 
         match v["method"].as_str() {
             Some("mining.set_difficulty") => {
-                let difficulty = v["params"][0].as_f64().unwrap_or(1.0);
-                println!("set_difficulty {difficulty}");
+                // The gateway announces its difficulty n as n * 65535 / 65536, relative to the
+                // 0x1d00ffff target; the share target it checks is the one n names.
+                let announced = v["params"][0].as_f64().unwrap_or(1.0);
+                let Some(difficulty) = stratum_difficulty::pool_difficulty(announced) else {
+                    println!("!! set_difficulty {announced} is not a positive difficulty");
+                    continue;
+                };
+                println!("set_difficulty {announced} (share difficulty {difficulty})");
                 lock.lock().expect("state").difficulty = difficulty;
             }
             Some("mining.notify") => {

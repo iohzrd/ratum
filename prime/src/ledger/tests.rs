@@ -1100,3 +1100,69 @@ fn a_read_back_that_stops_at_the_share_bound_is_count_capped_at_once() {
     assert_eq!(l.len(), 4);
     assert!(l.count_capped(), "before another share is recorded");
 }
+
+/// Hides the store's share table under another name, or restores it, so a read of the window
+/// fails as a read of a damaged file does.
+fn hide_share_table(l: &Ledger, hidden: bool) {
+    const SHARES: redb::TableDefinition<u64, &[u8]> = redb::TableDefinition::new("shares");
+    const HIDDEN: redb::TableDefinition<u64, &[u8]> = redb::TableDefinition::new("hidden_shares");
+    let (from, to) = if hidden { (SHARES, HIDDEN) } else { (HIDDEN, SHARES) };
+    let db = l.store.as_ref().expect("a ledger with a store").database();
+    db::write(&db, |w| {
+        use db::DbResult as _;
+        w.rename_table(from, to).db()
+    })
+    .unwrap();
+}
+
+#[test]
+fn a_widening_whose_read_failed_is_read_again_at_the_same_difficulty() {
+    let scratch = Scratch::new("widen-retry");
+    let mut l = Ledger::new(WindowRule { multiple: 1.0, floor: 1 }, SplitPolicy::default());
+    l.attach(Store::open(&scratch.join("regtest.redb"), None, Some("regtest")).unwrap()).unwrap();
+    assert_eq!(l.set_network_difficulty(56.0), 0, "nothing stored to re-read");
+    l.record(share(1, "alice", 16, hash(1), "")).unwrap();
+    l.record(share(2, "bob", 32, hash(2), "")).unwrap();
+    l.record(share(3, "carol", 8, hash(3), "")).unwrap();
+    assert_eq!(l.set_network_difficulty(8.0), 0, "narrowing reads nothing");
+    assert_eq!(l.accepted_times(), vec![3]);
+    assert_eq!(l.network_difficulty(), Some(8.0));
+
+    hide_share_table(&l, true);
+    assert_eq!(l.set_network_difficulty(56.0), 0, "the read fails");
+    assert_eq!(l.window(), 56, "the window is at its new size");
+    assert_eq!(l.accepted_times(), vec![3], "holding the shares it held");
+    assert_eq!(l.set_network_difficulty(56.0), 0, "and fails again while the table is hidden");
+
+    hide_share_table(&l, false);
+    assert_eq!(l.set_network_difficulty(56.0), 2, "the same difficulty re-reads alice and bob");
+    assert_eq!(l.accepted_times(), vec![1, 2, 3]);
+    assert_eq!(l.total_work(), 56);
+    assert_eq!(l.set_network_difficulty(56.0), 0, "once read, the same difficulty reads nothing");
+}
+
+#[test]
+fn a_read_back_of_no_shares_empties_the_window_and_clears_count_capped() {
+    let mut l = fixed(u128::MAX);
+    l.set_max_shares(4);
+    for i in 0..6u64 {
+        l.record(share(i, "alice", 16, hash(i), "")).unwrap();
+    }
+    assert!(l.count_capped());
+    let read = l.load_from(|_| Ok(ReadBack::default()));
+    assert_eq!(read.unwrap(), ReadBack::default());
+    assert!(l.is_empty());
+    assert_eq!(l.total_work(), 0);
+    assert!(!l.count_capped(), "an empty window holds fewer shares than the bound");
+}
+
+#[test]
+fn the_network_difficulty_is_the_one_last_set() {
+    let mut l = Ledger::new(WindowRule { multiple: 8.0, floor: 16 }, SplitPolicy::default());
+    assert_eq!(l.network_difficulty(), None, "none before the node is read");
+    l.set_network_difficulty(4.0);
+    assert_eq!(l.network_difficulty(), Some(4.0));
+    l.set_network_difficulty(1.0);
+    assert_eq!(l.network_difficulty(), Some(1.0), "recorded when the window keeps its size");
+    assert_eq!(l.window(), 16);
+}

@@ -12,7 +12,9 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_PORT: u16 = 80;
 const HTTPS_PORT: u16 = 443;
 
-const TEMPLATE_RULES: [&str; 2] = ["segwit", "blake2b"];
+/// The rules a template request names. `signet` is required by a signet node and ignored by the
+/// others, which accept a rule they do not enforce.
+const TEMPLATE_RULES: [&str; 3] = ["segwit", "blake2b", "signet"];
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -108,10 +110,16 @@ pub struct Tip {
     pub chain: Chain,
 }
 
+/// What the pool reads from a template: the block it describes (its parent, height and bits),
+/// the coinbase value it allows, and `mintime`, the earliest block time the node accepts on
+/// that parent (its median time past plus one).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TemplateSummary {
+    pub prev_hash: [u8; 32],
+    pub height: u32,
     pub coinbase_value: u64,
     pub bits: u32,
+    pub mintime: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -196,16 +204,18 @@ fn parse_url(url: &str) -> Result<RpcUrl, Error> {
     if scheme != "http" && scheme != "https" {
         return Err(bad());
     }
-    let (user, password, host) = match rest.rsplit_once('@') {
+    // The credentials are in the authority, before the path: an `@` in the path is part of
+    // the path.
+    let (authority, path) = match rest.split_once('/') {
+        Some((authority, path)) => (authority, format!("/{path}")),
+        None => (rest, String::new()),
+    };
+    let (user, password, authority) = match authority.rsplit_once('@') {
         Some((credentials, host)) => {
             let (user, password) = credentials.split_once(':').unwrap_or((credentials, ""));
-            (user, password, host)
+            (percent_decode(user), percent_decode(password), host)
         }
-        None => ("", "", rest),
-    };
-    let (authority, path) = match host.split_once('/') {
-        Some((authority, path)) => (authority, format!("/{path}")),
-        None => (host, String::new()),
+        None => (String::new(), String::new(), authority),
     };
     if authority.is_empty() {
         return Err(bad());
@@ -216,11 +226,38 @@ fn parse_url(url: &str) -> Result<RpcUrl, Error> {
         (false, "https") => format!(":{HTTPS_PORT}"),
         (false, _) => format!(":{HTTP_PORT}"),
     };
-    Ok(RpcUrl {
-        url: format!("{scheme}://{authority}{port}{path}"),
-        user: user.to_string(),
-        password: password.to_string(),
-    })
+    Ok(RpcUrl { url: format!("{scheme}://{authority}{port}{path}"), user, password })
+}
+
+/// `s` with each `%` followed by two hex digits replaced by the byte they give, as a URL's
+/// user and password are written; any other `%` is kept.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let escaped = (bytes[i] == b'%')
+            .then(|| bytes.get(i + 1..i + 3))
+            .flatten()
+            .and_then(|hex| u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok());
+        match escaped {
+            Some(byte) => {
+                out.push(byte);
+                i += 3;
+            }
+            None => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Whether `url` is an RPC URL `Client::new` accepts: an http:// or https:// scheme and a
+/// host. For checking a configuration before it is used, without building a client.
+pub fn check_url(url: &str) -> Result<(), Error> {
+    parse_url(url).map(drop)
 }
 
 impl Client {
@@ -360,7 +397,26 @@ impl Client {
         let bits_hex = str_field(&result, "bits")?;
         let bits = u32::from_str_radix(bits_hex, 16)
             .map_err(|_| Error::BadResponse(format!("bits {bits_hex:?}")))?;
-        Ok(TemplateSummary { coinbase_value, bits })
+        let prev_display = str_field(&result, "previousblockhash")?;
+        let prev_hash = crate::bitcoin::hash_from_display_hex(prev_display)
+            .ok_or_else(|| Error::BadResponse(format!("previousblockhash {prev_display:?}")))?;
+        let height = u32::try_from(u64_field(&result, "height")?)
+            .map_err(|_| Error::BadResponse("height out of range".into()))?;
+        let mintime = u64_field(&result, "mintime")?;
+        Ok(TemplateSummary { prev_hash, height, coinbase_value, bits, mintime })
+    }
+
+    /// Checks `block` with `getblocktemplate` in proposal mode: every consensus rule the node
+    /// applies to a block on its tip except the proof of work. None when the node finds the
+    /// block valid, otherwise its BIP 22 reason (`"inconclusive-not-best-prevblk"` when the
+    /// block is not on the node's tip).
+    pub fn propose_block(&self, block: &[u8]) -> Result<Option<String>, Error> {
+        let request = serde_json::json!([{"mode": "proposal", "data": hex::encode(block)}]);
+        Ok(match self.call("getblocktemplate", request)? {
+            serde_json::Value::Null => None,
+            serde_json::Value::String(reason) => Some(reason),
+            other => Some(other.to_string()),
+        })
     }
 
     pub fn mining_info(&self) -> Result<MiningInfo, Error> {
@@ -495,6 +551,22 @@ mod tests {
             "the scheme's port applies"
         );
         assert!(client("http://", "", "").is_err());
+        assert!(check_url("https://u:p@node.example").is_ok());
+        assert!(matches!(check_url("127.0.0.1:8332"), Err(Error::BadUrl(_))));
+        assert!(matches!(check_url("javascript:alert(1)"), Err(Error::BadUrl(_))));
+    }
+
+    #[test]
+    fn credentials_are_read_from_the_authority_alone_and_percent_decoded() {
+        let authorization = |c: &Client| crate::lock(&c.authorization).clone();
+        let c = client("http://node.example:8332/wallet/a@b", "", "").unwrap();
+        assert_eq!(c.url, "http://node.example:8332/wallet/a@b", "an @ in the path stays there");
+        assert_eq!(authorization(&c), basic_auth("", ""));
+
+        let c = client("http://us%40er:p%3Ass@127.0.0.1:8332/wallet/x", "", "").unwrap();
+        assert_eq!(authorization(&c), basic_auth("us@er", "p:ss"));
+        assert_eq!(c.url, "http://127.0.0.1:8332/wallet/x");
+        assert_eq!(percent_decode("100%"), "100%", "a % without two hex digits is kept");
     }
 
     /// The one rule every caller reaches: a named user first, then a cookie file, then the

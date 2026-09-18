@@ -149,7 +149,9 @@ impl Poller {
                 self.on_block_notification(hash);
             }
             Wake::Rebuild => self.on_rebuild(),
-            Wake::Timeout => {}
+            // A refresh asks for the template fetched after this wake and nothing else: the
+            // tip it builds on decides whether it is a new block, as after a timeout.
+            Wake::Refresh | Wake::Timeout => {}
         }
     }
 
@@ -278,5 +280,23 @@ mod tests {
         assert_eq!(p.classify(&t), Action::Build { new_block: true }, "the tip served");
         p.on_wake(Wake::Block { hash: None, rebuild: true });
         assert_eq!(p.classify(&t), Action::Build { new_block: true }, "within 2.5 s");
+    }
+
+    /// An anti-block-withholding assignment notice refreshes the work: on the tip already
+    /// served the template builds standard work, which marks no job stale.
+    #[test]
+    fn a_refresh_on_the_tip_served_builds_standard_work() {
+        let mut p = Poller::new();
+        let t = template();
+        p.classify(&t);
+        let waker = super::super::waker::TemplateWaker::default();
+        waker.refresh();
+        p.on_wake(waker.wait(Duration::from_millis(1)));
+        assert_eq!(p.classify(&t), Action::Build { new_block: false });
+        let mut next = template();
+        next.prev_hash = [0x11; 32];
+        waker.refresh();
+        p.on_wake(waker.wait(Duration::from_millis(1)));
+        assert_eq!(p.classify(&next), Action::Build { new_block: true }, "a new tip still is one");
     }
 }

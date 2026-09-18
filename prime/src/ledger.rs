@@ -197,6 +197,13 @@ pub struct Ledger {
     /// `MAX_SHARES` outside tests, which exercise the bound at a size they can reach.
     max_shares: usize,
     count_capped: bool,
+    /// The network difficulty last passed to `set_network_difficulty`, in the node's unit:
+    /// that of the block being mined, which is what the window is sized to.
+    network_difficulty: Option<f64>,
+    /// Set when a widening re-read of the store failed: the window is at its new size but holds
+    /// only the shares of the narrower one, so the next `set_network_difficulty` re-reads even
+    /// when the size it computes is the one already set.
+    refill_pending: bool,
 }
 
 impl Ledger {
@@ -215,6 +222,8 @@ impl Ledger {
             cumulative_work: 0,
             max_shares: MAX_SHARES,
             count_capped: false,
+            network_difficulty: None,
+            refill_pending: false,
         }
     }
 
@@ -237,7 +246,8 @@ impl Ledger {
 
     /// `load` with the read passed in: `read` gives the function it is called with the number
     /// of shares, then each share. The previous window is held until the read succeeds, so a
-    /// reload briefly holds two windows, the new one allocated once at its size.
+    /// reload briefly holds two windows, the new one allocated once at its size. A read that
+    /// succeeds with no shares leaves the window empty and not count capped.
     fn load_from(
         &mut self,
         read: impl FnOnce(&mut dyn FnMut(WindowRow)) -> io::Result<ReadBack>,
@@ -256,36 +266,49 @@ impl Ledger {
                 self.trim();
             }
         });
-        if loaded.is_err() {
-            (self.shares, self.identities, self.total_work, self.count_capped) = held;
+        match &loaded {
+            Ok(_) => self.count_capped = self.is_count_capped(),
+            Err(_) => (self.shares, self.identities, self.total_work, self.count_capped) = held,
         }
         loaded
     }
 
     /// Sizes the window to `network_difficulty` by the window rule and returns how many
-    /// shares widening it re-read from the store.
+    /// shares widening it re-read from the store. A widening whose re-read failed is re-read
+    /// at the next call, whatever size that call computes.
     pub fn set_network_difficulty(&mut self, network_difficulty: f64) -> usize {
+        self.network_difficulty = Some(network_difficulty);
         let window = self.window_rule.window_for(network_difficulty);
-        if window == self.window {
+        if window == self.window && !self.refill_pending {
             return 0;
         }
         self.set_window(window)
     }
 
+    /// The network difficulty the window was last sized to, in the node's unit; none before
+    /// the first `set_network_difficulty`.
+    pub fn network_difficulty(&self) -> Option<f64> {
+        self.network_difficulty
+    }
+
     fn set_window(&mut self, window: u128) -> usize {
         let window = window.max(1);
-        let widened = window > self.window;
+        let widened = window > self.window || self.refill_pending;
         self.window = window;
         let re_read = if widened { self.refill() } else { 0 };
         self.trim();
         re_read
     }
 
+    /// Re-reads the window from the store after a widening. On a failed read the shares held
+    /// stay as they were, which span less than the window, and `refill_pending` is set so the
+    /// read is tried again.
     fn refill(&mut self) -> usize {
         let Some(store) = self.store.take() else { return 0 };
         let before = self.shares.len();
         let loaded = self.load(&store);
         self.store = Some(store);
+        self.refill_pending = loaded.is_err();
         match loaded {
             Ok(read_back) => {
                 if read_back.truncated {
@@ -297,7 +320,11 @@ impl Ledger {
                 self.shares.len().saturating_sub(before)
             }
             Err(e) => {
-                warn!("could not re-read the ledger to widen the share window: {e}");
+                warn!(
+                    "could not re-read the ledger to widen the share window ({e}); it holds the \
+                     shares of the narrower window until the next time the node's difficulty \
+                     is read, when the read is retried"
+                );
                 0
             }
         }
@@ -452,7 +479,7 @@ impl Ledger {
         while self.shares.len() > self.max_shares {
             self.drop_oldest();
         }
-        let capped = self.shares.len() >= self.max_shares && self.total_work < self.window;
+        let capped = self.is_count_capped();
         if capped && !self.count_capped {
             warn!(
                 "the share window is capped at {0} shares, which hold less work than the \
@@ -463,6 +490,11 @@ impl Ledger {
             );
         }
         self.count_capped = capped;
+    }
+
+    /// Whether the window holds `max_shares` shares with less work than it asks for.
+    fn is_count_capped(&self) -> bool {
+        self.shares.len() >= self.max_shares && self.total_work < self.window
     }
 
     fn drop_oldest(&mut self) {
@@ -522,9 +554,21 @@ impl LedgerLocation {
         })
     }
 
+    /// The ledger file a ledger command reads, which must exist: the command opens it and
+    /// never creates one.
     pub fn existing_file(&self, flag: &str) -> io::Result<PathBuf> {
         Ok(match self {
-            Self::File(p) => p.clone(),
+            Self::File(p) if p.is_file() => p.clone(),
+            Self::File(p) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "no ledger file at {}; {flag} reads the ledger a pool wrote and does not \
+                         create one",
+                        p.display()
+                    ),
+                ));
+            }
             Self::InDir(dir) => match ledger_files_in(dir)?.as_slice() {
                 [one] => one.clone(),
                 [] => {

@@ -56,10 +56,15 @@ impl Gateway {
         })
     }
 
-    /// Serves the job under `kind`'s coinbase and wakes every connection to send it.
-    pub fn publish(&self, job: Arc<Job>, kind: CoinbaseKind) {
-        self.jobs.publish(job, kind);
-        self.stratum.wake_all();
+    /// Serves the job under `kind`'s coinbase and wakes every connection to send it. Returns
+    /// false, and wakes none, when the job table refused the job: it builds on a previous
+    /// block other than the newest template's (`JobTable::publish`).
+    pub fn publish(&self, job: Arc<Job>, kind: CoinbaseKind) -> bool {
+        let published = self.jobs.publish(job, kind);
+        if published {
+            self.stratum.wake_all();
+        }
+        published
     }
 
     pub fn network_share(&self) -> Option<f64> {

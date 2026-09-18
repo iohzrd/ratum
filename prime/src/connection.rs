@@ -9,7 +9,7 @@ use crate::bounded::BoundedSet;
 use crate::payout;
 use crate::server::Server;
 use crate::sessions::{SavedSession, V3Session};
-use crate::verify::{RebuiltShare, Verifier};
+use crate::verify::Verifier;
 use log::{debug, error, info, warn};
 use mio::Waker;
 use ratum::datum::bulk::{self, Reassembler};
@@ -21,7 +21,7 @@ use ratum::datum::messages::validation;
 use ratum::datum::server::{Hello, ServerChannel, accept, open_hello};
 use ratum::lock;
 use ratum::poll::{PolledSocket, WRITE_TIMEOUT};
-use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::io;
 use std::net::TcpStream;
 use std::sync::Arc;
@@ -34,6 +34,15 @@ const FRAME_BODY_TIMEOUT: Duration = Duration::from_secs(30);
 const FRAME_BODY_DEADLINE: Duration = Duration::from_secs(120);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
 const MAX_HELLO_FRAME_LEN: usize = 4 * 1024;
+/// How long a connection is kept without a frame from the gateway. A gateway sends a coinbaser
+/// request for every job it builds, about every 40 seconds with or without miners, so only a
+/// connection that stopped serving goes this long without one.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+/// The coinbaser requests a gateway may send at once, and how many a second after that. A
+/// gateway requests one a job; the budget bounds the splits (and the ledger reads building
+/// them) one connection can make the pool produce.
+const COINBASER_BURST: f64 = 16.0;
+const COINBASER_PER_SEC: f64 = 1.0;
 
 fn describe(header: FrameHeader, payload: &[u8]) -> String {
     let sub = payload.first().copied();
@@ -136,7 +145,11 @@ pub fn handle(stream: TcpStream, server: &Server) -> io::Result<()> {
         channel,
         verifier: Verifier::new(&server.share_policy),
         reported_unpayable: BoundedSet::new(shares::MAX_REPORTED_UNPAYABLE),
-        awaiting_txns: HashMap::new(),
+        held: Vec::new(),
+        txn_requests: VecDeque::new(),
+        warned: shares::WarnCounts::default(),
+        coinbaser_budget: RequestBudget::full(COINBASER_BURST),
+        last_frame_at: Instant::now(),
         last_send_at: Instant::now(),
         client_sign_pk,
         v3: None,
@@ -167,7 +180,13 @@ struct Connection<'a> {
     /// rather than only the first; the set is bounded so a gateway sending many of them
     /// cannot fill the log.
     reported_unpayable: BoundedSet<String>,
-    awaiting_txns: HashMap<u8, RebuiltShare>,
+    /// The shares waiting for their job's transactions, in the order they arrived.
+    held: Vec<shares::HeldShare>,
+    /// The requests for jobs' transactions not yet answered, in the order they were sent.
+    txn_requests: VecDeque<shares::TxnRequest>,
+    warned: shares::WarnCounts,
+    coinbaser_budget: RequestBudget,
+    last_frame_at: Instant,
     last_send_at: Instant,
     client_sign_pk: [u8; 32],
     v3: Option<V3Session>,
@@ -187,13 +206,18 @@ impl Drop for Connection<'_> {
             lock(&self.server.sessions).save(self.client_sign_pk, session);
             debug!("[{}] session saved for resume", self.peer);
         }
-        for (job, rebuilt) in &self.awaiting_txns {
-            error!(
-                "[{}]   !! a block on job {job} was never relayed: its transactions did not \
-                 arrive before the connection closed: {}",
+        if !self.held.is_empty() {
+            warn!(
+                "[{}]      {} share(s) waiting for their jobs' transactions were not answered \
+                 before the connection closed, and are not credited; their hashes are released \
+                 so a gateway replaying them on its next connection can be credited",
                 self.peer,
-                hex::encode(rebuilt.block_hash)
+                self.held.len()
             );
+            let mut accepted = lock(&self.server.accepted_hashes);
+            for hash in self.held.iter().filter_map(shares::HeldShare::claimed_hash) {
+                accepted.remove(&hash);
+            }
         }
     }
 }
@@ -209,9 +233,18 @@ impl Connection<'_> {
         Ok(())
     }
 
+    /// How long the loop may wait for a frame before something else is due: a keepalive, the
+    /// idle limit, a transaction request's deadline, or, while no share is held, a rotation or
+    /// a reveal (which wait for the held shares to be answered).
     fn until_next_action(&self) -> Duration {
-        let mut due = self.last_send_at + KEEPALIVE_INTERVAL;
-        if let Some(next) = self.abw().map(AbwSlotState::next_due) {
+        let mut due =
+            (self.last_send_at + KEEPALIVE_INTERVAL).min(self.last_frame_at + IDLE_TIMEOUT);
+        if let Some(deadline) = self.txn_requests.iter().map(shares::TxnRequest::deadline).min() {
+            due = due.min(deadline);
+        }
+        if self.held.is_empty()
+            && let Some(next) = self.abw().map(AbwSlotState::next_due)
+        {
             due = due.min(next);
         }
         due.saturating_duration_since(Instant::now())
@@ -263,10 +296,18 @@ impl Connection<'_> {
         let peer = self.peer;
         loop {
             self.notify_tip_change()?;
-            if let Some(why) = self.abw().and_then(|abw| abw.rotation_due(Instant::now())) {
+            self.expire_txn_requests()?;
+            self.answer_orphaned_held()?;
+            if let Some(why) = self.abw().and_then(|abw| abw.rotation_due(Instant::now()))
+                && self.may_rotate_or_reveal()?
+            {
                 self.rotate_abw(why)?;
             }
             self.send_due_reveals()?;
+            if self.last_frame_at.elapsed() >= IDLE_TIMEOUT {
+                info!("[{peer}] closing: no frame from the gateway in {}s", IDLE_TIMEOUT.as_secs());
+                return Ok(());
+            }
             if self.last_send_at.elapsed() >= KEEPALIVE_INTERVAL {
                 self.send_keepalive()?;
             }
@@ -298,6 +339,7 @@ impl Connection<'_> {
                     return Ok(());
                 }
             };
+            self.last_frame_at = Instant::now();
             debug!("[{peer}] {}", describe(header, &plain));
 
             let mining = match header.proto_cmd {
@@ -311,7 +353,7 @@ impl Connection<'_> {
             match mining.first().copied() {
                 Some(client_subcmd::COINBASER_REQUEST) => self.on_coinbaser_request(&mining)?,
                 Some(client_subcmd::SUBMIT_POW) => self.on_share(&mining)?,
-                Some(validation::SUBCMD) => self.on_block_txns(&mining),
+                Some(validation::SUBCMD) => self.on_block_txns(&mining)?,
                 _ => {}
             }
         }
@@ -358,24 +400,75 @@ impl Connection<'_> {
             req.value,
             &hex::encode(req.prev_hash)[..LOG_HEX_CHARS]
         );
+        if !self.coinbaser_budget.take(Instant::now(), COINBASER_BURST, COINBASER_PER_SEC) {
+            warn!(
+                "[{peer}]      coinbaser request not answered: more than {COINBASER_BURST} at \
+                 once or {COINBASER_PER_SEC} a second"
+            );
+            return Ok(());
+        }
         if !payout::value_is_plausible(self.server, peer, req.value) {
             return Ok(());
         }
         let coinbaser_id = self.verifier.next_coinbaser_id();
         let (dictated, payload) = payout::dictate(self.server, peer, req.value, coinbaser_id);
         let outputs = dictated.len();
-        self.verifier.record_dictated(coinbaser_id, dictated, ratum::unix_now());
+        self.verifier.record_dictated(
+            coinbaser_id,
+            req.value,
+            req.prev_hash,
+            dictated,
+            ratum::unix_now(),
+        );
         self.send_mining(&payload, false)?;
         info!("[{peer}]   <- coinbaser response ({outputs} outputs, id {coinbaser_id})");
         Ok(())
     }
 }
+/// Requests allowed at a steady rate with a burst: `tokens` refill at `per_sec` up to the
+/// burst, and each request takes one.
+struct RequestBudget {
+    tokens: f64,
+    at: Instant,
+}
+
+impl RequestBudget {
+    fn full(burst: f64) -> Self {
+        Self { tokens: burst, at: Instant::now() }
+    }
+
+    fn take(&mut self, now: Instant, burst: f64, per_sec: f64) -> bool {
+        let refill = now.saturating_duration_since(self.at).as_secs_f64() * per_sec;
+        self.tokens = (self.tokens + refill).min(burst);
+        self.at = now;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 fn agent_allowed(allowed: &[String], user_agent: &str) -> bool {
     allowed.is_empty() || allowed.iter().any(|p| user_agent.starts_with(p))
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_request_budget_allows_its_burst_then_its_rate() {
+        use super::RequestBudget;
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let mut budget = RequestBudget { tokens: 3.0, at: start };
+        let taken = (0..5).filter(|_| budget.take(start, 3.0, 1.0)).count();
+        assert_eq!(taken, 3, "the burst");
+        assert!(!budget.take(start + Duration::from_millis(500), 3.0, 1.0));
+        assert!(budget.take(start + Duration::from_millis(1000), 3.0, 1.0), "one a second");
+        assert!(!budget.take(start + Duration::from_millis(1000), 3.0, 1.0));
+    }
+
     #[test]
     fn agents_are_allowed_by_prefix_and_an_empty_list_allows_all() {
         use super::agent_allowed;

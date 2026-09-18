@@ -273,7 +273,15 @@ mod tests {
     fn the_window_is_sized_to_the_block_being_mined_and_to_the_tip_without_a_template() {
         let tip =
             rpc::Tip { hash: [0; 32], height: 2_016, difficulty: 5.0, chain: rpc::Chain::Regtest };
-        let template = |bits| Some(rpc::TemplateSummary { coinbase_value: 0, bits });
+        let template = |bits| {
+            Some(rpc::TemplateSummary {
+                prev_hash: [0; 32],
+                height: 2_017,
+                coinbase_value: 0,
+                bits,
+                mintime: 0,
+            })
+        };
         let next = window_difficulty(&tip, template(0x1d00ffff));
         assert!((next - 1.0).abs() < 1e-12, "the next block's, in the node's unit: {next}");
         assert_eq!(window_difficulty(&tip, None), 5.0, "no template read");

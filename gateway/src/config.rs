@@ -29,9 +29,22 @@ pub const MAX_NETWORK_SHARE_BPS_RANGE: std::ops::RangeInclusive<u64> =
 const MIN_VARDIFF_TARGET_SHARES_MIN: u64 = 1;
 const MIN_VARDIFF_QUICKDIFF_COUNT: u64 = 4;
 const MIN_VARDIFF_QUICKDIFF_DELTA: u64 = 3;
+/// The most shares a minute `stratum.vardiff_target_shares_min` may ask for. Vardiff's target
+/// is `60000 / vardiff_target_shares_min` milliseconds per share, and it compares a measured
+/// rate against that target divided by 2 (to double) and by `vardiff_quickdiff_delta` (to
+/// raise at once). At this bound the target is 3 ms, so both quotients are still nonzero at
+/// the smallest delta of 3; above 60000 the target itself is 0. `shares_in_stale_window`
+/// multiplies it by at most 262144 clients, 2 minutes and a headroom of 16, about 1.7e11,
+/// which a 64-bit usize holds.
+const MAX_VARDIFF_TARGET_SHARES_MIN: u64 =
+    ratum::SECS_PER_MINUTE * 1000 / MIN_VARDIFF_QUICKDIFF_DELTA;
 const SHARE_STALE_SECONDS_RANGE: std::ops::RangeInclusive<u64> = 60..=150;
 pub const DEFAULT_MAX_NETWORK_SHARE_BPS: u32 = 1000;
 pub const GLOBAL_TIMEOUT_MARGIN_SECS: u64 = 5;
+/// The longest `datum.protocol_global_timeout`. The DATUM session adds the timeout to
+/// `Instant::now()`, which panics on overflow for values near u64::MAX seconds; a day is far
+/// above any interval the pool is expected to stay silent for.
+const MAX_PROTOCOL_GLOBAL_TIMEOUT_SECS: u64 = ratum::SECS_PER_DAY;
 const JOB_RETENTION_STALE_WINDOWS: u32 = 2;
 /// How many times the shares the stale window holds the share queue and the duplicate-share
 /// table are sized to, so a burst above the vardiff target does not fill either.
@@ -309,6 +322,13 @@ fn in_range(name: &str, value: u64, range: &std::ops::RangeInclusive<u64>) -> Re
     Err(format!("{name} must be {}..{}", range.start(), range.end()))
 }
 
+/// Whether `url` begins with http:// or https://, in any letter case.
+pub fn is_web_url(url: &str) -> bool {
+    ["http://", "https://"]
+        .iter()
+        .any(|scheme| url.get(..scheme.len()).is_some_and(|s| s.eq_ignore_ascii_case(scheme)))
+}
+
 impl Config {
     pub fn parse(text: &str) -> Result<Self, String> {
         let mut c: Self = serde_json::from_str(text).map_err(|e| e.to_string())?;
@@ -334,6 +354,11 @@ impl Config {
         if self.bitcoind.rpcurl.is_empty() {
             return Err("Required configuration option (bitcoind.rpcurl) not found".into());
         }
+        // The check the node client applies at startup, so a file the settings page saves
+        // with a URL the client refuses is refused before it is written.
+        ratum::rpc::check_url(&self.bitcoind.rpcurl).map_err(|e| {
+            format!("bitcoind.rpcurl must be an http:// or https:// URL naming a host: {e}")
+        })?;
         if !self.bitcoind.rpcuser.is_empty() {
             if self.bitcoind.rpcpassword.is_empty() {
                 return Err("bitcoind.rpcpassword is required with bitcoind.rpcuser".into());
@@ -365,6 +390,11 @@ impl Config {
             "stratum.vardiff_target_shares_min",
             s.vardiff_target_shares_min,
             MIN_VARDIFF_TARGET_SHARES_MIN,
+        )?;
+        at_most(
+            "stratum.vardiff_target_shares_min",
+            s.vardiff_target_shares_min,
+            MAX_VARDIFF_TARGET_SHARES_MIN,
         )?;
         at_least(
             "stratum.vardiff_quickdiff_count",
@@ -483,6 +513,16 @@ impl Config {
                  {GLOBAL_TIMEOUT_MARGIN_SECS}"
             ));
         }
+        at_most(
+            "datum.protocol_global_timeout",
+            d.protocol_global_timeout,
+            MAX_PROTOCOL_GLOBAL_TIMEOUT_SECS,
+        )?;
+        // The status page links the pool's name to this URL, so a scheme a browser runs
+        // (javascript:, data:) is refused.
+        if !d.pool_url.is_empty() && !is_web_url(&d.pool_url) {
+            return Err("datum.pool_url must begin with http:// or https://".into());
+        }
         if d.pooled_mining_only && d.pool_host.is_empty() {
             return Err("datum.pooled_mining_only requires datum.pool_host".into());
         }
@@ -563,9 +603,9 @@ impl Config {
     pub fn shares_in_stale_window(&self) -> usize {
         let s = &self.stratum;
         s.max_clients
-            * s.vardiff_target_shares_min as usize
-            * (s.share_stale_seconds / ratum::SECS_PER_MINUTE) as usize
-            * SHARE_CAPACITY_HEADROOM
+            .saturating_mul(s.vardiff_target_shares_min as usize)
+            .saturating_mul((s.share_stale_seconds / ratum::SECS_PER_MINUTE) as usize)
+            .saturating_mul(SHARE_CAPACITY_HEADROOM)
     }
 
     /// The script the pool's share of a block pays: the pool's, while a pool configuration
@@ -676,6 +716,57 @@ mod tests {
             "\"pooled_mining_only\": false, \"pool_url\": \"https://pool.example\"",
         );
         assert_eq!(Config::parse(&text).unwrap().datum.pool_url, "https://pool.example");
+    }
+
+    #[test]
+    fn a_pool_url_must_be_a_web_url() {
+        let with_url = |url: &str| {
+            minimal().replace(
+                "\"pooled_mining_only\": false",
+                &format!("\"pooled_mining_only\": false, \"pool_url\": \"{url}\""),
+            )
+        };
+        for good in ["https://pool.example", "HTTP://pool.example/x", ""] {
+            assert!(Config::parse(&with_url(good)).is_ok(), "{good}");
+        }
+        for bad in ["javascript:alert(1)", "data:text/html,x", "pool.example", "ftp://x"] {
+            let e = Config::parse(&with_url(bad)).unwrap_err();
+            assert!(e.contains("datum.pool_url"), "{bad}: {e}");
+        }
+    }
+
+    #[test]
+    fn an_rpcurl_without_a_web_scheme_is_refused() {
+        for bad in ["127.0.0.1:18443", "ftp://127.0.0.1:18443", "http://"] {
+            let text = minimal().replace("http://127.0.0.1:18443", bad);
+            let e = Config::parse(&text).unwrap_err();
+            assert!(e.contains("bitcoind.rpcurl"), "{bad}: {e}");
+        }
+    }
+
+    #[test]
+    fn the_pool_timeout_and_the_share_rate_have_upper_bounds() {
+        let datum = |timeout: u64| {
+            minimal().replace(
+                "\"pooled_mining_only\": false",
+                &format!("\"pooled_mining_only\": false, \"protocol_global_timeout\": {timeout}"),
+            )
+        };
+        assert!(Config::parse(&datum(MAX_PROTOCOL_GLOBAL_TIMEOUT_SECS)).is_ok());
+        for over in [MAX_PROTOCOL_GLOBAL_TIMEOUT_SECS + 1, u64::MAX] {
+            let e = Config::parse(&datum(over)).unwrap_err();
+            assert!(e.contains("datum.protocol_global_timeout must be at most"), "{e}");
+        }
+
+        let rate =
+            |n: u64| with_extra(&format!(r#""stratum": {{"vardiff_target_shares_min": {n}}}"#));
+        let c = Config::parse(&rate(MAX_VARDIFF_TARGET_SHARES_MIN)).unwrap();
+        let target_ms = 60_000 / c.stratum.vardiff_target_shares_min;
+        assert!(target_ms / MIN_VARDIFF_QUICKDIFF_DELTA > 0 && target_ms / 2 > 0);
+        let e = Config::parse(&rate(MAX_VARDIFF_TARGET_SHARES_MIN + 1)).unwrap_err();
+        assert!(e.contains("stratum.vardiff_target_shares_min must be at most"), "{e}");
+        let e = Config::parse(&rate(u64::MAX)).unwrap_err();
+        assert!(e.contains("stratum.vardiff_target_shares_min"), "{e}");
     }
 
     #[test]

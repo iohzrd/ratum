@@ -80,6 +80,10 @@ impl<T: Clone + Eq + Hash> BoundedSet<T> {
         self.0.is_empty()
     }
 
+    pub fn contains(&self, value: &T) -> bool {
+        self.0.get(value).is_some()
+    }
+
     pub fn insert(&mut self, value: T) -> bool {
         if self.0.get(&value).is_some() {
             return false;

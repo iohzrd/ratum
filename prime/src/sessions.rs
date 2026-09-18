@@ -56,18 +56,22 @@ impl SessionStore {
         self.saved.remove(key)
     }
 
-    /// The session and splits for a hello, and whether they resumed a saved session.
+    /// The session and splits for a hello, and whether they resumed a saved session. A hello
+    /// that presents no token, or another token, leaves the saved session in place: the hello
+    /// carries no challenge from the pool, so a copy of an earlier hello can be sent again by
+    /// anyone who observed it, and must not discard the session its gateway is about to resume.
     pub fn resume_or_start(
         &mut self,
         client_sign_pk: [u8; 32],
         presented: Option<&ResumeToken>,
         now: Instant,
     ) -> (V3Session, DictatedSplits, bool) {
-        let saved = self.take(&client_sign_pk);
-        if let (Some(presented), Some(saved)) = (presented, saved)
-            && !saved.expired(now)
-            && saved.v3.token == *presented
-        {
+        let resumable = presented.is_some_and(|presented| {
+            self.saved
+                .get(&client_sign_pk)
+                .is_some_and(|saved| !saved.expired(now) && saved.v3.token == *presented)
+        });
+        if resumable && let Some(saved) = self.take(&client_sign_pk) {
             let SavedSession { mut v3, splits, saved_at, .. } = saved;
             v3.abw.resume(saved_at);
             return (v3, splits, true);
@@ -111,6 +115,8 @@ mod tests {
         let mut splits = DictatedSplits::default();
         splits.record(
             7,
+            split.value,
+            [0x5a; 32],
             vec![DictatedOutput {
                 payout: Payout { identity: "carol".to_string(), sats: split.value },
                 script_pubkey: split.script_pubkey.clone(),
@@ -156,14 +162,14 @@ mod tests {
         let (v3, _, resumed) = store.resume_or_start(key, Some(&other), now);
         assert!(!resumed);
         assert_ne!(v3.token, token);
-        assert_eq!(store.saved.len(), 0, "a mismatch consumes the entry too");
+        assert_eq!(store.saved.len(), 1, "a mismatch leaves the entry for the right token");
 
-        save(&mut store, now);
         let late = now + SESSION_KEEP + Duration::from_secs(1);
         assert!(!store.resume_or_start(key, Some(&token), late).2, "expired");
 
-        save(&mut store, now);
         assert!(!store.resume_or_start(key, None, now).2, "no token presented");
+        assert_eq!(store.saved.len(), 1, "and neither does a hello without one");
+        assert!(store.resume_or_start(key, Some(&token), now).2, "the right token resumes it");
         assert_eq!(store.saved.len(), 0);
 
         assert!(!store.resume_or_start([9u8; 32], Some(&token), now).2, "another gateway's key");

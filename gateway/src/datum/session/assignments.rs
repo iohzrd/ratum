@@ -12,8 +12,11 @@ impl Session<'_> {
         };
         self.gateway.pool.session().abw.install(notice.slot, notice.key_hash, notice.active);
         debug!("ABW assignment for slot {} (active {})", notice.slot, notice.active);
+        // Work under the new slot is a job update on the same tip, as the C gateway's
+        // `datum_blocktemplates_notifynew(NULL, 0)` makes it: a rebuild would announce the tip
+        // again and mark every job on it stale, refusing the shares still in transit on them.
         if notice.active {
-            self.gateway.template_waker.rebuild();
+            self.gateway.template_waker.refresh();
         }
     }
 

@@ -17,7 +17,6 @@ mio.workspace = true
 redb.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tiny_http.workspace = true
 toml.workspace = true
 
 [dev-dependencies]

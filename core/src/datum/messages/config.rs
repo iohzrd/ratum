@@ -36,6 +36,20 @@ fn take_counted<'a>(
     Ok(c.take(len, what)?)
 }
 
+const COINBASE_TAG_HOLDS_NUL: &str =
+    "coinbase tag holds a NUL byte, which a C gateway reads as the end of the tag";
+
+/// The tag as a gateway pushes it: the bytes before the first NUL, since the C gateway copies
+/// the field into a NUL-terminated string and every later use of it stops there. Bytes that are
+/// not UTF-8 are refused rather than replaced: replacing each invalid byte with U+FFFD, three
+/// bytes, would put other bytes in the coinbase than the pool sent, and could make an 81-byte
+/// tag too long for the scriptSig, after which the gateway builds no work at all.
+fn coinbase_tag(field: &[u8]) -> Result<String, Error> {
+    let before_nul = field.split(|&b| b == 0).next().unwrap_or_default();
+    String::from_utf8(before_nul.to_vec())
+        .map_err(|_| Error::Malformed("coinbase tag is not UTF-8"))
+}
+
 /// What the version 3 configuration carries beyond the version 1 fields.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct V3Config {
@@ -62,6 +76,9 @@ impl ClientConfig {
         }
         if self.coinbase_tag.len() > MAX_COINBASE_TAG_LEN {
             return Err(Error::TooLong { field: "coinbase tag", len: self.coinbase_tag.len() });
+        }
+        if self.coinbase_tag.contains('\0') {
+            return Err(Error::Malformed(COINBASE_TAG_HOLDS_NUL));
         }
         if !self.min_difficulty.is_power_of_two() {
             return Err(Error::MinDifficultyNotPowerOfTwo(self.min_difficulty));
@@ -117,8 +134,8 @@ impl ClientConfig {
             }
             other => return Err(Error::BadVersion(other)),
         };
-        let tag = take_counted(&mut c, "coinbase tag", MAX_COINBASE_TAG_LEN)?;
-        let coinbase_tag = String::from_utf8_lossy(tag).into_owned();
+        let coinbase_tag =
+            coinbase_tag(take_counted(&mut c, "coinbase tag", MAX_COINBASE_TAG_LEN)?)?;
         let min_difficulty = c.u64("min difficulty")?;
         let flags = c.u8("flags")?;
         read_terminator(&mut c)?;
@@ -276,6 +293,50 @@ mod tests {
             ClientConfig::decode(&bad),
             Err(Error::BadFlags(CONFIG_FLAG_ABW_DISABLED | 0x02))
         );
+    }
+
+    /// The tag field of `c` replaced by `tag`, with its count byte.
+    fn with_tag_bytes(c: &ClientConfig, tag: &[u8]) -> Vec<u8> {
+        let placeholder = ClientConfig { coinbase_tag: "\u{1}".into(), ..c.clone() };
+        let bytes = placeholder.encode().unwrap();
+        let at = bytes.windows(2).position(|w| w == [1, 1]).expect("count 1, byte 0x01");
+        let mut out = bytes[..at].to_vec();
+        out.push(tag.len() as u8);
+        out.extend_from_slice(tag);
+        out.extend_from_slice(&bytes[at + 2..]);
+        out
+    }
+
+    #[test]
+    fn the_coinbase_tag_ends_at_its_first_nul_as_the_c_gateway_reads_it() {
+        for c in [sample(), sample_v3()] {
+            let decoded = ClientConfig::decode(&with_tag_bytes(&c, b"OCEAN\0hidden")).unwrap();
+            assert_eq!(decoded.coinbase_tag, "OCEAN");
+            let decoded = ClientConfig::decode(&with_tag_bytes(&c, b"\0OCEAN")).unwrap();
+            assert_eq!(decoded.coinbase_tag, "", "a leading NUL is an empty tag");
+            assert_eq!(ClientConfig::decode(&with_tag_bytes(&c, b"RATUM")).unwrap(), c);
+        }
+        let with_nul = ClientConfig { coinbase_tag: "A\0B".into(), ..sample() };
+        assert_eq!(with_nul.encode(), Err(Error::Malformed(COINBASE_TAG_HOLDS_NUL)));
+    }
+
+    #[test]
+    fn a_coinbase_tag_that_is_not_utf8_is_refused_rather_than_replaced() {
+        let invalid = [0xffu8; MAX_COINBASE_TAG_LEN];
+        for c in [sample(), sample_v3()] {
+            assert_eq!(
+                ClientConfig::decode(&with_tag_bytes(&c, &invalid)),
+                Err(Error::Malformed("coinbase tag is not UTF-8"))
+            );
+            assert_eq!(
+                ClientConfig::decode(&with_tag_bytes(&c, b"ok\0\xff")).unwrap().coinbase_tag,
+                "ok",
+                "bytes after the NUL are not read"
+            );
+            let multibyte = "\u{e9}".repeat(MAX_COINBASE_TAG_LEN / 2);
+            let decoded = ClientConfig::decode(&with_tag_bytes(&c, multibyte.as_bytes())).unwrap();
+            assert_eq!(decoded.coinbase_tag, multibyte, "UTF-8 is kept byte for byte");
+        }
     }
 
     #[test]

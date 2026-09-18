@@ -116,7 +116,8 @@ poll(() => "stats.json", s => {
   st.className = "chain " + (bad ? "bad" : good ? "good" : "stale");
   const tags = [s.pool_tag, s.secondary_tag].filter(t => t).map(esc).join(" / ");
   const tagged = tags ? " · tag " + tags : "";
-  const host = s.pool_url
+  // Only an http(s) URL becomes a link, so no other scheme (javascript:, data:) reaches an href.
+  const host = /^https?:\/\//i.test(s.pool_url || "")
     ? `<a href="${esc(s.pool_url)}" target="_blank" rel="noopener">${esc(s.pool_host)}</a>`
     : esc(s.pool_host);
   const motd = s.pool_motd && s.pool_motd !== "RATUM Prime" ? " · " + esc(s.pool_motd) : "";

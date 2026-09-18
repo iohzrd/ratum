@@ -74,6 +74,9 @@ impl Verifier<'_> {
             paid_to_pool,
             unpaid_outputs,
             tag_secondary,
+            version: s.version & !ratum::header::V2_FLAG,
+            coinbase_digest: bitcoin::sha256d(&[&cb.coinb1[..], &cb.coinb2[..]].concat()),
+            job_generation: None,
         })
     }
 
@@ -85,6 +88,13 @@ impl Verifier<'_> {
     ) -> Result<Payments, RejectReason> {
         let payout_script = &self.policy.config.payout_script;
         let recorded = if s.subsidy_only { None } else { self.splits.get(job.coinbaser_id) };
+        // A split pays each identity its part of the value it was dictated for. Named by a job
+        // on another parent, or by a job whose coinbase carries less than that value, its
+        // outputs would pay the identities the coinbase keeps more than their part of the
+        // coinbase, with the rest reaching the pool's script scaled down as owed.
+        if recorded.is_some_and(|d| d.prev_hash != job.prev_hash || d.value > job.coinbase_value) {
+            return Err(RejectReason::BadCoinbaserId);
+        }
         let dictated: &[DictatedOutput] = recorded.map_or(&[], |d| &d.outputs);
 
         let mut next = 0usize;

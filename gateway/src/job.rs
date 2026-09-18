@@ -75,9 +75,13 @@ impl Job {
         }
     }
 
-    /// The sia ntime field of every job on this template: its curtime in the low word.
+    /// The sia ntime field of every job on this template, as the C gateway writes it: zero in
+    /// the low word and curtime in the high word, which the header carries as a time offset
+    /// of 0 and nonce3 equal to curtime (`share::set_sia_fields`). The block time is the
+    /// template's curtime either way: the header's time is curtime, and the time offset is
+    /// added to it only under `FLAG_USE_TIME_OFFSET`, which this gateway never sets.
     pub fn ntime_hex(&self) -> String {
-        hex::encode(self.template.curtime.to_le_bytes())
+        hex::encode(header::sia_words(0, self.template.curtime as u32))
     }
 
     pub fn is_stale_prevblock(&self) -> bool {
@@ -160,20 +164,49 @@ struct Jobs {
     current: Option<Publication>,
     published: u64,
     keep: Duration,
+    /// The previous block of the newest template work was built from, which `set_tip`
+    /// records; none before the first.
+    tip: Option<[u8; 32]>,
 }
 
 impl JobTable {
     pub fn new(slots: usize, keep: Duration) -> Self {
-        Self(Mutex::new(Jobs { slots: vec![None; slots], current: None, published: 0, keep }))
+        Self(Mutex::new(Jobs {
+            slots: vec![None; slots],
+            current: None,
+            published: 0,
+            keep,
+            tip: None,
+        }))
+    }
+
+    /// Records the previous block the newest template builds on, before any job is built
+    /// from it. From then on `publish` refuses a job on any other previous block: a job
+    /// built from an older template (the pooled job of a coinbaser answer that arrived
+    /// after the tip moved) is never served after the new tip's work.
+    pub fn set_tip(&self, prev_hash: [u8; 32]) {
+        lock(&self.0).tip = Some(prev_hash);
+    }
+
+    /// The previous block `set_tip` last recorded.
+    pub fn tip(&self) -> Option<[u8; 32]> {
+        lock(&self.0).tip
     }
 
     /// Installs the job in its slot, drops the jobs past `keep`, and makes it the work
-    /// served. Subsidy-only work announces a new tip, so every job already installed is
-    /// marked as building on a stale previous block.
-    pub fn publish(&self, job: Arc<Job>, kind: CoinbaseKind) {
+    /// served. Returns false, and changes nothing, when the job builds on a previous block
+    /// other than the tip `set_tip` recorded. Subsidy-only work announces a new tip, so every
+    /// job already installed is marked as building on a stale previous block; pooled work
+    /// marks the installed jobs on another previous block, which is how a tip served first as
+    /// pooled work (its priority job was not built) ends the work on the tip before it.
+    pub fn publish(&self, job: Arc<Job>, kind: CoinbaseKind) -> bool {
         let mut jobs = lock(&self.0);
-        if kind == CoinbaseKind::SubsidyOnly {
-            for other in jobs.slots.iter().flatten() {
+        let prev_hash = job.template.prev_hash;
+        if jobs.tip.is_some_and(|tip| tip != prev_hash) {
+            return false;
+        }
+        for other in jobs.slots.iter().flatten() {
+            if kind == CoinbaseKind::SubsidyOnly || other.template.prev_hash != prev_hash {
                 other.stale_prevblock.store(true, Ordering::Relaxed);
             }
         }
@@ -188,6 +221,7 @@ impl JobTable {
         }
         jobs.published += 1;
         jobs.current = Some(Publication { job, kind, sequence: jobs.published });
+        true
     }
 
     /// The job installed in the slot, or none while the slot is empty or out of range.
@@ -217,7 +251,13 @@ mod tests {
     }
 
     fn publish(table: &JobTable, job: Arc<Job>) {
-        table.publish(job, CoinbaseKind::Pooled);
+        assert!(table.publish(job, CoinbaseKind::Pooled));
+    }
+
+    /// The job of serial `serial` on a template whose previous block is `prev_hash`.
+    fn on_tip(serial: u64, prev_hash: [u8; 32]) -> Arc<Job> {
+        let t = Template { prev_hash, ..template() };
+        Arc::new(build(&config(), JobInputs::new(serial, Arc::new(t))).unwrap())
     }
 
     #[test]
@@ -245,8 +285,92 @@ mod tests {
         publish(&table, aged(0, Duration::ZERO));
         let kept = table.at(0).expect("slot 0");
         assert!(!kept.is_stale_prevblock());
-        table.publish(aged(1, Duration::ZERO), CoinbaseKind::SubsidyOnly);
+        assert!(table.publish(aged(1, Duration::ZERO), CoinbaseKind::SubsidyOnly));
         assert!(kept.is_stale_prevblock());
+    }
+
+    /// Pooled work on the tip it replaces keeps every earlier job valid, which is what an
+    /// anti-block-withholding refresh publishes; pooled work on another previous block marks
+    /// the jobs before it stale even when no empty work announced that block.
+    #[test]
+    fn pooled_work_marks_stale_only_the_jobs_on_another_previous_block() {
+        let table = JobTable::new(6, KEEP);
+        publish(&table, on_tip(0, [0; 32]));
+        let first = table.at(0).expect("slot 0");
+        publish(&table, on_tip(1, [0; 32]));
+        assert!(!first.is_stale_prevblock(), "the same tip");
+
+        publish(&table, on_tip(2, [0x11; 32]));
+        assert!(first.is_stale_prevblock(), "a new tip served as pooled work alone");
+        let second = table.at(1).expect("slot 1");
+        assert!(second.is_stale_prevblock());
+        assert!(!table.at(2).expect("slot 2").is_stale_prevblock());
+    }
+
+    /// A job built from an older template, published after the tip moved, is refused: it
+    /// is neither installed nor served, and the new tip's work stays current.
+    #[test]
+    fn a_job_on_a_previous_block_other_than_the_tip_is_refused() {
+        let table = JobTable::new(6, KEEP);
+        table.set_tip([0; 32]);
+        publish(&table, on_tip(0, [0; 32]));
+        table.set_tip([0x11; 32]);
+        assert!(table.publish(on_tip(1, [0x11; 32]), CoinbaseKind::SubsidyOnly));
+
+        let late = on_tip(2, [0; 32]);
+        assert!(!table.publish(Arc::clone(&late), CoinbaseKind::Pooled));
+        assert!(table.at(late.slot).is_none(), "not installed");
+        let current = table.current().expect("the new tip's work");
+        assert_eq!(current.job.serial, 1);
+        assert_eq!(current.kind, CoinbaseKind::SubsidyOnly);
+        assert!(!current.job.is_stale_prevblock());
+        assert_eq!(table.tip(), Some([0x11; 32]));
+    }
+
+    /// The notify's ntime is the C gateway's: curtime in the high word. A miner that returns
+    /// it unchanged submits a header with a time offset of 0 and nonce3 equal to curtime,
+    /// whose block time is curtime on the node and in the pool's rebuild of the share, and
+    /// whose hash the pool computes as the gateway does.
+    #[test]
+    fn the_notified_ntime_is_the_c_gateways_and_keeps_the_block_time() {
+        use ratum::datum::messages::share::{Blake2bSection, PowSubmit, share_extranonce};
+        let job = aged(0, Duration::ZERO);
+        let curtime = job.template.curtime as u32;
+        assert_eq!(job.ntime_hex(), format!("00000000{}", hex::encode(curtime.to_le_bytes())));
+
+        let ntime: [u8; SIA_WORDS_LEN] = hex::decode(job.ntime_hex()).unwrap().try_into().unwrap();
+        let (kind, target_byte) = (CoinbaseKind::Pooled, 14);
+        let h = job.header(kind, target_byte, [0; 16], ntime, header::sia_words(1, 2)).unwrap();
+        assert_eq!((h.time_offset, h.nonce3, h.time, h.flags), (0, curtime, curtime, 0));
+        let wire = h.serialize();
+        let time_on_wire_at = 4 + 32 + 32;
+        assert_eq!(&wire[time_on_wire_at..time_on_wire_at + 4], &curtime.to_le_bytes());
+        assert_eq!(BlockHeaderV2::deserialize(&wire).as_ref(), Some(&h), "the node's block time");
+
+        let blake2b = Blake2bSection::from_header(&h);
+        let submit = PowSubmit {
+            job_id: job.slot,
+            coinbase_id: kind.wire_id(),
+            is_block: false,
+            subsidy_only: false,
+            quickdiff: false,
+            target_byte,
+            ntime: blake2b.time_fields().0,
+            nonce: h.nonce,
+            version: header::V2_FLAG | h.version as u32,
+            extranonce: share_extranonce(&h.extranonce).unwrap(),
+            username: "bcrt1qexample".into(),
+            use_time_offset: false,
+            job: None,
+            coinbase: None,
+            blake2b,
+            abw_slot: None,
+        };
+        assert_eq!(submit.ntime, 0, "the share's ntime is the time offset word, as C sends it");
+        assert_eq!(submit.block_time(), curtime);
+        let rebuilt = submit.header(&job.job_section, &h.merkle_root, None).unwrap();
+        assert_eq!(rebuilt, h);
+        assert_eq!(rebuilt.pow_hashes().raw_pow_hash, job.raw_pow_hash(&h));
     }
 
     /// The empty work of a new tip and the pooled work that follows it are one job served
@@ -255,9 +379,9 @@ mod tests {
     fn one_job_published_under_both_coinbases_is_two_publications() {
         let table = JobTable::new(6, KEEP);
         let job = aged(0, Duration::ZERO);
-        table.publish(Arc::clone(&job), CoinbaseKind::SubsidyOnly);
+        assert!(table.publish(Arc::clone(&job), CoinbaseKind::SubsidyOnly));
         let empty_work = table.current().expect("published");
-        table.publish(job, CoinbaseKind::Pooled);
+        assert!(table.publish(job, CoinbaseKind::Pooled));
         let pooled = table.current().expect("published");
         assert_eq!(empty_work.job.serial, pooled.job.serial, "one job");
         assert_ne!(empty_work.sequence, pooled.sequence, "two publications");

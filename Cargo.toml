@@ -3,7 +3,7 @@ resolver = "3"
 members = ["core", "prime", "gateway", "miner"]
 
 [workspace.package]
-version = "0.1.42"
+version = "0.1.43"
 edition = "2024"
 publish = false
 license = "AGPL-3.0-or-later"
@@ -35,5 +35,4 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.11"
 thiserror = "2.0.20"
-tiny_http = "0.12"
 toml = "1.1.6"

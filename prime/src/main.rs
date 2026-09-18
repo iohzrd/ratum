@@ -21,11 +21,12 @@ mod server;
 mod sessions;
 mod settings;
 mod stats;
+mod txns;
 mod verify;
 
 use connection::handle;
 use ledger::{Ledger, LedgerLocation};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use node::watch_node;
 use ratum::rpc;
 use server::Server;
@@ -95,32 +96,55 @@ fn accept_connections(listener: TcpListener, server: &Arc<Server>) {
                 continue;
             }
         };
-        let Some(open) = Server::open_connection(server) else {
-            let max_connections = server.settings.max_connections;
-            match stream.peer_addr() {
-                Ok(p) => warn!(
-                    "[{p}] refused: already serving {max_connections} connections \
-                     (--max-connections)"
-                ),
-                Err(_) => warn!("refused a connection: at --max-connections"),
+        let peer = match stream.peer_addr() {
+            Ok(p) => p,
+            Err(e) => {
+                debug!("could not read the address of an accepted connection: {e}");
+                continue;
             }
-            continue;
+        };
+        let open = match Server::open_connection(server, peer.ip()) {
+            Ok(open) => open,
+            Err(limit) => {
+                warn!("[{peer}] refused: at {limit}");
+                continue;
+            }
         };
         let conn = Arc::clone(server);
         // `open` moves into the thread, so a thread that does not start drops it here.
         let spawned = ratum::thread::try_spawn("connection", move || {
             let _open = open;
-            let peer = stream.peer_addr().ok();
             if let Err(e) = handle(stream, &conn) {
-                match peer {
-                    Some(p) => warn!("[{p}] connection error: {e}"),
-                    None => warn!("connection error: {e}"),
-                }
+                warn!("[{peer}] connection error: {e}");
             }
         });
         if let Err(e) = spawned {
             error!("could not start a thread for a connection: {e}");
         }
+    }
+}
+
+/// Each gateway connection holds its socket and its poller's epoll instance and eventfd.
+const FDS_PER_CONNECTION: u64 = 3;
+/// The descriptors besides the connections: the ledger, the listeners, the node's RPC
+/// connections and the standard streams, with room.
+const FDS_BESIDES_CONNECTIONS: u64 = 64;
+
+/// Raises the soft open file limit to the hard limit and warns when `--max-connections` needs
+/// more descriptors than it allows.
+fn raise_open_file_limit(max_connections: usize) {
+    let Some((soft, hard)) = ratum::limits::raise_open_file_limit() else { return };
+    info!("open file limit: {soft} (hard limit {hard})");
+    let needed =
+        FDS_PER_CONNECTION.saturating_mul(max_connections as u64) + FDS_BESIDES_CONNECTIONS;
+    if needed > soft {
+        let fit = soft.saturating_sub(FDS_BESIDES_CONNECTIONS) / FDS_PER_CONNECTION;
+        warn!(
+            "--max-connections is {max_connections}, which needs {needed} open files; the open \
+             file limit of {soft} fits {fit} connections, and accepting past that fails. Raise \
+             the hard limit (ulimit -Hn, or LimitNOFILE= in a systemd unit) or lower \
+             --max-connections."
+        );
     }
 }
 
@@ -200,6 +224,7 @@ fn main() -> io::Result<()> {
 
     let server = Arc::new(Server::new(s, share, pool_keys, node, (ledger, records))?);
     let s = &server.settings;
+    raise_open_file_limit(s.max_connections);
 
     watch_node_in_background(&server, chain);
     confirmations::watch(Arc::clone(&server));
@@ -213,7 +238,10 @@ fn main() -> io::Result<()> {
 
     let listener = TcpListener::bind(&s.listen)?;
     let bound = listener.local_addr().map_or_else(|_| s.listen.clone(), |a| a.to_string());
-    info!("listening on {bound} (at most {} connections)", s.max_connections);
+    info!(
+        "listening on {bound} (at most {} connections, {} from one address)",
+        s.max_connections, s.max_connections_per_ip
+    );
     accept_connections(listener, &server);
     Ok(())
 }

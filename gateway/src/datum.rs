@@ -23,6 +23,34 @@ use std::time::{Duration, Instant};
 const MIN_QUEUE_CAPACITY: usize = 64;
 const FAILURES_BEFORE_SHUTDOWN: u32 = 2;
 
+/// The least time between two log lines `RepeatedEvent` lets through for one event.
+const REPEATED_EVENT_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Counts one event that can recur once per share, so it is logged at its first occurrence
+/// and then at most once per `REPEATED_EVENT_LOG_INTERVAL`, each later line carrying the count
+/// since the line before.
+#[derive(Default)]
+struct RepeatedEvent {
+    last_logged_at: Option<Instant>,
+    since_last_line: u64,
+}
+
+impl RepeatedEvent {
+    /// Counts one occurrence. Returns the occurrences to report, this one included, when a
+    /// line is due: 1 for an occurrence after more than an interval without a line.
+    fn occurred(&mut self, now: Instant) -> Option<u64> {
+        self.since_last_line += 1;
+        if self
+            .last_logged_at
+            .is_some_and(|t| now.saturating_duration_since(t) < REPEATED_EVENT_LOG_INTERVAL)
+        {
+            return None;
+        }
+        self.last_logged_at = Some(now);
+        Some(std::mem::take(&mut self.since_last_line))
+    }
+}
+
 /// The value under which the pool dictates no split, so no request is made for it.
 const MIN_COINBASER_VALUE: u64 = 31_250_000;
 
@@ -78,6 +106,8 @@ struct SessionView {
     abw: abw::AbwAssignments,
     coinbaser_request: Option<PendingCoinbaser>,
     waker: Option<Waker>,
+    /// Shares not sent because their anti-block-withholding commitment is not held.
+    abw_unheld: RepeatedEvent,
 }
 
 /// Whether new work must commit to an anti-block-withholding assignment, and which.
@@ -96,6 +126,8 @@ pub struct PoolState {
     tallies: Mutex<ShareTallies>,
     queue: Mutex<VecDeque<QueuedShare>>,
     queue_capacity: usize,
+    /// Shares not queued because the queue was full.
+    queue_full: Mutex<RepeatedEvent>,
 }
 
 impl PoolState {
@@ -105,6 +137,7 @@ impl PoolState {
             tallies: Mutex::new(ShareTallies::default()),
             queue: Mutex::new(VecDeque::new()),
             queue_capacity: queue_capacity.max(MIN_QUEUE_CAPACITY),
+            queue_full: Mutex::new(RepeatedEvent::default()),
         }
     }
 
@@ -193,11 +226,19 @@ impl PoolState {
     pub fn queue_share(&self, share: QueuedShare) {
         let mut q = lock(&self.queue);
         if q.len() >= self.queue_capacity {
-            error!(
-                "share queue full ({} shares waiting for the pool); share from {:?} not queued",
-                q.len(),
-                share.username
-            );
+            match lock(&self.queue_full).occurred(Instant::now()) {
+                Some(1) => error!(
+                    "share queue full ({} shares waiting for the pool); share from {:?} not queued",
+                    q.len(),
+                    share.username
+                ),
+                Some(n) => error!(
+                    "share queue full ({} shares waiting for the pool); {n} shares not queued \
+                     since the last report",
+                    q.len()
+                ),
+                None => {}
+            }
             return;
         }
         q.push_back(share);
@@ -246,5 +287,26 @@ pub fn run_forever(gateway: &Gateway, pool_pubkey: PublicKeys, identity: KeyPair
             ));
         info!("reconnecting to the pool in {:.1}s", delay.as_secs_f64());
         std::thread::sleep(delay);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_repeated_event_is_reported_first_and_then_once_per_interval_with_its_count() {
+        let mut e = RepeatedEvent::default();
+        let start = Instant::now();
+        assert_eq!(e.occurred(start), Some(1));
+        for i in 1..=5 {
+            assert_eq!(e.occurred(start + Duration::from_secs(i)), None);
+        }
+        let due = start + REPEATED_EVENT_LOG_INTERVAL;
+        assert_eq!(e.occurred(due), Some(6), "the five held back and this one");
+        assert_eq!(e.occurred(due + Duration::from_secs(1)), None);
+        let quiet = due + 3 * REPEATED_EVENT_LOG_INTERVAL;
+        assert_eq!(e.occurred(quiet), Some(2), "the one held back is carried to the next line");
+        assert_eq!(e.occurred(quiet + 2 * REPEATED_EVENT_LOG_INTERVAL), Some(1));
     }
 }

@@ -138,6 +138,12 @@ impl ClientChannel {
         self.channel.unmask_header(bytes)
     }
 
+    /// Opens a frame the pool sent after the handshake: encrypted on the channel, or sealed to
+    /// the session's box key. A frame with neither flag, or with both, is refused: its bytes
+    /// carry no MAC, so anyone who derives the header mask could write one, and the session
+    /// acts on every mining message it is given, a coinbaser split among them. The C gateway
+    /// accepts such a frame; the pool this gateway is released with never sends one, and
+    /// refuses them in the other direction (`ServerChannel::decrypt`).
     pub fn decrypt(&mut self, header: FrameHeader, ciphertext: &[u8]) -> Result<Vec<u8>, Error> {
         let verify = self.pool_session_sign_pk.as_ref();
         match (header.is_encrypted_channel, header.is_encrypted_pubkey) {
@@ -147,7 +153,9 @@ impl ClientChannel {
                     open_sealed(&self.session_keys.box_pk, &self.session_keys.box_sk, ciphertext)?;
                 strip_signature(plain, header, verify)
             }
-            _ => strip_signature(ciphertext.to_vec(), header, verify),
+            _ => Err(Error::Malformed(
+                "pool message is not a channel-encrypted or sealed frame (plain or both flags)",
+            )),
         }
     }
 }
@@ -252,6 +260,11 @@ mod tests {
         assert!(matches!(read_response(&mut client, &response, &pool.sign_pk), Err(Error::Unseal)));
     }
 
+    /// Every cut of the body the pool sent, 0 to its length less one, reaches
+    /// `read_handshake_response` on the client whose keys the response was sealed to, with the
+    /// header the pool sent. A cut shorter than the seal's overhead is refused by the length
+    /// check in `open_sealed` and a longer one by the seal's MAC; the length checks after the
+    /// unseal are reached by the test below, which seals each prefix of the plaintext.
     #[test]
     fn a_truncated_response_is_refused_rather_than_panicking() {
         let pool = KeyPairs::generate();
@@ -259,18 +272,54 @@ mod tests {
         let wire = client.hello(&pool.box_pk, "ua", ProtocolVersion::V1);
         let hello = server_read_hello(&wire, &pool).unwrap();
         let (response, _) = accept(hello, &pool, "hi").unwrap();
-        for cut in [0, 1, 3, 4, 10, response.len() - 1] {
-            let mut c = ClientChannel::with_key_pairs(
-                KeyPairs::generate(),
-                KeyPairs::generate(),
-                client.nk,
-            );
-            let _ = c.hello(&pool.box_pk, "ua", ProtocolVersion::V1);
-            assert!(
-                read_response(&mut c, &response[..cut], &pool.sign_pk).is_err(),
-                "cut at {cut} should not be accepted"
-            );
+        let header = client.unmask_header(response[..framing::HEADER_LEN].try_into().unwrap());
+        let body = &response[framing::HEADER_LEN..];
+        assert_eq!(body.len(), header.cmd_len as usize);
+        for cut in 0..body.len() {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                client.read_handshake_response(header, &body[..cut], &pool.sign_pk)
+            }));
+            let result = result.unwrap_or_else(|_| panic!("a body cut at {cut} panicked"));
+            assert!(result.is_err(), "a body cut at {cut} of {} was accepted", body.len());
         }
+        client
+            .read_handshake_response(header, body, &pool.sign_pk)
+            .expect("the whole body is read by the same client after every cut was refused");
+        assert_eq!(client.motd(), "hi");
+    }
+
+    /// Each prefix of the signed plaintext, sealed to the client's session key, so the body
+    /// opens and every length reaches the checks after the unseal: `split_signed` for a prefix
+    /// shorter than a signature, `PublicKeys::split_from` for one shorter than the three key
+    /// blocks, and the signature check for the rest.
+    #[test]
+    fn a_response_whose_sealed_body_is_short_is_refused_rather_than_panicking() {
+        use crate::datum::channel::seal;
+        let pool = KeyPairs::generate();
+        let mut client = client_with_generated_keys(1);
+        let _ = client.hello(&pool.box_pk, "ua", ProtocolVersion::V1);
+        let header = FrameHeader {
+            is_signed: true,
+            is_encrypted_pubkey: true,
+            proto_cmd: framing::cmd::HANDSHAKE_RESPONSE,
+            ..Default::default()
+        };
+        let mut signed = Vec::new();
+        signed.extend_from_slice(&client.long_term_keys.public().to_bytes());
+        signed.extend_from_slice(&client.session_keys.public().to_bytes());
+        signed.extend_from_slice(&KeyPairs::generate().public().to_bytes());
+        signed.extend_from_slice(b"hi\0");
+        crate::datum::channel::sign_append(&pool.sign_sk, &mut signed).unwrap();
+        for cut in 0..signed.len() {
+            let sealed = seal(&client.session_keys.box_pk, &signed[..cut]).unwrap();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                client.read_handshake_response(header, &sealed, &pool.sign_pk)
+            }));
+            let result = result.unwrap_or_else(|_| panic!("a plaintext cut at {cut} panicked"));
+            assert!(result.is_err(), "a plaintext cut at {cut} of {} was accepted", signed.len());
+        }
+        let sealed = seal(&client.session_keys.box_pk, &signed).unwrap();
+        client.read_handshake_response(header, &sealed, &pool.sign_pk).expect("the whole body");
     }
 
     #[test]
@@ -282,7 +331,7 @@ mod tests {
     }
 
     #[test]
-    fn a_plain_frame_after_the_handshake_is_read_as_sent_without_advancing_the_nonce() {
+    fn a_frame_neither_channel_encrypted_nor_sealed_is_refused_after_the_handshake() {
         let pool = KeyPairs::generate();
         let mut client = client_with_generated_keys(9);
         let wire = client.hello(&pool.box_pk, "ua", ProtocolVersion::V1);
@@ -290,24 +339,35 @@ mod tests {
         let (response, mut session) = accept(hello, &pool, "hi").unwrap();
         read_response(&mut client, &response, &pool.sign_pk).unwrap();
 
-        let plain = FrameHeader {
-            cmd_len: 3,
-            proto_cmd: framing::cmd::HELLO_OR_PING,
-            ..Default::default()
-        };
-        assert_eq!(client.decrypt(plain, b"abc").unwrap(), b"abc");
-
-        let wire = session.encrypt(framing::cmd::MINING, b"after", false).unwrap();
-        let header = client.unmask_header(wire[..4].try_into().unwrap());
-        assert_eq!(client.decrypt(header, &wire[4..]).unwrap(), b"after");
-
+        let coinbaser = [crate::datum::messages::server_subcmd::COINBASER, 0, 0, 0];
+        for proto_cmd in [framing::cmd::MINING, framing::cmd::HELLO_OR_PING, framing::cmd::INFO] {
+            let plain = FrameHeader { cmd_len: 4, proto_cmd, ..Default::default() };
+            assert!(
+                matches!(client.decrypt(plain, &coinbaser), Err(Error::Malformed(_))),
+                "a plain frame of command {proto_cmd}"
+            );
+            let both =
+                FrameHeader { is_encrypted_channel: true, is_encrypted_pubkey: true, ..plain };
+            assert!(
+                matches!(client.decrypt(both, &coinbaser), Err(Error::Malformed(_))),
+                "a frame of command {proto_cmd} carrying both encryption flags"
+            );
+        }
         let signed = FrameHeader {
             cmd_len: 70,
             is_signed: true,
             proto_cmd: framing::cmd::INFO,
             ..Default::default()
         };
-        assert!(matches!(client.decrypt(signed, &[0u8; 70]), Err(Error::BadSignature)));
+        assert!(matches!(client.decrypt(signed, &[0u8; 70]), Err(Error::Malformed(_))));
+
+        let wire = session.encrypt(framing::cmd::MINING, b"after", false).unwrap();
+        let header = client.unmask_header(wire[..4].try_into().unwrap());
+        assert_eq!(
+            client.decrypt(header, &wire[4..]).unwrap(),
+            b"after",
+            "a refused frame does not advance the channel's nonce"
+        );
     }
 
     #[test]

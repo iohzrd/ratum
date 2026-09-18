@@ -190,6 +190,21 @@ impl AbwSlotState {
         Some(PendingReveal { slot, resend, payload: Reveal { slot, xor_key: key }.encode() })
     }
 
+    /// The slot a rotation activates next.
+    fn next_slot(&self) -> u8 {
+        (self.active + 1) % abw::ASSIGNMENT_SLOTS
+    }
+
+    /// When the slot a rotation activates next is still retired, the instant its key is
+    /// revealed: the rotation waits for it, since seeding the slot again before then would
+    /// disclose its key before the delay the gateway relies on.
+    fn next_slot_reveal_at(&self) -> Option<Instant> {
+        match self.slots[usize::from(self.next_slot())] {
+            Slot::Retired { reveal_at, .. } => Some(reveal_at),
+            _ => None,
+        }
+    }
+
     /// The earliest instant a rotation or a reveal can be due, never before the hold ends.
     pub fn next_due(&self) -> Instant {
         let rotation = if self.tip_rotation_pending {
@@ -197,6 +212,7 @@ impl AbwSlotState {
         } else {
             self.activated_at + ROTATE_AFTER
         };
+        let rotation = self.next_slot_reveal_at().map_or(rotation, |at| rotation.max(at));
         let due =
             self.slots.iter().filter_map(Slot::due_at).min().map_or(rotation, |r| rotation.min(r));
         due.max(self.held_until)
@@ -216,9 +232,11 @@ impl AbwSlotState {
         due.into_iter().filter_map(|slot| self.reveal(slot)).collect()
     }
 
+    /// Retires the active slot and activates the next. `rotation_due` asks for no rotation
+    /// while the next slot's reveal is pending; a rotation made then reveals it first.
     pub fn rotate(&mut self, now: Instant) -> Rotation {
         let old = self.active;
-        let next = (old + 1) % abw::ASSIGNMENT_SLOTS;
+        let next = self.next_slot();
         let reveals: Vec<PendingReveal> = self.reveal(next).into_iter().collect();
         if let Slot::Seeded { key } = self.slots[usize::from(old)] {
             self.slots[usize::from(old)] = Slot::Retired {
@@ -239,8 +257,10 @@ impl AbwSlotState {
         self.shares_since_activation = self.shares_since_activation.saturating_add(1);
     }
 
+    /// Why a rotation is due, if one is: never during the hold, and never while the next
+    /// slot's reveal is pending (the rotation then waits for the reveal).
     pub fn rotation_due(&self, now: Instant) -> Option<&'static str> {
-        if self.held(now) {
+        if self.held(now) || self.next_slot_reveal_at().is_some() {
             None
         } else if self.tip_rotation_pending {
             Some("new tip")
@@ -388,6 +408,26 @@ mod tests {
         let reseeded = secret_key(&abw, 0).expect("seeded anew, the old key dropped");
         assert_ne!(reseeded, key0);
         assert_eq!(retired_slots(&abw), (1..=15).collect::<Vec<u8>>());
+    }
+
+    #[test]
+    fn a_rotation_onto_a_slot_awaiting_its_reveal_waits_for_the_reveal() {
+        let now = Instant::now();
+        let mut abw = AbwSlotState::start(now, AFTER);
+        for _ in 0..15 {
+            abw.rotate(now);
+        }
+        for _ in 0..ROTATE_AFTER_SHARES {
+            abw.note_share();
+        }
+        assert_eq!(abw.rotation_due(now), None, "slot 0 is retired and its reveal is pending");
+        assert_eq!(abw.next_due(), now + AFTER, "the loop wakes when slot 0's reveal is due");
+        let reveals = abw.reveals_due(now + AFTER);
+        assert!(reveals.iter().any(|r| r.slot == 0));
+        assert_eq!(abw.rotation_due(now + AFTER), Some("share count"));
+        let Rotation { reveals, .. } = abw.rotate(now + AFTER);
+        assert!(reveals.is_empty(), "nothing is revealed early");
+        assert_eq!(abw.active, 0);
     }
 
     #[test]

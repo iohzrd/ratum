@@ -1,12 +1,21 @@
 //! A submitted share: its verdict, the receipt an anti-block-withholding slot gets, the block
 //! relayed when the share is one, and the credit recorded to the ledger.
+//!
+//! No share is credited on a job whose block the node has not validated. The first share on a job
+//! that carries transactions makes the pool request them (0x50 0x12), before any share on the job
+//! can be known to be a block, and the shares on the job are held until they arrive; the node then
+//! checks the job's block with each coinbase its shares use (`getblocktemplate` proposal mode,
+//! every consensus rule but the proof of work). A gateway that withholds the transactions, or
+//! builds a job the node refuses, has none of its shares on that job credited, and a block found
+//! on a validated job is relayed from the transactions the pool already holds.
 
 use super::Connection;
 use crate::accounting;
 use crate::payout;
-use crate::relay;
-use crate::verify::{RebuiltShare, Refusal, Verifier};
-use log::{debug, error, info, warn};
+use crate::relay::{self, Relayed};
+use crate::txns;
+use crate::verify::{BlockCheck, JobTxns, RebuiltShare, Refusal, VERSION_ROLLING_MASK, Verifier};
+use log::{debug, error, warn};
 use ratum::datum::messages;
 use ratum::datum::messages::abw::CandidateRef;
 use ratum::datum::messages::share::PowSubmit;
@@ -14,135 +23,415 @@ use ratum::datum::messages::share_response::{RejectReason, ShareResponse, ShareV
 use ratum::datum::messages::validation::{self, TxnList};
 use ratum::username::address_of;
 use std::io;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// The distinct unpayable identities one connection names at warn level. Past this the rest
 /// are left at debug, so a gateway sending an unbounded number of bad usernames cannot fill
 /// the log.
 pub(super) const MAX_REPORTED_UNPAYABLE: usize = 4096;
 
+/// How long a gateway has to send a job's transactions once the pool requested them. Its
+/// shares on the job wait this long at most for their answer, inside the 25 to 30 seconds a
+/// gateway waits for an accepted share before it reconnects.
+pub(super) const TXNS_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The transaction requests one connection has outstanding. A gateway serves one job at a
+/// time and replaces it every few tens of seconds, so a request per job is outstanding for
+/// about one round trip; a share on a further job is refused rather than requested.
+const MAX_TXN_REQUESTS: usize = 8;
+
+/// The shares one connection may have held for their job's transactions: 200 a second over
+/// `TXNS_TIMEOUT`. A share past it is refused.
+const MAX_HELD_SHARES: usize = 4096;
+
+/// How long a node that did not answer a proposal is not asked again for that job's block
+/// with that coinbase; its shares are refused meanwhile.
+const PROPOSAL_RETRY_SECS: u64 = 10;
+
+/// The log lines of each kind below that one connection writes at warn level; the rest are
+/// written at debug, so a gateway sending such shares without limit cannot fill the log.
+const MAX_WARNED: u32 = 16;
+
+/// A share held until its job's transactions arrive: the share as verified and claimed on
+/// arrival, the generation of the job it was verified on, and when it arrived.
+pub(super) struct HeldShare {
+    s: PowSubmit,
+    verified: Result<RebuiltShare, Refusal>,
+    generation: u64,
+    received_at: u64,
+}
+
+impl HeldShare {
+    /// The block hash the share claimed on arrival, when it verified.
+    pub(super) fn claimed_hash(&self) -> Option<[u8; 32]> {
+        self.verified.as_ref().ok().map(|rebuilt| rebuilt.block_hash)
+    }
+}
+
+/// A request for a job's transactions: the job's slot and generation, and when it was sent.
+pub(super) struct TxnRequest {
+    job_id: u8,
+    generation: u64,
+    sent_at: Instant,
+}
+
+impl TxnRequest {
+    pub(super) fn deadline(&self) -> Instant {
+        self.sent_at + TXNS_TIMEOUT
+    }
+}
+
+/// How many lines of each rate-limited kind this connection has written at warn level.
+#[derive(Default)]
+pub(super) struct WarnCounts {
+    undecodable: u32,
+    refused_blocks: u32,
+}
+
+fn warn_level(count: &mut u32) -> log::Level {
+    *count = count.saturating_add(1);
+    if *count <= MAX_WARNED { log::Level::Warn } else { log::Level::Debug }
+}
+
+/// What the node's view of a share's job decides about the share.
+enum JobVerdict {
+    /// Nothing: the share is refused and is not a block, so the job's validity does not
+    /// change its answer.
+    NotNeeded,
+    /// Its job's transactions are awaited; the share is held under the job's generation.
+    Pending(u64),
+    /// The job's block with the share's coinbase is valid; the job's transactions, to relay
+    /// the share if it is a block.
+    Valid(Arc<[Arc<[u8]>]>),
+    /// The job's transactions, for a refused share that is a block by its job's bits: the
+    /// block is relayed and the node decides, but the share is not credited.
+    RelayOnly(Arc<[Arc<[u8]>]>),
+    /// The job cannot be credited: its transactions did not arrive or are not the job's, or
+    /// the node refused its block.
+    Invalid(RejectReason),
+}
+
+enum Txns {
+    Ready(Arc<[Arc<[u8]>]>),
+    Pending,
+    Refused(RejectReason),
+}
+
 struct ShareOutcome {
     verdict: ShareVerdict,
-    followup_request: Option<Vec<u8>>,
     raw_pow_hash: Option<[u8; 32]>,
+}
+
+fn no_txns() -> Arc<[Arc<[u8]>]> {
+    Arc::from(Vec::new())
+}
+
+/// The node's verdict on a job's block from its answer to the proposal, and whether it holds
+/// for every share on the job with that coinbase. A verdict on the header's own time or
+/// version holds for the share proposed alone, since each share carries its own.
+fn block_check_from(
+    proposal: Result<Option<String>, ratum::rpc::Error>,
+    version: u32,
+    now: u64,
+) -> (BlockCheck, bool) {
+    let reason = match proposal {
+        Ok(None) => return (BlockCheck::Valid { version }, true),
+        Ok(Some(reason)) => reason,
+        Err(_) => {
+            return (
+                BlockCheck::Unavailable { retry_at: now.saturating_add(PROPOSAL_RETRY_SECS) },
+                true,
+            );
+        }
+    };
+    let (reject, whole_job) = match reason.as_str() {
+        "duplicate" => return (BlockCheck::Valid { version }, true),
+        "inconclusive-not-best-prevblk" => (RejectReason::StaleBlock, true),
+        "bad-diffbits" => (RejectReason::BadTarget, true),
+        "bad-header-height" | "bad-cb-height" => (RejectReason::HeaderFieldMismatch, true),
+        "bad-txnmrklroot" | "bad-txns-duplicate" => (RejectReason::HeaderMerkleMismatch, true),
+        r if r.starts_with("time-") => (RejectReason::BadNtime, false),
+        r if r.starts_with("bad-version") => (RejectReason::BadVersion, false),
+        r if r.starts_with("bad-cb-") => (RejectReason::BadCoinbase, true),
+        _ => (RejectReason::Other, true),
+    };
+    (BlockCheck::Invalid(reject), whole_job)
 }
 
 impl Connection<'_> {
     pub(super) fn on_share(&mut self, plain: &[u8]) -> io::Result<()> {
-        let peer = self.peer;
-        let (response, followup_request) = match PowSubmit::decode(plain) {
-            Ok(s) => {
-                debug!("[{peer}]   -> share {}", describe_share(&s));
-                if let Some(v3) = &mut self.v3 {
-                    v3.abw.note_share();
-                }
-                let outcome = self.share_outcome(&s, ratum::unix_now())?;
-                let abw_ref = outcome
-                    .raw_pow_hash
-                    .zip(self.abw_slot_of(&s))
-                    .map(|(hash, slot)| CandidateRef::new(slot, &hash));
-                let response = ShareResponse {
-                    verdict: outcome.verdict,
-                    nonce: s.nonce,
-                    target_byte: s.target_byte,
-                    job_id: s.job_id,
-                    abw_ref,
-                };
-                (response, outcome.followup_request)
-            }
-            Err(e) => {
-                warn!("[{peer}]   !! could not decode share: {e}");
-                if matches!(
-                    e,
-                    messages::Error::BadBlake2bSection
-                        | messages::Error::MissingBlake2bSection
-                        | messages::Error::BadExtranonceSize(_)
-                ) {
-                    warn!(
-                        "[{peer}]      a share this pool cannot read indicates a gateway \
-                         built against a different revision of the protocol (an upstream \
-                         DATUM gateway sends no BLAKE2b section); the pool and the gateway \
-                         are released together"
-                    );
-                }
-                let prefix = PowSubmit::prefix(plain).unwrap_or_default();
-                let response = ShareResponse {
-                    verdict: ShareVerdict::Rejected(Verifier::reason_for_decode_error(&e)),
-                    nonce: prefix.nonce,
-                    target_byte: prefix.target_byte,
-                    job_id: prefix.job_id,
-                    abw_ref: None,
-                };
-                (response, None)
-            }
+        let s = match PowSubmit::decode(plain) {
+            Ok(s) => s,
+            Err(e) => return self.on_undecodable_share(plain, &e),
         };
-        self.send_mining(&response.encode(), false)?;
-        if let Some(request) = followup_request {
-            self.send_mining(&request, false)?;
-            info!("[{peer}]   <- requested the block's transactions (0x50 0x12)");
-        }
-        Ok(())
-    }
-
-    fn share_outcome(&mut self, s: &PowSubmit, now: u64) -> io::Result<ShareOutcome> {
+        debug!("[{}]   -> share {}", self.peer, describe_share(&s));
+        let now = ratum::unix_now();
         // Not `self.abw()`: the borrow must stay on `v3` alone, beside `verifier` under &mut.
         let abw = self.v3.as_ref().map(|v| &v.abw);
-        let verified = self.verifier.verify(s, abw, now);
-        let claimed = verified
+        let verified = self
+            .verifier
+            .verify(&s, abw, now)
             .and_then(|rebuilt| accounting::claim(&self.server.accepted_hashes, rebuilt, now));
-        match claimed {
-            Ok(rebuilt) => self.on_accepted(s, &rebuilt, now),
-            Err(refusal) => self.on_refused(s, refusal),
+        self.settle(s, verified, now)
+    }
+
+    fn on_undecodable_share(&mut self, plain: &[u8], e: &messages::Error) -> io::Result<()> {
+        let peer = self.peer;
+        let level = warn_level(&mut self.warned.undecodable);
+        log::log!(level, "[{peer}]   !! could not decode share: {e}");
+        if level == log::Level::Warn
+            && matches!(
+                e,
+                messages::Error::BadBlake2bSection
+                    | messages::Error::MissingBlake2bSection
+                    | messages::Error::BadExtranonceSize(_)
+            )
+        {
+            warn!(
+                "[{peer}]      a share this pool cannot read indicates a gateway built against a \
+                 different revision of the protocol (an upstream DATUM gateway sends no BLAKE2b \
+                 section); the pool and the gateway are released together"
+            );
         }
+        let prefix = PowSubmit::prefix(plain).unwrap_or_default();
+        let response = ShareResponse {
+            verdict: ShareVerdict::Rejected(Verifier::reason_for_decode_error(e)),
+            nonce: prefix.nonce,
+            target_byte: prefix.target_byte,
+            job_id: prefix.job_id,
+            abw_ref: None,
+        };
+        self.send_mining(&response.encode(), false)
+    }
+
+    /// Answers the share, or holds it while its job's transactions are awaited.
+    fn settle(
+        &mut self,
+        s: PowSubmit,
+        verified: Result<RebuiltShare, Refusal>,
+        received_at: u64,
+    ) -> io::Result<()> {
+        match self.job_verdict(&s, &verified, received_at)? {
+            JobVerdict::Pending(generation) if self.held.len() < MAX_HELD_SHARES => {
+                self.held.push(HeldShare { s, verified, generation, received_at });
+                Ok(())
+            }
+            JobVerdict::Pending(_) => {
+                warn!(
+                    "[{}]   !! {MAX_HELD_SHARES} shares already wait for their jobs' \
+                     transactions; refusing another",
+                    self.peer
+                );
+                self.answer(&s, verified, JobVerdict::Invalid(RejectReason::Other), received_at)
+            }
+            verdict => self.answer(&s, verified, verdict, received_at),
+        }
+    }
+
+    fn job_verdict(
+        &mut self,
+        s: &PowSubmit,
+        verified: &Result<RebuiltShare, Refusal>,
+        now: u64,
+    ) -> io::Result<JobVerdict> {
+        let (rebuilt, credited) = match verified {
+            Ok(rebuilt) => (rebuilt, true),
+            Err(Refusal { reason, rebuilt: Some(rebuilt) })
+                if *reason != RejectReason::DuplicateWork && rebuilt.meets_own_bits() =>
+            {
+                (rebuilt.as_ref(), false)
+            }
+            Err(_) => return Ok(JobVerdict::NotNeeded),
+        };
+        let refused =
+            |reason| if credited { JobVerdict::Invalid(reason) } else { JobVerdict::NotNeeded };
+        let Some(generation) = rebuilt.job_generation else {
+            return Ok(refused(RejectReason::StaleBlock));
+        };
+        let txns = match self.job_txns(s, generation)? {
+            Txns::Ready(txns) => txns,
+            Txns::Pending => return Ok(JobVerdict::Pending(generation)),
+            Txns::Refused(reason) => return Ok(refused(reason)),
+        };
+        if !credited {
+            return Ok(JobVerdict::RelayOnly(txns));
+        }
+        let digest = rebuilt.coinbase_digest;
+        let check = match self.verifier.block_check(s.job_id, generation, &digest) {
+            Some(BlockCheck::Unavailable { retry_at }) if now >= retry_at => {
+                self.check_block(s, rebuilt, generation, &txns, now)
+            }
+            Some(check) => check,
+            None => self.check_block(s, rebuilt, generation, &txns, now),
+        };
+        Ok(match check {
+            BlockCheck::Valid { version }
+                if (version ^ rebuilt.version) & !VERSION_ROLLING_MASK != 0 =>
+            {
+                JobVerdict::Invalid(RejectReason::BadVersion)
+            }
+            BlockCheck::Valid { .. } => JobVerdict::Valid(txns),
+            BlockCheck::Invalid(reason) => JobVerdict::Invalid(reason),
+            BlockCheck::Unavailable { .. } => JobVerdict::Invalid(RejectReason::Other),
+        })
+    }
+
+    /// The transactions of the share's job: none for a job that carries none (a subsidy-only
+    /// share's block holds the coinbase alone), those held, or a request for them.
+    fn job_txns(&mut self, s: &PowSubmit, generation: u64) -> io::Result<Txns> {
+        let Some(job) = self.verifier.job(s.job_id, generation) else {
+            return Ok(Txns::Refused(RejectReason::StaleBlock));
+        };
+        if s.subsidy_only || job.txn_count == 0 {
+            return Ok(Txns::Ready(no_txns()));
+        }
+        match self.verifier.job_txns(s.job_id, generation) {
+            Some(JobTxns::Held(txns)) => Ok(Txns::Ready(Arc::clone(txns))),
+            Some(JobTxns::Requested) => Ok(Txns::Pending),
+            Some(JobTxns::Refused(reason)) => Ok(Txns::Refused(*reason)),
+            None => Ok(Txns::Refused(RejectReason::StaleBlock)),
+            Some(JobTxns::Unrequested) if self.txn_requests.len() >= MAX_TXN_REQUESTS => {
+                warn!(
+                    "[{}]   !! {MAX_TXN_REQUESTS} transaction requests are outstanding; \
+                     refusing a share on job {}",
+                    self.peer, s.job_id
+                );
+                Ok(Txns::Refused(RejectReason::Other))
+            }
+            Some(JobTxns::Unrequested) => {
+                self.send_mining(&validation::request_block_txns(s.job_id), false)?;
+                self.verifier.set_job_txns(s.job_id, generation, JobTxns::Requested);
+                let sent_at = Instant::now();
+                self.txn_requests.push_back(TxnRequest { job_id: s.job_id, generation, sent_at });
+                debug!(
+                    "[{}]   <- requested the transactions of job {} (0x50 0x12)",
+                    self.peer, s.job_id
+                );
+                Ok(Txns::Pending)
+            }
+        }
+    }
+
+    /// Asks the node for its verdict on the job's block with the share's coinbase and records
+    /// it for the other shares on that coinbase.
+    fn check_block(
+        &mut self,
+        s: &PowSubmit,
+        rebuilt: &RebuiltShare,
+        generation: u64,
+        txns: &[Arc<[u8]>],
+        now: u64,
+    ) -> BlockCheck {
+        let proposal = relay::propose(&self.server.node, rebuilt, txns);
+        if let Err(e) = &proposal {
+            error!(
+                "[{}]   !! the node did not answer the proposal of job {}'s block ({e}); its \
+                 shares are refused until it does",
+                self.peer, s.job_id
+            );
+        }
+        let (check, whole_job) = block_check_from(proposal, rebuilt.version, now);
+        match check {
+            BlockCheck::Valid { .. } => {
+                debug!("[{}]      the node validated job {}'s block", self.peer, s.job_id);
+            }
+            BlockCheck::Invalid(reason) => warn!(
+                "[{}]   !! the node refused job {}'s block at height {} ({reason:?}); \
+                 {} not credited",
+                self.peer,
+                s.job_id,
+                rebuilt.height,
+                if whole_job { "no share on it is" } else { "this share is" }
+            ),
+            BlockCheck::Unavailable { .. } => {}
+        }
+        if whole_job {
+            self.verifier.record_block_check(s.job_id, generation, rebuilt.coinbase_digest, check);
+        }
+        check
+    }
+
+    fn answer(
+        &mut self,
+        s: &PowSubmit,
+        verified: Result<RebuiltShare, Refusal>,
+        verdict: JobVerdict,
+        received_at: u64,
+    ) -> io::Result<()> {
+        let outcome = match (verified, verdict) {
+            (Ok(rebuilt), JobVerdict::Valid(txns)) => {
+                self.on_accepted(s, &rebuilt, &txns, received_at)?
+            }
+            (Ok(rebuilt), verdict) => {
+                let reason = match verdict {
+                    JobVerdict::Invalid(reason) => reason,
+                    _ => RejectReason::Other,
+                };
+                ratum::lock(&self.server.accepted_hashes).remove(&rebuilt.block_hash);
+                self.on_refused(s, Refusal { reason, rebuilt: Some(Box::new(rebuilt)) }, None)?
+            }
+            (Err(refusal), JobVerdict::RelayOnly(txns)) => {
+                self.on_refused(s, refusal, Some((&txns, received_at)))?
+            }
+            (Err(refusal), _) => self.on_refused(s, refusal, None)?,
+        };
+        let abw_ref = outcome
+            .raw_pow_hash
+            .zip(self.abw_slot_of(s))
+            .map(|(hash, slot)| CandidateRef::new(slot, &hash));
+        let response = ShareResponse {
+            verdict: outcome.verdict,
+            nonce: s.nonce,
+            target_byte: s.target_byte,
+            job_id: s.job_id,
+            abw_ref,
+        };
+        self.send_mining(&response.encode(), false)
     }
 
     fn on_accepted(
         &mut self,
         s: &PowSubmit,
         rebuilt: &RebuiltShare,
+        txns: &[Arc<[u8]>],
         now: u64,
     ) -> io::Result<ShareOutcome> {
         let peer = self.peer;
         let raw_pow_hash = Some(rebuilt.raw_pow_hash);
-        let candidate = rebuilt.is_block_candidate();
-        if rebuilt.is_block {
+        if rebuilt.meets_own_bits() {
             warn!(
                 "[{peer}]   ** BLOCK at height {}: {}",
                 rebuilt.height,
                 hex::encode(rebuilt.block_hash)
             );
-        } else if candidate {
-            info!(
-                "[{peer}]      share meets its job's bits {:#010x} but not the node's \
-                 next target; not relayed",
-                rebuilt.job_bits
+        } else if s.is_block {
+            warn!(
+                "[{peer}]   !! gateway flagged a block but the hash does not meet its job's bits"
             );
         }
-        if candidate {
+        if rebuilt.is_block_candidate() {
             self.send_abw_receipt(s, rebuilt)?;
         }
-        let followup_request = if rebuilt.is_block {
-            self.relay_and_record(s, rebuilt, now)
-        } else {
-            if s.is_block {
-                warn!(
-                    "[{peer}]   !! gateway flagged a block but the hash does not meet the \
-                     network target"
-                );
-            }
-            None
-        };
+        if rebuilt.meets_own_bits() {
+            self.relay_and_record(s, rebuilt, txns, now);
+        }
+        if let Some(v3) = &mut self.v3 {
+            v3.abw.note_share();
+        }
         if self.refuse_if_unpayable(&s.username) {
             let verdict = ShareVerdict::Rejected(RejectReason::BadUsername);
-            return Ok(ShareOutcome { verdict, followup_request, raw_pow_hash });
+            return Ok(ShareOutcome { verdict, raw_pow_hash });
         }
         if let Err(e) = accounting::credit_share(self.server, peer, &s.username, rebuilt, now) {
             error!(
-                "[{peer}]   !! could not record the share to the ledger ({e}); it is \
-                 not credited and its hash was removed from the accepted share hashes so a \
-                 resend can be credited"
+                "[{peer}]   !! could not record the share to the ledger ({e}); it is not \
+                 credited, and is answered as refused"
             );
+            let verdict = ShareVerdict::Rejected(RejectReason::Other);
+            return Ok(ShareOutcome { verdict, raw_pow_hash });
         }
-        Ok(ShareOutcome { verdict: ShareVerdict::Accepted, followup_request, raw_pow_hash })
+        Ok(ShareOutcome { verdict: ShareVerdict::Accepted, raw_pow_hash })
     }
 
     fn refuse_if_unpayable(&mut self, username: &str) -> bool {
@@ -179,97 +468,181 @@ impl Connection<'_> {
         true
     }
 
+    /// Relays the block and, unless the node refused it, records it with what its coinbase
+    /// owes: a block the node refused paid nobody.
     fn relay_and_record(
         &mut self,
         s: &PowSubmit,
         rebuilt: &RebuiltShare,
+        txns: &[Arc<[u8]>],
         now: u64,
-    ) -> Option<Vec<u8>> {
-        let peer = self.peer;
-        let mut followup_request = None;
-        if !s.subsidy_only && rebuilt.txn_count != 0 {
-            info!(
-                "[{peer}]      block has {} more transactions; requesting them",
-                rebuilt.txn_count
-            );
-            if let Some(prev) = self.awaiting_txns.insert(s.job_id, rebuilt.clone()) {
-                error!(
-                    "[{peer}]   !! a block on job {} was still awaiting its transactions \
-                     and is abandoned: {}",
-                    s.job_id,
-                    hex::encode(prev.block_hash)
-                );
+    ) {
+        match relay::submit(self.peer, &self.server.node, s.job_id, rebuilt, txns) {
+            Relayed::Rejected(reason) => warn!(
+                "[{}]      the block is not recorded as found: the node refused it ({reason})",
+                self.peer
+            ),
+            Relayed::Accepted | Relayed::Unknown => {
+                accounting::record_block(self.server, self.peer, &s.username, rebuilt, now);
             }
-            followup_request = Some(validation::request_block_txns(s.job_id));
-        } else {
-            relay::submit(peer, &self.server.node, s.job_id, rebuilt, &[]);
         }
-        accounting::record_block(self.server, peer, &s.username, rebuilt, now);
-        followup_request
     }
 
-    fn on_refused(&mut self, s: &PowSubmit, refusal: Refusal) -> io::Result<ShareOutcome> {
+    fn on_refused(
+        &mut self,
+        s: &PowSubmit,
+        refusal: Refusal,
+        relay: Option<(&[Arc<[u8]>], u64)>,
+    ) -> io::Result<ShareOutcome> {
         let peer = self.peer;
         let Refusal { reason, rebuilt } = refusal;
         debug!("[{peer}]   <- rejected: {reason:?}");
         if let Some(r) = &rebuilt
             && s.is_block
         {
-            warn!(
-                "[{peer}]   !! pool built header {} coinbase {}",
+            let level = warn_level(&mut self.warned.refused_blocks);
+            log::log!(
+                level,
+                "[{peer}]   !! refused a share the gateway flagged as a block ({reason:?})"
+            );
+            debug!(
+                "[{peer}]      pool built header {} coinbase {}",
                 hex::encode(r.header),
                 hex::encode(&r.coinbase_tx)
             );
+        }
+        if let (Some(r), Some((txns, received_at))) = (&rebuilt, relay) {
+            warn!(
+                "[{peer}]   ** BLOCK at height {} on a refused share ({reason:?}); relaying it, \
+                 the share is not credited: {}",
+                r.height,
+                hex::encode(r.block_hash)
+            );
+            self.relay_and_record(s, r, txns, received_at);
         }
         let rebuilt = rebuilt.filter(|_| self.abw_slot_of(s).is_some());
         if let Some(r) = &rebuilt
             && r.is_block_candidate()
         {
-            warn!(
-                "[{peer}]   ** the refused share ({reason:?}) meets a block \
-                 target: sending the ABW receipt so the gateway counts it handled"
+            debug!(
+                "[{peer}]   ** the refused share ({reason:?}) meets a block target: sending the \
+                 ABW receipt so the gateway counts it handled"
             );
             self.send_abw_receipt(s, r)?;
         }
         Ok(ShareOutcome {
             verdict: ShareVerdict::Rejected(reason),
-            followup_request: None,
             raw_pow_hash: rebuilt.map(|r| r.raw_pow_hash),
         })
     }
 
-    pub(super) fn on_block_txns(&mut self, plain: &[u8]) {
+    /// A job's transactions (0x50 0x92): checked against the job's merkle branches and held,
+    /// or the job refused; then the shares held for them are answered.
+    pub(super) fn on_block_txns(&mut self, plain: &[u8]) -> io::Result<()> {
         let peer = self.peer;
         let selector = plain.get(validation::SELECTOR_AT).copied();
         if selector != Some(validation::response::BLOCK_TXNS) {
             warn!("[{peer}]   !! unhandled 0x50 response {selector:?}");
-            return;
+            return Ok(());
         }
         let list = match TxnList::decode(plain, validation::response::BLOCK_TXNS) {
             Ok(b) => b,
             Err(e) => {
-                error!("[{peer}]   !! bad block response: {e}");
-                return;
+                warn!("[{peer}]   !! malformed transactions response: {e}");
+                return Ok(());
             }
         };
-        info!(
-            "[{peer}]   -> block transactions: job {} {} {} txns",
+        let Some(at) = self.txn_requests.iter().position(|r| r.job_id == list.job_index) else {
+            warn!(
+                "[{peer}]      transactions for job {} that no request is waiting on",
+                list.job_index
+            );
+            return Ok(());
+        };
+        let request = self.txn_requests.remove(at).expect("the position is in range");
+        debug!(
+            "[{peer}]   -> transactions of job {}: {} {} txns",
             list.job_index,
             list.status,
             list.txns.len()
         );
-        let Some(rebuilt) = self.awaiting_txns.remove(&list.job_index) else {
-            warn!(
-                "[{peer}]      transactions for job {} that nothing is waiting on",
-                list.job_index
-            );
-            return;
+        let Some(job) = self.verifier.job(request.job_id, request.generation) else {
+            return self.release_held(|h| h.s.job_id == request.job_id);
         };
-        if list.status != validation::TxnListStatus::Ok {
-            error!("[{peer}]      cannot assemble the block: {}", list.status);
-            return;
+        let txns = if list.status == validation::TxnListStatus::Ok {
+            let txns = txns::intern_all(&self.server.txn_cache, list.txns);
+            match relay::txns_match_job(&txns, job.txn_count, &job.merkle_branches) {
+                Ok(()) => JobTxns::Held(txns),
+                Err(why) => {
+                    warn!(
+                        "[{peer}]   !! job {}: {why}; no share on it is credited",
+                        list.job_index
+                    );
+                    JobTxns::Refused(RejectReason::HeaderMerkleMismatch)
+                }
+            }
+        } else {
+            warn!(
+                "[{peer}]   !! the gateway sent no transactions for job {} ({}); no share on it \
+                 is credited",
+                list.job_index, list.status
+            );
+            JobTxns::Refused(RejectReason::Other)
+        };
+        self.verifier.set_job_txns(request.job_id, request.generation, txns);
+        self.release_held(|h| h.s.job_id == request.job_id && h.generation == request.generation)
+    }
+
+    /// Refuses the jobs whose transactions did not arrive within `TXNS_TIMEOUT` of their
+    /// request, and answers the shares held for them.
+    pub(super) fn expire_txn_requests(&mut self) -> io::Result<()> {
+        let now = Instant::now();
+        while let Some(at) = self.txn_requests.iter().position(|r| now >= r.deadline()) {
+            let request = self.txn_requests.remove(at).expect("the position is in range");
+            warn!(
+                "[{}]   !! the gateway did not send the transactions of job {} within {}s; no \
+                 share on it is credited",
+                self.peer,
+                request.job_id,
+                TXNS_TIMEOUT.as_secs()
+            );
+            self.verifier.set_job_txns(
+                request.job_id,
+                request.generation,
+                JobTxns::Refused(RejectReason::Other),
+            );
+            self.release_held(|h| {
+                h.s.job_id == request.job_id && h.generation == request.generation
+            })?;
         }
-        relay::submit(peer, &self.server.node, list.job_index, &rebuilt, &list.txns);
+        Ok(())
+    }
+
+    /// Answers the held shares whose job is no longer installed: another job replaced it in
+    /// its slot, or it was evicted with its tip.
+    pub(super) fn answer_orphaned_held(&mut self) -> io::Result<()> {
+        let verifier = &self.verifier;
+        let orphaned: Vec<(u8, u64)> = self
+            .held
+            .iter()
+            .filter(|h| verifier.job(h.s.job_id, h.generation).is_none())
+            .map(|h| (h.s.job_id, h.generation))
+            .collect();
+        for (job_id, generation) in orphaned {
+            self.release_held(|h| h.s.job_id == job_id && h.generation == generation)?;
+        }
+        Ok(())
+    }
+
+    /// Settles again, in the order they arrived, the held shares `matches` selects.
+    fn release_held(&mut self, matches: impl Fn(&HeldShare) -> bool) -> io::Result<()> {
+        let (released, kept): (Vec<HeldShare>, Vec<HeldShare>) =
+            std::mem::take(&mut self.held).into_iter().partition(|h| matches(h));
+        self.held = kept;
+        for HeldShare { s, verified, received_at, .. } in released {
+            self.settle(s, verified, received_at)?;
+        }
+        Ok(())
     }
 }
 
@@ -299,4 +672,37 @@ fn describe_share(s: &PowSubmit) -> String {
         if s.quickdiff { " quickdiff" } else { "" },
         sections
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_nodes_reasons_map_to_reject_codes_and_header_reasons_hold_for_one_share() {
+        let check = |reason: &str| block_check_from(Ok(Some(reason.to_string())), 7, 100);
+        assert_eq!(block_check_from(Ok(None), 7, 100), (BlockCheck::Valid { version: 7 }, true));
+        assert_eq!(check("duplicate"), (BlockCheck::Valid { version: 7 }, true));
+        assert_eq!(check("bad-diffbits"), (BlockCheck::Invalid(RejectReason::BadTarget), true));
+        assert_eq!(
+            check("bad-header-height"),
+            (BlockCheck::Invalid(RejectReason::HeaderFieldMismatch), true)
+        );
+        assert_eq!(check("bad-cb-amount"), (BlockCheck::Invalid(RejectReason::BadCoinbase), true));
+        assert_eq!(
+            check("inconclusive-not-best-prevblk"),
+            (BlockCheck::Invalid(RejectReason::StaleBlock), true)
+        );
+        assert_eq!(check("time-too-old"), (BlockCheck::Invalid(RejectReason::BadNtime), false));
+        assert_eq!(
+            check("bad-version(0x00000001)"),
+            (BlockCheck::Invalid(RejectReason::BadVersion), false)
+        );
+        assert_eq!(check("bad-blk-weight"), (BlockCheck::Invalid(RejectReason::Other), true));
+        let unanswered = block_check_from(Err(ratum::rpc::Error::BadResponse("x".into())), 7, 100);
+        assert_eq!(
+            unanswered,
+            (BlockCheck::Unavailable { retry_at: 100 + PROPOSAL_RETRY_SECS }, true)
+        );
+    }
 }

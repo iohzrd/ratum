@@ -39,7 +39,7 @@ fn record(v: &mut Verifier, r: &CoinbaserResponse, identities: &[&str], now: u64
             script_pubkey: output.script_pubkey.clone(),
         })
         .collect();
-    v.record_dictated(r.coinbaser_id, outputs, now);
+    v.record_dictated(r.coinbaser_id, r.value, [0x5a; 32], outputs, now);
 }
 
 /// The policy the helpers below verify against, which outlives every `Verifier` they hand

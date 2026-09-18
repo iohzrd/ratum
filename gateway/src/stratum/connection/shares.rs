@@ -123,21 +123,16 @@ impl Connection {
             .ok_or(UNKNOWN_WORK)?;
         let hash = job.raw_pow_hash(&header);
         let is_block = job.abw.is_none() && target::meets_target(&hash, &job.block_target);
-        if is_block {
-            let display = hex::encode(hash);
+        let block = is_block.then(|| (hex::encode(hash), header.serialize()));
+        if let Some((display, _)) = &block {
             for _ in 0..BLOCK_FOUND_LOG_LINES {
                 warn!("******** BLOCK FOUND - {display} ********");
             }
-            crate::submit_block::found_block(
-                &self.gateway,
-                job,
-                prefix.coinbase(),
-                target_byte,
-                &header.serialize(),
-                &display,
-            );
         }
 
+        // A block is queued for the pool before the node submission, which waits on
+        // submitblock and preciousblock, as the C gateway calls `datum_protocol_pow_submit`
+        // before `assembleBlockAndSubmit`. A block is queued whatever the share checks say.
         let checked = self.check_share(job, &hash, target_byte, &req.miner_username);
         if job.is_datum_job && (is_block || checked.is_ok()) {
             let wire_username = self.credited_username(req, &hash);
@@ -149,6 +144,16 @@ impl Connection {
                 header,
                 username: wire_username,
             });
+        }
+        if let Some((display, serialized)) = &block {
+            crate::submit_block::found_block(
+                &self.gateway,
+                job,
+                prefix.coinbase(),
+                target_byte,
+                serialized,
+                display,
+            );
         }
         checked
     }

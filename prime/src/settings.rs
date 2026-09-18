@@ -21,6 +21,7 @@ const MAX_FEE_BPS: u16 = 100;
 const DEFAULT_POLL_SECS: f64 = 0.5;
 const DEFAULT_MIN_DIFFICULTY: u64 = 16384;
 const DEFAULT_MAX_CONNECTIONS: usize = 1024;
+const DEFAULT_MAX_CONNECTIONS_PER_IP: usize = 32;
 const DEFAULT_LISTEN: &str = "0.0.0.0:28915";
 const DEFAULT_MOTD: &str = "RATUM Prime";
 const DEFAULT_WINDOW_MULTIPLE: f64 = 8.0;
@@ -43,6 +44,7 @@ pub struct Settings {
     pub require_v3: bool,
     pub abw_reveal_after: Duration,
     pub max_connections: usize,
+    pub max_connections_per_ip: usize,
     pub ledger_path: Option<String>,
     pub ledger_keep_shares: Option<u64>,
     pub poll: Duration,
@@ -73,6 +75,13 @@ pub fn resolve(o: &Options) -> Result<Resolved, String> {
             o.max_connections,
             DEFAULT_MAX_CONNECTIONS,
             "--max-connections",
+            "a positive number",
+            |n| *n > 0,
+        )?,
+        max_connections_per_ip: valid_or(
+            o.max_connections_per_ip,
+            DEFAULT_MAX_CONNECTIONS_PER_IP,
+            "--max-connections-per-ip",
             "a positive number",
             |n| *n > 0,
         )?,
@@ -150,6 +159,12 @@ fn coinbase_tag(tag: String) -> Result<String, String> {
              every pooled coinbase's scriptSig ahead of the miner's secondary tag",
             tag.len()
         ));
+    }
+    if tag.contains('\0') {
+        return Err("--coinbase-tag must not hold a NUL byte: a gateway reads the tag up to the \
+                    first NUL and pushes only that, so the pool would not find its own tag in \
+                    the coinbases it verifies"
+            .to_string());
     }
     Ok(tag)
 }
@@ -431,6 +446,9 @@ mod tests {
         let long_tag = Some("x".repeat(MAX_COINBASE_TAG_LEN + 1));
         let e = policy(Options { coinbase_tag: long_tag, ..Default::default() }).unwrap_err();
         assert!(e.contains("--coinbase-tag"), "{e}");
+        let nul_tag = Some("RAT\0UM".to_string());
+        let e = policy(Options { coinbase_tag: nul_tag, ..Default::default() }).unwrap_err();
+        assert!(e.contains("--coinbase-tag") && e.contains("NUL"), "{e}");
         let e = policy(Options { min_diff: Some(3), ..Default::default() }).unwrap_err();
         assert!(e.contains("--min-diff"), "{e}");
     }

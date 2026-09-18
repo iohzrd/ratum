@@ -17,6 +17,9 @@ use ratum::datum::messages::share_response::RejectReason;
 use ratum::header;
 use ratum::{rpc, target};
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
+
+pub use jobs::{BlockCheck, JobTxns};
 
 /// The coinbase sections one connection's jobs may hold, about twice what a gateway serving
 /// every job slot with the widest split the coinbaser dictates (512 outputs) installs. It
@@ -26,6 +29,16 @@ const MAX_INSTALLED_COINBASE_BYTES: usize = 16 << 20;
 pub const NTIME_WINDOW_SECS: u64 = 2 * ratum::SECS_PER_HOUR;
 
 const SPLIT_GRACE_SECS: u64 = 10;
+
+/// The splits one session keeps. A gateway requests one per job, so this covers the jobs of
+/// several tips; past it the oldest is dropped, and a share naming it is checked as naming no
+/// split.
+const MAX_SPLITS: usize = 64;
+
+/// The version bits a miner may roll (BIP 320). A share whose version differs from the version
+/// its job's block was validated with outside these bits is refused, since the node checks the
+/// rest of the version (the minimum version and any signalling a deployment requires).
+pub const VERSION_ROLLING_MASK: u32 = 0x1fff_e000;
 
 /// What a share is checked against: the configuration sent to every gateway (its version 1
 /// form; a version 3 session adds the version 3 fields) and the pool's own share rules.
@@ -54,8 +67,9 @@ impl Refusal {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RebuiltShare {
-    /// The block hash meets the node's next target as the verifier held it at the rebuild:
-    /// the share is a block and is relayed.
+    /// The block hash meets the node's next target as the verifier held it at the rebuild.
+    /// Whether the share is relayed is decided by its job's own bits once the node has
+    /// validated the job (`meets_own_bits`).
     pub is_block: bool,
     pub difficulty: u64,
     pub block_hash: [u8; 32],
@@ -72,6 +86,15 @@ pub struct RebuiltShare {
     /// The dictated outputs the coinbase left out, other than those paying the pool's script.
     pub unpaid_outputs: Vec<Payout>,
     pub tag_secondary: String,
+    /// The header version without the version 2 flag, which `VERSION_ROLLING_MASK` compares.
+    pub version: u32,
+    /// SHA-256d of the coinbase section the share was rebuilt on (`coinb1 || coinb2`), which
+    /// keys the node's verdict on the job's block with that coinbase.
+    pub coinbase_digest: [u8; 32],
+    /// The generation of the job installed in the share's slot when the share was rebuilt on
+    /// it; none when the share's job was not installed (a share refused before its sections
+    /// were installed, or on a job another share has since replaced).
+    pub job_generation: Option<u64>,
 }
 
 impl RebuiltShare {
@@ -80,20 +103,32 @@ impl RebuiltShare {
     pub fn is_block_candidate(&self) -> bool {
         self.is_block || meets_own_bits(self)
     }
+
+    /// A block by its job's own bits: what the pool relays once the node has validated the
+    /// job, whose bits are then the ones the node requires of it.
+    pub fn meets_own_bits(&self) -> bool {
+        meets_own_bits(self)
+    }
 }
 
+/// A split the pool dictated: its outputs, and the value and previous block hash of the
+/// coinbaser request it answered, which a job naming it must match (`check_outputs`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DictatedSplit {
-    pub outputs: Vec<DictatedOutput>,
+    pub outputs: Arc<[DictatedOutput]>,
+    pub value: u64,
+    pub prev_hash: [u8; 32],
     pub sent_at: u64,
 }
 
 /// The splits a session dictated, by coinbaser id, and the id of the newest; saved with a
-/// version 3 session so the shares a resumed gateway replays are checked against them.
+/// version 3 session so the shares a resumed gateway replays are checked against them. At
+/// most `MAX_SPLITS` are held, and consecutive splits with the same outputs share them.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DictatedSplits {
     last_id: u8,
     by_id: HashMap<u8, DictatedSplit>,
+    order: VecDeque<u8>,
 }
 
 impl DictatedSplits {
@@ -106,14 +141,64 @@ impl DictatedSplits {
         }
     }
 
-    pub fn record(&mut self, id: u8, outputs: Vec<DictatedOutput>, sent_at: u64) {
-        self.by_id.insert(id, DictatedSplit { outputs, sent_at });
+    pub fn record(
+        &mut self,
+        id: u8,
+        value: u64,
+        prev_hash: [u8; 32],
+        outputs: Vec<DictatedOutput>,
+        sent_at: u64,
+    ) {
+        let outputs: Arc<[DictatedOutput]> = match self.by_id.get(&self.last_id) {
+            Some(last) if *last.outputs == *outputs => Arc::clone(&last.outputs),
+            _ => outputs.into(),
+        };
+        self.order.retain(|held| *held != id);
+        self.by_id.insert(id, DictatedSplit { outputs, value, prev_hash, sent_at });
+        self.order.push_back(id);
         self.last_id = id;
+        while self.order.len() > MAX_SPLITS {
+            if let Some(oldest) = self.order.pop_front() {
+                self.by_id.remove(&oldest);
+            }
+        }
     }
 
     pub fn get(&self, id: u8) -> Option<&DictatedSplit> {
         self.by_id.get(&id)
     }
+
+    /// Drops the splits dictated for a previous block hash `keep` refuses: a share on a job
+    /// whose parent is no longer credited cannot use them.
+    pub fn retain_prev(&mut self, keep: impl Fn(&[u8; 32]) -> bool) {
+        self.by_id.retain(|_, split| keep(&split.prev_hash));
+        let by_id = &self.by_id;
+        self.order.retain(|id| by_id.contains_key(id));
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.by_id.len()
+    }
+}
+
+/// What the node's template says of the block it describes, as far as the verifier holds it:
+/// its bits, and, when read from the node rather than set by a test, its parent, height and
+/// earliest valid block time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NextBlock {
+    prev_hash: Option<[u8; 32]>,
+    bits: u32,
+    height: Option<u32>,
+    mintime: Option<u64>,
+}
+
+/// Whether the chain lets a block carry the minimum difficulty when its time is far enough past
+/// its parent's (testnet and testnet4). There the bits a block requires depend on its own
+/// time, so a job's bits are checked by the node's validation of the job, not against the
+/// template's.
+fn allows_min_difficulty_blocks(chain: Option<rpc::Chain>) -> bool {
+    matches!(chain, Some(rpc::Chain::Test | rpc::Chain::Testnet4))
 }
 
 /// The share checks of one connection. The policy is the server's, borrowed: it is fixed at
@@ -124,8 +209,15 @@ pub struct Verifier<'a> {
     jobs: Vec<Option<jobs::JobState>>,
     splits: DictatedSplits,
     tip: Option<[u8; 32]>,
-    next_bits: Option<u32>,
+    next: Option<NextBlock>,
     recent_tips: VecDeque<jobs::ReplacedTip>,
+    /// The generation the next job installed takes, so a job replaced in its slot is told
+    /// apart from the job replacing it.
+    next_generation: u64,
+    /// The pow hashes of the shares that installed sections on this connection: one share
+    /// installs sections once, so a single share resent under other job and coinbase ids
+    /// cannot fill the section cap.
+    installed_by: crate::bounded::BoundedSet<[u8; 32]>,
     installed_coinbase_bytes: usize,
     /// `MAX_INSTALLED_COINBASE_BYTES` for the life of every connection. It is a field rather
     /// than the constant so a test can lower it and reach the cap without installing sixteen
@@ -140,8 +232,10 @@ impl<'a> Verifier<'a> {
             jobs: vec![None; MAX_JOBS],
             splits: DictatedSplits::default(),
             tip: None,
-            next_bits: None,
+            next: None,
             recent_tips: VecDeque::new(),
+            next_generation: 1,
+            installed_by: crate::bounded::BoundedSet::new(jobs::MAX_INSTALLING_SHARES),
             installed_coinbase_bytes: 0,
             installed_coinbase_bytes_cap: MAX_INSTALLED_COINBASE_BYTES,
         }
@@ -151,25 +245,64 @@ impl<'a> Verifier<'a> {
         self.tip
     }
 
-    /// Sets the bits of the node's next block template; returns whether they changed.
+    /// Sets the node's template for the next block; returns whether its bits changed.
+    pub fn set_template(&mut self, template: Option<rpc::TemplateSummary>) -> bool {
+        let next = template.map(|t| NextBlock {
+            prev_hash: Some(t.prev_hash),
+            bits: t.bits,
+            height: Some(t.height),
+            mintime: Some(t.mintime),
+        });
+        let changed = self.next.map(|n| n.bits) != next.map(|n| n.bits);
+        self.next = next;
+        changed
+    }
+
+    /// Sets the bits of the node's next block alone, as a template read without its other
+    /// fields; returns whether they changed.
+    #[cfg(test)]
     pub fn set_next_bits(&mut self, next_bits: Option<u32>) -> bool {
-        std::mem::replace(&mut self.next_bits, next_bits) != next_bits
+        let next =
+            next_bits.map(|bits| NextBlock { prev_hash: None, bits, height: None, mintime: None });
+        std::mem::replace(&mut self.next, next).map(|n| n.bits) != next_bits
     }
 
     fn next_target(&self) -> Option<target::Target> {
-        self.next_bits.and_then(target::bits_to_target)
+        self.next.and_then(|n| target::bits_to_target(n.bits))
+    }
+
+    /// The template, when it describes the block a job on `prev_hash` builds: its parent is
+    /// the template's, or, for a template set without one, the tip's.
+    fn next_on(&self, prev_hash: [u8; 32]) -> Option<NextBlock> {
+        self.next.filter(|n| match n.prev_hash {
+            Some(parent) => parent == prev_hash,
+            None => self.tip == Some(prev_hash),
+        })
     }
 
     pub fn next_coinbaser_id(&self) -> u8 {
         self.splits.next_id()
     }
 
-    pub fn record_dictated(&mut self, coinbaser_id: u8, outputs: Vec<DictatedOutput>, now: u64) {
-        self.splits.record(coinbaser_id, outputs, now);
+    pub fn record_dictated(
+        &mut self,
+        coinbaser_id: u8,
+        value: u64,
+        prev_hash: [u8; 32],
+        outputs: Vec<DictatedOutput>,
+        now: u64,
+    ) {
+        self.splits.record(coinbaser_id, value, prev_hash, outputs, now);
     }
 
+    /// The splits to save with a session: those dictated on the tip or on a tip replaced
+    /// recently enough that a share on it can still be credited.
     pub fn take_splits(&mut self) -> DictatedSplits {
-        std::mem::take(&mut self.splits)
+        let mut splits = std::mem::take(&mut self.splits);
+        if self.tip.is_some() {
+            splits.retain_prev(|prev| self.tip == Some(*prev) || self.recent_tip(*prev));
+        }
+        splits
     }
 
     pub fn restore_splits(&mut self, splits: DictatedSplits) {
@@ -215,15 +348,21 @@ impl<'a> Verifier<'a> {
         }
     }
 
-    fn check_job_target(&self, rebuilt: &RebuiltShare) -> Result<(), RejectReason> {
-        if self.tip == Some(rebuilt.prev_hash)
-            && let Some(node_target) = self.next_target()
-        {
-            let job_target =
-                target::bits_to_target(rebuilt.job_bits).ok_or(RejectReason::BadTarget)?;
-            if job_target > node_target {
-                return Err(RejectReason::BadTarget);
-            }
+    /// The header fields of a job on the template's parent that the template decides: the
+    /// bits (except where the chain lets a block's own time lower them), the height, and the
+    /// earliest block time. The node's validation of the job checks the same fields; these
+    /// refuse a share before that, and the time is checked per share since each share
+    /// carries its own.
+    fn check_job_header(&self, s: &PowSubmit, rebuilt: &RebuiltShare) -> Result<(), RejectReason> {
+        let Some(next) = self.next_on(rebuilt.prev_hash) else { return Ok(()) };
+        if !allows_min_difficulty_blocks(self.policy.chain) && rebuilt.job_bits != next.bits {
+            return Err(RejectReason::BadTarget);
+        }
+        if next.height.is_some_and(|height| height != rebuilt.height) {
+            return Err(RejectReason::HeaderFieldMismatch);
+        }
+        if next.mintime.is_some_and(|mintime| u64::from(s.block_time()) < mintime) {
+            return Err(RejectReason::BadNtime);
         }
         Ok(())
     }
@@ -293,12 +432,19 @@ impl<'a> Verifier<'a> {
         abw: Option<&AbwSlotState>,
         now: u64,
     ) -> Result<RebuiltShare, Refusal> {
-        let rebuilt = self.rebuild(s, abw)?;
+        let rebuilt = self.rebuild(s, abw).map_err(|mut refusal| {
+            if let Some(r) = &mut refusal.rebuilt {
+                r.job_generation = self.installed_generation(s);
+            }
+            refusal
+        })?;
         let meets_share_target = target::meets_target(
             &rebuilt.raw_pow_hash,
             &target::target_for_exponent(s.target_byte),
         );
-        match self.check_rebuilt(s, &rebuilt, now, meets_share_target) {
+        let checked = self.check_rebuilt(s, &rebuilt, now, meets_share_target);
+        let rebuilt = RebuiltShare { job_generation: self.installed_generation(s), ..rebuilt };
+        match checked {
             Ok(()) => Ok(rebuilt),
             Err(reason) => Err(Refusal { reason, rebuilt: Some(Box::new(rebuilt)) }),
         }
@@ -313,9 +459,9 @@ impl<'a> Verifier<'a> {
         now: u64,
         meets_share_target: bool,
     ) -> Result<(), RejectReason> {
-        self.check_job_target(rebuilt)?;
+        self.check_job_header(s, rebuilt)?;
         if meets_share_target || rebuilt.is_block {
-            self.install_sections(s)?;
+            self.install_sections(s, rebuilt.raw_pow_hash, now)?;
         }
         self.check_share(s, rebuilt, now)?;
         if !meets_share_target {
