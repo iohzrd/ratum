@@ -221,7 +221,7 @@ impl Connection {
         };
         if let Some((what, secs)) = reason {
             debug!(
-                "Kicking client {} ({}) for {what} for more than {secs} seconds",
+                "Kicking client {} ({:?}) for {what} for more than {secs} seconds",
                 st.peer, st.username
             );
             return Err(Disconnect::Idle(what));
@@ -330,13 +330,19 @@ impl Connection {
 
     fn on_authorize(&mut self, id: &str, params: &Value) -> io::Result<()> {
         let username = params.get(0).and_then(Value::as_str).unwrap_or("NULL");
+        // Cut at a NUL, as the C gateway's copy of the username stops at one: the share
+        // message ends the username at its first NUL, so a username carrying one would make
+        // every share on it undecodable by the pool.
+        let username = username.split('\0').next().unwrap_or_default();
         let name: String = username.chars().take(MAX_USERNAME_CHARS).collect();
+        let refused: Option<String> =
+            self.gateway.config.stratum.refuses_username(username).then(|| {
+                name.chars()
+                    .map(|c| if c.is_ascii_graphic() || c == ' ' { c } else { '?' })
+                    .collect()
+            });
         self.stats().username = name;
-        if self.gateway.config.stratum.refuses_username(username) {
-            let shown: String = username
-                .chars()
-                .map(|c| if c.is_ascii_graphic() || c == ' ' { c } else { '?' })
-                .collect();
+        if let Some(shown) = refused {
             info!(
                 "Refusing authorization of \"{shown}\" from {}: stratum.require_address_username is set and the username does not begin with an address a coinbase output can pay.",
                 self.stats().peer

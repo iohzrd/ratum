@@ -92,7 +92,6 @@ impl<T: Clone + Eq + Hash> BoundedSet<T> {
         true
     }
 
-    #[cfg(test)]
     pub fn remove(&mut self, value: &T) -> bool {
         self.0.remove(value).is_some()
     }

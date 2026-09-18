@@ -23,7 +23,13 @@ struct Field {
 
 enum FieldKind {
     Text,
-    Int { min: i64, max: i64 },
+    /// A URL shown with its password redacted (`rpc::redact_url`); a redacted password
+    /// submitted back is replaced by the file's.
+    RedactedUrl,
+    Int {
+        min: i64,
+        max: i64,
+    },
     Bool,
     Password,
 }
@@ -72,41 +78,21 @@ const FIELDS: &[Field] = &[
     field!(stratum.require_address_username, "Require an address as the username", FieldKind::Bool),
     field!(bitcoind.work_update_seconds, "Job update interval", int(&WORK_UPDATE_SECONDS_RANGE)),
     // Shown and compared in its redacted form, so the page never carries the password a
-    // `user:password@` in the URL holds, and a save that returns the redacted form unchanged
-    // keeps the file's value.
+    // `user:password@` in the URL holds: a save that returns the redacted form unchanged keeps
+    // the file's value, and one that edits another part of it keeps the file's password.
     Field {
         name: "bitcoind_rpcurl",
         label: "bitcoind RPC URL",
         section: "bitcoind",
         key: "rpcurl",
-        kind: FieldKind::Text,
-        current: |c| json!(redacted_rpcurl(&c.bitcoind.rpcurl)),
+        kind: FieldKind::RedactedUrl,
+        current: |c| json!(ratum::rpc::redact_url(&c.bitcoind.rpcurl)),
     },
     field!(bitcoind.rpcuser, "bitcoind RPC user", FieldKind::Text),
     field!(bitcoind.rpcpassword, "bitcoind RPC password", FieldKind::Password),
 ];
 
 const OLD_POOL_HOST: &str = "pool_host(old)";
-
-/// What replaces the password of an RPC URL on the settings page.
-const REDACTED: &str = "***";
-
-/// `url` with the password of any `user:password@` it carries replaced by `REDACTED`. The
-/// credentials are found where the node client (`rpc::parse_url`) finds them: before the
-/// last `@` after the scheme, the password after their first `:`.
-fn redacted_rpcurl(url: &str) -> String {
-    let (scheme, rest) = match url.split_once("://") {
-        Some((scheme, rest)) => (&url[..scheme.len() + 3], rest),
-        None => ("", url),
-    };
-    let Some((credentials, host)) = rest.rsplit_once('@') else { return url.to_string() };
-    match credentials.split_once(':') {
-        Some((user, password)) if !password.is_empty() => {
-            format!("{scheme}{user}:{REDACTED}@{host}")
-        }
-        _ => url.to_string(),
-    }
-}
 
 fn shown_pool_host(cfg: &Config, doc: &Value) -> String {
     if !cfg.datum.pool_host.is_empty() {
@@ -334,6 +320,19 @@ pub fn apply(
         let current = (f.current)(cfg);
         match f.kind {
             FieldKind::Text => edit.set_if_changed(f.section, f.key, json!(text.trim()), current),
+            FieldKind::RedactedUrl => {
+                if json!(text.trim()) != current {
+                    let original = edit
+                        .doc
+                        .get(f.section)
+                        .and_then(|section| section.get(f.key))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let url = ratum::rpc::restore_redacted_password(text.trim(), &original);
+                    edit.set(f.section, f.key, json!(url));
+                }
+            }
             FieldKind::Int { min, max } => match parse_int(f.label, text, min, max) {
                 Ok(v) => edit.set_if_changed(f.section, f.key, json!(v), current),
                 Err(e) => edit.errors.push(e),
@@ -400,8 +399,9 @@ fn check_startup(running: &Config, new: &Config) -> Result<(), String> {
 /// Replaces the configuration file with `text`. A symlink at `path` is resolved and its target
 /// written, so the link is kept. The text is written to a new file beside the target, created
 /// exclusively after removing anything already at that name (so a link there is never
-/// followed) and, on unix, with the target's permission bits whatever the umask; it is synced,
-/// renamed over the target, and the directory synced so the rename is on disk.
+/// followed) and, on unix, with the target's owner and group where the process may set them
+/// (a warning names the file otherwise) and its permission bits whatever the umask; it is
+/// synced, renamed over the target, and the directory synced so the rename is on disk.
 pub fn write_file(path: &str, text: &str) -> std::io::Result<()> {
     use std::io::Write as _;
 
@@ -410,7 +410,8 @@ pub fn write_file(path: &str, text: &str) -> std::io::Result<()> {
     let mut tmp_name = target.file_name().unwrap_or_default().to_os_string();
     tmp_name.push(".new");
     let tmp = dir.join(tmp_name);
-    let permissions = std::fs::metadata(&target)?.permissions();
+    let metadata = std::fs::metadata(&target)?;
+    let permissions = metadata.permissions();
     match std::fs::remove_file(&tmp) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
         _ => {}
@@ -423,7 +424,20 @@ pub fn write_file(path: &str, text: &str) -> std::io::Result<()> {
         options.mode(permissions.mode() & 0o7777);
     }
     let written = options.open(&tmp).and_then(|mut file| {
-        // The mode given at creation is reduced by the umask; this sets it exactly.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let (uid, gid) = (metadata.uid(), metadata.gid());
+            if let Err(e) = std::os::unix::fs::fchown(&file, Some(uid), Some(gid)) {
+                log::warn!(
+                    "{}: could not keep its owner {uid} and group {gid} ({e}); the saved file \
+                     is owned by this process's user",
+                    target.display()
+                );
+            }
+        }
+        // The mode given at creation is reduced by the umask, and a change of owner can clear
+        // the set-id bits; this sets it exactly.
         #[cfg(unix)]
         file.set_permissions(permissions)?;
         file.write_all(text.as_bytes())?;
@@ -488,7 +502,7 @@ mod tests {
             let want = match f.kind {
                 FieldKind::Bool => Some("checkbox"),
                 FieldKind::Password => Some("password"),
-                FieldKind::Text | FieldKind::Int { .. } => None,
+                FieldKind::Text | FieldKind::RedactedUrl | FieldKind::Int { .. } => None,
             };
             assert_eq!(*input_type, want, "{} has the wrong input type on the page", f.name);
         }
@@ -630,15 +644,6 @@ mod tests {
 
     #[test]
     fn an_rpcurl_password_is_redacted_and_the_redacted_form_keeps_the_file_value() {
-        assert_eq!(
-            redacted_rpcurl("http://u:secret@127.0.0.1:8332"),
-            "http://u:***@127.0.0.1:8332"
-        );
-        assert_eq!(redacted_rpcurl("https://u:p:q@a@host/wallet"), "https://u:***@host/wallet");
-        assert_eq!(redacted_rpcurl("http://u@host"), "http://u@host", "no password to hide");
-        assert_eq!(redacted_rpcurl("http://127.0.0.1:8332"), "http://127.0.0.1:8332");
-        assert_eq!(redacted_rpcurl("u:secret@host:8332"), "u:***@host:8332");
-
         let file = FILE.replace("http://127.0.0.1:18443", "http://rpc:secret@127.0.0.1:18443");
         let c = Config::parse(&file).unwrap();
         let shown = form_values(&c, &Value::Null);
@@ -649,6 +654,13 @@ mod tests {
         let text = apply(&c, &file, &edited).unwrap().unwrap();
         let doc: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(doc["bitcoind"]["rpcurl"], "http://rpc:other@127.0.0.1:18443");
+        let port_only = form(&[("bitcoind_rpcurl", "http://rpc:***@127.0.0.1:18444")]);
+        let text = apply(&c, &file, &port_only).unwrap().unwrap();
+        let doc: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            doc["bitcoind"]["rpcurl"], "http://rpc:secret@127.0.0.1:18444",
+            "an edit of another part keeps the file's password"
+        );
     }
 
     #[test]

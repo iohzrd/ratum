@@ -5,15 +5,19 @@
 //! and headers, the body, and the time the request and the reply may take.
 
 use log::{debug, warn};
+use std::collections::HashMap;
 use std::io::{self, Read as _, Write as _};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// The connections one server serves at once. A connection accepted while this many are open
 /// is closed without reading from it.
 pub const MAX_CONNECTIONS: usize = 32;
+/// The connections one server serves at once from one address (`net::limit_key`), so one
+/// client cannot hold every slot. Loopback clients, a reverse proxy on the same host among
+/// them, are counted only against `MAX_CONNECTIONS`.
+pub const MAX_CONNECTIONS_PER_ADDRESS: usize = 8;
 /// The read and write timeout of every socket operation.
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 /// The time from accepting a connection to having read its whole request.
@@ -280,22 +284,57 @@ pub fn serve(
     crate::thread::spawn(name, move || accept_forever(&owned, &server.listener, max_body, &handle));
 }
 
-/// One of the `MAX_CONNECTIONS` a server serves at once, given back when dropped.
-struct ConnectionSlot(Arc<AtomicUsize>);
+/// The connections a server has open, in all and per address.
+#[derive(Default)]
+struct OpenConnections {
+    total: usize,
+    per_address: HashMap<IpAddr, usize>,
+}
+
+/// Why a connection was not given a slot.
+enum Full {
+    Server,
+    Address,
+}
+
+/// One of the `MAX_CONNECTIONS` a server serves at once, and of the
+/// `MAX_CONNECTIONS_PER_ADDRESS` its address may hold, given back when dropped.
+struct ConnectionSlot {
+    open: Arc<Mutex<OpenConnections>>,
+    address: Option<IpAddr>,
+}
 
 impl ConnectionSlot {
-    fn take(open: &Arc<AtomicUsize>) -> Option<Self> {
-        open.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-            (n < MAX_CONNECTIONS).then_some(n + 1)
-        })
-        .ok()
-        .map(|_| Self(Arc::clone(open)))
+    fn take(open: &Arc<Mutex<OpenConnections>>, peer: IpAddr) -> Result<Self, Full> {
+        let address = (!peer.to_canonical().is_loopback()).then(|| crate::net::limit_key(peer));
+        let mut counts = crate::lock(open);
+        if counts.total >= MAX_CONNECTIONS {
+            return Err(Full::Server);
+        }
+        if let Some(address) = address {
+            let from_address = counts.per_address.entry(address).or_default();
+            if *from_address >= MAX_CONNECTIONS_PER_ADDRESS {
+                return Err(Full::Address);
+            }
+            *from_address += 1;
+        }
+        counts.total += 1;
+        Ok(Self { open: Arc::clone(open), address })
     }
 }
 
 impl Drop for ConnectionSlot {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+        let mut counts = crate::lock(&self.open);
+        counts.total -= 1;
+        if let Some(address) = self.address
+            && let Some(from_address) = counts.per_address.get_mut(&address)
+        {
+            *from_address -= 1;
+            if *from_address == 0 {
+                counts.per_address.remove(&address);
+            }
+        }
     }
 }
 
@@ -328,7 +367,7 @@ fn accept_forever(
     max_body: usize,
     handle: &Arc<dyn Fn(Request) -> Reply + Send + Sync>,
 ) {
-    let open = Arc::new(AtomicUsize::new(0));
+    let open = Arc::new(Mutex::new(OpenConnections::default()));
     let mut accept_warning = IntervalWarning::default();
     let mut full_warning = IntervalWarning::default();
     let connection_thread = format!("{name}-conn");
@@ -349,12 +388,22 @@ fn accept_forever(
                 continue;
             }
         };
-        let Some(slot) = ConnectionSlot::take(&open) else {
-            full_warning.warn(format_args!(
-                "{name}: {MAX_CONNECTIONS} connections open; closed the connection from {peer}"
-            ));
-            drop(stream);
-            continue;
+        let slot = match ConnectionSlot::take(&open, peer.ip()) {
+            Ok(slot) => slot,
+            Err(full) => {
+                match full {
+                    Full::Server => full_warning.warn(format_args!(
+                        "{name}: {MAX_CONNECTIONS} connections open; closed the connection from \
+                         {peer}"
+                    )),
+                    Full::Address => full_warning.warn(format_args!(
+                        "{name}: {MAX_CONNECTIONS_PER_ADDRESS} connections open from the address \
+                         of {peer}; closed its connection"
+                    )),
+                }
+                drop(stream);
+                continue;
+            }
         };
         let handle = Arc::clone(handle);
         let thread_name = name.to_string();
@@ -581,6 +630,29 @@ fn close(mut stream: TcpStream) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_address_holds_at_most_its_share_of_the_slots_and_loopback_only_the_total() {
+        let open = Arc::new(Mutex::new(OpenConnections::default()));
+        let remote: IpAddr = "192.0.2.1".parse().unwrap();
+        let other: IpAddr = "192.0.2.2".parse().unwrap();
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        let held: Vec<ConnectionSlot> = (0..MAX_CONNECTIONS_PER_ADDRESS)
+            .map(|_| ConnectionSlot::take(&open, remote).ok().unwrap())
+            .collect();
+        assert!(matches!(ConnectionSlot::take(&open, remote), Err(Full::Address)));
+        let from_other = ConnectionSlot::take(&open, other).ok().unwrap();
+        let local: Vec<ConnectionSlot> = (MAX_CONNECTIONS_PER_ADDRESS + 1..MAX_CONNECTIONS)
+            .map(|_| ConnectionSlot::take(&open, loopback).ok().unwrap())
+            .collect();
+        assert!(matches!(ConnectionSlot::take(&open, loopback), Err(Full::Server)));
+        drop(local);
+        drop(from_other);
+        drop(held);
+        let counts = crate::lock(&open);
+        assert_eq!(counts.total, 0);
+        assert!(counts.per_address.is_empty(), "every slot is given back");
+    }
 
     #[test]
     fn params_decode() {

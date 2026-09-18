@@ -88,8 +88,11 @@ pub struct RebuiltShare {
     pub tag_secondary: String,
     /// The header version without the version 2 flag, which `VERSION_ROLLING_MASK` compares.
     pub version: u32,
-    /// SHA-256d of the coinbase section the share was rebuilt on (`coinb1 || coinb2`), which
-    /// keys the node's verdict on the job's block with that coinbase.
+    /// SHA-256d of the coinbase section the share was rebuilt on (`coinb1 || coinb2`) and of
+    /// whether the share is subsidy-only, which keys the node's verdict on the job's block with
+    /// that coinbase. A subsidy-only share's block holds the coinbase alone and a pooled
+    /// share's the job's transactions too, so the same coinbase bytes make two blocks, and the
+    /// verdict on one is not the verdict on the other.
     pub coinbase_digest: [u8; 32],
     /// The generation of the job installed in the share's slot when the share was rebuilt on
     /// it; none when the share's job was not installed (a share refused before its sections
@@ -193,6 +196,10 @@ struct NextBlock {
     mintime: Option<u64>,
 }
 
+/// How many bits easier than the template's target a job on another parent may name for its
+/// block to be submitted (`Verifier::relayable`): 2, the fourfold easing one retarget allows.
+const MAX_RELAY_TARGET_SHIFT: u32 = 2;
+
 /// Whether the chain lets a block carry the minimum difficulty when its time is far enough past
 /// its parent's (testnet and testnet4). There the bits a block requires depend on its own
 /// time, so a job's bits are checked by the node's validation of the job, not against the
@@ -269,6 +276,30 @@ impl<'a> Verifier<'a> {
 
     fn next_target(&self) -> Option<target::Target> {
         self.next.and_then(|n| target::bits_to_target(n.bits))
+    }
+
+    /// Whether a refused share that meets its job's own bits is submitted to the node, which
+    /// then decides it. The bits are the gateway's, and `check_job_header` compares them with
+    /// the template's only for a job on the template's parent, so on another parent they could
+    /// name any target and make every share a block to submit. There the job's target may be
+    /// at most `MAX_RELAY_TARGET_SHIFT` bits easier than the template's: one retarget eases a
+    /// target at most fourfold, which covers a job on the tip the template replaced. On
+    /// testnet and testnet4, whose blocks may carry the minimum difficulty, and while the pool
+    /// holds no template, the bits are not compared.
+    pub fn relayable(&self, rebuilt: &RebuiltShare) -> bool {
+        if !rebuilt.meets_own_bits() {
+            return false;
+        }
+        if allows_min_difficulty_blocks(self.policy.chain) {
+            return true;
+        }
+        if let Some(next) = self.next_on(rebuilt.prev_hash) {
+            return rebuilt.job_bits == next.bits;
+        }
+        match (self.next_target(), target::bits_to_target(rebuilt.job_bits)) {
+            (Some(next), Some(own)) => own <= target::shl_saturating(&next, MAX_RELAY_TARGET_SHIFT),
+            _ => true,
+        }
     }
 
     /// The template, when it describes the block a job on `prev_hash` builds: its parent is

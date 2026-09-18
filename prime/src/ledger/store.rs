@@ -23,6 +23,11 @@ const META_CHAIN: &str = "chain";
 const META_CUMULATIVE_WORK: &str = "cumulative_work";
 
 const SHARE_PREFIX_LEN: usize = 2 * size_of::<u64>() + HASH_SIZE;
+/// The most rows one retention call removes. It runs under the ledger lock as each share is
+/// recorded, so a surplus of millions of rows (retention set or lowered on a large ledger) is
+/// removed over successive shares rather than in one transaction that holds every share
+/// waiting and a vector of every surplus row's key.
+const MAX_RETAINED_PER_CALL: u64 = 4096;
 
 fn pack(share: &Share) -> Vec<u8> {
     let mut v =
@@ -230,8 +235,8 @@ impl Store {
     /// newest `keep_newest` hashes accepted within `ACCEPTED_HASH_RETENTION_SECS`, so those
     /// rows must stay for a resend of their share to be refused after a restart. Disk cannot
     /// be bounded below what these need, so the configured figure is a request and both floors
-    /// override it. The rows to remove are found in a read transaction, so a call that removes
-    /// none commits nothing.
+    /// override it. At most `MAX_RETAINED_PER_CALL` rows go per call. The rows to remove are
+    /// found in a read transaction, so a call that removes none commits nothing.
     pub(super) fn retain(
         &self,
         floor: u64,
@@ -243,7 +248,7 @@ impl Store {
             let r = self.db.begin_read().db()?;
             let shares = r.open_table(SHARES).db()?;
             let count = shares.len().db()?;
-            let surplus = count.saturating_sub(configured.max(floor));
+            let surplus = count.saturating_sub(configured.max(floor)).min(MAX_RETAINED_PER_CALL);
             let recent_from = count.saturating_sub(keep_newest as u64);
             let mut oldest = Vec::new();
             for (position, entry) in shares.iter().db()?.take(surplus as usize).enumerate() {

@@ -31,9 +31,12 @@ struct SubmitRequest {
 }
 
 impl Connection {
+    /// The difficulty the job `r` names was served at; none for a quickdiff id while no
+    /// quickdiff notify has been sent, whose value is then 0 (the C gateway's quickdiff target
+    /// starts at zero, which no share meets).
     fn served_diff(&self, r: NotifyId) -> Option<u64> {
         if r.prefix == NotifyPrefix::Quickdiff {
-            Some(self.vardiff.quickdiff_value())
+            Some(self.vardiff.quickdiff_value()).filter(|&diff| diff > 0)
         } else {
             self.job_diffs[r.slot as usize]
         }
@@ -123,7 +126,10 @@ impl Connection {
             .ok_or(UNKNOWN_WORK)?;
         let hash = job.raw_pow_hash(&header);
         let is_block = job.abw.is_none() && target::meets_target(&hash, &job.block_target);
-        let block = is_block.then(|| (hex::encode(hash), header.serialize()));
+        // A share resubmitted after its block was found is refused as a duplicate below and
+        // neither submitted to the nodes nor sent to the pool as a block again.
+        let first_find = is_block && self.gateway.first_find(hash);
+        let block = first_find.then(|| (hex::encode(hash), header.serialize()));
         if let Some((display, _)) = &block {
             for _ in 0..BLOCK_FOUND_LOG_LINES {
                 warn!("******** BLOCK FOUND - {display} ********");
@@ -132,9 +138,10 @@ impl Connection {
 
         // A block is queued for the pool before the node submission, which waits on
         // submitblock and preciousblock, as the C gateway calls `datum_protocol_pow_submit`
-        // before `assembleBlockAndSubmit`. A block is queued whatever the share checks say.
+        // before `assembleBlockAndSubmit`. A block is queued whatever the share checks say,
+        // the first time it is found.
         let checked = self.check_share(job, &hash, target_byte, &req.miner_username);
-        if job.is_datum_job && (is_block || checked.is_ok()) {
+        if job.is_datum_job && (first_find || checked.is_ok()) {
             let wire_username = self.credited_username(req, &hash);
             self.gateway.pool.queue_share(QueuedShare {
                 job: Arc::clone(job),

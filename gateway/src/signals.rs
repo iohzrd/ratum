@@ -23,6 +23,11 @@ pub fn install(gateway: Arc<Gateway>) {
         return;
     }
     let [read_fd, write_fd] = fds;
+    // Close-on-exec, so the restart a settings save performs (an exec) does not carry both
+    // ends into the new process, which opens a pipe of its own.
+    for fd in fds {
+        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
     PIPE_WRITE.store(write_fd, Ordering::Relaxed);
     let installed = unsafe {
         libc::signal(libc::SIGUSR1, on_usr1 as extern "C" fn(libc::c_int) as libc::sighandler_t)

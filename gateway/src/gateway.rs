@@ -9,8 +9,9 @@ use log::warn;
 use ratum::latest::Latest;
 use ratum::mining_info::LatestMiningInfo;
 use ratum::rpc;
-use std::sync::Arc;
+use std::collections::VecDeque;
 use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Mutex};
 
 pub struct Gateway {
     pub config: Config,
@@ -28,7 +29,13 @@ pub struct Gateway {
     /// while work is served.
     pub work_error: Latest<Option<String>>,
     pub stratum: stratum::State,
+    /// The hashes of the newest blocks miners found, so a share resubmitted after it was found
+    /// is not submitted to the nodes, or sent to the pool as a block, again.
+    found_blocks: Mutex<VecDeque<[u8; 32]>>,
 }
+
+/// The block hashes `Gateway::found_blocks` holds.
+const MAX_FOUND_BLOCKS: usize = 64;
 
 impl Gateway {
     pub fn new(config: Config, node: rpc::Client) -> Arc<Self> {
@@ -53,7 +60,21 @@ impl Gateway {
             mining_info: LatestMiningInfo::default(),
             template_waker: TemplateWaker::default(),
             work_error: Latest::default(),
+            found_blocks: Mutex::new(VecDeque::with_capacity(MAX_FOUND_BLOCKS)),
         })
+    }
+
+    /// Records a block found under `hash`; false when it was found already.
+    pub fn first_find(&self, hash: [u8; 32]) -> bool {
+        let mut found = ratum::lock(&self.found_blocks);
+        if found.contains(&hash) {
+            return false;
+        }
+        if found.len() >= MAX_FOUND_BLOCKS {
+            found.pop_front();
+        }
+        found.push_back(hash);
+        true
     }
 
     /// Serves the job under `kind`'s coinbase and wakes every connection to send it. Returns

@@ -75,7 +75,9 @@ impl Verifier<'_> {
             unpaid_outputs,
             tag_secondary,
             version: s.version & !ratum::header::V2_FLAG,
-            coinbase_digest: bitcoin::sha256d(&[&cb.coinb1[..], &cb.coinb2[..]].concat()),
+            coinbase_digest: bitcoin::sha256d(
+                &[&cb.coinb1[..], &cb.coinb2[..], &[u8::from(s.subsidy_only)]].concat(),
+            ),
             job_generation: None,
         })
     }
@@ -91,8 +93,11 @@ impl Verifier<'_> {
         // A split pays each identity its part of the value it was dictated for. Named by a job
         // on another parent, or by a job whose coinbase carries less than that value, its
         // outputs would pay the identities the coinbase keeps more than their part of the
-        // coinbase, with the rest reaching the pool's script scaled down as owed.
-        if recorded.is_some_and(|d| d.prev_hash != job.prev_hash || d.value > job.coinbase_value) {
+        // coinbase, with the rest reaching the pool's script scaled down as owed; by a job whose
+        // coinbase carries more, the difference would reach the pool's script with no owed
+        // record naming it. A gateway uses a split only on the value it requested it for (the C
+        // gateway compares the response's value with its request's), so the values are equal.
+        if recorded.is_some_and(|d| d.prev_hash != job.prev_hash || d.value != job.coinbase_value) {
             return Err(RejectReason::BadCoinbaserId);
         }
         let dictated: &[DictatedOutput] = recorded.map_or(&[], |d| &d.outputs);

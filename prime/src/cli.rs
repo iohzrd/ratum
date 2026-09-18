@@ -149,11 +149,17 @@ pub fn load() -> Options {
             "--rpc-pass puts the node's password in this process's command line, where any \
              local user can read it; a configuration file and --rpc-cookie do not"
         );
-        if options.rpc_cookie.is_some() {
-            warn!(
+        let user_set = options.rpc_user.as_deref().is_some_and(|user| !user.is_empty());
+        match (&options.rpc_cookie, user_set) {
+            (Some(_), true) => warn!(
                 "--rpc-cookie was given as well, but --rpc-user is set, so the user and \
                  password are the credential being used; drop --rpc-user to read the cookie"
-            );
+            ),
+            (Some(_), false) => warn!(
+                "--rpc-cookie was given as well, and no --rpc-user is set, so the cookie is the \
+                 credential being used and --rpc-pass is ignored"
+            ),
+            (None, _) => {}
         }
     }
     options

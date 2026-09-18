@@ -110,6 +110,10 @@ enum JobVerdict {
     /// The job cannot be credited: its transactions did not arrive or are not the job's, or
     /// the node refused its block.
     Invalid(RejectReason),
+    /// The node gave no verdict on the job's block, or found its parent no longer the tip:
+    /// the share is refused for the reason, and is relayed with the job's transactions if it
+    /// is a block, so the node decides it.
+    Unchecked(RejectReason, Arc<[Arc<[u8]>]>),
 }
 
 enum Txns {
@@ -147,6 +151,14 @@ fn block_check_from(
     };
     let (reject, whole_job) = match reason.as_str() {
         "duplicate" => return (BlockCheck::Valid { version }, true),
+        // The node holds the block's header but has not yet validated its transactions, as
+        // while it fetches a block the gateway submitted to its own node: asked again later.
+        "duplicate-inconclusive" => {
+            return (
+                BlockCheck::Unavailable { retry_at: now.saturating_add(PROPOSAL_RETRY_SECS) },
+                true,
+            );
+        }
         "inconclusive-not-best-prevblk" => (RejectReason::StaleBlock, true),
         "bad-diffbits" => (RejectReason::BadTarget, true),
         "bad-header-height" | "bad-cb-height" => (RejectReason::HeaderFieldMismatch, true),
@@ -212,7 +224,19 @@ impl Connection<'_> {
         verified: Result<RebuiltShare, Refusal>,
         received_at: u64,
     ) -> io::Result<()> {
-        match self.job_verdict(&s, &verified, received_at)? {
+        let verdict = match self.job_verdict(&s, &verified, received_at) {
+            Ok(verdict) => verdict,
+            Err(e) => {
+                // The write of the transaction request failed and the connection ends with the
+                // share unanswered: its hash is released, as a held share's is, so the gateway
+                // can replay it on its next connection.
+                if let Ok(rebuilt) = &verified {
+                    ratum::lock(&self.server.accepted_hashes).remove(&rebuilt.block_hash);
+                }
+                return Err(e);
+            }
+        };
+        match verdict {
             JobVerdict::Pending(generation) if self.held.len() < MAX_HELD_SHARES => {
                 self.held.push(HeldShare { s, verified, generation, received_at });
                 Ok(())
@@ -238,7 +262,7 @@ impl Connection<'_> {
         let (rebuilt, credited) = match verified {
             Ok(rebuilt) => (rebuilt, true),
             Err(Refusal { reason, rebuilt: Some(rebuilt) })
-                if *reason != RejectReason::DuplicateWork && rebuilt.meets_own_bits() =>
+                if *reason != RejectReason::DuplicateWork && self.verifier.relayable(rebuilt) =>
             {
                 (rebuilt.as_ref(), false)
             }
@@ -272,8 +296,13 @@ impl Connection<'_> {
                 JobVerdict::Invalid(RejectReason::BadVersion)
             }
             BlockCheck::Valid { .. } => JobVerdict::Valid(txns),
+            // "inconclusive-not-best-prevblk": the tip moved while the share waited for its
+            // job's transactions, and a block on the replaced tip may still win its height.
+            BlockCheck::Invalid(RejectReason::StaleBlock) => {
+                JobVerdict::Unchecked(RejectReason::StaleBlock, txns)
+            }
             BlockCheck::Invalid(reason) => JobVerdict::Invalid(reason),
-            BlockCheck::Unavailable { .. } => JobVerdict::Invalid(RejectReason::Other),
+            BlockCheck::Unavailable { .. } => JobVerdict::Unchecked(RejectReason::Other, txns),
         })
     }
 
@@ -364,12 +393,15 @@ impl Connection<'_> {
                 self.on_accepted(s, &rebuilt, &txns, received_at)?
             }
             (Ok(rebuilt), verdict) => {
-                let reason = match verdict {
-                    JobVerdict::Invalid(reason) => reason,
-                    _ => RejectReason::Other,
+                let (reason, txns) = match verdict {
+                    JobVerdict::Invalid(reason) => (reason, None),
+                    JobVerdict::Unchecked(reason, txns) => (reason, Some(txns)),
+                    _ => (RejectReason::Other, None),
                 };
                 ratum::lock(&self.server.accepted_hashes).remove(&rebuilt.block_hash);
-                self.on_refused(s, Refusal { reason, rebuilt: Some(Box::new(rebuilt)) }, None)?
+                let relay = txns.as_deref().filter(|_| rebuilt.meets_own_bits());
+                let refusal = Refusal { reason, rebuilt: Some(Box::new(rebuilt)) };
+                self.on_refused(s, refusal, relay.map(|txns| (txns, received_at)))?
             }
             (Err(refusal), JobVerdict::RelayOnly(txns)) => {
                 self.on_refused(s, refusal, Some((&txns, received_at)))?
@@ -410,28 +442,38 @@ impl Connection<'_> {
                 "[{peer}]   !! gateway flagged a block but the hash does not meet its job's bits"
             );
         }
-        if rebuilt.is_block_candidate() {
-            self.send_abw_receipt(s, rebuilt)?;
-        }
+        // The block is relayed and the share credited before the receipt is written, so a
+        // failed write to the gateway, which ends the connection, loses neither: under an
+        // anti-block-withholding assignment the pool is the only submitter of the block, and a
+        // replay of a share whose hash stayed claimed would be refused as duplicate work.
         if rebuilt.meets_own_bits() {
             self.relay_and_record(s, rebuilt, txns, now);
         }
         if let Some(v3) = &mut self.v3 {
             v3.abw.note_share();
         }
-        if self.refuse_if_unpayable(&s.username) {
-            let verdict = ShareVerdict::Rejected(RejectReason::BadUsername);
-            return Ok(ShareOutcome { verdict, raw_pow_hash });
+        let verdict = self.credit(s, rebuilt, now);
+        if rebuilt.is_block_candidate() {
+            self.send_abw_receipt(s, rebuilt)?;
         }
+        Ok(ShareOutcome { verdict, raw_pow_hash })
+    }
+
+    /// Records the share's credit, or refuses it when its identity cannot be paid or the ledger
+    /// cannot record it.
+    fn credit(&mut self, s: &PowSubmit, rebuilt: &RebuiltShare, now: u64) -> ShareVerdict {
+        if self.refuse_if_unpayable(&s.username) {
+            return ShareVerdict::Rejected(RejectReason::BadUsername);
+        }
+        let peer = self.peer;
         if let Err(e) = accounting::credit_share(self.server, peer, &s.username, rebuilt, now) {
             error!(
                 "[{peer}]   !! could not record the share to the ledger ({e}); it is not \
                  credited, and is answered as refused"
             );
-            let verdict = ShareVerdict::Rejected(RejectReason::Other);
-            return Ok(ShareOutcome { verdict, raw_pow_hash });
+            return ShareVerdict::Rejected(RejectReason::Other);
         }
-        Ok(ShareOutcome { verdict: ShareVerdict::Accepted, raw_pow_hash })
+        ShareVerdict::Accepted
     }
 
     fn refuse_if_unpayable(&mut self, username: &str) -> bool {
@@ -477,12 +519,25 @@ impl Connection<'_> {
         txns: &[Arc<[u8]>],
         now: u64,
     ) {
+        if !ratum::lock(&self.server.relayed_blocks).insert(rebuilt.block_hash) {
+            debug!(
+                "[{}]      block {} was already submitted to the node; not submitted again",
+                self.peer,
+                hex::encode(rebuilt.block_hash)
+            );
+            return;
+        }
         match relay::submit(self.peer, &self.server.node, s.job_id, rebuilt, txns) {
             Relayed::Rejected(reason) => warn!(
                 "[{}]      the block is not recorded as found: the node refused it ({reason})",
                 self.peer
             ),
-            Relayed::Accepted | Relayed::Unknown => {
+            Relayed::Accepted => {
+                accounting::record_block(self.server, self.peer, &s.username, rebuilt, now);
+            }
+            Relayed::Unknown => {
+                // The node did not answer: the share sent again is submitted again.
+                ratum::lock(&self.server.relayed_blocks).remove(&rebuilt.block_hash);
                 accounting::record_block(self.server, self.peer, &s.username, rebuilt, now);
             }
         }
@@ -699,6 +754,10 @@ mod tests {
             (BlockCheck::Invalid(RejectReason::BadVersion), false)
         );
         assert_eq!(check("bad-blk-weight"), (BlockCheck::Invalid(RejectReason::Other), true));
+        assert_eq!(
+            check("duplicate-inconclusive"),
+            (BlockCheck::Unavailable { retry_at: 100 + PROPOSAL_RETRY_SECS }, true)
+        );
         let unanswered = block_check_from(Err(ratum::rpc::Error::BadResponse("x".into())), 7, 100);
         assert_eq!(
             unanswered,

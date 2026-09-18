@@ -224,6 +224,16 @@ impl JobTable {
         true
     }
 
+    /// Marks every installed job on a previous block other than `prev_hash` as building on a
+    /// stale previous block, for a tip no job can be built on yet.
+    pub fn mark_stale_off(&self, prev_hash: [u8; 32]) {
+        for other in lock(&self.0).slots.iter().flatten() {
+            if other.template.prev_hash != prev_hash {
+                other.stale_prevblock.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
     /// The job installed in the slot, or none while the slot is empty or out of range.
     pub fn at(&self, slot: u8) -> Option<Arc<Job>> {
         lock(&self.0).slots.get(usize::from(slot))?.clone()

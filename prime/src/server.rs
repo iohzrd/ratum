@@ -2,6 +2,7 @@
 //! the node and what it last reported, and the sessions saved for resume.
 
 use crate::accounting::{ACCEPTED_HASH_RETENTION_SECS, AcceptedShareHashes, MAX_ACCEPTED_HASHES};
+use crate::bounded::BoundedSet;
 use crate::ledger::Ledger;
 use crate::ledger::blocks::BlockRecords;
 use crate::node::NodeState;
@@ -21,6 +22,9 @@ use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// The block hashes `Server::relayed_blocks` holds.
+const MAX_RELAYED_BLOCKS: usize = 1024;
+
 pub struct Server {
     pub settings: Settings,
     pub pool_keys: KeyPairs,
@@ -36,6 +40,9 @@ pub struct Server {
     /// The open connections from each address, which `--max-connections-per-ip` bounds.
     pub open_per_ip: Mutex<HashMap<IpAddr, usize>>,
     pub txn_cache: Mutex<TxnCache>,
+    /// The hashes of the blocks most recently submitted to the node, so a share sent again,
+    /// on any connection, is not submitted again.
+    pub relayed_blocks: Mutex<BoundedSet<[u8; 32]>>,
 }
 
 impl Server {
@@ -68,6 +75,7 @@ impl Server {
             open_connections: AtomicUsize::new(0),
             open_per_ip: Mutex::new(HashMap::new()),
             txn_cache: Mutex::new(TxnCache::default()),
+            relayed_blocks: Mutex::new(BoundedSet::new(MAX_RELAYED_BLOCKS)),
         })
     }
 

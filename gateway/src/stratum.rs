@@ -15,7 +15,7 @@ use ratum::lock;
 use std::collections::HashMap;
 use std::io;
 use std::net::TcpListener;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -85,7 +85,35 @@ pub struct State {
     clients: Mutex<HashMap<u64, Arc<ClientEntry>>>,
     seen_share_hashes: Mutex<SeenShareHashes>,
     next_unique_id: AtomicU64,
+    /// The connections accepted whose thread has not ended, which `stratum.max_clients`
+    /// bounds: counted at acceptance, before the thread registers the connection in
+    /// `clients`, so a burst of connections accepted faster than their threads register
+    /// cannot pass the bound.
+    accepted: AtomicUsize,
     pub listening: AtomicBool,
+}
+
+/// One accepted connection counted in `State::accepted`, counted back when dropped: when the
+/// connection's thread ends, or with the thread's closure when the thread cannot start.
+struct AcceptedSlot(Arc<Gateway>);
+
+impl AcceptedSlot {
+    fn take(gateway: &Arc<Gateway>, max_clients: usize) -> Option<Self> {
+        gateway
+            .stratum
+            .accepted
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < max_clients).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| Self(Arc::clone(gateway)))
+    }
+}
+
+impl Drop for AcceptedSlot {
+    fn drop(&mut self) {
+        self.0.stratum.accepted.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl State {
@@ -96,6 +124,7 @@ impl State {
             clients: Mutex::new(HashMap::new()),
             seen_share_hashes: Mutex::new(seen_share_hashes),
             next_unique_id: AtomicU64::new(1),
+            accepted: AtomicUsize::new(0),
             listening: AtomicBool::new(false),
         }
     }
@@ -105,10 +134,6 @@ impl State {
         for c in lock(&self.clients).values() {
             c.wake();
         }
-    }
-
-    pub fn connection_count(&self) -> usize {
-        lock(&self.clients).len()
     }
 
     pub fn summary(&self) -> ClientsSummary {
@@ -222,12 +247,13 @@ fn listen(gateway: Arc<Gateway>) -> io::Result<()> {
             }
             continue;
         }
-        if gateway.stratum.connection_count() >= s.max_clients {
+        let Some(slot) = AcceptedSlot::take(&gateway, s.max_clients) else {
             debug!("refusing a connection: {} clients connected", s.max_clients);
             continue;
-        }
+        };
         let gateway = Arc::clone(&gateway);
         ratum::thread::spawn_or_warn("stratum-client", move || {
+            let _slot = slot;
             match Connection::run(gateway, stream) {
                 Ok(()) | Err(Disconnect::Io(_) | Disconnect::Killed | Disconnect::Idle(_)) => {}
                 Err(e @ Disconnect::Protocol(_)) => info!("Stratum client connection closed: {e}"),

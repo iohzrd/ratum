@@ -56,6 +56,8 @@ pub(super) enum SessionError {
     ShareAckTimeout(Duration),
     #[error("could not resolve {0}")]
     Resolve(String),
+    #[error("malformed pool configuration: {0}")]
+    BadConfig(String),
 }
 
 struct Session<'a> {
@@ -222,7 +224,7 @@ impl<'a> Session<'a> {
                     error!("pool configuration was not signed; ignored");
                     return Ok(());
                 }
-                self.on_config_message(plain);
+                self.on_config_message(plain)?;
             }
             Some(server_subcmd::MIGRATION) => {
                 if !header.is_signed {
@@ -302,19 +304,15 @@ impl<'a> Session<'a> {
         publish::on_coinbaser(self.gateway, &waiting, split);
     }
 
-    fn on_config_message(&mut self, plain: &[u8]) {
-        let c = match ClientConfig::decode(plain) {
-            Ok(c) => c,
-            Err(e) => {
-                error!("malformed pool configuration ({e}); ignored");
-                return;
-            }
-        };
+    /// A configuration that does not decode ends the session, which then reconnects: without
+    /// one the session serves no pooled work, and the pool's keepalives would hold it open.
+    fn on_config_message(&mut self, plain: &[u8]) -> Result<(), SessionError> {
+        let c = ClientConfig::decode(plain).map_err(|e| SessionError::BadConfig(e.to_string()))?;
         match (c.v3, self.gateway.config.datum.protocol_v3) {
             (Some(v3), true) => *self.resume_token = Some(v3.resume_token),
             (Some(_), false) => {
                 error!("pool answered the version 1 hello with a version 3 configuration; ignored");
-                return;
+                return Ok(());
             }
             (None, true) => warn!(
                 "pool responded to the version 3 hello with a version 1 configuration; this \
@@ -323,6 +321,7 @@ impl<'a> Session<'a> {
             (None, false) => {}
         }
         self.on_config(with_rounded_min_difficulty(c));
+        Ok(())
     }
 
     fn on_config(&self, config: ClientConfig) {

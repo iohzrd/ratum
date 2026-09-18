@@ -74,7 +74,7 @@ impl Poller {
                 work_error.set(Some("Could not fetch new template!".into()));
                 error!(
                     "Could not fetch new template from {}! ({e})",
-                    gateway.config.bitcoind.rpcurl
+                    ratum::rpc::redact_url(&gateway.config.bitcoind.rpcurl)
                 );
                 return None;
             }
@@ -205,6 +205,14 @@ pub fn run(gateway: &Arc<Gateway>) {
                 continue;
             }
             Action::Build { new_block } => {
+                // A tip no job was served on (the anti-block-withholding assignment was awaited
+                // when it arrived) is announced as a new block when work is first built on it,
+                // rather than as a job update of a tip the miners were never sent.
+                let unserved_tip = gateway
+                    .jobs
+                    .current()
+                    .is_none_or(|p| p.job.template.prev_hash != template.prev_hash);
+                let new_block = new_block || unserved_tip;
                 let t = Arc::new(template);
                 info!(
                     "Updating {} stratum job for block {}: {:.8} BTC, {} txns, {} bytes",

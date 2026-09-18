@@ -115,12 +115,18 @@ fn read(path: &Path) -> io::Result<VecDeque<HashrateSample>> {
 }
 
 /// Writes `data` to a file beside `path` and renames it over `path`, so a reader of `path`
-/// sees either the previous samples or the new ones, never half a file.
+/// sees either the previous samples or the new ones, never half a file. The file's data is
+/// flushed to disk before the rename, so a power loss after the rename cannot leave `path`
+/// naming a file whose data was not written.
 fn write_replacing(path: &Path, data: &[u8]) -> io::Result<()> {
+    use std::io::Write as _;
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
-    std::fs::write(&tmp, data)?;
+    let mut file = std::fs::File::create(&tmp)?;
+    file.write_all(data)?;
+    file.sync_all()?;
+    drop(file);
     std::fs::rename(&tmp, path)
 }
 

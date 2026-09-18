@@ -300,3 +300,27 @@ fn a_testnet_job_may_carry_bits_other_than_the_templates() {
         "a block far enough past its parent may carry the minimum difficulty there"
     );
 }
+
+#[test]
+fn a_refused_block_is_relayed_only_on_bits_the_template_allows() {
+    let (mut v, s) = setup();
+    let job = s.job.clone().unwrap();
+    let rebuilt = v.rebuild_checked_ignoring_target(&s, None, NOW).unwrap();
+    assert!(rebuilt.meets_own_bits());
+    assert!(v.relayable(&rebuilt), "no template: the node decides");
+
+    v.set_template(Some(template(job.prev_hash, NBITS, job.height, NOW - 60)));
+    assert!(v.relayable(&rebuilt), "the template's own bits");
+    v.set_template(Some(template(job.prev_hash, HARD_NBITS, job.height, NOW - 60)));
+    assert!(!v.relayable(&rebuilt), "on the template's parent the bits must be its");
+
+    v.set_template(Some(template([0x11; 32], NBITS, job.height + 1, NOW - 60)));
+    assert!(v.relayable(&rebuilt), "another parent, a target no easier than the template's");
+    v.set_template(Some(template([0x11; 32], HARD_NBITS, job.height + 1, NOW - 60)));
+    assert!(!v.relayable(&rebuilt), "another parent, a target far easier than the template's");
+
+    let testnet = SharePolicy { chain: Some(rpc::Chain::Testnet4), ..policy() };
+    let mut v = Verifier::new(&testnet);
+    v.set_template(Some(template([0x11; 32], HARD_NBITS, job.height + 1, NOW - 60)));
+    assert!(v.relayable(&rebuilt), "a testnet block may carry the minimum difficulty");
+}

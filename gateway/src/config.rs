@@ -171,6 +171,9 @@ pub struct MiningConfig {
     pub coinbase_tag_secondary: String,
     pub coinbase_unique_id: u32,
     pub save_submitblocks_dir: String,
+    /// C keys with no effect here, read so a set value is reported at startup.
+    pub allow_hasher_time_rolling: Option<bool>,
+    pub abw_verify_all_shares_on_disclosure: Option<bool>,
 }
 
 impl Default for MiningConfig {
@@ -181,6 +184,8 @@ impl Default for MiningConfig {
             coinbase_tag_secondary: String::new(),
             coinbase_unique_id: 4242,
             save_submitblocks_dir: String::new(),
+            allow_hasher_time_rolling: None,
+            abw_verify_all_shares_on_disclosure: None,
         }
     }
 }
@@ -259,6 +264,8 @@ pub struct DatumConfig {
     pub pooled_mining_only: bool,
     pub protocol_global_timeout: u64,
     pub protocol_v3: bool,
+    /// A C key with no effect here, read so a set value is reported at startup.
+    pub migration_max_seconds: Option<i64>,
 }
 
 impl Default for DatumConfig {
@@ -275,6 +282,7 @@ impl Default for DatumConfig {
             pooled_mining_only: true,
             protocol_global_timeout: 60,
             protocol_v3: true,
+            migration_max_seconds: None,
         }
     }
 }
@@ -537,6 +545,15 @@ impl Config {
         }
         if self.datum.always_pay_self.is_some() {
             self.note_warning("datum.always_pay_self has no effect: the coinbase always pays the pool script the split leaves");
+        }
+        if self.mining.allow_hasher_time_rolling == Some(true) {
+            self.note_warning("mining.allow_hasher_time_rolling has no effect: jobs never set the time-offset flag, so hashers do not roll the block time");
+        }
+        if self.mining.abw_verify_all_shares_on_disclosure == Some(true) {
+            self.note_warning("mining.abw_verify_all_shares_on_disclosure has no effect: this gateway retains no anti-block-withholding proofs and does not audit the pool's reveals (the pool relays every block)");
+        }
+        if self.datum.migration_max_seconds.is_some_and(|secs| secs != 0) {
+            self.note_warning("datum.migration_max_seconds has no effect: a migration request from the pool is logged and not followed");
         }
         Ok(())
     }

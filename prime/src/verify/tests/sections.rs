@@ -346,3 +346,22 @@ fn a_job_whose_parent_the_node_never_reports_is_evicted() {
     v.set_tip(Some([0x12; 32]), NOW + jobs::UNSEEN_PARENT_SECS + 1);
     assert!(v.job(s.job_id, generation).is_none(), "evicted once it has not in time");
 }
+
+#[test]
+fn a_connection_holds_the_transactions_of_its_newest_jobs_only() {
+    let (mut v, s) = setup();
+    let on_slot = |slot: u8| PowSubmit { job_id: slot, ..s.clone() };
+    for slot in 0..6u8 {
+        v.install_sections(&on_slot(slot), [slot; 32], NOW).unwrap();
+        let generation = v.installed_generation(&on_slot(slot)).unwrap();
+        let none: std::sync::Arc<[std::sync::Arc<[u8]>]> = std::sync::Arc::from(Vec::new());
+        assert!(v.set_job_txns(slot, generation, crate::verify::JobTxns::Held(none)));
+    }
+    let holding: Vec<u8> = (0..6u8)
+        .filter(|&slot| {
+            let generation = v.installed_generation(&on_slot(slot)).unwrap();
+            matches!(v.job_txns(slot, generation), Some(crate::verify::JobTxns::Held(_)))
+        })
+        .collect();
+    assert_eq!(holding, vec![2, 3, 4, 5], "the four newest jobs keep theirs");
+}

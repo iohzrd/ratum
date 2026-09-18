@@ -1,6 +1,6 @@
 //! HTTP Basic authentication against `api.admin_password`, compared over the whole string rather
 //! than returning at the first byte that differs, with a limit on the failed attempts one remote
-//! address may make.
+//! address may make: an IPv4 address, or an IPv6 /64 prefix (`net::limit_key`).
 
 use super::Context;
 use base64::Engine as _;
@@ -98,7 +98,7 @@ pub(super) fn authorized(ctx: &Context, req: &Request) -> Result<bool, Reply> {
         return Ok(false);
     }
     let Some(value) = http::header_value(req, "Authorization") else { return Ok(false) };
-    let ip = req.peer.ip().to_canonical();
+    let ip = ratum::net::limit_key(req.peer.ip());
     ctx.failed_logins
         .check(ip, Instant::now(), || basic_password_matches(&value, password))
         .map_err(too_many_failures)

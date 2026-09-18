@@ -54,11 +54,13 @@ ignored. `RUST_LOG` overrides `logger.log_level_console`.
   prompted for `api.admin_password`. Authentication is HTTP Basic, not Digest: keep the API
   behind TLS or on a private interface. `/cmd` takes form fields with the page's token and is
   refused without an admin password. After 10 failed Basic authentication attempts within 60
-  seconds from one address, a request from that address carrying credentials is answered 429
+  seconds from one address (an IPv4 address, or an IPv6 /64 prefix), a request from that
+  address carrying credentials is answered 429
   until the 60 seconds end, without the password being compared. Every admin reply carries
   `X-Frame-Options: DENY` and `Content-Security-Policy: frame-ancestors 'none'`.
-- The API and miner lookup ports each serve at most 32 connections at once and one request per
-  connection. A request must arrive within 10 seconds, with at most 16 KiB and 100 headers in
+- The API and miner lookup ports each serve at most 32 connections at once, 8 of them from one
+  address (an IPv4 address, or an IPv6 /64 prefix; loopback clients, a reverse proxy on the same
+  host among them, count only against the 32), and one request per connection. A request must arrive within 10 seconds, with at most 16 KiB and 100 headers in
   its request line and headers, and a body of at most 1 MiB on the API port and none on the
   miner lookup port (413 otherwise, before any body is read); chunked bodies are refused
   (501).
@@ -148,8 +150,8 @@ ignored. `RUST_LOG` overrides `logger.log_level_console`.
 - After the handshake a frame from the pool that is neither channel-encrypted nor sealed ends
   the session, which then reconnects; the C gateway processes it, which lets anyone able to
   write to the connection send an unauthenticated coinbaser split. The pool's coinbase tag is
-  cut at its first NUL byte, as the C gateway's use of it is, and a tag that is not UTF-8 ends
-  the session.
+  cut at its first NUL byte, as the C gateway's use of it is, and a tag that is not UTF-8, like
+  any configuration that does not decode, ends the session.
 - A transaction request (0x50 0x11) that names one index twice is answered bad-request, and a
   transaction reply that would not fit in one frame is answered too-many-transactions; the C
   gateway copies a repeated index once per listing and sends large replies bulk-framed. While
@@ -169,11 +171,28 @@ ignored. `RUST_LOG` overrides `logger.log_level_console`.
   it, and are sent when the pool resumed the session (their assignment is announced again)
   and discarded when it did not.
 
+- The stratum dialect differs from the C gateway's in four details a miner sees:
+  `mining.notify` carries an empty version field (C sends the template's version); its
+  `coinb1` is 35 bytes and the extranonce1 of `mining.subscribe` 8 bytes (C sends 39 and 4:
+  the concatenation the work root hashes is the same bytes); `mining.configure` answers
+  `version-rolling` false when it is listed, as well as `minimum-difficulty` (C answers only
+  the latter); and a request id that is a JSON object or array is accepted (C refuses it).
+- A template with more than 16383 transactions (the DATUM short-id list limit) is refused
+  and no job is built on it; the C gateway serves its first 16383 transactions. Only a block
+  of 4,000,000 weight units, after RDTS ends, can hold that many.
+- A share whose hash is a block and that a miner submits again is refused as a duplicate and
+  is not submitted to the node, or sent to the pool, a second time (the newest 64 blocks
+  found are held).
+- A username is cut at its first NUL character, as the C gateway's copy of it stops there.
+
 Not served: the PROXY protocol (`stratum.trust_proxy`), daily rotation
 and SIGHUP (`logger.log_rotate_daily`; the file is held open, so rotate it with logrotate's
 `copytruncate`), `datum.always_pay_self`, the per-client pacing of job updates, the
-testnet fast-forward, `--help`, `--example-conf`, `--test` and `/assets`. Set values among
-these are reported at startup.
+testnet fast-forward, hasher time rolling (`mining.allow_hasher_time_rolling`), the
+retention and audit of anti-block-withholding proofs
+(`mining.abw_verify_all_shares_on_disclosure`), migration (`datum.migration_max_seconds`),
+`--help`, `--example-conf`, `--test` and `/assets`. Set values among these are reported at
+startup.
 
 ### Coinbase size
 
@@ -330,7 +349,8 @@ job that carries transactions makes the pool request them from the gateway (0x50
 any share on the job can be known to be a block, and every share on the job waits for them, at
 most 20 seconds. The transactions must be the job's: their count and their merkle branch on
 the coinbase's side are the ones the job section carries. The node then checks the job's
-block with each coinbase its shares use (`getblocktemplate` in proposal mode: every consensus
+block with each coinbase its shares use (a subsidy-only share's block, which holds the coinbase
+alone, is checked apart from the pooled block with the same coinbase) (`getblocktemplate` in proposal mode: every consensus
 rule but the proof of work, among them the bits, the height, the time against the parent's
 median time past, the coinbase value, the witness commitment, the weight and the sigops), and
 each share's header version may differ from the validated one only in the bits BIP 320 lets a
@@ -349,14 +369,24 @@ The cost is one transfer of each job's transactions from its gateway (a job's bl
 per job and coinbase on the pool's node, and the share responses of a job's first shares
 delayed by that round trip. A transaction is held once however many jobs and connections
 name it. A connection holds at most 8 transaction requests and 4096 waiting shares; a share
-past either is refused. A block the node refuses is not recorded as found.
+past either is refused. It holds the transactions of its 4 newest jobs that have sent them; a
+share on an older job requests them again. A block the node refuses is not recorded as found;
+one `submitblock` answers "duplicate" (the node already held it, as when the gateway's own
+submission reached it first) or "inconclusive" (stored without being connected) is recorded,
+and the confirmation pass reads whether it stays on the best chain. A block is submitted once
+however many times its share is sent, on any connection, unless the node did not answer. A
+refused share that is a block by its job's own bits is submitted only when those bits are the
+template's for a job on the template's parent, or name a target at most four times the
+template's for a job on another parent (any bits on testnet and testnet4).
 
 ### Ledger and window
 
 Every accepted share is written to a [redb](https://github.com/cberner/redb) database before
 it is credited: `--ledger` names the file, `--data-dir` puts `<chain>.redb` inside, with
 neither the window is in memory only. `--ledger-keep-shares <n>` keeps the newest `n` shares
-on disk and removes the rest as each share is recorded; unset keeps every one, which is what
+on disk and removes the rest as each share is recorded, at most 4096 rows per share, so a
+surplus left by setting or lowering it on a large ledger is removed over the shares that
+follow; unset keeps every one, which is what
 TIDES specifies, since a rising network difficulty widens the window over shares that had
 left it. Retention never removes a share the window holds, since the window reads itself back
 from these rows, nor one of the newest `2^20` accepted in the last 4 hours 10 minutes, whose
@@ -429,9 +459,10 @@ value that reaches the pool's payout script as the remainder.
 the pool's payout script as the remainder.
 
 A split pays each identity its part of the value it was dictated for, so a share whose job
-names a split dictated for another previous block, or for more than the job's coinbase
-value, is refused (`BadCoinbaserId`): its outputs would pay the identities the coinbase keeps
-more than their part. A connection may request 16 splits at once and one a second after that;
+names a split dictated for another previous block, or for a value other than the job's
+coinbase value, is refused (`BadCoinbaserId`): for more, its outputs would pay the identities
+the coinbase keeps more than their part; for less, the difference would reach the pool's
+script with no owed record. A gateway uses a split only on the value it requested it for. A connection may request 16 splits at once and one a second after that;
 a request past that is not answered. A session keeps its 64 newest splits, and saves with it
 for resume only those on the tip or a tip replaced within the last second.
 
@@ -514,7 +545,8 @@ that.
 
 `--stats-listen <address>` serves one endpoint, the read-only snapshot at `/stats.json`;
 every other path is a 404. A request carrying a body is refused (413), and the interface
-serves at most 32 connections at once, one request each. It carries the tip, the coinbase value, the fee, the connected gateways, the build (`--version` prints the
+serves at most 32 connections at once, 8 of them from one address (an IPv4 address, or an IPv6
+/64 prefix; loopback clients count only against the 32), one request each. It carries the tip, the coinbase value, the fee, the connected gateways, the build (`--version` prints the
 same string), an approximate hashrate (accepted-share difficulty over the last 10 minutes,
 at 2^32 hashes per difficulty unit, for the pool and per miner) and each miner's share of the
 window with `payable`, `unpayable_reason`, `tag` (the secondary coinbase tag of the

@@ -46,6 +46,29 @@ pub fn meets_target(hash: &[u8; 32], target: &Target) -> bool {
     hash <= target
 }
 
+/// `target` multiplied by 2^`bits`, or the largest target when the product does not fit in
+/// 256 bits.
+pub fn shl_saturating(target: &Target, bits: u32) -> Target {
+    let byte_shift = (bits / 8) as usize;
+    let bit_shift = bits % 8;
+    let overflows = if byte_shift >= TARGET_BYTES {
+        target.iter().any(|&b| b != 0)
+    } else {
+        target[..byte_shift].iter().any(|&b| b != 0)
+            || (bit_shift > 0 && target[byte_shift] >> (8 - bit_shift) != 0)
+    };
+    if overflows {
+        return [0xff; TARGET_BYTES];
+    }
+    let mut out = [0u8; TARGET_BYTES];
+    for (i, slot) in out.iter_mut().enumerate().take(TARGET_BYTES.saturating_sub(byte_shift)) {
+        let high = target[i + byte_shift];
+        let low = target.get(i + byte_shift + 1).copied().unwrap_or(0);
+        *slot = if bit_shift == 0 { high } else { (high << bit_shift) | (low >> (8 - bit_shift)) };
+    }
+    out
+}
+
 pub const fn target_for_exponent(exponent: u8) -> Target {
     let mut t = [0u8; TARGET_BYTES];
     let bit = DIFF1_EXPONENT.saturating_sub(exponent as u32);
@@ -127,6 +150,25 @@ pub fn pow2_ceil(v: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_target_shifted_left_multiplies_it_and_saturates_past_256_bits() {
+        let one = target_for_exponent(0);
+        assert_eq!(shl_saturating(&one, 0), one);
+        assert_eq!(shl_saturating(&one, 2), target_for_exponent(0).map(|b| b << 2));
+        let mut spans = [0u8; TARGET_BYTES];
+        spans[30] = 0xc1;
+        let mut expected = [0u8; TARGET_BYTES];
+        expected[29] = 0x03;
+        expected[30] = 0x04;
+        assert_eq!(shl_saturating(&spans, 2), expected, "bits carry into the higher byte");
+        let mut top = [0u8; TARGET_BYTES];
+        top[0] = 0x40;
+        assert_eq!(shl_saturating(&top, 1)[0], 0x80);
+        assert_eq!(shl_saturating(&top, 2), [0xff; TARGET_BYTES], "past 256 bits");
+        assert_eq!(shl_saturating(&one, 300), [0xff; TARGET_BYTES]);
+        assert_eq!(shl_saturating(&[0; TARGET_BYTES], 300), [0; TARGET_BYTES]);
+    }
 
     #[test]
     fn known_compact_values() {

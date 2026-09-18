@@ -53,15 +53,22 @@ fn build(
     pool_config: Option<&ClientConfig>,
     coinbaser: Option<CoinbaserResponse>,
 ) -> Option<Arc<Job>> {
+    // Without a pool configuration the job is not pooled, and is built without a commitment
+    // whatever the session holds: under one the gateway cannot recognize a block, and a job
+    // that is not pooled sends no share to the pool, so a block on it would reach no node. The
+    // configuration and an assignment can arrive during the template request.
     let abw = match gateway.pool.abw_state() {
+        _ if pool_config.is_none() => None,
         AbwState::NotRequired => None,
         AbwState::Assigned(a) => Some(a),
-        AbwState::Awaiting if pool_config.is_none() => None,
         AbwState::Awaiting => {
             debug!(
                 "waiting for the pool's anti-withholding assignment before building {} work",
                 what.name()
             );
+            // No work is built on this tip until the assignment arrives, so the work on the
+            // tip it replaced ends now rather than at the next job built.
+            gateway.jobs.mark_stale_off(t.prev_hash);
             return None;
         }
     };

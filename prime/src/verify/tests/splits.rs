@@ -71,7 +71,7 @@ fn the_dictated_outputs_a_coinbase_leaves_out_are_reported_with_their_identities
 
     let (mut v, s) = with_outputs(&[]);
     let to_the_pool_script = CoinbaserResponse {
-        value: COINBASE_VALUE - 1,
+        value: COINBASE_VALUE,
         coinbaser_id: 1,
         outputs: vec![TxOut { value: COINBASE_VALUE - 1, script_pubkey: p2wpkh(0xee) }],
     };
@@ -235,7 +235,7 @@ fn ignores_zero_value_outputs() {
 }
 
 #[test]
-fn a_split_named_by_a_job_on_another_parent_or_worth_more_than_its_coinbase_is_refused() {
+fn a_split_named_by_a_job_on_another_parent_or_worth_other_than_its_coinbase_is_refused() {
     let (mut v, s) = setup();
     record(&mut v, &split(), NAMES, NOW);
     assert!(v.rebuild_checked_ignoring_target(&s, None, NOW).is_ok(), "the split's own job");
@@ -252,9 +252,10 @@ fn a_split_named_by_a_job_on_another_parent_or_worth_more_than_its_coinbase_is_r
     let (mut v, s) = setup();
     let smaller = CoinbaserResponse { value: COINBASE_VALUE - 1, ..split() };
     record(&mut v, &smaller, NAMES, NOW);
-    assert!(
-        v.rebuild_checked_ignoring_target(&s, None, NOW).is_ok(),
-        "a split of less than the coinbase leaves the rest to the pool's script"
+    assert_eq!(
+        v.rebuild_checked_ignoring_target(&s, None, NOW),
+        Err(RejectReason::BadCoinbaserId),
+        "dictated for less than the coinbase, the rest would reach the pool's script unowed"
     );
 
     let (mut v, s) = setup();

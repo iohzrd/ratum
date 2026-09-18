@@ -302,6 +302,14 @@ fn rebuilds_a_subsidy_only_share() {
     assert_eq!(rebuilt.paid_to_split, 0);
     assert_eq!(rebuilt.paid_to_pool, COINBASE_VALUE);
     assert_eq!(built_header(&rebuilt).merkle_root, bitcoin::sha256d(&rebuilt.coinbase_tx));
+
+    // The same coinbase bytes on the pooled job make a block that also holds the job's
+    // transactions, so the node's verdict on the subsidy-only block is not kept for it.
+    let (job, cb) = (share.job.clone().unwrap(), share.coinbase.clone().unwrap());
+    let pooled = PowSubmit { subsidy_only: false, ..share.clone() };
+    let pooled = v.rebuild_share(&job, &cb, &pooled, None).unwrap();
+    let subsidy_only = v.rebuild_share(&job, &cb, &share, None).unwrap();
+    assert_ne!(pooled.coinbase_digest, subsidy_only.coinbase_digest);
 }
 
 #[test]

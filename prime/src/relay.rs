@@ -31,7 +31,7 @@ const TX_LOCK_TIME_LEN: usize = 4;
 /// What the node did with a block the pool submitted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Relayed {
-    /// `submitblock` answered null: the node accepted the block.
+    /// `submitblock` answered null, "duplicate" or "inconclusive": the node holds the block.
     Accepted,
     /// The node refused the block, or the pool did not submit it because its transactions do
     /// not form the header's merkle root.
@@ -168,6 +168,15 @@ fn submit_with_retries(peer: SocketAddr, node: &rpc::Client, block: &[u8]) -> Re
         match node.submit_block(block) {
             Ok(None) => {
                 info!("[{peer}]      submitted: node accepted the block");
+                return Relayed::Accepted;
+            }
+            // `submitblock` answers "duplicate" when the node already held the block as valid
+            // (the gateway's own submission reached it first), and "inconclusive" when it stored
+            // the block without connecting it, as on a branch that is not yet the best chain.
+            // Neither is a refusal: the block is recorded, and the confirmation pass reads
+            // whether it stays on the best chain.
+            Ok(Some(reason)) if reason == "duplicate" || reason == "inconclusive" => {
+                info!("[{peer}]      submitted: the node holds the block ({reason:?})");
                 return Relayed::Accepted;
             }
             Ok(Some(reason)) => {

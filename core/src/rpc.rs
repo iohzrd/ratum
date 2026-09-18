@@ -198,8 +198,48 @@ struct RpcUrl {
     password: String,
 }
 
+/// What replaces the password of a URL's `user:password@` in text shown or logged.
+pub const REDACTED_PASSWORD: &str = "***";
+
+/// The parts of `url` around the password of the `user:password@` in its authority, where
+/// `parse_url` reads the credentials: before the last `@` of the text between the scheme and
+/// the first `/`, the password after the first `:`. None when there is no password.
+fn password_span(url: &str) -> Option<(usize, usize)> {
+    let authority_at = url.find("://").map_or(0, |at| at + 3);
+    let rest = &url[authority_at..];
+    let authority = rest.split_once('/').map_or(rest, |(authority, _)| authority);
+    let (credentials, _) = authority.rsplit_once('@')?;
+    let (user, password) = credentials.split_once(':')?;
+    let start = authority_at + user.len() + 1;
+    (!password.is_empty()).then_some((start, start + password.len()))
+}
+
+/// `url` with the password of its `user:password@` replaced by `REDACTED_PASSWORD`, for text
+/// that is shown or logged.
+pub fn redact_url(url: &str) -> String {
+    match password_span(url) {
+        Some((start, end)) => format!("{}{REDACTED_PASSWORD}{}", &url[..start], &url[end..]),
+        None => url.to_string(),
+    }
+}
+
+/// `edited` with a password of exactly `REDACTED_PASSWORD` replaced by the password `original`
+/// carries, so a URL shown redacted and then edited elsewhere keeps its password. Unchanged when
+/// `edited` carries another password or `original` none.
+pub fn restore_redacted_password(edited: &str, original: &str) -> String {
+    let (Some((start, end)), Some((o_start, o_end))) =
+        (password_span(edited), password_span(original))
+    else {
+        return edited.to_string();
+    };
+    if &edited[start..end] != REDACTED_PASSWORD {
+        return edited.to_string();
+    }
+    format!("{}{}{}", &edited[..start], &original[o_start..o_end], &edited[end..])
+}
+
 fn parse_url(url: &str) -> Result<RpcUrl, Error> {
-    let bad = || Error::BadUrl(url.to_string());
+    let bad = || Error::BadUrl(redact_url(url));
     let (scheme, rest) = url.split_once("://").ok_or_else(bad)?;
     if scheme != "http" && scheme != "https" {
         return Err(bad());
@@ -554,6 +594,40 @@ mod tests {
         assert!(check_url("https://u:p@node.example").is_ok());
         assert!(matches!(check_url("127.0.0.1:8332"), Err(Error::BadUrl(_))));
         assert!(matches!(check_url("javascript:alert(1)"), Err(Error::BadUrl(_))));
+    }
+
+    #[test]
+    fn a_password_is_redacted_where_the_client_reads_it_and_restored_from_the_original() {
+        assert_eq!(redact_url("http://u:secret@127.0.0.1:8332"), "http://u:***@127.0.0.1:8332");
+        assert_eq!(redact_url("https://u:p:q@a@host/wallet"), "https://u:***@host/wallet");
+        assert_eq!(redact_url("http://u@host"), "http://u@host", "no password to hide");
+        assert_eq!(redact_url("http://127.0.0.1:8332"), "http://127.0.0.1:8332");
+        assert_eq!(redact_url("u:secret@host:8332"), "u:***@host:8332");
+        assert_eq!(
+            redact_url("http://127.0.0.1:8332/wallet/a:b@c"),
+            "http://127.0.0.1:8332/wallet/a:b@c",
+            "an @ in the path is not a credential"
+        );
+        match parse_url("htpp://u:secret@127.0.0.1:8332") {
+            Err(Error::BadUrl(shown)) => assert_eq!(shown, "htpp://u:***@127.0.0.1:8332"),
+            _ => panic!("the scheme is refused"),
+        }
+
+        let original = "http://u:secret@127.0.0.1:8332";
+        assert_eq!(
+            restore_redacted_password("http://u:***@127.0.0.1:8333", original),
+            "http://u:secret@127.0.0.1:8333"
+        );
+        assert_eq!(
+            restore_redacted_password("http://u:other@127.0.0.1:8333", original),
+            "http://u:other@127.0.0.1:8333",
+            "a new password is kept"
+        );
+        assert_eq!(
+            restore_redacted_password("http://u:***@h", "http://h"),
+            "http://u:***@h",
+            "nothing to restore"
+        );
     }
 
     #[test]

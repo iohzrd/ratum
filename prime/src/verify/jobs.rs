@@ -23,6 +23,13 @@ pub(super) const UNSEEN_PARENT_SECS: u64 = 120;
 /// The pow hashes of the shares that installed sections, held per connection.
 pub(super) const MAX_INSTALLING_SHARES: usize = 4096;
 
+/// The jobs one connection holds transactions for. A gateway serves the priority and the
+/// coinbaser job of its tip, and shares on the replaced tip's pair arrive within the tip grace,
+/// so four cover an honest gateway; the bound keeps a gateway that installs a job in each of the
+/// 256 slots and answers each request with a full frame of transactions from making the pool
+/// hold a frame per slot.
+pub(super) const MAX_JOBS_HOLDING_TXNS: usize = 4;
+
 /// The node's verdicts one job keeps, one per coinbase its shares were rebuilt on. A gateway
 /// sends at most `MAX_COINBASE_TYPES` coinbases a job; past this the verdicts are cleared and
 /// the next share of each coinbase is validated again.
@@ -177,9 +184,36 @@ impl Verifier<'_> {
         self.live_job(job_id, generation).map(|st| &st.txns)
     }
 
-    /// Sets the job's transactions; false when the job is no longer installed.
+    /// Sets the job's transactions; false when the job is no longer installed. Past
+    /// `MAX_JOBS_HOLDING_TXNS` jobs holding transactions, the oldest are released, and a
+    /// further share on one requests them again.
     pub fn set_job_txns(&mut self, job_id: u8, generation: u64, txns: JobTxns) -> bool {
-        self.live_job_mut(job_id, generation).map(|st| st.txns = txns).is_some()
+        let holds = matches!(txns, JobTxns::Held(_));
+        let set = self.live_job_mut(job_id, generation).map(|st| st.txns = txns).is_some();
+        if set && holds {
+            self.release_oldest_held_txns();
+        }
+        set
+    }
+
+    fn release_oldest_held_txns(&mut self) {
+        let mut holding: Vec<(u64, usize)> = self
+            .jobs
+            .iter()
+            .enumerate()
+            .filter_map(|(at, st)| {
+                st.as_ref()
+                    .filter(|st| matches!(st.txns, JobTxns::Held(_)))
+                    .map(|st| (st.generation, at))
+            })
+            .collect();
+        let Some(surplus) = holding.len().checked_sub(MAX_JOBS_HOLDING_TXNS) else { return };
+        holding.sort_unstable();
+        for &(_, at) in &holding[..surplus] {
+            if let Some(st) = self.jobs[at].as_mut() {
+                st.txns = JobTxns::Unrequested;
+            }
+        }
     }
 
     pub fn block_check(
