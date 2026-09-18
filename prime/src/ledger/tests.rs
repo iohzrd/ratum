@@ -24,6 +24,17 @@ fn tags_of(l: &Ledger) -> HashMap<String, String> {
     l.identities().into_iter().map(|(id, s)| (id, s.tag_secondary)).collect()
 }
 
+/// Every share the ledger file stores, oldest first.
+fn dumped(path: &Path) -> Vec<Share> {
+    let mut out = Vec::new();
+    dump_file(path, |share| {
+        out.push(share);
+        Ok(())
+    })
+    .unwrap();
+    out
+}
+
 fn fixed(window: u128) -> Ledger {
     Ledger::new(WindowRule::fixed(window), SplitPolicy::default())
 }
@@ -181,7 +192,7 @@ fn a_window_of_u128_max_still_caps_the_share_count() {
     assert_eq!(l.total_work(), CAP as u128);
     assert_eq!(work_by_identity(&l), vec![identity_work("a", CAP as u128)]);
     assert!(l.count_capped(), "the count bound, not the window, ends the payout set");
-    assert_eq!(l.shares.back().unwrap().accepted_at, (CAP + 49) as u64, "the newest are kept");
+    assert_eq!(l.accepted_times().last(), Some(&((CAP + 49) as u64)), "the newest are kept");
 }
 
 #[test]
@@ -539,31 +550,27 @@ fn persists_across_a_restart() {
 }
 
 #[test]
-fn hashes_persist_across_a_restart() {
-    let scratch = Scratch::new("hashes");
+fn the_window_is_read_back_across_a_restart_oldest_first() {
+    let scratch = Scratch::new("window-restart");
     {
         let (mut l, _) = open(&scratch, 1_000_000, None);
         l.record(share(1, "alice", 16, hash(1), "")).unwrap();
         l.record(share(2, "bob", 32, hash(2), "")).unwrap();
     }
     let (l, _) = open(&scratch, 1_000_000, None);
-    assert_eq!(
-        l.block_hashes().copied().collect::<Vec<_>>(),
-        vec![hash(1), hash(2)],
-        "oldest first"
-    );
+    assert_eq!(l.accepted_times(), vec![1, 2], "oldest first");
 }
 
 #[test]
-fn hashes_returns_the_hashes_the_window_holds() {
+fn accepted_times_are_the_shares_the_window_holds() {
     let mut l = ledger_with(1_000_000, &[("alice", 16), ("bob", 32)]);
     l.record(share(1_100, "carol", 8, hash(99), "")).unwrap();
-    assert_eq!(l.block_hashes().copied().collect::<Vec<_>>(), vec![hash(0), hash(1), hash(99)]);
+    assert_eq!(l.accepted_times(), vec![1_000, 1_001, 1_100]);
 
     let mut narrow = fixed(8);
     narrow.record(share(1, "alice", 8, hash(1), "")).unwrap();
     narrow.record(share(2, "bob", 8, hash(2), "")).unwrap();
-    assert_eq!(narrow.block_hashes().copied().collect::<Vec<_>>(), vec![hash(2)]);
+    assert_eq!(narrow.accepted_times(), vec![2]);
 }
 
 #[test]
@@ -579,7 +586,7 @@ fn read_back_reads_only_as_far_back_as_the_window_needs() {
     assert!(!read_back.truncated);
     assert!(l.total_work() >= 160, "covers the window");
     assert!(l.len() < 100, "without reading the whole store: {} shares", l.len());
-    assert_eq!(l.shares.back().unwrap().accepted_at, 999, "and the newest work is in it");
+    assert_eq!(l.accepted_times().last(), Some(&999), "and the newest work is in it");
 }
 
 #[test]
@@ -617,7 +624,7 @@ fn widening_the_window_re_reads_shares_from_the_store() {
 
     assert_eq!(l.set_window(8), 0);
     assert_eq!(work_by_identity(&l), vec![identity_work("carol", 8)]);
-    assert_eq!(l.block_hashes().copied().collect::<Vec<_>>(), vec![hash(3)]);
+    assert_eq!(l.accepted_times(), vec![3]);
 
     assert_eq!(l.set_window(56), 2, "alice and bob are re-read");
     assert_eq!(l.total_work(), 56);
@@ -625,7 +632,7 @@ fn widening_the_window_re_reads_shares_from_the_store() {
         work_by_identity(&l),
         vec![identity_work("bob", 32), identity_work("alice", 16), identity_work("carol", 8)]
     );
-    assert_eq!(l.block_hashes().copied().collect::<Vec<_>>(), vec![hash(1), hash(2), hash(3)]);
+    assert_eq!(l.accepted_times(), vec![1, 2, 3]);
 }
 
 /// Disk cannot be bounded below what the window needs, since the window reads itself back
@@ -639,22 +646,45 @@ fn retention_never_removes_a_share_the_window_holds() {
     }
     assert_eq!(l.len(), 10, "the window holds every share, well past the two asked for");
     drop(l);
-    let dumped = dump_file(&scratch.join("regtest.redb")).unwrap();
+    let dumped = dumped(&scratch.join("regtest.redb"));
     assert_eq!(dumped.len(), 10, "so every one is still on disk to read back");
 }
 
 #[test]
 fn retention_removes_what_is_past_the_window_and_the_configured_count() {
+    const APART: u64 = 5 * ratum::SECS_PER_HOUR;
     let scratch = Scratch::new("retain-past-window");
     let (mut l, _) = open(&scratch, 32, Some(3));
     for i in 0..10u64 {
-        l.record(share(i, "alice", 16, hash(i), "")).unwrap();
+        l.record(share(i * APART, "alice", 16, hash(i), "")).unwrap();
     }
     assert_eq!(l.len(), 2, "a window of 32 work holds two shares of 16");
     drop(l);
-    let dumped = dump_file(&scratch.join("regtest.redb")).unwrap();
+    let dumped = dumped(&scratch.join("regtest.redb"));
     assert_eq!(dumped.len(), 3, "the configured count, which is above the window's two");
-    assert_eq!(dumped.first().unwrap().accepted_at, 7, "the newest three");
+    assert_eq!(dumped.first().unwrap().accepted_at, 7 * APART, "the newest three");
+}
+
+/// The duplicate check reads back the hashes accepted within `ACCEPTED_HASH_RETENTION_SECS` at
+/// startup, so retention keeps those rows whatever `--ledger-keep-shares` asks for.
+#[test]
+fn retention_never_removes_a_share_accepted_within_the_duplicate_retention() {
+    const APART: u64 = ratum::SECS_PER_HOUR;
+    let scratch = Scratch::new("retain-duplicates");
+    let (mut l, _) = open(&scratch, 16, Some(1));
+    for i in 0..10u64 {
+        l.record(share(i * APART, "alice", 16, hash(i), "")).unwrap();
+    }
+    assert_eq!(l.len(), 1, "the window holds only the newest");
+    let newest = 9 * APART;
+    assert_eq!(
+        l.accepted_since(newest - ACCEPTED_HASH_RETENTION_SECS, 100).unwrap().len(),
+        5,
+        "the five accepted in the 4 hours 10 minutes to the newest are kept for the restart"
+    );
+    drop(l);
+    let dumped = dumped(&scratch.join("regtest.redb"));
+    assert_eq!(dumped.len(), 5, "and only those, however few were asked for");
 }
 
 #[test]
@@ -666,7 +696,7 @@ fn dump_returns_every_stored_share_oldest_first() {
     l.record(share(3, "carol", 16, hash(3), "")).unwrap();
     assert_eq!(l.len(), 1, "the window holds only the newest");
     drop(l);
-    let dumped = dump_file(&scratch.join("regtest.redb")).unwrap();
+    let dumped = dumped(&scratch.join("regtest.redb"));
     assert_eq!(dumped.len(), 3, "but the store holds all three");
     assert_eq!(dumped.iter().map(|s| s.accepted_at).collect::<Vec<_>>(), vec![1, 2, 3]);
 }
@@ -730,4 +760,343 @@ fn work_since_sums_only_the_shares_at_or_after_the_cutoff() {
         l.work_since(150),
         "the two queries read the same shares"
     );
+}
+
+#[test]
+fn accepted_since_reads_the_newest_rows_back_to_the_cutoff_oldest_first() {
+    let scratch = Scratch::new("accepted-since");
+    let (mut l, _) = open(&scratch, 16, None);
+    for (i, at) in [100u64, 200, 300, 400, 500].into_iter().enumerate() {
+        l.record(share(at, "alice", 16, hash(i as u64), "")).unwrap();
+    }
+    assert_eq!(
+        l.accepted_since(300, 10).unwrap(),
+        vec![(300, hash(2)), (400, hash(3)), (500, hash(4))],
+        "from the cutoff on, even though the window holds only the newest share"
+    );
+    assert_eq!(l.accepted_since(300, 2).unwrap(), vec![(400, hash(3)), (500, hash(4))]);
+    assert!(fixed(16).accepted_since(0, 10).unwrap().is_empty(), "a file-less ledger has none");
+}
+
+/// The window as it was held before its shares were reduced to 16 bytes: every share whole in a
+/// deque, identities by name, and a widening read back from the full history of recorded
+/// shares, as the ledger file holds them after retention. `count_capped` follows the current
+/// rule, the bound held with less work than the target, where the old window set it only
+/// when a trim cut on the count. `the_compact_window_matches_*` drive
+/// it beside `Ledger` and compare everything a caller can read.
+struct Reference {
+    shares: VecDeque<Share>,
+    identities: HashMap<String, IdentityState>,
+    total_work: u128,
+    window: u128,
+    max_shares: usize,
+    count_capped: bool,
+    public_tag: Option<String>,
+    history: Vec<Share>,
+    has_store: bool,
+    /// `--ledger-keep-shares`, pruning `history` as the store's retention prunes its rows.
+    keep: Option<usize>,
+}
+
+impl Reference {
+    fn new(window: u128, public_tag: Option<&str>, has_store: bool, keep: Option<usize>) -> Self {
+        Self {
+            shares: VecDeque::new(),
+            identities: HashMap::new(),
+            total_work: 0,
+            window,
+            max_shares: MAX_SHARES,
+            count_capped: false,
+            public_tag: public_tag.map(str::to_string),
+            history: Vec::new(),
+            has_store,
+            keep,
+        }
+    }
+
+    fn own(&self, s: &Share) -> bool {
+        self.public_tag.as_ref().is_some_and(|t| &s.tag_secondary != t)
+    }
+
+    fn push(&mut self, share: Share) {
+        self.total_work += u128::from(share.difficulty);
+        let own = self.own(&share);
+        let state = self.identities.entry(share.identity.clone()).or_default();
+        state.work += u128::from(share.difficulty);
+        if own {
+            state.own_gateway_work += u128::from(share.difficulty);
+        }
+        state.tag_secondary.clone_from(&share.tag_secondary);
+        self.shares.push_back(share);
+    }
+
+    fn trim(&mut self) {
+        while self.shares.len() > 1 && self.total_work > self.window {
+            let over = self.total_work - self.window;
+            if u128::from(self.shares.front().unwrap().difficulty) > over {
+                break;
+            }
+            self.drop_oldest();
+        }
+        while self.shares.len() > self.max_shares {
+            self.drop_oldest();
+        }
+        self.count_capped = self.shares.len() >= self.max_shares && self.total_work < self.window;
+    }
+
+    fn drop_oldest(&mut self) {
+        let Some(oldest) = self.shares.pop_front() else { return };
+        self.total_work -= u128::from(oldest.difficulty);
+        let own = self.own(&oldest);
+        let Some(state) = self.identities.get_mut(&oldest.identity) else { return };
+        state.work -= u128::from(oldest.difficulty);
+        if own {
+            state.own_gateway_work -= u128::from(oldest.difficulty);
+        }
+        if state.work == 0 {
+            self.identities.remove(&oldest.identity);
+        }
+    }
+
+    fn record(&mut self, share: Share) {
+        let keep_after = share.accepted_at.saturating_sub(ACCEPTED_HASH_RETENTION_SECS);
+        self.history.push(share.clone());
+        self.push(share);
+        self.trim();
+        if let Some(keep) = self.keep {
+            let surplus = self.history.len().saturating_sub(keep.max(self.shares.len()));
+            let removable =
+                self.history.iter().take(surplus).take_while(|s| s.accepted_at < keep_after);
+            let removable = removable.count();
+            self.history.drain(..removable);
+        }
+    }
+
+    fn set_window(&mut self, window: u128) {
+        let window = window.max(1);
+        let widened = window > self.window;
+        self.window = window;
+        if widened && self.has_store {
+            let mut collected = Vec::new();
+            let mut work = 0u128;
+            for s in self.history.iter().rev() {
+                if work >= self.window || collected.len() >= self.max_shares {
+                    break;
+                }
+                work += u128::from(s.difficulty);
+                collected.push(s.clone());
+            }
+            self.shares.clear();
+            self.identities.clear();
+            self.total_work = 0;
+            for s in collected.into_iter().rev() {
+                self.push(s);
+                self.trim();
+            }
+        }
+        self.trim();
+    }
+
+    fn set_max_shares(&mut self, max_shares: usize) {
+        self.max_shares = max_shares.max(1);
+        self.trim();
+    }
+
+    fn identities(&self) -> Vec<(String, IdentityState)> {
+        let mut v: Vec<_> = self.identities.iter().map(|(n, s)| (n.clone(), s.clone())).collect();
+        v.sort_by(|(a, x), (b, y)| most_work_first((a, x.work), (b, y.work)));
+        v
+    }
+
+    fn work_since_by_identity(&self, cutoff: u64) -> HashMap<String, u128> {
+        let mut by_identity = HashMap::new();
+        for s in self.shares.iter().rev().take_while(|s| s.accepted_at >= cutoff) {
+            *by_identity.entry(s.identity.clone()).or_insert(0) += u128::from(s.difficulty);
+        }
+        by_identity
+    }
+}
+
+/// A seeded xorshift, so a failing run of the equivalence test replays exactly.
+struct XorShift(u64);
+
+impl XorShift {
+    fn below(&mut self, n: u64) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0 % n
+    }
+}
+
+/// `seconds_apart` is the most time between two shares, in units a random 0 to 2 multiplies.
+fn drive_beside_the_reference(
+    l: &mut Ledger,
+    r: &mut Reference,
+    seed: u64,
+    steps: u64,
+    seconds_apart: u64,
+) {
+    const NAMES: [&str; 6] = ["alice", "bob", "carol", "dave", "erin", "frank"];
+    const TAGS: [&str; 3] = ["", "public", "own"];
+    let mut rng = XorShift(seed);
+    let mut now = 1_000u64;
+    for step in 0..steps {
+        match rng.below(100) {
+            0..=79 => {
+                now += rng.below(3) * seconds_apart;
+                let difficulty =
+                    if rng.below(2) == 0 { 1 << rng.below(6) } else { 1 + rng.below(40) };
+                let s = share(
+                    now,
+                    NAMES[rng.below(6) as usize],
+                    difficulty,
+                    hash(step),
+                    TAGS[rng.below(3) as usize],
+                );
+                l.record(s.clone()).unwrap();
+                r.record(s);
+            }
+            80..=91 => {
+                let window = 1 + u128::from(rng.below(600));
+                l.set_window(window);
+                r.set_window(window);
+            }
+            _ => {
+                let max = if rng.below(4) == 0 { 1_000 } else { 1 + rng.below(40) as usize };
+                l.set_max_shares(max);
+                r.set_max_shares(max);
+            }
+        }
+        let at = |what: &str| format!("seed {seed} step {step}: {what}");
+        assert_eq!(l.identities(), r.identities(), "{}", at("identities"));
+        assert_eq!(l.total_work(), r.total_work, "{}", at("total work"));
+        assert_eq!(l.len(), r.shares.len(), "{}", at("share count"));
+        assert_eq!(l.count_capped(), r.count_capped, "{}", at("count capped"));
+        let times: Vec<u64> = r.shares.iter().map(|s| s.accepted_at).collect();
+        assert_eq!(l.accepted_times(), times, "{}", at("the shares held"));
+        let cutoff = now.saturating_sub(4);
+        assert_eq!(
+            l.work_since_by_identity(cutoff),
+            r.work_since_by_identity(cutoff),
+            "{}",
+            at("recent work")
+        );
+        assert_eq!(
+            l.work_since(cutoff),
+            r.work_since_by_identity(cutoff).values().sum(),
+            "{}",
+            at("recent total")
+        );
+    }
+}
+
+fn gateway_policy() -> SplitPolicy {
+    SplitPolicy { public_gateway: Some(public(FEE_BPS, 5_000)), ..SplitPolicy::default() }
+}
+
+#[test]
+fn the_compact_window_matches_the_whole_share_window_file_less() {
+    for seed in [1, 0x5eed, 0xdead_beef, 0x0123_4567_89ab_cdef] {
+        let mut l = Ledger::new(WindowRule::fixed(200), gateway_policy());
+        let mut r = Reference::new(200, Some("public"), false, None);
+        drive_beside_the_reference(&mut l, &mut r, seed, 3_000, 1);
+    }
+}
+
+#[test]
+fn the_compact_window_matches_the_whole_share_window_read_back_from_a_store() {
+    for seed in [7, 0xfeed_f00d] {
+        let scratch = Scratch::new(&format!("equivalence-{seed}"));
+        let mut l = Ledger::new(WindowRule::fixed(200), gateway_policy());
+        l.attach(Store::open(&scratch.join("regtest.redb"), None, Some("regtest")).unwrap())
+            .unwrap();
+        let mut r = Reference::new(200, Some("public"), true, None);
+        drive_beside_the_reference(&mut l, &mut r, seed, 1_500, 1);
+    }
+}
+
+/// Retention on, and shares 50 minutes apart at most so the 4 hours 10 minutes the duplicate
+/// check keeps cover only a few: a widening then reads back less than the window asks for.
+#[test]
+fn the_compact_window_matches_the_whole_share_window_read_back_from_a_pruned_store() {
+    const KEEP: u64 = 30;
+    for seed in [11, 0xabad_cafe] {
+        let scratch = Scratch::new(&format!("equivalence-pruned-{seed}"));
+        let mut l = Ledger::new(WindowRule::fixed(200), gateway_policy());
+        let store = Store::open(&scratch.join("regtest.redb"), Some(KEEP), Some("regtest"));
+        l.attach(store.unwrap()).unwrap();
+        let mut r = Reference::new(200, Some("public"), true, Some(KEEP as usize));
+        drive_beside_the_reference(&mut l, &mut r, seed, 1_500, 3_000);
+    }
+}
+
+#[test]
+fn a_read_that_fails_part_way_leaves_the_window_as_it_was() {
+    let mut l = ledger_with(1_000_000, &[("alice", 16), ("bob", 32)]);
+    let before = (l.identities(), l.total_work(), l.accepted_times(), l.count_capped());
+    let failed = l.load_from(|push| {
+        push(WindowRow::Count(1));
+        push(WindowRow::Share(share(5_000, "carol", 8, hash(50), "")));
+        Err(io::Error::other("the file stopped reading"))
+    });
+    assert!(failed.is_err());
+    assert_eq!((l.identities(), l.total_work(), l.accepted_times(), l.count_capped()), before);
+    l.record(share(5_001, "carol", 8, hash(51), "")).unwrap();
+    assert_eq!(l.total_work(), 56, "and records on from there");
+}
+
+#[test]
+fn a_read_back_allocates_the_window_once_at_its_size() {
+    let scratch = Scratch::new("read-back-size");
+    {
+        let (mut l, _) = open(&scratch, u128::MAX, None);
+        for i in 0..1_000u64 {
+            l.record(share(i, "alice", 16, hash(i), "")).unwrap();
+        }
+    }
+    let (mut l, _) = open(&scratch, u128::MAX, None);
+    let read_back = l.shares.capacity();
+    assert_eq!(l.len(), 1_000);
+    assert!((1_001..1_100).contains(&read_back), "one slot over, not 1024: {read_back}");
+    l.record(share(1_000, "alice", 16, hash(1_000), "")).unwrap();
+    assert_eq!(l.shares.capacity(), read_back, "which the next share takes without growing");
+    for i in 1_001..1_200u64 {
+        l.record(share(i, "alice", 16, hash(i), "")).unwrap();
+    }
+    assert!(
+        l.shares.capacity() <= 1_200 + 1_200 / 8,
+        "a growing window grows its buffer by an eighth, not by doubling: {}",
+        l.shares.capacity()
+    );
+}
+
+#[test]
+fn at_the_bound_the_window_grows_by_one_slot_not_by_doubling() {
+    let mut l = fixed(u128::MAX);
+    l.set_max_shares(64);
+    for i in 0..64u64 {
+        l.record(share(i, "a", 1, hash(i), "")).unwrap();
+    }
+    l.shares.shrink_to_fit();
+    for i in 64..200u64 {
+        l.record(share(i, "a", 1, hash(i), "")).unwrap();
+    }
+    assert!(l.shares.capacity() <= 65, "capacity {}", l.shares.capacity());
+}
+
+#[test]
+fn a_read_back_that_stops_at_the_share_bound_is_count_capped_at_once() {
+    let scratch = Scratch::new("capped-read-back");
+    {
+        let (mut l, _) = open(&scratch, u128::MAX, None);
+        for i in 0..10u64 {
+            l.record(share(i, "alice", 16, hash(i), "")).unwrap();
+        }
+    }
+    let mut l = fixed(u128::MAX);
+    l.set_max_shares(4);
+    l.attach(Store::open(&scratch.join("regtest.redb"), None, Some("regtest")).unwrap()).unwrap();
+    assert_eq!(l.len(), 4);
+    assert!(l.count_capped(), "before another share is recorded");
 }

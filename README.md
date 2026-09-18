@@ -263,41 +263,53 @@ it is credited: `--ledger` names the file, `--data-dir` puts `<chain>.redb` insi
 neither the window is in memory only. `--ledger-keep-shares <n>` keeps the newest `n` shares
 on disk and removes the rest as each share is recorded; unset keeps every one, which is what
 TIDES specifies, since a rising network difficulty widens the window over shares that had
-left it. The window reads itself back from these rows, so retention never removes a share the
-window holds however small `n` is: the file cannot be bounded below what the payout set needs,
-and `n` is a request that this floor overrides.
+left it. Retention never removes a share the window holds, since the window reads itself back
+from these rows, nor one of the newest `2^20` accepted in the last 4 hours 10 minutes, whose
+hashes the duplicate check reads back at startup, however small `n` is: the file cannot be
+bounded below what these need, and `n` is a request that both floors override.
 A ledger is stamped with the node's chain and refused on another chain.
 
-A payout is measured over the most recent shares whose difficulties sum to `--window` times
-the network difficulty (8, OCEAN's TIDES rule), never below `--window-floor`. At the BLAKE2b
-activation height Knots resets the target to the previous target shifted left by
-`Blake2bTargetShift` bits (22 on mainnet, 20 elsewhere), so set `--window-floor` to hold
-the intended span of work and keep the whole ledger across the fork.
+A payout is measured over the most recent shares whose difficulties sum to `--window` times the
+difficulty of the block being mined, read from the node's template (the tip's while no template
+has been read), as OCEAN's TIDES rule specifies (8 by default), never below `--window-floor`. At
+the BLAKE2b activation height Knots resets the target to the previous target shifted left by
+`Blake2bTargetShift` bits (22 on mainnet, 20 elsewhere), so set `--window-floor` to hold the
+intended span of work and keep the whole ledger across the fork.
 
-The window holds at most `2^22` shares whatever their difficulties sum to. The window is a
-work target and how many shares that is depends on their difficulty, so a count bound is the
-only memory guarantee that does not depend on an assigned difficulty being reasonable. It is
-not a limit to run against: what keeps the count below it is `--min-diff`, since the window
-requires at most `--window × network difficulty ÷ --min-diff` shares. At a window of 8 and
-the default `--min-diff` of 16384 the count stays under `2^22` while the network difficulty
-is under `2^33`, and higher as vardiff assigns more than the floor. In memory a share costs
-about 160 bytes in the window and another 100 in the set of accepted hashes (measured at 2
-million shares), so the bound corresponds to about 1 GiB, beside redb's page cache, which
-holds the pages the window occupies; on disk a share is 119 bytes, 0.47 GiB at the bound. The
-bound is sized for a 4 GiB host. `--min-diff` determines how much of it is used: at `2^33` on
-a window of 8 the window is at its bound, while the same `--min-diff` at the present mainnet
-difficulty holds the window and hash set under 450 MiB. Reading a 2.2 million share window
-back from the store at startup, and again each time a difficulty increase widens it, measures
-265 ms.
+The window holds at most `2^22` shares whatever their difficulties sum to. The window is a work
+target and how many shares that is depends on their difficulty, so a count bound is the only
+memory guarantee that does not depend on an assigned difficulty being reasonable. It is not a
+limit to run against: what keeps the count below it is `--min-diff`, since the window requires
+at most `--window × network difficulty ÷ --min-diff` shares. At a window of 8 and the default
+`--min-diff` of 16384 the count stays under `2^22` while the network difficulty is under `2^33`,
+and higher as vardiff assigns more than the floor. In memory a share costs 16 bytes in the
+window, whose buffer is kept within an eighth of the shares it has held, and each identity with
+a share in it about 260 more (both measured), so the bound corresponds to 64 MiB for a pool of a
+few dozen miners and about 1.1 GiB if every share in the window came from a different address,
+and twice either while a reload holds the previous window. On disk a share is 119 bytes, 0.47
+GiB at the bound, and redb keeps the pages it has read in a cache of 64 MiB. `--min-diff`
+determines how much of the bound is used: at `2^33` on a window of 8 the window is at its bound,
+while the same `--min-diff` at the present mainnet difficulty holds it under 30 MiB. The window
+is read back from the store at startup, and again each time a difficulty increase widens it,
+oldest first and without holding the shares it reads: 2.2 million shares take about 0.4 seconds
+with the file in the operating system's page cache. The previous window is kept until the read
+succeeds, so a failed read leaves it in place, and a reload briefly holds two windows.
+
+A share is credited once however many times it is sent, across every connection and across a
+restart: its block hash is held for 4 hours 10 minutes after it is accepted, and read back
+from the ledger at startup. No resend can be accepted after that, since a share is refused
+when its header time, which is hashed into it, is more than 2 hours from the pool's clock; the
+10 minutes cover the clock stepping back. At most `2^20` hashes are held, about 123 MiB, which
+covers 69 shares a second; past that the oldest are forgotten early and the pool warns.
 
 Reaching the count bound ends the window at the newest `2^22` shares, spanning less work than
-`--window` specifies, which raises payout variance; the pool warns the first time it trims on
-the count, and `/stats.json` reports `window.count_capped` beside `window.max_shares` for as
-long as it does. The correction is to raise `--min-diff` and the gateways'
-`stratum.vardiff_min` (both 16384 by default) so the window requires fewer shares to span the
-same work: each doubling of the floor halves the count required. The smallest miner served
-sets the other end of that range: at a floor of 8192 a 1 TH/s miner submits a share every 35
-seconds, and at 16384 every 70.
+`--window` specifies, which raises payout variance; the pool warns each time the window reaches
+the bound with less work than the target, and `/stats.json` reports `window.count_capped` beside
+`window.max_shares` for as long as it holds. The correction is to raise `--min-diff` and the
+gateways' `stratum.vardiff_min` (both 16384 by default) so the window requires fewer shares to
+span the same work: each doubling of the floor halves the count required. The smallest miner
+served sets the other end of that range: at a floor of 8192 a 1 TH/s miner submits a share every
+35 seconds, and at 16384 every 70.
 
 ### The split
 

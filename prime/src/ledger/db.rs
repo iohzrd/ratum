@@ -2,7 +2,7 @@
 //! durable write transaction, reporting a store error as an `io::Error`, and the separator the
 //! packed rows put between a name and the bytes after it.
 
-use redb::{Database, Durability};
+use redb::{Builder, Database, Durability};
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
@@ -28,8 +28,24 @@ impl<T, E: std::fmt::Display> DbResult<T> for Result<T, E> {
     }
 }
 
+/// The memory redb may hold pages of the file in, in place of its 1 GiB default, which a file
+/// read back at startup fills. The pool appends at the end of the share table and otherwise
+/// scans it in order; read-back time and insert rate measured the same from 16 MiB to 1 GiB.
+const PAGE_CACHE_BYTES: usize = 64 << 20;
+
+fn builder() -> Builder {
+    let mut b = Builder::new();
+    b.set_cache_size(PAGE_CACHE_BYTES);
+    b
+}
+
 pub(super) fn create_database(path: &Path) -> io::Result<Arc<Database>> {
-    Database::create(path).db().map(Arc::new)
+    builder().create(path).db().map(Arc::new)
+}
+
+/// Opens an existing database, repairing a file a pool stopped by a signal did not close.
+pub(super) fn open_database(path: &Path) -> io::Result<Database> {
+    builder().open(path).db()
 }
 
 /// Runs `f` in a write transaction committed at `Durability::Immediate`, so a row is on disk

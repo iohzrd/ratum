@@ -9,6 +9,7 @@ mod store;
 #[cfg(test)]
 mod tests;
 
+use crate::accounting::{ACCEPTED_HASH_RETENTION_SECS, MAX_ACCEPTED_HASHES};
 use blocks::BlockRecords;
 use log::{info, warn};
 use ratum::rpc;
@@ -16,7 +17,8 @@ use split::SplitPolicy;
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
-use store::Store;
+use std::sync::Arc;
+use store::{Store, WindowRow};
 
 /// The most shares the window holds whatever their difficulties sum to. The window is a work
 /// target, and how many shares that is depends on their difficulty, so a count bound is the
@@ -24,9 +26,10 @@ use store::Store;
 /// pool is not meant to reach it in normal operation: `--min-diff` is what keeps the count
 /// below it, since the window requires at most `--window` times the network difficulty divided
 /// by `--min-diff` shares. Reaching this bound ends the window at the newest `MAX_SHARES`
-/// shares, spanning less work than `--window` specifies. At about 260 bytes of memory per
-/// share across the window and the accepted-hash set, `2^22` keeps both near 1 GiB, which a
-/// 4 GiB host can hold beside redb's page cache and the operating system.
+/// shares, spanning less work than `--window` specifies. A share costs 16 bytes in the window
+/// and an identity with a share in it about 260 more (both measured), so `2^22` is 64 MiB for
+/// a pool of a few dozen miners and about 1.1 GiB if every share came from a different
+/// address; a widening reload holds the previous window beside the new one, twice either.
 pub const MAX_SHARES: usize = 1 << 22;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,7 +50,7 @@ pub struct ReadBack {
 
 /// What the window holds for one identity: its work, the part of it from shares carrying
 /// a secondary tag other than the public gateway's, and the tag of its newest share. An
-/// entry exists while the identity has work in the window.
+/// entry exists while the identity has a share in the window.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct IdentityState {
     pub work: u128,
@@ -77,9 +80,114 @@ impl WindowRule {
     }
 }
 
+// An identity is held only while a share in the window credits it, so there are at most
+// `MAX_SHARES + 1` (a share is pushed before the window is trimmed), indexed up to
+// `MAX_SHARES`, and `WindowShare::credit` shifts the index left one bit into a `u32`.
+const _: () = assert!(MAX_SHARES < 1 << 31);
+
+/// One share in the window, as much of it as the window reads: its work, its acceptance time for
+/// the hashrate, and the identity it credits with whether it counts as own-gateway work. The
+/// block hash, the identity's name and the tag stay in the ledger file. 16 bytes.
+#[derive(Clone, Copy, Debug)]
+struct WindowShare {
+    difficulty: u64,
+    /// Seconds since the Unix epoch; `u32` holds them until 2106.
+    accepted_at: u32,
+    /// The identity's index in `Identities`, shifted left one bit, with the low bit set when
+    /// the share is own-gateway work.
+    credit: u32,
+}
+
+impl WindowShare {
+    fn new(share: &Share, identity: u32, own_gateway: bool) -> Self {
+        Self {
+            difficulty: share.difficulty,
+            accepted_at: u32::try_from(share.accepted_at).unwrap_or(u32::MAX),
+            credit: identity << 1 | u32::from(own_gateway),
+        }
+    }
+
+    fn identity(self) -> u32 {
+        self.credit >> 1
+    }
+
+    fn own_gateway(self) -> bool {
+        self.credit & 1 == 1
+    }
+
+    fn work(self) -> u128 {
+        u128::from(self.difficulty)
+    }
+}
+
+/// The identities with a share in the window, each under the index its shares refer to. An
+/// index is released when the last share referring to it leaves the window, and reused.
+#[derive(Debug, Default)]
+struct Identities {
+    /// Each name once, shared with its entry.
+    by_name: HashMap<Arc<str>, u32>,
+    entries: Vec<Option<IdentityEntry>>,
+    free: Vec<u32>,
+}
+
+#[derive(Debug)]
+struct IdentityEntry {
+    name: Arc<str>,
+    state: IdentityState,
+    /// The shares in the window crediting this identity; the index is released at zero.
+    shares: u32,
+}
+
+impl Identities {
+    /// The index of `name`, taking a released one or a new one for an identity not held.
+    fn index_of(&mut self, name: &str) -> u32 {
+        if let Some(&i) = self.by_name.get(name) {
+            return i;
+        }
+        let name: Arc<str> = Arc::from(name);
+        let entry =
+            IdentityEntry { name: Arc::clone(&name), state: IdentityState::default(), shares: 0 };
+        let i = match self.free.pop() {
+            Some(i) => {
+                self.entries[i as usize] = Some(entry);
+                i
+            }
+            None => {
+                self.entries.push(Some(entry));
+                u32::try_from(self.entries.len() - 1).expect("at most MAX_SHARES + 1 identities")
+            }
+        };
+        self.by_name.insert(name, i);
+        i
+    }
+
+    fn entry_mut(&mut self, i: u32) -> &mut IdentityEntry {
+        self.entries[i as usize].as_mut().expect("a share in the window refers to it")
+    }
+
+    fn name(&self, i: u32) -> &str {
+        &self.entries[i as usize].as_ref().expect("a share in the window refers to it").name
+    }
+
+    fn release(&mut self, i: u32) {
+        if let Some(entry) = self.entries[i as usize].take() {
+            self.by_name.remove(&entry.name);
+            self.free.push(i);
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&str, &IdentityState)> {
+        self.entries.iter().flatten().map(|e| (&*e.name, &e.state))
+    }
+
+    fn len(&self) -> usize {
+        self.by_name.len()
+    }
+}
+
 pub struct Ledger {
-    shares: VecDeque<Share>,
-    identities: HashMap<String, IdentityState>,
+    shares: VecDeque<WindowShare>,
+    identities: Identities,
     window_rule: WindowRule,
     split_policy: SplitPolicy,
     total_work: u128,
@@ -98,7 +206,7 @@ impl Ledger {
     pub fn new(window_rule: WindowRule, split_policy: SplitPolicy) -> Self {
         Self {
             shares: VecDeque::new(),
-            identities: HashMap::new(),
+            identities: Identities::default(),
             window: window_rule.floor.max(1),
             window_rule,
             split_policy,
@@ -113,12 +221,45 @@ impl Ledger {
     /// Reads the store's share window back into this empty ledger, which records every later
     /// share to the store.
     fn attach(&mut self, store: Store) -> io::Result<ReadBack> {
-        let (shares, mut read_back) = store.read_back(self.window, self.max_shares)?;
+        let mut read_back = self.load(&store)?;
         read_back.stamped = store.stamped;
-        self.fill(shares);
         self.cumulative_work = store.cumulative_work;
         self.store = Some(store);
         Ok(read_back)
+    }
+
+    /// Replaces the window with the store's newest shares whose work reaches it, streamed
+    /// from the file oldest first. A read that fails part way leaves the window as it was.
+    fn load(&mut self, store: &Store) -> io::Result<ReadBack> {
+        let (window, max_shares) = (self.window, self.max_shares);
+        self.load_from(|push| store.read_window(window, max_shares, push))
+    }
+
+    /// `load` with the read passed in: `read` gives the function it is called with the number
+    /// of shares, then each share. The previous window is held until the read succeeds, so a
+    /// reload briefly holds two windows, the new one allocated once at its size.
+    fn load_from(
+        &mut self,
+        read: impl FnOnce(&mut dyn FnMut(WindowRow)) -> io::Result<ReadBack>,
+    ) -> io::Result<ReadBack> {
+        let held = (
+            std::mem::take(&mut self.shares),
+            std::mem::take(&mut self.identities),
+            std::mem::replace(&mut self.total_work, 0),
+            self.count_capped,
+        );
+        let loaded = read(&mut |row| match row {
+            // One slot over the count: a recorded share is pushed before the oldest is trimmed.
+            WindowRow::Count(n) => self.shares.reserve_exact(n + 1),
+            WindowRow::Share(share) => {
+                self.push(&share);
+                self.trim();
+            }
+        });
+        if loaded.is_err() {
+            (self.shares, self.identities, self.total_work, self.count_capped) = held;
+        }
+        loaded
     }
 
     /// Sizes the window to `network_difficulty` by the window rule and returns how many
@@ -141,34 +282,24 @@ impl Ledger {
     }
 
     fn refill(&mut self) -> usize {
+        let Some(store) = self.store.take() else { return 0 };
         let before = self.shares.len();
-        let (shares, read_back) = match self.store.as_ref() {
-            Some(store) => match store.read_back(self.window, self.max_shares) {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!("could not re-read the ledger to widen the share window: {e}");
-                    return 0;
+        let loaded = self.load(&store);
+        self.store = Some(store);
+        match loaded {
+            Ok(read_back) => {
+                if read_back.truncated {
+                    warn!(
+                        "the wider share window exceeds the retained ledger; work older than \
+                         that is not credited (raise --ledger-keep-shares to keep it)"
+                    );
                 }
-            },
-            None => return 0,
-        };
-        if read_back.truncated {
-            warn!(
-                "the wider share window exceeds the retained ledger; work older than \
-                 that is not credited (raise --ledger-keep-shares to keep it)"
-            );
-        }
-        self.fill(shares);
-        self.shares.len().saturating_sub(before)
-    }
-
-    fn fill(&mut self, shares: Vec<Share>) {
-        self.shares.clear();
-        self.identities.clear();
-        self.total_work = 0;
-        for share in shares {
-            self.push(share);
-            self.trim();
+                self.shares.len().saturating_sub(before)
+            }
+            Err(e) => {
+                warn!("could not re-read the ledger to widen the share window: {e}");
+                0
+            }
         }
     }
 
@@ -219,22 +350,35 @@ impl Ledger {
         self.shares.is_empty()
     }
 
-    pub fn block_hashes(&self) -> impl Iterator<Item = &[u8; 32]> {
-        self.shares.iter().map(|s| &s.block_hash)
+    /// The acceptance time of every share in the window, oldest first: which shares it holds.
+    #[cfg(test)]
+    pub fn accepted_times(&self) -> Vec<u64> {
+        self.shares.iter().map(|s| u64::from(s.accepted_at)).collect()
+    }
+
+    /// The acceptance time and block hash of the stored shares accepted at or after `cutoff`,
+    /// at most `max`, oldest first; none for a file-less ledger, which starts empty.
+    pub fn accepted_since(&self, cutoff: u64, max: usize) -> io::Result<Vec<(u64, [u8; 32])>> {
+        match &self.store {
+            Some(store) => store.accepted_since(cutoff, max),
+            None => Ok(Vec::new()),
+        }
     }
 
     /// Records the share and returns how many stored shares `--ledger-keep-shares` retention
     /// removed. A duplicate is refused before it reaches the ledger (`accounting::claim`).
     pub fn record(&mut self, share: Share) -> io::Result<usize> {
+        let keep_after = share.accepted_at.saturating_sub(ACCEPTED_HASH_RETENTION_SECS);
         let cumulative_work = self.cumulative_work + u128::from(share.difficulty);
         if let Some(store) = &mut self.store {
             store.insert(&share, cumulative_work)?;
         }
         self.cumulative_work = cumulative_work;
-        self.push(share);
+        self.push(&share);
         self.trim();
         let Some(store) = &self.store else { return Ok(0) };
-        Ok(store.retain(self.shares.len() as u64).unwrap_or_else(|e| {
+        let retained = store.retain(self.shares.len() as u64, keep_after, MAX_ACCEPTED_HASHES);
+        Ok(retained.unwrap_or_else(|e| {
             warn!("ledger retention failed; the share is recorded ({e})");
             0
         }))
@@ -245,60 +389,71 @@ impl Ledger {
     }
 
     /// The shares accepted at or after `cutoff`, newest first.
-    fn shares_since(&self, cutoff: u64) -> impl Iterator<Item = &Share> {
-        self.shares.iter().rev().take_while(move |s| s.accepted_at >= cutoff)
+    fn shares_since(&self, cutoff: u64) -> impl Iterator<Item = &WindowShare> {
+        self.shares.iter().rev().take_while(move |s| u64::from(s.accepted_at) >= cutoff)
     }
 
     /// The work of the shares accepted at or after `cutoff`.
     pub fn work_since(&self, cutoff: u64) -> u128 {
-        self.shares_since(cutoff).map(|s| u128::from(s.difficulty)).sum()
+        self.shares_since(cutoff).map(|s| s.work()).sum()
     }
 
     /// The work of the shares accepted at or after `cutoff`, by identity. The hashrate
     /// sampler wants the total alone, so it calls `work_since` and allocates nothing.
     pub fn work_since_by_identity(&self, cutoff: u64) -> HashMap<String, u128> {
-        let mut by_identity: HashMap<String, u128> = HashMap::new();
+        let mut by_index: HashMap<u32, u128> = HashMap::new();
         for s in self.shares_since(cutoff) {
-            *by_identity.entry(s.identity.clone()).or_insert(0) += u128::from(s.difficulty);
+            *by_index.entry(s.identity()).or_insert(0) += s.work();
         }
-        by_identity
+        by_index.into_iter().map(|(i, work)| (self.identities.name(i).to_string(), work)).collect()
     }
 
     /// Every identity with work in the window and its state, most work first.
     pub fn identities(&self) -> Vec<(String, IdentityState)> {
         let mut v: Vec<(String, IdentityState)> =
-            self.identities.iter().map(|(id, state)| (id.clone(), state.clone())).collect();
+            self.identities.iter().map(|(id, state)| (id.to_string(), state.clone())).collect();
         v.sort_by(|(a, x), (b, y)| most_work_first((a, x.work), (b, y.work)));
         v
     }
 
-    fn push(&mut self, share: Share) {
-        self.total_work += u128::from(share.difficulty);
-        let own = self.is_own_gateway_share(&share);
-        let state = self.identities.entry(share.identity.clone()).or_default();
-        state.work += u128::from(share.difficulty);
+    fn push(&mut self, share: &Share) {
+        let own = self.is_own_gateway_share(share);
+        let index = self.identities.index_of(&share.identity);
+        let entry = self.identities.entry_mut(index);
+        let work = u128::from(share.difficulty);
+        entry.state.work += work;
         if own {
-            state.own_gateway_work += u128::from(share.difficulty);
+            entry.state.own_gateway_work += work;
         }
-        state.tag_secondary.clone_from(&share.tag_secondary);
-        self.shares.push_back(share);
+        entry.state.tag_secondary.clone_from(&share.tag_secondary);
+        entry.shares += 1;
+        self.total_work += work;
+        let len = self.shares.len();
+        if len == self.shares.capacity() {
+            // Grown here rather than by `push_back`, which doubles: by an eighth, so the buffer
+            // stays within an eighth of the most shares the window has held, and never past
+            // `max_shares + 1`, the most it holds since a share is pushed before the oldest is
+            // trimmed.
+            let room = (self.max_shares + 1).saturating_sub(len);
+            self.shares.reserve_exact((len / 8).min(room).max(1));
+        }
+        self.shares.push_back(WindowShare::new(share, index, own));
     }
 
     fn trim(&mut self) {
         while self.shares.len() > 1 && self.total_work > self.window {
             let over = self.total_work - self.window;
-            let oldest_difficulty = u128::from(self.shares.front().expect("non-empty").difficulty);
-            if oldest_difficulty > over {
+            let oldest = self.shares.front().expect("non-empty");
+            if oldest.work() > over {
                 break;
             }
             self.drop_oldest();
         }
-        let mut count_trimmed = false;
         while self.shares.len() > self.max_shares {
             self.drop_oldest();
-            count_trimmed = true;
         }
-        if count_trimmed && !self.count_capped {
+        let capped = self.shares.len() >= self.max_shares && self.total_work < self.window;
+        if capped && !self.count_capped {
             warn!(
                 "the share window is capped at {0} shares, which hold less work than the \
                  configured window times network difficulty; miners are paid over the newest \
@@ -307,20 +462,22 @@ impl Ledger {
                 self.max_shares
             );
         }
-        self.count_capped = count_trimmed;
+        self.count_capped = capped;
     }
 
     fn drop_oldest(&mut self) {
         let Some(oldest) = self.shares.pop_front() else { return };
-        self.total_work -= u128::from(oldest.difficulty);
-        let own = self.is_own_gateway_share(&oldest);
-        let Some(state) = self.identities.get_mut(&oldest.identity) else { return };
-        state.work -= u128::from(oldest.difficulty);
-        if own {
-            state.own_gateway_work -= u128::from(oldest.difficulty);
+        let work = oldest.work();
+        self.total_work -= work;
+        let index = oldest.identity();
+        let entry = self.identities.entry_mut(index);
+        entry.state.work -= work;
+        if oldest.own_gateway() {
+            entry.state.own_gateway_work -= work;
         }
-        if state.work == 0 {
-            self.identities.remove(&oldest.identity);
+        entry.shares -= 1;
+        if entry.shares == 0 {
+            self.identities.release(index);
         }
     }
 }
@@ -404,10 +561,11 @@ fn ledger_files_in(dir: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(found)
 }
 
-/// Every share the existing ledger file stores, oldest first, read in one read transaction
-/// without reading back the share window or opening the block records.
-pub fn dump_file(path: &Path) -> io::Result<Vec<Share>> {
-    store::dump_file(path)
+/// Passes `f` every share the existing ledger file stores, oldest first and one at a time, so
+/// a ledger larger than memory can be read; one read transaction, without reading back the
+/// share window or opening the block records. Stops at the first error `f` returns.
+pub fn dump_file(path: &Path, f: impl FnMut(Share) -> io::Result<()>) -> io::Result<()> {
+    store::dump_file(path, f)
 }
 
 /// `ledger` with the store at `path` attached, and the block records stored beside it; with
@@ -454,8 +612,10 @@ pub fn open_share_ledger(
     match keep {
         Some(n) => info!(
             "keeping at most {n} of the most recent shares in {}, and never fewer than the \
-             window holds",
-            path.display()
+             window holds or than were accepted in the last {} seconds (at most {})",
+            path.display(),
+            ACCEPTED_HASH_RETENTION_SECS,
+            MAX_ACCEPTED_HASHES
         ),
         None => info!("every share in {} is kept", path.display()),
     }

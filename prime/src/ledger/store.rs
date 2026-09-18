@@ -1,7 +1,9 @@
 //! The share rows on disk, each under a sequence number, and the metadata beside them: the chain
 //! the ledger serves and the running total of credited work.
 
-use super::db::{DbResult as _, NAME_SEPARATOR, create_database, split_at_separator, write};
+use super::db::{
+    DbResult as _, NAME_SEPARATOR, create_database, open_database, split_at_separator, write,
+};
 use super::{ReadBack, Share};
 use bytes::BufMut as _;
 use ratum::bitcoin::HASH_SIZE;
@@ -47,6 +49,28 @@ fn unpack(bytes: &[u8]) -> Option<Share> {
         block_hash: hash,
         tag_secondary: String::from_utf8_lossy(tag).into_owned(),
     })
+}
+
+/// The fixed fields at the head of a packed row, without the identity and tag after them, so a
+/// scan that needs only these allocates nothing. A row `unpack` cannot read fails here too.
+struct RowHead {
+    accepted_at: u64,
+    difficulty: u64,
+    block_hash: [u8; HASH_SIZE],
+}
+
+fn unpack_head(bytes: &[u8]) -> Option<RowHead> {
+    let mut c = ByteReader::new(bytes);
+    let accepted_at = c.u64("accepted_at").ok()?;
+    let difficulty = c.u64("difficulty").ok()?;
+    let block_hash: [u8; HASH_SIZE] = c.arr("hash").ok()?;
+    Some(RowHead { accepted_at, difficulty, block_hash })
+}
+
+/// What `Store::read_window` passes on: the number of shares it will read, then each one.
+pub(super) enum WindowRow {
+    Count(usize),
+    Share(Share),
 }
 
 pub(super) struct Store {
@@ -124,65 +148,120 @@ impl Store {
         Ok(())
     }
 
-    /// The newest shares whose difficulties reach `window`, oldest first, and at most
-    /// `max_shares` of them: the ledger discards anything past its own count bound, so
-    /// reading further would only be trimmed again.
-    pub(super) fn read_back(
+    /// Passes `f` the newest shares whose difficulties reach `window`, oldest first, and at
+    /// most `max_shares` of them: the ledger discards anything past its own count bound, so
+    /// reading further would only be trimmed again. Both passes read one snapshot. The first
+    /// walks back from the newest row summing difficulties to find the row the window starts
+    /// at, and gives `f` the number of shares it counted, so a buffer is sized once; the
+    /// second walks forward from it, so no share outlives its call to `f`.
+    pub(super) fn read_window(
         &self,
         window: u128,
         max_shares: usize,
-    ) -> io::Result<(Vec<Share>, ReadBack)> {
+        mut f: impl FnMut(WindowRow),
+    ) -> io::Result<ReadBack> {
         let r = self.db.begin_read().db()?;
         let shares = r.open_table(SHARES).db()?;
-        let mut collected = Vec::new();
-        let mut work = 0u128;
         let mut read_back = ReadBack::default();
-        let mut iter = shares.iter().db()?;
+        let mut work = 0u128;
+        let mut counted = 0usize;
+        let mut start = None;
         let mut hit_count_cap = false;
+        let mut iter = shares.iter().db()?;
         while work < window {
-            if collected.len() >= max_shares {
+            if counted >= max_shares {
                 hit_count_cap = true;
                 break;
             }
             let Some(entry) = iter.next_back() else { break };
-            let (_seq, value) = entry.db()?;
-            match unpack(value.value()) {
-                Some(share) => {
-                    work = work.saturating_add(u128::from(share.difficulty));
-                    collected.push(share);
+            let (seq, value) = entry.db()?;
+            match unpack_head(value.value()) {
+                Some(head) => {
+                    work = work.saturating_add(u128::from(head.difficulty));
+                    counted += 1;
+                    start = Some(seq.value());
                 }
                 None => read_back.skipped += 1,
             }
         }
         read_back.truncated = work < window && !hit_count_cap;
+        let Some(start) = start else { return Ok(read_back) };
+        f(WindowRow::Count(counted));
+        for entry in shares.range(start..).db()? {
+            let (_seq, value) = entry.db()?;
+            if let Some(share) = unpack(value.value()) {
+                f(WindowRow::Share(share));
+            }
+        }
+        Ok(read_back)
+    }
+
+    /// The acceptance time and block hash of the shares accepted at or after `cutoff`, at most
+    /// `max` of them, oldest first. Rows are stored in the order they were recorded, so the
+    /// scan from the newest stops at the first row older than `cutoff`: every row recorded
+    /// before it is older still, unless the pool's clock stepped back between the two.
+    pub(super) fn accepted_since(
+        &self,
+        cutoff: u64,
+        max: usize,
+    ) -> io::Result<Vec<(u64, [u8; 32])>> {
+        let r = self.db.begin_read().db()?;
+        let shares = r.open_table(SHARES).db()?;
+        let mut collected = Vec::new();
+        let mut iter = shares.iter().db()?;
+        while collected.len() < max {
+            let Some(entry) = iter.next_back() else { break };
+            let (_seq, value) = entry.db()?;
+            let Some(head) = unpack_head(value.value()) else { continue };
+            if head.accepted_at < cutoff {
+                break;
+            }
+            collected.push((head.accepted_at, head.block_hash));
+        }
         collected.reverse();
-        Ok((collected, read_back))
+        Ok(collected)
     }
 
     /// Removes the oldest rows past what `--ledger-keep-shares` asks to retain, never
-    /// dropping below `floor`, the shares the window holds. The window reads itself back from
+    /// dropping below `floor`, the shares the window holds, and never a row accepted at or
+    /// after `keep_after` among the newest `keep_newest`. The window reads itself back from
     /// these rows, so retention below it would shrink the payout set the next time a rising
-    /// network difficulty widens the window. Disk cannot be bounded below what the window
-    /// needs, so the configured figure is a request and this floor overrides it.
-    pub(super) fn retain(&self, floor: u64) -> io::Result<usize> {
+    /// network difficulty widens the window; and at startup the duplicate check reads back the
+    /// newest `keep_newest` hashes accepted within `ACCEPTED_HASH_RETENTION_SECS`, so those
+    /// rows must stay for a resend of their share to be refused after a restart. Disk cannot
+    /// be bounded below what these need, so the configured figure is a request and both floors
+    /// override it. The rows to remove are found in a read transaction, so a call that removes
+    /// none commits nothing.
+    pub(super) fn retain(
+        &self,
+        floor: u64,
+        keep_after: u64,
+        keep_newest: usize,
+    ) -> io::Result<usize> {
         let Some(configured) = self.retain_bound else { return Ok(0) };
-        let retain = configured.max(floor);
-        let count = {
+        let oldest = {
             let r = self.db.begin_read().db()?;
-            r.open_table(SHARES).db()?.len().db()?
+            let shares = r.open_table(SHARES).db()?;
+            let count = shares.len().db()?;
+            let surplus = count.saturating_sub(configured.max(floor));
+            let recent_from = count.saturating_sub(keep_newest as u64);
+            let mut oldest = Vec::new();
+            for (position, entry) in shares.iter().db()?.take(surplus as usize).enumerate() {
+                let (seq, value) = entry.db()?;
+                let read_back = position as u64 >= recent_from
+                    && unpack_head(value.value()).is_some_and(|h| h.accepted_at >= keep_after);
+                if read_back {
+                    break;
+                }
+                oldest.push(seq.value());
+            }
+            oldest
         };
-        let Some(surplus) = count.checked_sub(retain) else { return Ok(0) };
-        if surplus == 0 {
+        if oldest.is_empty() {
             return Ok(0);
         }
         write(&self.db, |w| {
             let mut shares = w.open_table(SHARES).db()?;
-            let oldest = shares
-                .iter()
-                .db()?
-                .take(surplus as usize)
-                .map(|entry| entry.map(|(seq, _)| seq.value()).db())
-                .collect::<io::Result<Vec<u64>>>()?;
             for seq in &oldest {
                 shares.remove(*seq).db()?;
             }
@@ -191,29 +270,39 @@ impl Store {
     }
 }
 
-/// `Database::open` rather than `ReadOnlyDatabase::open`: a pool stopped by a signal leaves
+/// Opened writable (`open_database`) rather than read-only: a pool stopped by a signal leaves
 /// the file not closed cleanly, which only a writable open repairs.
-pub(super) fn dump_file(path: &Path) -> io::Result<Vec<Share>> {
-    dump(&Database::open(path).db()?)
+pub(super) fn dump_file(path: &Path, f: impl FnMut(Share) -> io::Result<()>) -> io::Result<()> {
+    dump(&open_database(path)?, f)
 }
 
-fn dump(db: &impl ReadableDatabase) -> io::Result<Vec<Share>> {
+/// Passes `f` each stored share, oldest first, and stops at the first error it returns.
+fn dump(db: &impl ReadableDatabase, mut f: impl FnMut(Share) -> io::Result<()>) -> io::Result<()> {
     let r = db.begin_read().db()?;
     let shares = r.open_table(SHARES).db()?;
-    let mut out = Vec::new();
     for entry in shares.iter().db()? {
         let (_seq, value) = entry.db()?;
         if let Some(share) = unpack(value.value()) {
-            out.push(share);
+            f(share)?;
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::fixtures::{Scratch, hash};
+
+    fn dumped(db: &Database) -> Vec<Share> {
+        let mut out = Vec::new();
+        dump(db, |share| {
+            out.push(share);
+            Ok(())
+        })
+        .unwrap();
+        out
+    }
 
     #[test]
     fn packs_and_unpacks_a_share() {
@@ -249,12 +338,37 @@ mod tests {
         assert!(r.open_table(RETIRED_BY_HASH).is_err(), "the table is gone");
     }
 
+    /// Only the newest `keep_newest` recent rows are read back at startup, so only those are
+    /// kept past the configured count.
+    #[test]
+    fn retention_keeps_recent_rows_only_as_far_as_they_are_read_back() {
+        let scratch = Scratch::new("retain-read-back");
+        let mut store = Store::open(&scratch.join("regtest.redb"), Some(2), None).unwrap();
+        for i in 0..10u64 {
+            let share = Share {
+                accepted_at: 5_000,
+                identity: "m".into(),
+                difficulty: 16,
+                block_hash: hash(i),
+                tag_secondary: String::new(),
+            };
+            store.insert(&share, 16 * (i + 1) as u128).unwrap();
+        }
+        assert_eq!(
+            store.retain(0, 5_000, 5).unwrap(),
+            5,
+            "every row is recent; five are read back"
+        );
+        assert_eq!(store.retain(0, 5_000, 5).unwrap(), 0, "and nothing further goes");
+        assert_eq!(dumped(&store.db).first().unwrap().block_hash, hash(5));
+    }
+
     #[test]
     fn retention_keeps_the_most_recent_shares() {
         let scratch = Scratch::new("retain");
         let mut store = Store::open(&scratch.join("regtest.redb"), None, None).unwrap();
         store.retain_bound = Some(5);
-        let floor = 0;
+        let (floor, keep_after, keep_newest) = (0, u64::MAX, 0);
         for i in 0..12u64 {
             let share = Share {
                 accepted_at: i,
@@ -264,9 +378,9 @@ mod tests {
                 tag_secondary: String::new(),
             };
             store.insert(&share, 16 * (i + 1) as u128).unwrap();
-            store.retain(floor).unwrap();
+            store.retain(floor, keep_after, keep_newest).unwrap();
         }
-        let dumped = dump(&*store.db).unwrap();
+        let dumped = dumped(&store.db);
         assert_eq!(dumped.len(), 5, "only the five most recent are retained");
         assert_eq!(dumped.first().unwrap().accepted_at, 7, "the oldest kept");
         assert_eq!(dumped.last().unwrap().accepted_at, 11, "through the newest");

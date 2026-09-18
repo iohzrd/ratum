@@ -70,11 +70,13 @@ fn print_owed(o: &OwedBlock, state: Option<ConfirmationReading>) {
     }
 }
 
+/// Writes each share as it is read, so the ledger is never held in memory whole.
 fn dump_ledger(location: &LedgerLocation) -> io::Result<()> {
-    use std::fmt::Write as _;
-    let mut out = String::new();
-    for share in ledger::dump_file(&location.existing_file("--dump-ledger")?)? {
-        let _ = writeln!(
+    use std::io::Write as _;
+    let path = location.existing_file("--dump-ledger")?;
+    let mut out = io::BufWriter::new(io::stdout().lock());
+    ledger::dump_file(&path, |share| {
+        writeln!(
             out,
             "{} {} {} {} {}",
             share.accepted_at,
@@ -82,10 +84,9 @@ fn dump_ledger(location: &LedgerLocation) -> io::Result<()> {
             share.identity,
             hex::encode(share.block_hash),
             share.tag_secondary
-        );
-    }
-    print!("{out}");
-    Ok(())
+        )
+    })?;
+    out.flush()
 }
 
 fn owed_entries(entries: &[String]) -> Vec<Payout> {

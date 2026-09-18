@@ -165,8 +165,24 @@ fn read_template_summary(node: &rpc::Client) -> Option<rpc::TemplateSummary> {
     }
 }
 
+/// `difficulty_from_bits` measures a target against share difficulty 1, `2^224`; the node's
+/// `getblockchaininfo` against the target of bits `0x1d00ffff`, `0xffff × 2^208`. Multiplying
+/// by this turns the first into the second.
+const NODE_DIFFICULTY_PER_SHARE_DIFFICULTY: f64 = 65_535.0 / 65_536.0;
+
+/// The difficulty the share window is sized to: that of the block being mined, as TIDES
+/// specifies, read from the template's bits in the node's unit; the tip's when no template was
+/// read. The two differ for the first block after a retarget and for the BLAKE2b activation
+/// block.
+fn window_difficulty(tip: &rpc::Tip, template: Option<rpc::TemplateSummary>) -> f64 {
+    template
+        .and_then(|t| ratum::target::difficulty_from_bits(t.bits))
+        .map_or(tip.difficulty, |d| d * NODE_DIFFICULTY_PER_SHARE_DIFFICULTY)
+}
+
 /// Reads the node's tip, template and mining info into the server's node state, waking
-/// the gateway connections on a change and resizing the share window on each new tip.
+/// the gateway connections on a change and resizing the share window to the difficulty of
+/// the block being mined on each new tip or newly read template.
 pub fn watch_node(server: &Server, expected_chain: Option<rpc::Chain>) {
     let (node, view, interval) = (&server.node, &server.node_state, server.settings.poll);
     let mut have_template = false;
@@ -189,7 +205,16 @@ pub fn watch_node(server: &Server, expected_chain: Option<rpc::Chain>) {
                         ratum::bitcoin::hash_to_display_hex(&t.hash),
                         t.chain.name()
                     );
-                    let re_read = lock(&server.ledger).set_network_difficulty(t.difficulty);
+                }
+                let template = (tip_changed || !have_template).then(|| {
+                    let read = read_template_summary(node);
+                    have_template = read.is_some();
+                    read
+                });
+                let next = template.flatten();
+                if tip_changed || next.is_some() {
+                    let difficulty = window_difficulty(&t, next);
+                    let re_read = lock(&server.ledger).set_network_difficulty(difficulty);
                     if re_read != 0 {
                         info!(
                             "difficulty rose; the wider window re-read {re_read} share(s) from \
@@ -197,11 +222,6 @@ pub fn watch_node(server: &Server, expected_chain: Option<rpc::Chain>) {
                         );
                     }
                 }
-                let template = (tip_changed || !have_template).then(|| {
-                    let read = read_template_summary(node);
-                    have_template = read.is_some();
-                    read
-                });
                 if view.update(t, template) {
                     view.wake_connections();
                 }
@@ -242,5 +262,21 @@ pub fn watch_node(server: &Server, expected_chain: Option<rpc::Chain>) {
             },
             None => std::thread::sleep(interval),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_window_is_sized_to_the_block_being_mined_and_to_the_tip_without_a_template() {
+        let tip =
+            rpc::Tip { hash: [0; 32], height: 2_016, difficulty: 5.0, chain: rpc::Chain::Regtest };
+        let template = |bits| Some(rpc::TemplateSummary { coinbase_value: 0, bits });
+        let next = window_difficulty(&tip, template(0x1d00ffff));
+        assert!((next - 1.0).abs() < 1e-12, "the next block's, in the node's unit: {next}");
+        assert_eq!(window_difficulty(&tip, None), 5.0, "no template read");
+        assert_eq!(window_difficulty(&tip, template(0x1d80ffff)), 5.0, "bits with no difficulty");
     }
 }

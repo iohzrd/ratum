@@ -75,7 +75,7 @@ impl Ledger {
         let mut public_gateway_work = 0u128;
         let mut fee_work = 0u128;
         let mut own_gateway_work = 0u128;
-        for state in self.identities.values() {
+        for (_, state) in self.identities.iter() {
             public_gateway_work += state.work - state.own_gateway_work;
             fee_work += charged_work(state, gateway.fee_bps);
             own_gateway_work += state.own_gateway_work;
@@ -104,12 +104,12 @@ impl Ledger {
             self.public_gateway_fee_work().unwrap_or_default();
         let mut given = 0u128;
         let mut weights = Vec::with_capacity(self.identities.len());
-        for (identity, state) in &self.identities {
+        for (identity, state) in self.identities.iter() {
             let own = state.own_gateway_work;
             let extra =
                 reassigned_work.saturating_mul(own).checked_div(own_gateway_work).unwrap_or(0);
             given += extra;
-            weights.push((identity.as_str(), state.work - charged_work(state, fee_bps) + extra));
+            weights.push((identity, state.work - charged_work(state, fee_bps) + extra));
         }
         weights.sort_by(|(a, x), (b, y)| most_work_first((a, *x), (b, *y)));
         (weights, fee_work.saturating_sub(given))

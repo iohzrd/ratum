@@ -1,9 +1,9 @@
 //! The state every pool thread shares: the settings, the keys, the ledger and its block records,
 //! the node and what it last reported, and the sessions saved for resume.
 
-use crate::accounting::AcceptedShareHashes;
+use crate::accounting::{ACCEPTED_HASH_RETENTION_SECS, AcceptedShareHashes, MAX_ACCEPTED_HASHES};
+use crate::ledger::Ledger;
 use crate::ledger::blocks::BlockRecords;
-use crate::ledger::{self, Ledger};
 use crate::node::NodeState;
 use crate::sessions::SessionStore;
 use crate::settings::Settings;
@@ -51,7 +51,7 @@ impl Server {
             settings,
             pool_keys,
             sessions,
-            accepted_hashes: accepted_hashes_from(&ledger),
+            accepted_hashes: accepted_hashes_from(&ledger)?,
             node,
             node_state: NodeState::default(),
             ledger: Mutex::new(ledger),
@@ -81,13 +81,20 @@ impl Server {
     }
 }
 
-fn accepted_hashes_from(ledger: &Ledger) -> Mutex<AcceptedShareHashes> {
-    let mut hashes = AcceptedShareHashes::new(ledger::MAX_SHARES);
-    let seeded = ledger.block_hashes().fold(0usize, |n, h| n + usize::from(hashes.insert(*h)));
+/// The hashes of the shares the ledger recorded within `ACCEPTED_HASH_RETENTION_SECS`, so a
+/// share accepted before a restart is still refused as a duplicate after it.
+fn accepted_hashes_from(ledger: &Ledger) -> io::Result<Mutex<AcceptedShareHashes>> {
+    let now = ratum::unix_now();
+    let cutoff = now.saturating_sub(ACCEPTED_HASH_RETENTION_SECS);
+    let mut hashes = AcceptedShareHashes::new(MAX_ACCEPTED_HASHES);
+    let seeded = ledger
+        .accepted_since(cutoff, MAX_ACCEPTED_HASHES)?
+        .into_iter()
+        .fold(0usize, |n, (at, hash)| n + usize::from(hashes.restore(hash, at, now)));
     if seeded != 0 {
         info!("{seeded} accepted share hash(es) seeded from the ledger");
     }
-    Mutex::new(hashes)
+    Ok(Mutex::new(hashes))
 }
 
 pub struct OpenConnectionGuard(Arc<Server>);

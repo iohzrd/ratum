@@ -1,11 +1,11 @@
 //! Crediting each share once, across every connection and however its sections are resent.
 
 use super::*;
-use crate::accounting::{AcceptedShareHashes, claim};
+use crate::accounting::{AcceptedShareHashes, MAX_ACCEPTED_HASHES, claim};
 use std::sync::Mutex;
 
 fn fresh_hashes() -> Mutex<AcceptedShareHashes> {
-    Mutex::new(AcceptedShareHashes::new(crate::ledger::MAX_SHARES))
+    Mutex::new(AcceptedShareHashes::new(MAX_ACCEPTED_HASHES))
 }
 
 /// `verify` followed by `claim`, as a connection runs them, with the refusal reduced to its
@@ -15,7 +15,7 @@ fn claimed(
     hashes: &Mutex<AcceptedShareHashes>,
     s: &PowSubmit,
 ) -> Result<RebuiltShare, RejectReason> {
-    v.verify(s, None, NOW).and_then(|rebuilt| claim(hashes, rebuilt)).map_err(|r| r.reason)
+    v.verify(s, None, NOW).and_then(|rebuilt| claim(hashes, rebuilt, NOW)).map_err(|r| r.reason)
 }
 
 #[test]
@@ -59,30 +59,30 @@ fn a_share_is_credited_once_across_connections() {
 #[test]
 fn accepted_share_hashes_remove_the_oldest_first() {
     let mut hashes = AcceptedShareHashes::new(2);
-    assert!(hashes.insert([1; 32]));
-    assert!(hashes.insert([2; 32]));
-    assert!(!hashes.insert([1; 32]));
+    assert!(hashes.insert([1; 32], NOW));
+    assert!(hashes.insert([2; 32], NOW));
+    assert!(!hashes.insert([1; 32], NOW));
     assert_eq!(hashes.len(), 2);
-    assert!(hashes.insert([3; 32]));
+    assert!(hashes.insert([3; 32], NOW));
     assert_eq!(hashes.len(), 2);
-    assert!(hashes.insert([1; 32]));
-    assert!(!hashes.insert([3; 32]));
+    assert!(hashes.insert([1; 32], NOW));
+    assert!(!hashes.insert([3; 32], NOW));
     let mut hashes = AcceptedShareHashes::new(0);
-    assert!(hashes.insert([9; 32]));
-    assert!(!hashes.insert([9; 32]));
+    assert!(hashes.insert([9; 32], NOW));
+    assert!(!hashes.insert([9; 32], NOW));
 }
 
 #[test]
 fn a_removed_hash_can_be_accepted_again() {
     let mut hashes = AcceptedShareHashes::new(4);
-    assert!(hashes.insert([1; 32]));
-    assert!(hashes.insert([2; 32]));
-    assert!(!hashes.insert([1; 32]));
+    assert!(hashes.insert([1; 32], NOW));
+    assert!(hashes.insert([2; 32], NOW));
+    assert!(!hashes.insert([1; 32], NOW));
     assert!(hashes.remove(&[1; 32]), "the hash was present");
     assert!(!hashes.remove(&[1; 32]), "and is gone now");
     assert_eq!(hashes.len(), 1);
-    assert!(hashes.insert([1; 32]), "a removed hash is accepted again when it is resent");
-    assert!(!hashes.insert([2; 32]), "the one that stayed is still a duplicate");
+    assert!(hashes.insert([1; 32], NOW), "a removed hash is accepted again when it is resent");
+    assert!(!hashes.insert([2; 32], NOW), "the one that stayed is still a duplicate");
 }
 
 #[test]
@@ -94,4 +94,23 @@ fn a_rejected_share_is_not_recorded_as_seen() {
     assert_eq!(claimed(&mut v, &hashes, &s), Err(RejectReason::HighHash));
     s.target_byte = 0;
     assert!(claimed(&mut v, &hashes, &s).is_ok());
+}
+
+/// `ACCEPTED_HASH_RETENTION_SECS` rests on the time check: a share whose header time is as far
+/// ahead as that check allows, accepted at `NOW`, fails it on every resend once
+/// `2 × NTIME_WINDOW_SECS` have passed, so forgetting its hash then credits nothing twice.
+#[test]
+fn no_resend_passes_the_time_check_once_its_hash_is_forgotten() {
+    use crate::accounting::ACCEPTED_HASH_RETENTION_SECS;
+    let (mut v, mut s) = setup();
+    s.blake2b.time_on_wire = (NOW + NTIME_WINDOW_SECS) as u32;
+    assert!(v.rebuild_checked_ignoring_target(&s, None, NOW).is_ok(), "accepted at NOW");
+    for later in [NOW + 2 * NTIME_WINDOW_SECS + 1, NOW + ACCEPTED_HASH_RETENTION_SECS + 1] {
+        assert_eq!(
+            v.rebuild_checked_ignoring_target(&s, None, later),
+            Err(RejectReason::BadNtime),
+            "resent at NOW + {}",
+            later - NOW
+        );
+    }
 }

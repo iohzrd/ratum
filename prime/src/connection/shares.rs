@@ -87,8 +87,9 @@ impl Connection<'_> {
         // Not `self.abw()`: the borrow must stay on `v3` alone, beside `verifier` under &mut.
         let abw = self.v3.as_ref().map(|v| &v.abw);
         let verified = self.verifier.verify(s, abw, now);
-        match verified.and_then(|rebuilt| accounting::claim(&self.server.accepted_hashes, rebuilt))
-        {
+        let claimed = verified
+            .and_then(|rebuilt| accounting::claim(&self.server.accepted_hashes, rebuilt, now));
+        match claimed {
             Ok(rebuilt) => self.on_accepted(s, &rebuilt, now),
             Err(refusal) => self.on_refused(s, refusal),
         }

@@ -30,6 +30,11 @@ pub fn server_with_fee(shares: &[(&str, u64)], min_payout: u64, fee_bps: u16) ->
         hash[0] = i as u8;
         ledger.record(share(1_000 + i as u64, identity, *difficulty, hash, "")).unwrap();
     }
+    server_on(ledger, BlockRecords::default())
+}
+
+/// A server on regtest over `ledger` and `records`, as `Server::new` builds it at startup.
+pub fn server_on(ledger: Ledger, records: BlockRecords) -> Server {
     let Resolved { mut settings, .. } = crate::settings::resolve(&Options::default()).unwrap();
     settings.motd = String::new();
     settings.listen = "0.0.0.0:28915".into();
@@ -46,14 +51,7 @@ pub fn server_with_fee(shares: &[(&str, u64)], min_payout: u64, fee_bps: u16) ->
         chain: Some(rpc::Chain::Regtest),
     };
     let node = rpc::Client::new("http://127.0.0.1:1", "u", "p", None).unwrap();
-    Server::new(
-        settings,
-        share_policy,
-        KeyPairs::generate(),
-        node,
-        (ledger, BlockRecords::default()),
-    )
-    .unwrap()
+    Server::new(settings, share_policy, KeyPairs::generate(), node, (ledger, records)).unwrap()
 }
 
 /// A server whose window holds 100 work from `ALICE` on the public gateway (tag "public") and

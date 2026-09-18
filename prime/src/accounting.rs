@@ -2,32 +2,138 @@
 //! credited once, the share recorded to the window, and the block recorded with whatever its
 //! coinbase failed to pay.
 
-use crate::bounded::BoundedSet;
 use crate::ledger::Share;
 use crate::ledger::blocks::{FoundBlock, OwedBlock};
 use crate::ledger::split::Payout;
 use crate::payout::dictated_outputs;
 use crate::server::Server;
-use crate::verify::{RebuiltShare, Refusal};
+use crate::verify::{NTIME_WINDOW_SECS, RebuiltShare, Refusal};
 use log::{debug, error, info, warn};
 use ratum::datum::messages::share_response::RejectReason;
 use ratum::lock;
 use ratum::username::address_of;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Mutex;
 
-/// The block hashes of the shares accepted across every connection, so a share is credited
-/// once however many times it is sent; the oldest is forgotten past the ledger's share count.
-pub type AcceptedShareHashes = BoundedSet<[u8; 32]>;
+/// How far back the pool's clock may step without a hash being forgotten while a resend of its
+/// share could still be accepted.
+const CLOCK_STEP_MARGIN_SECS: u64 = 10 * ratum::SECS_PER_MINUTE;
 
-/// Claims the share's block hash; a hash already claimed refuses the share as duplicate work,
-/// with the rebuilt share for its reference.
+/// How long an accepted share's hash is held. A share is accepted only while its header time is
+/// within `NTIME_WINDOW_SECS` of the pool's clock, and that time is hashed into the share, so a
+/// share accepted at `A` carries a header time of at most `A + NTIME_WINDOW_SECS` and no resend
+/// of it passes the same check after `A + 2 × NTIME_WINDOW_SECS`. Holding a hash longer refuses
+/// nothing more.
+pub const ACCEPTED_HASH_RETENTION_SECS: u64 = 2 * NTIME_WINDOW_SECS + CLOCK_STEP_MARGIN_SECS;
+
+/// The most hashes held however many shares are accepted within `ACCEPTED_HASH_RETENTION_SECS`:
+/// the memory bound, about 123 MiB (123 bytes a hash, measured). It covers 69 shares a second
+/// for the whole retention; past that the oldest are forgotten early, and a share resent after
+/// its hash was forgotten would be credited again.
+pub const MAX_ACCEPTED_HASHES: usize = 1 << 20;
+
+/// The block hashes of the shares accepted across every connection within
+/// `ACCEPTED_HASH_RETENTION_SECS`, so a share is credited once however many times it is sent.
+#[derive(Debug)]
+pub struct AcceptedShareHashes {
+    /// Each held hash and the time it was accepted at.
+    accepted_at: HashMap<[u8; 32], u64>,
+    /// Every hash held, in the order it was accepted, including ones removed since. An entry
+    /// leaves `accepted_at` only if that map holds the hash under this entry's time, so a hash
+    /// removed and accepted again in a later second is kept for its later acceptance; accepted
+    /// again in the same second, it leaves with the first of its two entries the cap drops.
+    order: VecDeque<(u64, [u8; 32])>,
+    capacity: usize,
+    warned_capped: bool,
+}
+
+impl AcceptedShareHashes {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            accepted_at: HashMap::new(),
+            order: VecDeque::new(),
+            capacity: capacity.max(1),
+            warned_capped: false,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.accepted_at.len()
+    }
+
+    /// Holds `hash` as accepted at `now`; false when it is already held.
+    pub fn insert(&mut self, hash: [u8; 32], now: u64) -> bool {
+        self.hold(hash, now, now)
+    }
+
+    /// Holds `hash` as accepted at `at`, a time read back from the ledger; called oldest first.
+    pub fn restore(&mut self, hash: [u8; 32], at: u64, now: u64) -> bool {
+        self.hold(hash, at, now)
+    }
+
+    pub fn remove(&mut self, hash: &[u8; 32]) -> bool {
+        self.accepted_at.remove(hash).is_some()
+    }
+
+    fn hold(&mut self, hash: [u8; 32], at: u64, now: u64) -> bool {
+        self.expire(now);
+        if self.accepted_at.contains_key(&hash) {
+            return false;
+        }
+        // Dropped before the new hash is added, so neither `order` nor `accepted_at` grows
+        // past the capacity and doubles its buffer.
+        let mut forgot_early = false;
+        while self.order.len() >= self.capacity {
+            let oldest = self.order.pop_front().expect("at the capacity");
+            forgot_early |= self.forget(oldest);
+        }
+        if forgot_early && !self.warned_capped {
+            self.warned_capped = true;
+            warn!(
+                "more share hashes were accepted within {ACCEPTED_HASH_RETENTION_SECS} seconds \
+                 than the {} held; the oldest are forgotten before a resend of their share stops \
+                 being accepted, so such a resend would be credited again. Raise --min-diff to \
+                 accept fewer, larger shares.",
+                self.capacity
+            );
+        }
+        self.accepted_at.insert(hash, at);
+        self.order.push_back((at, hash));
+        true
+    }
+
+    fn expire(&mut self, now: u64) {
+        while let Some(&(at, hash)) = self.order.front() {
+            if at.saturating_add(ACCEPTED_HASH_RETENTION_SECS) >= now {
+                break;
+            }
+            self.order.pop_front();
+            self.forget((at, hash));
+        }
+    }
+
+    /// Removes `hash` from `accepted_at` if it is held there at `at`; true when it was.
+    fn forget(&mut self, (at, hash): (u64, [u8; 32])) -> bool {
+        if self.accepted_at.get(&hash) == Some(&at) {
+            self.accepted_at.remove(&hash);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Claims the share's block hash as accepted at `now`; a hash already claimed refuses the share
+/// as duplicate work, with the rebuilt share for its reference.
 pub fn claim(
     hashes: &Mutex<AcceptedShareHashes>,
     rebuilt: RebuiltShare,
+    now: u64,
 ) -> Result<RebuiltShare, Refusal> {
-    if lock(hashes).insert(rebuilt.block_hash) {
+    if lock(hashes).insert(rebuilt.block_hash, now) {
         Ok(rebuilt)
     } else {
         Err(Refusal { reason: RejectReason::DuplicateWork, rebuilt: Some(Box::new(rebuilt)) })
@@ -58,7 +164,9 @@ pub fn credit_share(
         }
     };
     if removed != 0 {
-        info!("[{peer}]      ledger retention removed {removed} share(s) past --ledger-keep");
+        info!(
+            "[{peer}]      ledger retention removed {removed} share(s) past --ledger-keep-shares"
+        );
     }
     debug!(
         "[{peer}]   <- accepted diff={} hash={} height={} split={} pool={} sats from {username}",
@@ -332,19 +440,98 @@ mod tests {
     #[test]
     fn a_hash_is_claimed_once_and_a_released_one_again() {
         let server = server();
-        assert!(claim(&server.accepted_hashes, block(900, 100, Vec::new())).is_ok());
-        let refusal = claim(&server.accepted_hashes, block(900, 100, Vec::new())).unwrap_err();
+        assert!(claim(&server.accepted_hashes, block(900, 100, Vec::new()), 42).is_ok());
+        let refusal = claim(&server.accepted_hashes, block(900, 100, Vec::new()), 42).unwrap_err();
         assert_eq!(refusal.reason, RejectReason::DuplicateWork);
         assert_eq!(refusal.rebuilt.map(|r| r.block_hash), Some([0xbb; 32]));
         lock(&server.accepted_hashes).remove(&[0xbb; 32]);
-        assert!(claim(&server.accepted_hashes, block(900, 100, Vec::new())).is_ok());
+        assert!(claim(&server.accepted_hashes, block(900, 100, Vec::new()), 42).is_ok());
     }
 
     #[test]
-    fn a_share_in_the_window_at_startup_is_already_claimed() {
-        let server = server();
-        let recorded = RebuiltShare { block_hash: [0; 32], ..block(900, 100, Vec::new()) };
-        let refusal = claim(&server.accepted_hashes, recorded).unwrap_err();
-        assert_eq!(refusal.reason, RejectReason::DuplicateWork, "ALICE's share, hash 0");
+    fn a_share_recorded_within_the_retention_is_claimed_after_a_restart() {
+        use crate::fixtures::{Scratch, server_on, share};
+        use crate::ledger::blocks::BlockRecords;
+        use crate::ledger::split::SplitPolicy;
+        use crate::ledger::{Ledger, WindowRule, open_share_ledger};
+        let scratch = Scratch::new("claimed-after-restart");
+        let path = scratch.join("regtest.redb");
+        let open = || {
+            let ledger = Ledger::new(WindowRule::fixed(u128::MAX), SplitPolicy::default());
+            open_share_ledger(Some(&path), None, Some("regtest"), ledger).unwrap()
+        };
+        let now = ratum::unix_now();
+        {
+            let (mut ledger, _) = open();
+            let expired = now - ACCEPTED_HASH_RETENTION_SECS - 1;
+            ledger.record(share(expired, ALICE, 1, [1; 32], "")).unwrap();
+            ledger.record(share(now, ALICE, 1, [2; 32], "")).unwrap();
+        }
+        let server = server_on(open().0, BlockRecords::default());
+        let again = |hash| RebuiltShare { block_hash: hash, ..block(900, 100, Vec::new()) };
+        let refusal = claim(&server.accepted_hashes, again([2; 32]), now).unwrap_err();
+        assert_eq!(refusal.reason, RejectReason::DuplicateWork, "accepted before the restart");
+        assert!(
+            claim(&server.accepted_hashes, again([1; 32]), now).is_ok(),
+            "accepted past the retention, so no resend of it passes the time check"
+        );
+    }
+
+    #[test]
+    fn a_hash_is_held_for_the_retention_and_forgotten_after() {
+        let mut hashes = AcceptedShareHashes::new(8);
+        assert!(hashes.insert([1; 32], 1_000));
+        assert!(hashes.insert([2; 32], 1_000 + 60));
+        let end = 1_000 + ACCEPTED_HASH_RETENTION_SECS;
+        assert!(!hashes.insert([1; 32], end), "held through its last second");
+        assert!(hashes.insert([1; 32], end + 1), "and accepted again once it has passed");
+        assert!(!hashes.insert([2; 32], end + 1), "the later one is still held");
+        assert!(hashes.insert([2; 32], end + 61), "then its own retention passes");
+        assert!(!hashes.insert([1; 32], end + 61), "while the re-accepted one is held");
+    }
+
+    #[test]
+    fn a_hash_removed_and_accepted_again_is_held_from_its_later_acceptance() {
+        let mut hashes = AcceptedShareHashes::new(8);
+        assert!(hashes.insert([1; 32], 1_000));
+        assert!(hashes.remove(&[1; 32]), "released after a failed ledger write");
+        assert!(hashes.insert([1; 32], 2_000), "and credited on its resend");
+        let first_expiry = 1_000 + ACCEPTED_HASH_RETENTION_SECS + 1;
+        assert!(
+            !hashes.insert([1; 32], first_expiry),
+            "the first acceptance expiring does not release the second"
+        );
+        assert!(hashes.insert([1; 32], 2_000 + ACCEPTED_HASH_RETENTION_SECS + 1));
+    }
+
+    #[test]
+    fn restored_hashes_keep_the_time_they_were_accepted_at() {
+        let mut hashes = AcceptedShareHashes::new(8);
+        let now = 10_000 + ACCEPTED_HASH_RETENTION_SECS;
+        assert!(hashes.restore([1; 32], 10_000, now));
+        assert!(!hashes.insert([1; 32], now), "held until its own retention ends");
+        assert!(hashes.insert([1; 32], now + 1));
+    }
+
+    #[test]
+    fn past_the_capacity_the_buffers_stay_at_the_capacity() {
+        let mut hashes = AcceptedShareHashes::new(64);
+        for i in 0..200u8 {
+            assert!(hashes.insert([i; 32], 5));
+        }
+        assert_eq!(hashes.len(), 64);
+        let capacity = hashes.order.capacity();
+        assert!(capacity < 128, "not doubled past the capacity of 64: {capacity}");
+    }
+
+    #[test]
+    fn past_the_capacity_the_oldest_hash_is_forgotten() {
+        let mut hashes = AcceptedShareHashes::new(2);
+        assert!(hashes.insert([1; 32], 5));
+        assert!(hashes.insert([2; 32], 5));
+        assert!(hashes.insert([3; 32], 5));
+        assert_eq!(hashes.len(), 2);
+        assert!(hashes.insert([1; 32], 5), "forgotten before its retention ended");
+        assert!(!hashes.insert([3; 32], 5));
     }
 }
