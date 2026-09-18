@@ -1,56 +1,30 @@
+//! The thread that reads getmininginfo from the node once a minute, which is where the network
+//! hashrate estimate and the node's warnings come from.
+
+use crate::gateway::Gateway;
 use log::{error, info, warn};
-use ratum::{lock, rpc};
-use std::sync::{Arc, Mutex};
+use ratum::rpc;
+use std::sync::Arc;
 use std::time::Duration;
 
 const INFO_INTERVAL: Duration = Duration::from_secs(ratum::SECS_PER_MINUTE);
 const INFO_RETRY: Duration = Duration::from_secs(10);
 
-#[derive(Default)]
-pub struct NodeView {
-    network_hashps: Mutex<Option<f64>>,
-    warnings: Mutex<Vec<String>>,
-}
-
-impl NodeView {
-    pub fn network_hashps(&self) -> Option<f64> {
-        *lock(&self.network_hashps)
-    }
-
-    pub fn set_network_hashps(&self, hashps: f64) {
-        if hashps > 0.0 {
-            *lock(&self.network_hashps) = Some(hashps);
-        }
-    }
-
-    pub fn warnings(&self) -> Vec<String> {
-        lock(&self.warnings).clone()
-    }
-
-    pub fn set_warnings(&self, warnings: Vec<String>) {
-        *lock(&self.warnings) = warnings;
-    }
-}
-
-pub fn start_info_thread(
-    node: rpc::Client,
-    node_view: Arc<NodeView>,
-    max_network_share: Option<f64>,
-) {
+pub fn start_info_thread(gateway: Arc<Gateway>) {
     ratum::thread::spawn("node-info", move || {
+        let mining_info = &gateway.mining_info;
         let mut announced = false;
         let mut reported = false;
         loop {
-            match node.mining_info() {
-                Ok(info) => {
+            match ratum::mining_info::refresh(&gateway.node, mining_info) {
+                Ok(refreshed) => {
                     reported = false;
-                    node_view.set_warnings(info.warnings);
-                    if info.chain == rpc::Chain::Main {
-                        node_view.set_network_hashps(info.network_hashps);
-                    }
                     if !announced {
                         announced = true;
-                        announce_network_share_limit(max_network_share, info.chain);
+                        announce_network_share_limit(
+                            gateway.config.max_network_share(),
+                            refreshed.chain,
+                        );
                     }
                 }
                 Err(e) if e.is_method_not_found() => {

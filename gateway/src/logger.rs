@@ -1,3 +1,6 @@
+//! The log sinks the configuration names, a console or stderr sink and a file, each at its own
+//! level, and the timestamp format the C gateway writes.
+
 use crate::config::{LoggerConfig, StartupNote};
 use log::{Level, LevelFilter, Log, Metadata, Record};
 use std::fmt::Write as _;

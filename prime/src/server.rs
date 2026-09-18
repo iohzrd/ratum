@@ -1,106 +1,96 @@
-use crate::ledger::Ledger;
-use crate::node::NodeView;
-use crate::payout::PayoutPolicy;
-use crate::payout::resolver::AddressResolver;
+//! The state every pool thread shares: the settings, the keys, the ledger and its block records,
+//! the node and what it last reported, and the sessions saved for resume.
+
+use crate::accounting::AcceptedShareHashes;
+use crate::ledger::blocks::BlockRecords;
+use crate::ledger::{self, Ledger};
+use crate::node::NodeState;
 use crate::sessions::SessionStore;
 use crate::settings::Settings;
-use crate::verify::{AcceptedShareHashes, SharePolicy};
+use crate::verify::SharePolicy;
 use log::info;
 use ratum::datum::handshake::ResumeToken;
 use ratum::datum::keys::KeyPairs;
-use ratum::datum::messages::config::ClientConfigV3;
+use ratum::datum::messages::config::{ClientConfig, V3Config};
 use ratum::rpc;
+use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 pub struct Server {
+    pub settings: Settings,
     pub pool_keys: KeyPairs,
-    pub motd: String,
-    pub allowed_agents: Vec<String>,
-    pub require_v3: bool,
     pub sessions: Mutex<SessionStore>,
-    pub abw_reveal_after: Duration,
     pub node: rpc::Client,
-    pub node_view: Arc<NodeView>,
-    pub accepted_hashes: Arc<Mutex<AcceptedShareHashes>>,
+    pub node_state: NodeState,
+    pub accepted_hashes: Mutex<AcceptedShareHashes>,
     pub ledger: Mutex<Ledger>,
-    pub resolver: AddressResolver,
-    pub payout_policy: PayoutPolicy,
+    pub records: Mutex<BlockRecords>,
     pub share_policy: SharePolicy,
     pub config_payload: Vec<u8>,
     pub open_connections: AtomicUsize,
-    pub max_connections: usize,
-    pub datum_port: u16,
-    pub advertise_address: Option<String>,
-    pub public_gateway: Option<String>,
 }
 
 impl Server {
     pub fn new(
-        s: &Settings,
+        settings: Settings,
+        share_policy: SharePolicy,
         pool_keys: KeyPairs,
         node: rpc::Client,
-        node_view: Arc<NodeView>,
-        ledger: Ledger,
-        share_policy: SharePolicy,
-        config_payload: Vec<u8>,
-    ) -> Self {
-        Self {
+        (ledger, records): (Ledger, BlockRecords),
+    ) -> io::Result<Self> {
+        let config_payload = share_policy.config.encode().map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("cannot build the client config: {e}"),
+            )
+        })?;
+        let sessions =
+            Mutex::new(SessionStore::new(share_policy.config.prime_id, settings.abw_reveal_after));
+        Ok(Self {
+            settings,
             pool_keys,
-            motd: s.motd.clone(),
-            allowed_agents: s.allowed_agents.clone(),
-            require_v3: s.require_v3,
-            sessions: Mutex::new(SessionStore::default()),
-            abw_reveal_after: s.abw_reveal_after,
+            sessions,
             accepted_hashes: accepted_hashes_from(&ledger),
             node,
-            node_view,
+            node_state: NodeState::default(),
             ledger: Mutex::new(ledger),
-            resolver: AddressResolver::new(),
-            payout_policy: PayoutPolicy {
-                min_payout: s.min_payout,
-                window_multiple: s.window_multiple,
-                window_floor: s.window_floor,
-                fee_bps: s.fee_bps,
-                public_gateway_fee_bps: s.public_gateway_fee_bps,
-                public_gateway_fee_subsidy_bps: s.public_gateway_fee_subsidy_bps,
-            },
+            records: Mutex::new(records),
             share_policy,
             config_payload,
             open_connections: AtomicUsize::new(0),
-            max_connections: s.max_connections,
-            datum_port: s.listen.rsplit_once(':').and_then(|(_, p)| p.parse().ok()).unwrap_or(0),
-            advertise_address: s.advertise_address.clone(),
-            public_gateway: s.public_gateway.clone(),
-        }
+        })
+    }
+
+    /// Counts one more open connection and returns the guard that counts it back down when
+    /// it is dropped, or none when `--max-connections` are already open. Every change to the
+    /// count is here and in that guard's `Drop`.
+    pub fn open_connection(server: &Arc<Self>) -> Option<OpenConnectionGuard> {
+        let held = server.open_connections.fetch_add(1, Ordering::Relaxed);
+        let guard = OpenConnectionGuard(Arc::clone(server));
+        (held < server.settings.max_connections).then_some(guard)
     }
 
     pub fn config_payload_v3(&self, token: &ResumeToken) -> Vec<u8> {
-        ClientConfigV3 {
-            payout_script: self.share_policy.payout_script.clone(),
-            prime_id: self.share_policy.prime_id,
-            resume_token: *token,
-            coinbase_tag: self.share_policy.coinbase_tag.clone(),
-            min_difficulty: self.share_policy.min_difficulty,
-            bulk_framing: true,
-            abw_disabled: false,
+        ClientConfig {
+            v3: Some(V3Config { resume_token: *token, bulk_framing: true, abw_disabled: false }),
+            ..self.share_policy.config.clone()
         }
         .encode()
         .expect("the v1 config from the same policy encoded at startup")
     }
 }
 
-fn accepted_hashes_from(ledger: &Ledger) -> Arc<Mutex<AcceptedShareHashes>> {
-    let mut hashes = AcceptedShareHashes::default();
-    let seeded = ledger.block_hashes().fold(0usize, |n, h| n + usize::from(hashes.accept(*h)));
+fn accepted_hashes_from(ledger: &Ledger) -> Mutex<AcceptedShareHashes> {
+    let mut hashes = AcceptedShareHashes::new(ledger::MAX_SHARES);
+    let seeded = ledger.block_hashes().fold(0usize, |n, h| n + usize::from(hashes.insert(*h)));
     if seeded != 0 {
         info!("{seeded} accepted share hash(es) seeded from the ledger");
     }
-    Arc::new(Mutex::new(hashes))
+    Mutex::new(hashes)
 }
 
-pub struct OpenConnectionGuard(pub Arc<Server>);
+pub struct OpenConnectionGuard(Arc<Server>);
 
 impl Drop for OpenConnectionGuard {
     fn drop(&mut self) {

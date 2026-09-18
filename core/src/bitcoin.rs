@@ -1,20 +1,24 @@
+//! Block and transaction primitives: double SHA-256, merkle roots and the branches a coinbase path
+//! needs, the CompactSize encoding, and block serialization.
+
+pub mod address;
 pub mod script;
 pub mod transaction;
 
-use crate::reader::{ByteReader, Truncated};
+use crate::reader::ByteReader;
 use bytes::BufMut as _;
 use sha2::{Digest, Sha256};
 
 pub const HASH_SIZE: usize = 32;
-pub const WITNESS_SCALE_FACTOR: u64 = 4;
-pub const MAX_COMPACT_SIZE_LEN: usize = 1 + size_of::<u64>();
+pub(crate) const WITNESS_SCALE_FACTOR: u64 = 4;
+pub(crate) const MAX_COMPACT_SIZE_LEN: usize = 1 + size_of::<u64>();
 
 pub fn sha256d(data: &[u8]) -> [u8; 32] {
     let first = Sha256::digest(data);
     Sha256::digest(first).into()
 }
 
-pub fn reversed(hash: &[u8; 32]) -> [u8; 32] {
+pub(crate) fn reversed(hash: &[u8; 32]) -> [u8; 32] {
     let mut out = *hash;
     out.reverse();
     out
@@ -29,15 +33,38 @@ pub fn hash_to_display_hex(v: &[u8; 32]) -> String {
     hex::encode(reversed(v))
 }
 
-pub fn merkle_root_from_branches(coinbase_txid: &[u8; 32], branches: &[[u8; 32]]) -> [u8; 32] {
-    let mut acc = *coinbase_txid;
+fn hash_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
     let mut combined = [0u8; 2 * HASH_SIZE];
-    for b in branches {
-        combined[..HASH_SIZE].copy_from_slice(&acc);
-        combined[HASH_SIZE..].copy_from_slice(b);
-        acc = sha256d(&combined);
+    combined[..HASH_SIZE].copy_from_slice(left);
+    combined[HASH_SIZE..].copy_from_slice(right);
+    sha256d(&combined)
+}
+
+/// The next level of a merkle tree: an odd level's last entry is paired with itself.
+fn next_level<T: Copy>(mut level: Vec<T>, hash: impl Fn(T, T) -> T) -> Vec<T> {
+    if level.len() % 2 == 1 {
+        level.push(*level.last().expect("non-empty"));
     }
-    acc
+    level.as_chunks::<2>().0.iter().map(|&[a, b]| hash(a, b)).collect()
+}
+
+pub fn merkle_root_from_branches(coinbase_txid: &[u8; 32], branches: &[[u8; 32]]) -> [u8; 32] {
+    branches.iter().fold(*coinbase_txid, |acc, b| hash_pair(&acc, b))
+}
+
+pub fn merkle_branches(txids: &[[u8; 32]]) -> Vec<[u8; 32]> {
+    if txids.is_empty() {
+        return Vec::new();
+    }
+    let mut level: Vec<Option<[u8; 32]>> = Vec::with_capacity(txids.len() + 1);
+    level.push(None);
+    level.extend(txids.iter().map(|t| Some(*t)));
+    let mut branches = Vec::new();
+    while level.len() > 1 {
+        branches.push(level[1].expect("a sibling on the coinbase path is known"));
+        level = next_level(level, |a, b| Some(hash_pair(&a?, &b?)));
+    }
+    branches
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,21 +78,10 @@ pub fn merkle_tree_root(txids: &[[u8; 32]]) -> Option<MerkleTreeRoot> {
         return None;
     }
     let mut level = txids.to_vec();
-    let mut combined = [0u8; 2 * HASH_SIZE];
     let mut mutated = false;
     while level.len() > 1 {
         mutated |= level.as_chunks::<2>().0.iter().any(|[a, b]| a == b);
-        if level.len() % 2 == 1 {
-            let last = *level.last().expect("non-empty");
-            level.push(last);
-        }
-        let mut next = Vec::with_capacity(level.len() / 2);
-        for [a, b] in level.as_chunks::<2>().0 {
-            combined[..HASH_SIZE].copy_from_slice(a);
-            combined[HASH_SIZE..].copy_from_slice(b);
-            next.push(sha256d(&combined));
-        }
-        level = next;
+        level = next_level(level, |a, b| hash_pair(&a, &b));
     }
     Some(MerkleTreeRoot { root: level[0], mutated })
 }
@@ -77,7 +93,7 @@ const COMPACT_SIZE_MAX_1: u64 = COMPACT_SIZE_U16_TAG as u64 - 1;
 const COMPACT_SIZE_MAX_2: u64 = u16::MAX as u64;
 const COMPACT_SIZE_MAX_4: u64 = u32::MAX as u64;
 
-pub fn encode_compact_size(n: u64) -> Vec<u8> {
+pub(crate) fn encode_compact_size(n: u64) -> Vec<u8> {
     let mut v = Vec::with_capacity(MAX_COMPACT_SIZE_LEN);
     match n {
         0..=COMPACT_SIZE_MAX_1 => v.put_u8(n as u8),
@@ -97,19 +113,7 @@ pub fn encode_compact_size(n: u64) -> Vec<u8> {
     v
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CompactSizeError {
-    Truncated(&'static str),
-    NonCanonical,
-}
-
-impl From<Truncated> for CompactSizeError {
-    fn from(t: Truncated) -> Self {
-        Self::Truncated(t.0)
-    }
-}
-
-pub fn decode_compact_size(c: &mut ByteReader<'_>) -> Result<u64, CompactSizeError> {
+pub(crate) fn decode_compact_size(c: &mut ByteReader<'_>) -> Result<u64, transaction::TxError> {
     let first = c.u8("compact size")?;
     let (v, minimum) = match first {
         COMPACT_SIZE_U16_TAG => (u64::from(c.u16("compact size")?), COMPACT_SIZE_MAX_1 + 1),
@@ -118,7 +122,7 @@ pub fn decode_compact_size(c: &mut ByteReader<'_>) -> Result<u64, CompactSizeErr
         n => (u64::from(n), 0),
     };
     if v < minimum {
-        return Err(CompactSizeError::NonCanonical);
+        return Err(transaction::TxError::BadCompactSize);
     }
     Ok(v)
 }
@@ -201,6 +205,21 @@ mod tests {
         let duplicated = super::merkle_tree_root(&[a, b, c, c]).unwrap();
         assert_eq!(duplicated.root, original.root, "the duplicated list produces the same root");
         assert!(duplicated.mutated, "the duplicated adjacent pair is reported as mutated");
+    }
+
+    #[test]
+    fn branches_reproduce_the_tree_root() {
+        let cb = [0x11u8; 32];
+        for n in [1usize, 2, 3, 4, 5, 6, 7, 8, 9, 100] {
+            let txids: Vec<[u8; 32]> = (0..n).map(|i| [i as u8 + 1; 32]).collect();
+            let branches = merkle_branches(&txids);
+            let from_branches = merkle_root_from_branches(&cb, &branches);
+            let mut all = vec![cb];
+            all.extend_from_slice(&txids);
+            let tree = merkle_tree_root(&all).unwrap();
+            assert_eq!(from_branches, tree.root, "{n} transactions");
+        }
+        assert!(merkle_branches(&[]).is_empty());
     }
 
     #[test]

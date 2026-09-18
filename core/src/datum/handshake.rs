@@ -1,22 +1,10 @@
-pub const PUBKEY_LEN: usize = 32;
-pub(crate) const HELLO_PUBKEY_COUNT: usize = 4;
-pub(crate) const HELLO_PUBKEYS_LEN: usize = HELLO_PUBKEY_COUNT * PUBKEY_LEN;
-pub(crate) const POOL_SIGN_KEY_INDEX: usize = HELLO_PUBKEY_COUNT;
-pub(crate) const POOL_BOX_KEY_INDEX: usize = HELLO_PUBKEY_COUNT + 1;
-pub(crate) const RESPONSE_PUBKEYS_LEN: usize = (POOL_BOX_KEY_INDEX + 1) * PUBKEY_LEN;
+//! The DRS extension a version 3 hello carries: the protocol version the gateway asks for and the
+//! resume token naming the session it continues.
 
-pub(crate) fn key_at(block: &[u8], n: usize) -> Option<&[u8]> {
-    block.get(n * PUBKEY_LEN..(n + 1) * PUBKEY_LEN)
-}
-
-pub(crate) fn pubkey_at(block: &[u8], n: usize) -> [u8; PUBKEY_LEN] {
-    key_at(block, n).expect("the caller checked the length").try_into().expect("PUBKEY_LEN bytes")
-}
-
-pub const DRS_MARKER: [u8; 4] = *b"DRS\x01";
-pub const DRS_RESUME_PRESENT: u8 = 1;
-pub const DRS_FLAG_AT: usize = DRS_MARKER.len();
-pub const DRS_TOKEN_AT: usize = DRS_FLAG_AT + 1;
+pub(crate) const DRS_MARKER: [u8; 4] = *b"DRS\x01";
+pub(crate) const DRS_RESUME_PRESENT: u8 = 1;
+pub(crate) const DRS_FLAG_AT: usize = DRS_MARKER.len();
+pub(crate) const DRS_TOKEN_AT: usize = DRS_FLAG_AT + 1;
 
 pub const RESUME_TOKEN_LEN: usize = 40;
 pub type ResumeToken = [u8; RESUME_TOKEN_LEN];

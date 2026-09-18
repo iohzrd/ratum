@@ -1,3 +1,8 @@
+//! The node's JSON-RPC client: the calls both binaries make, the chain and tip the node reports,
+//! and the cookie file re-read once when the node refuses the credential, which is what a node
+//! restart needs.
+
+use crate::bitcoin::address;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -39,7 +44,7 @@ impl Error {
         matches!(self, Self::Rpc { code: RPC_METHOD_NOT_FOUND, .. })
     }
 
-    pub fn is_not_found(&self) -> bool {
+    pub(crate) fn is_not_found(&self) -> bool {
         matches!(self, Self::Rpc { code: RPC_INVALID_ADDRESS_OR_KEY, .. })
     }
 
@@ -83,6 +88,16 @@ impl Chain {
             Self::Other => "other",
         }
     }
+
+    /// The prefixes of this chain's addresses; none for a chain this build has no name for.
+    pub fn address_prefixes(self) -> Option<address::Prefixes> {
+        match self {
+            Self::Main => Some(address::MAIN),
+            Self::Test | Self::Testnet4 | Self::Signet => Some(address::TEST),
+            Self::Regtest => Some(address::REGTEST),
+            Self::Other => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -104,6 +119,31 @@ pub struct MiningInfo {
     pub chain: Chain,
     pub network_hashps: f64,
     pub warnings: Vec<String>,
+}
+
+/// Whether a `getblockheader` confirmation count says the block is on the node's best chain.
+/// The node answers a negative count for a block on a branch it does not build on, and 0 for
+/// the tip itself.
+pub const fn on_best_chain(confirmations: i64) -> bool {
+    confirmations >= 0
+}
+
+/// The field of an RPC result, or `BadResponse` naming the one the node did not answer.
+/// Zero is a value like any other: a chain at its genesis block answers 0 blocks.
+fn u64_field(v: &serde_json::Value, key: &str) -> Result<u64, Error> {
+    v[key].as_u64().ok_or_else(|| missing(key))
+}
+
+fn f64_field(v: &serde_json::Value, key: &str) -> Result<f64, Error> {
+    v[key].as_f64().ok_or_else(|| missing(key))
+}
+
+fn str_field<'a>(v: &'a serde_json::Value, key: &str) -> Result<&'a str, Error> {
+    v[key].as_str().ok_or_else(|| missing(key))
+}
+
+fn missing(key: &str) -> Error {
+    Error::BadResponse(format!("no {key}"))
 }
 
 fn warnings_of(v: &serde_json::Value) -> Vec<String> {
@@ -184,19 +224,29 @@ fn parse_url(url: &str) -> Result<RpcUrl, Error> {
 }
 
 impl Client {
-    pub fn new(url: &str, user: &str, password: &str) -> Result<Self, Error> {
-        Ok(Self::build(parse_url(url)?.url, basic_auth(user, password), None))
-    }
-
-    pub fn with_cookie(url: &str, cookie_path: PathBuf) -> Result<Self, Error> {
-        let url = parse_url(url)?.url;
-        let (user, password) = read_cookie(&cookie_path)?;
-        Ok(Self::build(url, basic_auth(&user, &password), Some(cookie_path)))
-    }
-
-    pub fn from_url(url: &str) -> Result<Self, Error> {
+    /// The client for a node configured with any combination of the credential settings,
+    /// taken in the order of the more specific instruction: `user` when it is set, since
+    /// naming a user is the most specific; the cookie file when one is given; and otherwise
+    /// the `user:password@` the URL itself carries. This is the only constructor, so every
+    /// caller applies that one rule, rather than one call site reading a URL's credentials
+    /// and another discarding them.
+    pub fn new(
+        url: &str,
+        user: &str,
+        password: &str,
+        cookie_path: Option<PathBuf>,
+    ) -> Result<Self, Error> {
         let parsed = parse_url(url)?;
-        Ok(Self::build(parsed.url, basic_auth(&parsed.user, &parsed.password), None))
+        if let Some(path) = cookie_path.filter(|_| user.is_empty()) {
+            let (user, password) = read_cookie(&path)?;
+            return Ok(Self::build(parsed.url, basic_auth(&user, &password), Some(path)));
+        }
+        let (user, password) = if user.is_empty() {
+            (parsed.user.as_str(), parsed.password.as_str())
+        } else {
+            (user, password)
+        };
+        Ok(Self::build(parsed.url, basic_auth(user, password), None))
     }
 
     fn build(url: String, authorization: String, cookie_path: Option<PathBuf>) -> Self {
@@ -280,22 +330,13 @@ impl Client {
 
     pub fn tip(&self) -> Result<Tip, Error> {
         let info = self.call("getblockchaininfo", serde_json::json!([]))?;
-        let display = info["bestblockhash"]
-            .as_str()
-            .ok_or_else(|| Error::BadResponse("no bestblockhash".into()))?;
-        let height =
-            info["blocks"].as_u64().ok_or_else(|| Error::BadResponse("no blocks".into()))? as u32;
-        let difficulty = info["difficulty"]
-            .as_f64()
-            .ok_or_else(|| Error::BadResponse("no difficulty".into()))?;
-        let chain = Chain::parse(
-            info["chain"].as_str().ok_or_else(|| Error::BadResponse("no chain".into()))?,
-        );
-        let hash: [u8; 32] = hex::decode(display)
-            .ok()
-            .and_then(|b| b.try_into().ok())
+        let display = str_field(&info, "bestblockhash")?;
+        let height = u64_field(&info, "blocks")? as u32;
+        let difficulty = f64_field(&info, "difficulty")?;
+        let chain = Chain::parse(str_field(&info, "chain")?);
+        let hash = crate::bitcoin::hash_from_display_hex(display)
             .ok_or_else(|| Error::BadResponse(format!("bestblockhash {display:?}")))?;
-        Ok(Tip { hash: crate::bitcoin::reversed(&hash), height, difficulty, chain })
+        Ok(Tip { hash, height, difficulty, chain })
     }
 
     pub fn wait_for_block_height(&self, height: u32, timeout: Duration) -> Result<u32, Error> {
@@ -315,11 +356,8 @@ impl Client {
 
     pub fn template_summary(&self) -> Result<TemplateSummary, Error> {
         let result = self.block_template()?;
-        let coinbase_value = result["coinbasevalue"]
-            .as_u64()
-            .ok_or_else(|| Error::BadResponse("no coinbasevalue".into()))?;
-        let bits_hex =
-            result["bits"].as_str().ok_or_else(|| Error::BadResponse("no bits".into()))?;
+        let coinbase_value = u64_field(&result, "coinbasevalue")?;
+        let bits_hex = str_field(&result, "bits")?;
         let bits = u32::from_str_radix(bits_hex, 16)
             .map_err(|_| Error::BadResponse(format!("bits {bits_hex:?}")))?;
         Ok(TemplateSummary { coinbase_value, bits })
@@ -327,14 +365,14 @@ impl Client {
 
     pub fn mining_info(&self) -> Result<MiningInfo, Error> {
         let v = self.call("getmininginfo", serde_json::json!([]))?;
-        let chain =
-            Chain::parse(v["chain"].as_str().ok_or_else(|| Error::BadResponse("no chain".into()))?);
-        let network_hashps = v["networkhashps"]
-            .as_f64()
-            .ok_or_else(|| Error::BadResponse("no networkhashps".into()))?;
+        let chain = Chain::parse(str_field(&v, "chain")?);
+        let network_hashps = f64_field(&v, "networkhashps")?;
         Ok(MiningInfo { chain, network_hashps, warnings: warnings_of(&v["warnings"]) })
     }
 
+    /// The node's confirmation count for the block, or none when it stores no such block.
+    /// `on_best_chain` reads the count's sign, which is what says whether the block is still
+    /// on the chain the node builds on.
     pub fn block_confirmations(&self, hash_display_hex: &str) -> Result<Option<i64>, Error> {
         let header = match self.call("getblockheader", serde_json::json!([hash_display_hex, true]))
         {
@@ -379,23 +417,27 @@ mod tests {
         assert_eq!(basic_auth("rpcuser", "rpcpass"), "Basic cnBjdXNlcjpycGNwYXNz");
     }
 
+    fn client(url: &str, user: &str, password: &str) -> Result<Client, Error> {
+        Client::new(url, user, password, None)
+    }
+
     #[test]
     fn parses_urls() {
-        let c = Client::new("http://127.0.0.1:18443", "x", "y").unwrap();
+        let c = client("http://127.0.0.1:18443", "x", "y").unwrap();
         assert_eq!(c.url, "http://127.0.0.1:18443");
         assert_eq!(*crate::lock(&c.authorization), "Basic eDp5");
 
-        let c = Client::new("http://node.example:8332/wallet/main", "u", "p").unwrap();
+        let c = client("http://node.example:8332/wallet/main", "u", "p").unwrap();
         assert_eq!(c.url, "http://node.example:8332/wallet/main");
 
-        let c = Client::new("https://node.example:8332", "u", "p").unwrap();
+        let c = client("https://node.example:8332", "u", "p").unwrap();
         assert_eq!(c.url, "https://node.example:8332");
 
-        let c = Client::new("http://nohost", "u", "p").unwrap();
+        let c = client("http://nohost", "u", "p").unwrap();
         assert_eq!(c.url, "http://nohost:80", "the scheme's port applies");
 
         for bad in ["127.0.0.1:18443", "ftp://127.0.0.1:18443", "http://"] {
-            assert!(Client::new(bad, "x", "y").is_err(), "{bad:?} should not parse");
+            assert!(client(bad, "x", "y").is_err(), "{bad:?} should not parse");
         }
     }
 
@@ -442,17 +484,63 @@ mod tests {
 
     #[test]
     fn urls_take_both_schemes_and_optional_credentials() {
-        assert!(Client::from_url("http://u:p@127.0.0.1:8332").is_ok());
-        assert!(Client::from_url("https://u:p@node.example:8332").is_ok());
-        assert!(Client::from_url("http://127.0.0.1:8332").is_ok());
-        assert!(matches!(Client::from_url("ftp://127.0.0.1:8332"), Err(Error::BadUrl(_))));
-        assert!(matches!(Client::from_url("127.0.0.1:8332"), Err(Error::BadUrl(_))));
+        assert!(client("http://u:p@127.0.0.1:8332", "", "").is_ok());
+        assert!(client("https://u:p@node.example:8332", "", "").is_ok());
+        assert!(client("http://127.0.0.1:8332", "", "").is_ok());
+        assert!(matches!(client("ftp://127.0.0.1:8332", "", ""), Err(Error::BadUrl(_))));
+        assert!(matches!(client("127.0.0.1:8332", "", ""), Err(Error::BadUrl(_))));
         assert_eq!(
-            Client::from_url("http://nohost").map(|c| c.url).ok(),
+            client("http://nohost", "", "").map(|c| c.url).ok(),
             Some("http://nohost:80".to_string()),
             "the scheme's port applies"
         );
-        assert!(Client::from_url("http://").is_err());
+        assert!(client("http://", "", "").is_err());
+    }
+
+    /// The one rule every caller reaches: a named user first, then a cookie file, then the
+    /// credentials the URL carries.
+    #[test]
+    fn credentials_are_taken_in_order_of_the_more_specific_setting() {
+        let authorization = |c: &Client| crate::lock(&c.authorization).clone();
+        let url = "http://u:p@127.0.0.1:8332";
+
+        let c = client(url, "", "").unwrap();
+        assert_eq!(authorization(&c), basic_auth("u", "p"), "the URL's own credentials");
+        assert_eq!(c.url, "http://127.0.0.1:8332", "which are not left in the URL");
+
+        let c = client(url, "flag", "word").unwrap();
+        assert_eq!(authorization(&c), basic_auth("flag", "word"), "a named user wins");
+
+        let dir = std::env::temp_dir().join(format!("ratum-cookie-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cookie");
+        std::fs::write(&path, "__cookie__:secret\n").unwrap();
+
+        let c = Client::new(url, "", "", Some(path.clone())).unwrap();
+        assert_eq!(
+            authorization(&c),
+            basic_auth("__cookie__", "secret"),
+            "the cookie file outranks the URL's credentials"
+        );
+        assert_eq!(c.cookie_path, Some(path.clone()), "and is re-read on a refused credential");
+
+        let c = Client::new(url, "flag", "word", Some(path)).unwrap();
+        assert_eq!(authorization(&c), basic_auth("flag", "word"), "a named user wins over both");
+        assert_eq!(c.cookie_path, None, "so there is no cookie to re-read");
+
+        let missing = dir.join("absent");
+        assert!(matches!(Client::new(url, "", "", Some(missing)), Err(Error::Io(_))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_chain_names_the_prefixes_of_its_addresses() {
+        assert_eq!(Chain::parse("main").address_prefixes(), Some(address::MAIN));
+        for testnet in ["test", "testnet4", "signet"] {
+            assert_eq!(Chain::parse(testnet).address_prefixes(), Some(address::TEST), "{testnet}");
+        }
+        assert_eq!(Chain::parse("regtest").address_prefixes(), Some(address::REGTEST));
+        assert_eq!(Chain::parse("blake2btest").address_prefixes(), None);
     }
 
     #[test]

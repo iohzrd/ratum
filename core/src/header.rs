@@ -1,3 +1,8 @@
+//! The version 2 (BLAKE2b) block header. `serialize` and `deserialize` are its 164-byte wire form;
+//! `hash_stages` takes it through the two tagged SHA-256 stages and the BLAKE2b work root to the
+//! input the hardware hashes, and `pow_hashes` on to the proof-of-work hash and the block hash the
+//! XOR key mask separates it from.
+
 use crate::reader::ByteReader;
 use blake2::Blake2b;
 use blake2::digest::Digest as _;
@@ -8,13 +13,27 @@ use sha2::Sha256;
 pub const HEADER_V2_SIZE: usize = 164;
 pub const V2_FLAG: u32 = 0x8000_0000;
 pub const FLAG_USE_TIME_OFFSET: u8 = 4;
-pub const FLAG_PROFILE_MASK: u8 = 3;
+pub(crate) const FLAG_PROFILE_MASK: u8 = 3;
 
 pub const ASIC_INPUT_LEN: [usize; 4] = [80, 80, 128, 160];
 const ASIC_INPUT_LEADING_ZEROS: [usize; 4] = [0, 0, 48, 80];
 
-pub const H1_PREIMAGE_SIZE: usize = 119;
-pub const H2_PREIMAGE_SIZE: usize = 96;
+/// One of the two little-endian words a sia nonce or sia time field packs.
+pub const SIA_WORD_LEN: usize = size_of::<u32>();
+/// The sia nonce and sia time fields, of two words each.
+pub const SIA_WORDS_LEN: usize = 2 * SIA_WORD_LEN;
+
+/// The body profiles 0, 2 and 3 share, which is the whole input under profile 0.
+pub const ASIC_INPUT_BODY_LEN: usize = ASIC_INPUT_LEN[0];
+const ASIC_INPUT_HEAD_LEN: usize = 32;
+/// Where the nonce sits in `asic_input_body`, which is where a miner splices the one it
+/// searches.
+pub const ASIC_INPUT_NONCE_AT: usize = ASIC_INPUT_HEAD_LEN;
+const ASIC_INPUT_NTIME_AT: usize = ASIC_INPUT_NONCE_AT + SIA_WORDS_LEN;
+const ASIC_INPUT_WORK_ROOT_AT: usize = ASIC_INPUT_NTIME_AT + SIA_WORDS_LEN;
+
+pub(crate) const H1_PREIMAGE_SIZE: usize = 119;
+pub(crate) const H2_PREIMAGE_SIZE: usize = 96;
 const H2_MM_RHS_OFFSET: usize = 64;
 
 pub const WORK_ROOT_LEAF_SIZE: usize = 52;
@@ -50,7 +69,7 @@ fn sha256(data: &[u8]) -> [u8; 32] {
     Sha256::digest(data).into()
 }
 
-pub fn tagged_sha256(tag: &str, data: &[u8]) -> [u8; 32] {
+pub(crate) fn tagged_sha256(tag: &str, data: &[u8]) -> [u8; 32] {
     let t = sha256(tag.as_bytes());
     let mut h = Sha256::new();
     h.update(t);
@@ -63,6 +82,36 @@ pub fn blake2b_256(data: &[u8]) -> [u8; 32] {
     let mut h = Blake2b::<U32>::new();
     h.update(data);
     h.finalize().into()
+}
+
+/// The bytes the hardware hashes under profile 0, and the body profiles 2 and 3 place after
+/// their leading zeros: a 32-byte head, the sia nonce and time fields the header's four nonce
+/// words pack into, and the work root. The head is the hidden previous block hash under
+/// profile 0 and H2 under profiles 2 and 3.
+///
+/// This is the one encoding of that layout: `asic_input_with` builds every profile but 1 from
+/// it, and a miner holding the stratum fields rather than a header calls it directly.
+pub fn asic_input_body(
+    head: &[u8; ASIC_INPUT_HEAD_LEN],
+    sia_nonce: &[u8; SIA_WORDS_LEN],
+    sia_ntime: &[u8; SIA_WORDS_LEN],
+    work_root: &[u8; 32],
+) -> [u8; ASIC_INPUT_BODY_LEN] {
+    let mut out = [0u8; ASIC_INPUT_BODY_LEN];
+    out[..ASIC_INPUT_NONCE_AT].copy_from_slice(head);
+    out[ASIC_INPUT_NONCE_AT..ASIC_INPUT_NTIME_AT].copy_from_slice(sia_nonce);
+    out[ASIC_INPUT_NTIME_AT..ASIC_INPUT_WORK_ROOT_AT].copy_from_slice(sia_ntime);
+    out[ASIC_INPUT_WORK_ROOT_AT..].copy_from_slice(work_root);
+    out
+}
+
+/// The two little-endian words `asic_input_body` reads a sia field as.
+pub fn sia_words(low: u32, high: u32) -> [u8; SIA_WORDS_LEN] {
+    let mut f = [0u8; SIA_WORDS_LEN];
+    let (l, h) = f.split_at_mut(SIA_WORD_LEN);
+    l.copy_from_slice(&low.to_le_bytes());
+    h.copy_from_slice(&high.to_le_bytes());
+    f
 }
 
 impl BlockHeaderV2 {
@@ -148,16 +197,13 @@ impl BlockHeaderV2 {
             }
             p => {
                 ss.resize(ASIC_INPUT_LEADING_ZEROS[p as usize], 0);
-                if p == 0 {
-                    ss.put_slice(&prevblock_hidden(&self.prev_block));
-                } else {
-                    ss.put_slice(h2);
-                }
-                ss.put_u32_le(self.nonce);
-                ss.put_u32_le(self.nonce2);
-                ss.put_u32_le(self.time_offset);
-                ss.put_u32_le(self.nonce3);
-                ss.put_slice(work_root);
+                let head = if p == 0 { prevblock_hidden(&self.prev_block) } else { *h2 };
+                ss.put_slice(&asic_input_body(
+                    &head,
+                    &sia_words(self.nonce, self.nonce2),
+                    &sia_words(self.time_offset, self.nonce3),
+                    work_root,
+                ));
             }
         }
         debug_assert_eq!(ss.len(), ASIC_INPUT_LEN[profile as usize]);
@@ -192,22 +238,22 @@ impl BlockHeaderV2 {
         h2d[H2_MM_RHS_OFFSET..].copy_from_slice(&self.mm_rhs);
         let h2 = tagged_sha256("Merge-mining hook", &h2d);
 
-        let mut leaf = [0u8; WORK_ROOT_LEAF_SIZE];
-        leaf[WORK_ROOT_H2_OFFSET..WORK_ROOT_EXTRANONCE_OFFSET].copy_from_slice(&h2);
-        leaf[WORK_ROOT_EXTRANONCE_OFFSET..].copy_from_slice(&self.extranonce);
-        let work_root = blake2b_256(&leaf);
-
         HashStages {
             h1,
             h2,
-            work_root,
+            work_root: work_root(&h2, &self.extranonce),
             xor_key_mask: xor_key_mask(&self.xor_key, self.xor_key_mask_clear_bits),
         }
     }
 
+    /// The BLAKE2b hash of the ASIC input `stages` give, before the XOR mask is applied.
+    pub fn raw_pow_hash(&self, stages: &HashStages) -> [u8; 32] {
+        blake2b_256(&self.asic_input_with(&stages.work_root, &stages.h2))
+    }
+
     pub fn pow_hashes(&self) -> PowHashes {
         let stages = self.hash_stages();
-        let raw_pow_hash = blake2b_256(&self.asic_input_with(&stages.work_root, &stages.h2));
+        let raw_pow_hash = self.raw_pow_hash(&stages);
         let mut block_hash = raw_pow_hash;
         for (b, m) in block_hash.iter_mut().zip(stages.xor_key_mask) {
             *b ^= m;
@@ -228,6 +274,39 @@ pub struct HashStages {
     pub h2: [u8; 32],
     pub work_root: [u8; 32],
     pub xor_key_mask: [u8; 32],
+}
+
+/// The BLAKE2b work root the ASIC input commits to: H2 and the header's 16-byte extranonce
+/// at their offsets in a `WORK_ROOT_LEAF_SIZE` leaf, the bytes before H2 left zero.
+///
+/// This is the one place the leaf is laid out. A miner holding the stratum fields rather
+/// than a header reaches the same bytes through `work_root_from_stratum`, so neither side
+/// can be moved without the other.
+pub fn work_root(h2: &[u8; 32], extranonce: &[u8; 16]) -> [u8; 32] {
+    let mut leaf = [0u8; WORK_ROOT_LEAF_SIZE];
+    leaf[WORK_ROOT_H2_OFFSET..WORK_ROOT_EXTRANONCE_OFFSET].copy_from_slice(h2);
+    leaf[WORK_ROOT_EXTRANONCE_OFFSET..].copy_from_slice(extranonce);
+    blake2b_256(&leaf)
+}
+
+/// The zero bytes a stratum miner puts before `coinb1` to reach `WORK_ROOT_H2_OFFSET`: the
+/// gateway writes `COINB1_LEADING_ZEROS` of them into coinb1 itself and the miner supplies
+/// the rest. Splitting the offset this way is what a stratum coinbase looks like, so both
+/// halves are named here rather than one of them living in the miner.
+pub(crate) const STRATUM_LEAF_PREFIX_LEN: usize = WORK_ROOT_H2_OFFSET - COINB1_LEADING_ZEROS;
+
+/// The work root of a stratum job: the prefix above, then `coinb1` (the gateway's leading
+/// zeros and H2), the extranonce, and `coinb2`, which is empty under version 2. None unless
+/// the four total a whole leaf, which is what says the gateway sent the layout `work_root`
+/// builds.
+pub fn work_root_from_stratum(coinb1: &[u8], extranonce: &[u8], coinb2: &[u8]) -> Option<[u8; 32]> {
+    let mut leaf = Vec::with_capacity(WORK_ROOT_LEAF_SIZE);
+    leaf.resize(STRATUM_LEAF_PREFIX_LEN, 0);
+    leaf.extend_from_slice(coinb1);
+    leaf.extend_from_slice(extranonce);
+    leaf.extend_from_slice(coinb2);
+    let leaf: [u8; WORK_ROOT_LEAF_SIZE] = leaf.try_into().ok()?;
+    Some(blake2b_256(&leaf))
 }
 
 pub fn xor_key_hash(xor_key: &XorKey) -> [u8; 32] {
@@ -255,4 +334,41 @@ pub fn xor_key_mask(xor_key: &XorKey, clear_bits: u8) -> [u8; 32] {
         *b &= u8::MAX >> (clear_bits % bits_per_byte);
     }
     m
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The miner builds the work root from the stratum fields and the pool builds it from a
+    /// header. Both reach `work_root`, so a change to `WORK_ROOT_H2_OFFSET` or to
+    /// `COINB1_LEADING_ZEROS` moves them together rather than silently parting them.
+    #[test]
+    fn the_stratum_leaf_and_the_header_leaf_are_the_same_work_root() {
+        let h2 = crate::fixtures::ramp(0x11);
+        let extranonce: [u8; 16] = std::array::from_fn(|i| 0xa0 + i as u8);
+
+        let mut coinb1 = vec![0u8; COINB1_LEADING_ZEROS];
+        coinb1.extend_from_slice(&h2);
+        assert_eq!(
+            work_root_from_stratum(&coinb1, &extranonce, &[]),
+            Some(work_root(&h2, &extranonce)),
+            "the gateway's coinb1 plus the miner's prefix is the header's leaf"
+        );
+        assert_eq!(STRATUM_LEAF_PREFIX_LEN + coinb1.len(), WORK_ROOT_EXTRANONCE_OFFSET);
+
+        let header = BlockHeaderV2 { extranonce, ..Default::default() };
+        let stages = header.hash_stages();
+        assert_eq!(stages.work_root, work_root(&stages.h2, &extranonce));
+    }
+
+    #[test]
+    fn a_stratum_leaf_of_the_wrong_length_is_refused_rather_than_padded() {
+        let h2 = crate::fixtures::ramp(0);
+        let mut coinb1 = vec![0u8; COINB1_LEADING_ZEROS];
+        coinb1.extend_from_slice(&h2);
+        assert_eq!(work_root_from_stratum(&coinb1, &[0u8; 15], &[]), None, "short extranonce");
+        assert_eq!(work_root_from_stratum(&coinb1, &[0u8; 16], &[0]), None, "coinb2 is not empty");
+        assert_eq!(work_root_from_stratum(&coinb1[1..], &[0u8; 16], &[]), None, "short coinb1");
+    }
 }

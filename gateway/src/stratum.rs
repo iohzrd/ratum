@@ -1,17 +1,18 @@
+//! The stratum server: the listener, the connected clients, and the conditions under which a new
+//! connection is refused.
+
 mod connection;
-mod notify_id;
+pub mod notify_id;
 
 use crate::config::Config;
-use crate::datum;
-use crate::job::Job;
-use crate::node::NodeView;
+use crate::gateway::Gateway;
 use crate::seen_shares::SeenShareHashes;
 use crate::tally::ShareTallies;
 use connection::{Connection, Disconnect};
 use log::{debug, info, warn};
 use mio::Waker;
-use ratum::datum::messages::share::MAX_JOBS;
 use ratum::lock;
+use std::collections::HashMap;
 use std::io;
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -21,44 +22,42 @@ use std::time::{Duration, Instant};
 const HASHRATE_WINDOW_VALID: Duration = Duration::from_secs(3 * ratum::SECS_PER_MINUTE);
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
 const REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(5);
-const DIFF_TO_THS: f64 = ratum::HASHES_PER_DIFFICULTY / ratum::HASHES_PER_TERAHASH;
-
-#[derive(Default)]
-struct Jobs {
-    ring: Vec<Option<Arc<Job>>>,
-    current: Option<Arc<Job>>,
-}
 
 #[derive(Clone, Debug, Default)]
 pub struct ClientStats {
     pub peer: String,
-    pub unique_id: u64,
     pub user_agent: String,
     pub username: String,
-    pub subscribed: bool,
+    /// When `mining.subscribe` was answered; none until it is, which is what `subscribed`
+    /// reads.
     pub subscribed_at: Option<Instant>,
     pub current_diff: u64,
     pub shares: ShareTallies,
     pub last_accepted_at: Option<Instant>,
-    pub window_diff: u64,
-    pub window_length: Duration,
-    pub window_ended_at: Option<Instant>,
+    /// The rate the last completed window measured and the instant it ended, written
+    /// together by `roll_window`, so no reader divides one window's work by another's
+    /// length.
+    pub hashrate: Option<(Instant, f64)>,
 }
 
 impl ClientStats {
-    pub fn hashrate_ths(&self) -> Option<f64> {
-        let ended_at = self.window_ended_at?;
-        if ended_at.elapsed() > HASHRATE_WINDOW_VALID || self.window_length.is_zero() {
-            return None;
-        }
-        Some(self.window_diff as f64 / self.window_length.as_secs_f64() * DIFF_TO_THS)
+    pub fn subscribed(&self) -> bool {
+        self.subscribed_at.is_some()
+    }
+
+    /// Hashes per second over the last completed window, while that window is recent.
+    pub fn hashrate_hs(&self) -> Option<f64> {
+        self.hashrate.filter(|(at, _)| at.elapsed() <= HASHRATE_WINDOW_VALID).map(|(_, hs)| hs)
     }
 }
 
 pub struct ClientEntry {
+    /// The connection's identity, fixed at construction. It is outside `stats` so the
+    /// registry can be keyed by it without locking every client to read one id.
+    pub unique_id: u64,
     pub kill_requested: AtomicBool,
     pub stats: Mutex<ClientStats>,
-    waker: Arc<Waker>,
+    waker: Waker,
 }
 
 impl ClientEntry {
@@ -74,99 +73,38 @@ impl ClientEntry {
     }
 }
 
-struct CurrentJob {
-    job: Option<Arc<Job>>,
-    generation: u64,
-}
-
 #[derive(Default)]
 pub struct ClientsSummary {
     pub connections: usize,
     pub subscribed: usize,
-    pub hashrate_ths: f64,
+    pub hashrate_hs: f64,
 }
 
-pub struct Server {
-    pub config: Arc<Config>,
-    pub pool: Arc<datum::PoolConnectionState>,
-    pub node: ratum::rpc::Client,
-    pub template_waker: Arc<crate::template::waker::TemplateWaker>,
-    jobs: Mutex<Jobs>,
-    generation: AtomicU64,
-    clients: Mutex<Vec<Arc<ClientEntry>>>,
+/// The stratum side of the gateway: the connected clients and the duplicate-share table.
+pub struct State {
+    clients: Mutex<HashMap<u64, Arc<ClientEntry>>>,
     seen_share_hashes: Mutex<SeenShareHashes>,
     next_unique_id: AtomicU64,
-    pub refuse_while_pool_unreachable: AtomicBool,
-    pub node_view: Arc<NodeView>,
-    pub extra_nodes: Vec<ratum::rpc::Client>,
     pub listening: AtomicBool,
 }
 
-impl Server {
-    pub fn new(
-        config: Arc<Config>,
-        pool: Arc<datum::PoolConnectionState>,
-        node: ratum::rpc::Client,
-        node_view: Arc<NodeView>,
-        template_waker: Arc<crate::template::waker::TemplateWaker>,
-    ) -> Arc<Self> {
-        let extra_nodes = config
-            .extra_block_submissions
-            .urls
-            .iter()
-            .filter_map(|u| {
-                ratum::rpc::Client::from_url(u)
-                    .inspect_err(|e| warn!("extra_block_submissions url ignored: {e}"))
-                    .ok()
-            })
-            .collect();
+impl State {
+    pub fn new(config: &Config) -> Self {
         let seen_share_hashes =
-            SeenShareHashes::new(config.seen_share_hashes_capacity(), config.stale_window());
-        Arc::new(Self {
-            config,
-            pool,
-            node,
-            template_waker,
-            jobs: Mutex::new(Jobs { ring: vec![None; MAX_JOBS], ..Default::default() }),
-            generation: AtomicU64::new(0),
-            clients: Mutex::new(Vec::new()),
+            SeenShareHashes::new(config.shares_in_stale_window(), config.stale_window());
+        Self {
+            clients: Mutex::new(HashMap::new()),
             seen_share_hashes: Mutex::new(seen_share_hashes),
             next_unique_id: AtomicU64::new(1),
-            refuse_while_pool_unreachable: AtomicBool::new(false),
-            node_view,
-            extra_nodes,
             listening: AtomicBool::new(false),
-        })
+        }
     }
 
-    pub fn publish(&self, job: Arc<Job>) {
-        self.pool.install_job(&job);
-        let mut j = lock(&self.jobs);
-        if job.is_empty_work {
-            for other in j.ring.iter().flatten() {
-                other.stale_prevblock.store(true, Ordering::Relaxed);
-            }
-        }
-        j.ring[job.global_index as usize] = Some(Arc::clone(&job));
-        j.current = Some(job);
-        self.generation.fetch_add(1, Ordering::Release);
-        drop(j);
-        for c in lock(&self.clients).iter() {
+    /// Wakes every connection to serve the job just installed.
+    pub fn wake_all(&self) {
+        for c in lock(&self.clients).values() {
             c.wake();
         }
-    }
-
-    pub fn job_at(&self, global_index: u8) -> Option<Arc<Job>> {
-        lock(&self.jobs).ring[global_index as usize].clone()
-    }
-
-    pub fn current_job(&self) -> Option<Arc<Job>> {
-        lock(&self.jobs).current.clone()
-    }
-
-    fn current_for_send(&self) -> CurrentJob {
-        let j = lock(&self.jobs);
-        CurrentJob { job: j.current.clone(), generation: self.generation.load(Ordering::Acquire) }
     }
 
     pub fn connection_count(&self) -> usize {
@@ -175,63 +113,49 @@ impl Server {
 
     pub fn summary(&self) -> ClientsSummary {
         let mut s = ClientsSummary::default();
-        for c in lock(&self.clients).iter() {
+        for c in lock(&self.clients).values() {
             let st = lock(&c.stats);
             s.connections += 1;
-            s.subscribed += usize::from(st.subscribed);
-            s.hashrate_ths += st.hashrate_ths().unwrap_or(0.0);
+            s.subscribed += usize::from(st.subscribed());
+            s.hashrate_hs += st.hashrate_hs().unwrap_or(0.0);
         }
         s
     }
 
-    pub fn subscriber_count(&self) -> usize {
-        self.summary().subscribed
-    }
-
-    pub fn network_share(&self) -> Option<f64> {
-        share_of_network(self.summary().hashrate_ths, self.node_view.network_hashps())
-    }
-
-    pub fn over_network_share(&self) -> Option<f64> {
-        let limit = self.config.max_network_share()?;
-        self.network_share().filter(|share| *share > limit)
-    }
-
-    pub fn client_stats(&self) -> Vec<ClientStats> {
+    pub fn client_stats(&self) -> Vec<(u64, ClientStats)> {
         self.client_stats_where(|_| true)
     }
 
-    pub fn client_stats_where(&self, keep: impl Fn(&ClientStats) -> bool) -> Vec<ClientStats> {
+    /// Each client's id and a copy of its stats, for the clients `keep` accepts.
+    pub fn client_stats_where(
+        &self,
+        keep: impl Fn(&ClientStats) -> bool,
+    ) -> Vec<(u64, ClientStats)> {
         lock(&self.clients)
-            .iter()
+            .values()
             .filter_map(|c| {
                 let st = lock(&c.stats);
-                keep(&st).then(|| st.clone())
+                keep(&st).then(|| (c.unique_id, st.clone()))
             })
             .collect()
     }
 
     pub fn shutdown_all(&self) {
         info!("Disconnecting all stratum clients");
-        for c in lock(&self.clients).iter() {
+        for c in lock(&self.clients).values() {
             c.request_kill();
         }
     }
 
     pub fn kill_client(&self, unique_id: u64) -> bool {
-        for c in lock(&self.clients).iter() {
-            if lock(&c.stats).unique_id == unique_id {
+        match lock(&self.clients).get(&unique_id) {
+            Some(c) => {
                 c.request_kill();
-                return true;
+                true
             }
+            None => false,
         }
-        false
     }
-}
-
-pub fn share_of_network(gateway_ths: f64, network_hashps: Option<f64>) -> Option<f64> {
-    let network = network_hashps.filter(|hs| *hs > 0.0)?;
-    Some(gateway_ths * ratum::HASHES_PER_TERAHASH / network)
 }
 
 #[derive(Default)]
@@ -252,13 +176,23 @@ impl ConnectionRefusals {
     }
 }
 
-pub fn listen(server: Arc<Server>) -> io::Result<()> {
-    let s = &server.config.stratum;
+/// Starts the listener on its own thread. A listener that cannot bind ends the process:
+/// without it the gateway serves no miner.
+pub fn spawn_listener(gateway: Arc<Gateway>) {
+    ratum::thread::spawn("stratum-listener", move || {
+        if let Err(e) = listen(gateway) {
+            crate::fatal(format!("stratum listener: {e}"));
+        }
+    });
+}
+
+fn listen(gateway: Arc<Gateway>) -> io::Result<()> {
+    let s = &gateway.config.stratum;
     let listener =
         ratum::net::bind_first(&s.listen_addr, s.listen_port, |a: &str| TcpListener::bind(a))
             .map_err(io::Error::other)?;
     info!("Stratum V1 Server Init complete: listening on {}", listener.local_addr()?);
-    server.listening.store(true, Ordering::Relaxed);
+    gateway.stratum.listening.store(true, Ordering::Relaxed);
     let mut pool_refusals = ConnectionRefusals::default();
     let mut share_refusals = ConnectionRefusals::default();
     for stream in listener.incoming() {
@@ -270,7 +204,7 @@ pub fn listen(server: Arc<Server>) -> io::Result<()> {
                 continue;
             }
         };
-        if server.refuse_while_pool_unreachable.load(Ordering::Relaxed) {
+        if gateway.config.datum.pooled_mining_only && !gateway.pool.is_active() {
             if let Some(refused) = pool_refusals.note() {
                 warn!(
                     "Refusing stratum connections while the pool is unreachable and datum.pooled_mining_only is set ({refused} refused)"
@@ -278,30 +212,27 @@ pub fn listen(server: Arc<Server>) -> io::Result<()> {
             }
             continue;
         }
-        if let Some(share) = server.over_network_share() {
+        if let Some(share) = gateway.over_network_share() {
             if let Some(refused) = share_refusals.note() {
                 warn!(
                     "Refusing stratum connections: this gateway's miners measure {:.2}% of the network's hashrate, above the stratum.max_network_share_bps limit of {:.2}% ({refused} refused). Connected miners keep mining; point new ones at another gateway.",
                     share * 100.0,
-                    server.config.max_network_share().unwrap_or_default() * 100.0
+                    gateway.config.max_network_share().unwrap_or_default() * 100.0
                 );
             }
             continue;
         }
-        if server.connection_count() >= s.max_clients {
+        if gateway.stratum.connection_count() >= s.max_clients {
             debug!("refusing a connection: {} clients connected", s.max_clients);
             continue;
         }
-        let server = Arc::clone(&server);
-        let spawned = ratum::thread::try_spawn("stratum-client", move || {
-            match Connection::run(server, stream) {
+        let gateway = Arc::clone(&gateway);
+        ratum::thread::spawn_or_warn("stratum-client", move || {
+            match Connection::run(gateway, stream) {
                 Ok(()) | Err(Disconnect::Io(_) | Disconnect::Killed | Disconnect::Idle(_)) => {}
                 Err(e @ Disconnect::Protocol(_)) => info!("Stratum client connection closed: {e}"),
             }
         });
-        if let Err(e) = spawned {
-            warn!("could not start a client thread: {e}");
-        }
     }
     Ok(())
 }
@@ -309,107 +240,79 @@ pub fn listen(server: Arc<Server>) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixtures::{test_server, test_server_with};
+    use crate::fixtures::test_gateway;
 
-    fn add_client(server: &Server, hashrate_ths: f64) -> mio::Poll {
+    fn add_client(gateway: &Gateway, hashrate_hs: f64) -> mio::Poll {
         let poll = mio::Poll::new().unwrap();
-        let waker = Arc::new(mio::Waker::new(poll.registry(), mio::Token(0)).unwrap());
-        let window_length = Duration::from_secs(1);
-        lock(&server.clients).push(Arc::new(ClientEntry {
-            kill_requested: AtomicBool::new(false),
-            waker,
-            stats: Mutex::new(ClientStats {
-                subscribed: true,
-                window_diff: (hashrate_ths * window_length.as_secs_f64() / DIFF_TO_THS) as u64,
-                window_length,
-                window_ended_at: Some(Instant::now()),
-                ..Default::default()
+        let waker = mio::Waker::new(poll.registry(), mio::Token(0)).unwrap();
+        let unique_id = gateway.stratum.next_unique_id.fetch_add(1, Ordering::Relaxed);
+        lock(&gateway.stratum.clients).insert(
+            unique_id,
+            Arc::new(ClientEntry {
+                unique_id,
+                kill_requested: AtomicBool::new(false),
+                waker,
+                stats: Mutex::new(ClientStats {
+                    subscribed_at: Some(Instant::now()),
+                    hashrate: Some((Instant::now(), hashrate_hs)),
+                    ..Default::default()
+                }),
             }),
-        }));
+        );
         poll
     }
 
     #[test]
-    fn a_share_needs_an_estimate_of_the_network() {
-        assert_eq!(share_of_network(100.0, None), None, "no estimate has been read");
-        assert_eq!(share_of_network(100.0, Some(0.0)), None, "a chain with no blocks");
-        assert_eq!(share_of_network(100.0, Some(-1.0)), None, "a negative estimate");
-    }
-
-    #[test]
-    fn a_share_is_the_gateway_over_the_network() {
-        assert_eq!(share_of_network(0.0, Some(1e18)), Some(0.0));
-        assert_eq!(share_of_network(1.0, Some(ratum::HASHES_PER_TERAHASH)), Some(1.0));
-        assert_eq!(share_of_network(50.0, Some(1e15)), Some(0.05));
-        assert_eq!(share_of_network(1.0, Some(1e15)), Some(0.001));
-    }
-
-    #[test]
-    fn an_estimate_of_zero_or_less_is_not_recorded() {
-        let server = test_server();
-        server.node_view.set_network_hashps(0.0);
-        assert_eq!(
-            server.node_view.network_hashps(),
-            None,
-            "a chain with no blocks leaves no estimate"
-        );
-        server.node_view.set_network_hashps(-1.0);
-        assert_eq!(server.node_view.network_hashps(), None, "a negative estimate leaves none");
-        server.node_view.set_network_hashps(1e18);
-        assert_eq!(server.node_view.network_hashps(), Some(1e18));
-    }
-
-    #[test]
     fn without_an_estimate_no_share_refuses_a_connection() {
-        let server = test_server_with(|c| c.stratum.max_network_share_bps = 500);
-        let _poll = add_client(&server, 1e9);
-        assert!(server.network_share().is_none(), "no estimate has been read");
-        assert!(server.over_network_share().is_none(), "so no connection is refused");
+        let gateway = test_gateway(|c| c.stratum.max_network_share_bps = 500);
+        let _poll = add_client(&gateway, 1e21);
+        assert!(gateway.network_share().is_none(), "no estimate has been read");
+        assert!(gateway.over_network_share().is_none(), "so no connection is refused");
     }
 
     #[test]
     fn a_gateway_over_the_limit_refuses_and_one_under_it_does_not() {
-        let server = test_server_with(|c| c.stratum.max_network_share_bps = 500);
-        let _poll = add_client(&server, 60_000.0);
-        server.node_view.set_network_hashps(1e18);
-        let share = server.over_network_share().expect("6% is over the 5% limit");
+        let gateway = test_gateway(|c| c.stratum.max_network_share_bps = 500);
+        let _poll = add_client(&gateway, 6e16);
+        gateway.mining_info.set_network_hashps(1e18);
+        let share = gateway.over_network_share().expect("6% is over the 5% limit");
         assert!((share - 0.06).abs() < 1e-6, "share {share}");
 
-        server.node_view.set_network_hashps(2e18);
-        assert!(server.over_network_share().is_none(), "3% is under the 5% limit");
-        let share = server.network_share().expect("an estimate has been read");
+        gateway.mining_info.set_network_hashps(2e18);
+        assert!(gateway.over_network_share().is_none(), "3% is under the 5% limit");
+        let share = gateway.network_share().expect("an estimate has been read");
         assert!((share - 0.03).abs() < 1e-6, "share {share}");
     }
 
     #[test]
     fn a_gateway_exactly_at_the_limit_is_not_refused() {
-        let server = test_server_with(|c| c.stratum.max_network_share_bps = 500);
-        let _poll = add_client(&server, 50_000.0);
-        server.node_view.set_network_hashps(1e18);
-        let share = server.network_share().expect("an estimate has been read");
-        let limit = server.config.max_network_share().expect("the configured limit");
+        let gateway = test_gateway(|c| c.stratum.max_network_share_bps = 500);
+        let _poll = add_client(&gateway, 5e16);
+        gateway.mining_info.set_network_hashps(1e18);
+        let share = gateway.network_share().expect("an estimate has been read");
+        let limit = gateway.config.max_network_share().expect("the configured limit");
         assert!((share - limit).abs() < 1e-6, "share {share}");
         assert!(
-            server.over_network_share().is_none(),
+            gateway.over_network_share().is_none(),
             "a connection is refused above the limit, not at it"
         );
     }
 
     #[test]
     fn the_limit_is_the_configured_share_and_defaults_to_ten_percent() {
-        let server = test_server();
+        let gateway = test_gateway(|_| {});
         assert_eq!(
-            server.config.stratum.max_network_share_bps,
+            gateway.config.stratum.max_network_share_bps,
             crate::config::DEFAULT_MAX_NETWORK_SHARE_BPS
         );
-        assert_eq!(server.config.max_network_share(), Some(0.1));
+        assert_eq!(gateway.config.max_network_share(), Some(0.1));
 
         for (bps, over) in [(500, true), (600, false), (1_000, false), (100, true)] {
-            let server = test_server_with(|c| c.stratum.max_network_share_bps = bps);
-            let _poll = add_client(&server, 60_000.0);
-            server.node_view.set_network_hashps(1e18);
+            let gateway = test_gateway(|c| c.stratum.max_network_share_bps = bps);
+            let _poll = add_client(&gateway, 6e16);
+            gateway.mining_info.set_network_hashps(1e18);
             assert_eq!(
-                server.over_network_share().is_some(),
+                gateway.over_network_share().is_some(),
                 over,
                 "6% of the network against a {bps} bps limit"
             );
@@ -418,13 +321,13 @@ mod tests {
 
     #[test]
     fn a_limit_of_zero_refuses_nothing() {
-        let server = test_server_with(|c| c.stratum.max_network_share_bps = 0);
-        let _poll = add_client(&server, 900_000.0);
-        server.node_view.set_network_hashps(1e18);
-        assert_eq!(server.config.max_network_share(), None);
-        let share = server.network_share().expect("the share is still reported");
+        let gateway = test_gateway(|c| c.stratum.max_network_share_bps = 0);
+        let _poll = add_client(&gateway, 9e17);
+        gateway.mining_info.set_network_hashps(1e18);
+        assert_eq!(gateway.config.max_network_share(), None);
+        let share = gateway.network_share().expect("the share is still reported");
         assert!((share - 0.9).abs() < 1e-6, "share {share}");
-        assert!(server.over_network_share().is_none(), "but no connection is refused");
+        assert!(gateway.over_network_share().is_none(), "but no connection is refused");
     }
 
     #[test]

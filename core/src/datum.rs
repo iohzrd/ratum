@@ -1,3 +1,6 @@
+//! The DATUM protocol: the frames a connection is read and written in, the encrypted channel they
+//! carry once the handshake completes, and the messages inside it.
+
 pub mod bulk;
 pub mod channel;
 pub mod client;

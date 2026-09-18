@@ -1,24 +1,26 @@
+//! One gateway connection from its hello to its end: the handshake, the configuration and
+//! assignments it opens with, and the frames it reads and dispatches.
+
 mod assignments;
-mod blocks;
-mod credit;
 mod shares;
 
 use crate::abw::AbwSlotState;
-use crate::coinbaser;
+use crate::bounded::BoundedSet;
+use crate::payout;
 use crate::server::Server;
-use crate::sessions::{SavedSession, SessionState, StartedSession};
-use crate::verify::{AcceptedShare, Verifier};
-use credit::CreditState;
+use crate::sessions::{SavedSession, V3Session};
+use crate::verify::{RebuiltShare, Verifier};
 use log::{debug, error, info, warn};
 use mio::Waker;
 use ratum::datum::bulk::{self, Reassembler};
-use ratum::datum::framing::{self, FrameHeader, HeaderKeyRatchet};
+use ratum::datum::framing::{self, FrameHeader, FrameRead, HeaderKeyRatchet};
 use ratum::datum::handshake::{ProtocolVersion, ResumeToken};
 use ratum::datum::messages::client_subcmd;
 use ratum::datum::messages::coinbaser::CoinbaserRequest;
+use ratum::datum::messages::validation;
 use ratum::datum::server::{Hello, ServerChannel, accept, open_hello};
 use ratum::lock;
-use ratum::poll::{Fill, PolledSocket, WRITE_TIMEOUT};
+use ratum::poll::{PolledSocket, WRITE_TIMEOUT};
 use std::collections::HashMap;
 use std::io;
 use std::net::TcpStream;
@@ -28,7 +30,6 @@ use std::time::{Duration, Instant};
 const LOG_PAYLOAD_BYTES: usize = 16;
 const LOG_HEX_CHARS: usize = 16;
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(15);
-const FRAME_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 const FRAME_BODY_TIMEOUT: Duration = Duration::from_secs(30);
 const FRAME_BODY_DEADLINE: Duration = Duration::from_secs(120);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
@@ -39,7 +40,7 @@ fn describe(header: FrameHeader, payload: &[u8]) -> String {
     let name = match (header.proto_cmd, sub) {
         (framing::cmd::MINING, Some(client_subcmd::COINBASER_REQUEST)) => "coinbaser request",
         (framing::cmd::MINING, Some(client_subcmd::SUBMIT_POW)) => "share submission",
-        (framing::cmd::MINING, Some(client_subcmd::VALIDATION)) => "job validation response",
+        (framing::cmd::MINING, Some(validation::SUBCMD)) => "job validation response",
         (framing::cmd::MINING, _) => "mining (unknown sub-command)",
         (framing::cmd::BULK, _) => "bulk fragment",
         (framing::cmd::HELLO_OR_PING, _) => "ping",
@@ -55,20 +56,16 @@ fn read_hello(
     peer: std::net::SocketAddr,
     started_at: Instant,
 ) -> io::Result<Option<Hello>> {
-    let left = || HANDSHAKE_DEADLINE.saturating_sub(started_at.elapsed());
-    let mut rx = HeaderKeyRatchet::initial();
-    let mut header_bytes = [0u8; framing::HEADER_LEN];
-    socket.read_exact(&mut header_bytes, left(), left())?;
-    let header = rx.unmask(header_bytes);
+    let (header, payload) = framing::read_frame(
+        socket,
+        |bytes| HeaderKeyRatchet::initial().unmask(bytes),
+        MAX_HELLO_FRAME_LEN,
+        started_at + HANDSHAKE_DEADLINE,
+    )?;
     debug!(
         "[{peer}] hello header: cmd={} len={} signed={} encrypted_pubkey={}",
         header.proto_cmd, header.cmd_len, header.is_signed, header.is_encrypted_pubkey
     );
-    if header.cmd_len as usize > MAX_HELLO_FRAME_LEN {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "hello frame too large"));
-    }
-    let mut payload = vec![0u8; header.cmd_len as usize];
-    socket.read_exact(&mut payload, left(), left())?;
     match open_hello(header, &payload, &server.pool_keys) {
         Ok(hello) => Ok(Some(hello)),
         Err(e) => {
@@ -87,16 +84,16 @@ pub fn handle(stream: TcpStream, server: &Server) -> io::Result<()> {
     let Some(hello) = read_hello(&mut socket, server, peer, handshake_started_at)? else {
         return Ok(());
     };
-    if !agent_allowed(&server.allowed_agents, &hello.user_agent) {
+    if !agent_allowed(&server.settings.allowed_agents, &hello.user_agent) {
         warn!(
             "[{peer}] hello refused: agent {:?} matches none of the allowed prefixes {:?}",
-            hello.user_agent, server.allowed_agents
+            hello.user_agent, server.settings.allowed_agents
         );
         return Ok(());
     }
     let protocol_version = hello.protocol_version;
-    let client_sign_pk = hello.client_sign_pk;
-    if server.require_v3 && protocol_version == ProtocolVersion::V1 {
+    let client_sign_pk = hello.client.sign_pk;
+    if server.settings.require_v3 && protocol_version == ProtocolVersion::V1 {
         warn!(
             "[{peer}] hello refused: agent {:?} uses the version 1 protocol (no DRS \
              extension) and this pool requires version 3 (--require-v3)",
@@ -108,8 +105,8 @@ pub fn handle(stream: TcpStream, server: &Server) -> io::Result<()> {
         "[{peer}] hello ok: ua={:?} nk={:#010x} client={} session={} protocol_version={}",
         hello.user_agent,
         hello.nk,
-        &hex::encode(hello.client_sign_pk)[..LOG_HEX_CHARS],
-        &hex::encode(hello.session_sign_pk)[..LOG_HEX_CHARS],
+        &hex::encode(hello.client.sign_pk)[..LOG_HEX_CHARS],
+        &hex::encode(hello.session.sign_pk)[..LOG_HEX_CHARS],
         match protocol_version {
             ProtocolVersion::V1 => "v1",
             ProtocolVersion::V3 { .. } => "v3",
@@ -117,7 +114,7 @@ pub fn handle(stream: TcpStream, server: &Server) -> io::Result<()> {
     );
 
     let (response, channel): (Vec<u8>, ServerChannel) =
-        match accept(hello, &server.pool_keys, &server.motd) {
+        match accept(hello, &server.pool_keys, &server.settings.motd) {
             Ok(v) => v,
             Err(e) => {
                 error!("[{peer}] could not build handshake response: {e}");
@@ -128,7 +125,7 @@ pub fn handle(stream: TcpStream, server: &Server) -> io::Result<()> {
     debug!("[{peer}] handshake response sent ({} bytes)", response.len());
 
     let waker = Arc::new(socket.waker()?);
-    server.node_view.add_waker(&waker);
+    server.node_state.add_waker(&waker);
 
     let mut conn = Connection {
         server,
@@ -137,12 +134,9 @@ pub fn handle(stream: TcpStream, server: &Server) -> io::Result<()> {
         socket,
         waker,
         channel,
-        verifier: Verifier::new(server.share_policy.clone(), Arc::clone(&server.accepted_hashes)),
-        credit: CreditState::new(peer),
-        last_coinbaser_id: 0,
+        verifier: Verifier::new(&server.share_policy),
+        reported_unpayable: BoundedSet::new(shares::MAX_REPORTED_UNPAYABLE),
         awaiting_txns: HashMap::new(),
-        known_tip: None,
-        known_next_bits: None,
         last_send_at: Instant::now(),
         client_sign_pk,
         v3: None,
@@ -154,21 +148,10 @@ pub fn handle(stream: TcpStream, server: &Server) -> io::Result<()> {
             conn.send_mining(&server.config_payload, true)?;
             debug!("[{peer}] sent v1 0x99 config ({} bytes, signed)", server.config_payload.len());
         }
-        ProtocolVersion::V3 { resume } => conn.start_v3_session(client_sign_pk, resume.as_ref())?,
+        ProtocolVersion::V3 { resume } => conn.start_v3_session(resume.as_ref())?,
     }
 
     conn.run()
-}
-
-enum FrameHeaderRead {
-    Complete,
-    Idle,
-    Closed,
-}
-
-struct V3Session {
-    token: ResumeToken,
-    abw: AbwSlotState,
 }
 
 struct Connection<'a> {
@@ -178,12 +161,13 @@ struct Connection<'a> {
     socket: PolledSocket,
     waker: Arc<Waker>,
     channel: ServerChannel,
-    verifier: Verifier,
-    credit: CreditState,
-    last_coinbaser_id: u8,
-    awaiting_txns: HashMap<u8, AcceptedShare>,
-    known_tip: Option<[u8; 32]>,
-    known_next_bits: Option<u32>,
+    verifier: Verifier<'a>,
+    /// The unpayable identities already reported at warn level on this connection. One
+    /// connection carries every miner on a gateway, so each bad username is named once
+    /// rather than only the first; the set is bounded so a gateway sending many of them
+    /// cannot fill the log.
+    reported_unpayable: BoundedSet<String>,
+    awaiting_txns: HashMap<u8, RebuiltShare>,
     last_send_at: Instant,
     client_sign_pk: [u8; 32],
     v3: Option<V3Session>,
@@ -192,28 +176,23 @@ struct Connection<'a> {
 
 impl Drop for Connection<'_> {
     fn drop(&mut self) {
-        self.server.node_view.remove_waker(&self.waker);
+        self.server.node_state.remove_waker(&self.waker);
         if let Some(v3) = self.v3.take() {
-            let state = SessionState {
-                token: v3.token,
-                abw: v3.abw,
-                splits: self.verifier.take_splits(),
-                last_coinbaser_id: self.last_coinbaser_id,
-            };
             let session = SavedSession {
-                state,
+                v3,
+                splits: self.verifier.take_splits(),
                 saved_at: Instant::now(),
                 connection_opened_at: self.opened_at,
             };
             lock(&self.server.sessions).save(self.client_sign_pk, session);
             debug!("[{}] session saved for resume", self.peer);
         }
-        for (job, a) in &self.awaiting_txns {
+        for (job, rebuilt) in &self.awaiting_txns {
             error!(
                 "[{}]   !! a block on job {job} was never relayed: its transactions did not \
                  arrive before the connection closed: {}",
                 self.peer,
-                hex::encode(a.rebuilt.block_hash)
+                hex::encode(rebuilt.block_hash)
             );
         }
     }
@@ -233,65 +212,27 @@ impl Connection<'_> {
     fn until_next_action(&self) -> Duration {
         let mut due = self.last_send_at + KEEPALIVE_INTERVAL;
         if let Some(next) = self.abw().map(AbwSlotState::next_due) {
-            due = due.min(next.max(self.opened_at + assignments::REPLAY_GRACE));
+            due = due.min(next);
         }
         due.saturating_duration_since(Instant::now())
-    }
-
-    fn read_frame_header(
-        &mut self,
-        hdr: &mut [u8; framing::HEADER_LEN],
-    ) -> io::Result<FrameHeaderRead> {
-        let mut got = 0usize;
-        let mut partial_since: Option<Instant> = None;
-        loop {
-            if !self.socket.readable() {
-                let Some(since) = partial_since else { return Ok(FrameHeaderRead::Idle) };
-                let left =
-                    FRAME_HEADER_TIMEOUT.checked_sub(since.elapsed()).filter(|d| !d.is_zero());
-                let Some(left) = left else {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "frame header partially received",
-                    ));
-                };
-                self.socket.wait(Some(left))?;
-                continue;
-            }
-            match self.socket.fill(hdr, &mut got)? {
-                Fill::Closed => return Ok(FrameHeaderRead::Closed),
-                Fill::Complete => return Ok(FrameHeaderRead::Complete),
-                Fill::Partial => {}
-            }
-            if got > 0 {
-                partial_since.get_or_insert_with(Instant::now);
-            }
-        }
-    }
-
-    fn read_frame_body(&mut self, n: usize) -> io::Result<Vec<u8>> {
-        let mut buf = vec![0u8; n];
-        self.socket.read_exact(&mut buf, FRAME_BODY_TIMEOUT, FRAME_BODY_DEADLINE)?;
-        Ok(buf)
     }
 
     fn send_mining(&mut self, payload: &[u8], sign: bool) -> io::Result<()> {
         self.send_frame(framing::cmd::MINING, payload, sign)
     }
 
-    fn start_v3_session(
-        &mut self,
-        client_sign_pk: [u8; 32],
-        resume: Option<&ResumeToken>,
-    ) -> io::Result<()> {
+    fn start_v3_session(&mut self, resume: Option<&ResumeToken>) -> io::Result<()> {
         let peer = self.peer;
-        let StartedSession { state, resumed } =
-            self.server.resume_or_start(client_sign_pk, resume, Instant::now());
-        self.verifier.restore_splits(state.splits);
-        self.last_coinbaser_id = state.last_coinbaser_id;
-        let payload = self.server.config_payload_v3(&state.token);
-        self.v3 = Some(V3Session { token: state.token, abw: state.abw });
-        let notices = self.with_abw(|abw| abw.notices()).expect("a version 3 session");
+        let (mut v3, splits, resumed) = lock(&self.server.sessions).resume_or_start(
+            self.client_sign_pk,
+            resume,
+            Instant::now(),
+        );
+        self.verifier.restore_splits(splits);
+        v3.abw.connect(self.opened_at);
+        let payload = self.server.config_payload_v3(&v3.token);
+        let notices = v3.abw.notices();
+        self.v3 = Some(v3);
         self.send_mining(&payload, true)?;
         debug!("[{peer}] sent v3 0x99 config ({} bytes, signed)", payload.len());
         match (resume.is_some(), resumed) {
@@ -335,17 +276,21 @@ impl Connection<'_> {
                 self.socket.wait(Some(timeout))?;
                 continue;
             }
-            let mut hdr = [0u8; framing::HEADER_LEN];
-            match self.read_frame_header(&mut hdr)? {
-                FrameHeaderRead::Closed => {
+            let unmask = |bytes| self.channel.unmask_header(bytes);
+            let read = framing::read_next_frame(
+                &mut self.socket,
+                unmask,
+                FRAME_BODY_TIMEOUT,
+                FRAME_BODY_DEADLINE,
+            )?;
+            let (header, body) = match read {
+                FrameRead::Closed => {
                     debug!("[{peer}] disconnected");
                     return Ok(());
                 }
-                FrameHeaderRead::Idle => continue,
-                FrameHeaderRead::Complete => {}
-            }
-            let header = self.channel.unmask_header(hdr);
-            let body = self.read_frame_body(header.cmd_len as usize)?;
+                FrameRead::Empty => continue,
+                FrameRead::Complete(header, body) => (header, body),
+            };
             let plain = match self.channel.decrypt(header, &body) {
                 Ok(p) => p,
                 Err(e) => {
@@ -366,7 +311,7 @@ impl Connection<'_> {
             match mining.first().copied() {
                 Some(client_subcmd::COINBASER_REQUEST) => self.on_coinbaser_request(&mining)?,
                 Some(client_subcmd::SUBMIT_POW) => self.on_share(&mining)?,
-                Some(client_subcmd::VALIDATION) => self.on_block_txns(&mining),
+                Some(validation::SUBCMD) => self.on_block_txns(&mining),
                 _ => {}
             }
         }
@@ -401,27 +346,27 @@ impl Connection<'_> {
 
     fn on_coinbaser_request(&mut self, plain: &[u8]) -> io::Result<()> {
         let peer = self.peer;
-        let Some(req) = CoinbaserRequest::decode(plain) else {
-            warn!("[{peer}] malformed coinbaser request");
-            return Ok(());
+        let req = match CoinbaserRequest::decode(plain) {
+            Ok(req) => req,
+            Err(e) => {
+                warn!("[{peer}] malformed coinbaser request: {e}");
+                return Ok(());
+            }
         };
         info!(
             "[{peer}]   -> coinbaser request: {} sats, prev {}",
             req.value,
             &hex::encode(req.prev_hash)[..LOG_HEX_CHARS]
         );
-        if !coinbaser::value_is_plausible(self.server, peer, req.value) {
+        if !payout::value_is_plausible(self.server, peer, req.value) {
             return Ok(());
         }
-        self.last_coinbaser_id = coinbaser::next_id(self.last_coinbaser_id);
-        let split = coinbaser::dictate(self.server, peer, req.value, self.last_coinbaser_id)?;
-        self.verifier.record_dictated(self.last_coinbaser_id, split.dictated, ratum::unix_now());
-        self.send_mining(&split.payload, false)?;
-        info!(
-            "[{peer}]   <- coinbaser response ({} outputs, id {})",
-            split.response.outputs.len(),
-            self.last_coinbaser_id
-        );
+        let coinbaser_id = self.verifier.next_coinbaser_id();
+        let (dictated, payload) = payout::dictate(self.server, peer, req.value, coinbaser_id);
+        let outputs = dictated.len();
+        self.verifier.record_dictated(coinbaser_id, dictated, ratum::unix_now());
+        self.send_mining(&payload, false)?;
+        info!("[{peer}]   <- coinbaser response ({outputs} outputs, id {coinbaser_id})");
         Ok(())
     }
 }

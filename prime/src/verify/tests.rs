@@ -1,3 +1,6 @@
+//! The share verifier's tests and the values they share: a policy, a job, a coinbase carrying the
+//! pool's tag, and a share mined at difficulty 1 on it.
+
 mod checks;
 mod duplicates;
 mod rebuild;
@@ -5,13 +8,16 @@ mod sections;
 mod splits;
 
 use super::jobs::{MAX_COINBASE_TYPES, MAX_RECENT_TIPS, TIP_GRACE_SECS, coinbase_bytes};
-use super::rebuild::{Payments, build_header_v2, check_outputs, decode_tag, locate_target_byte};
+use super::rebuild::Payments;
 use super::*;
+use crate::abw::AbwSlotState;
 use crate::fixtures::payout;
 use ratum::bitcoin;
 use ratum::bitcoin::transaction::CoinbaseTx;
 use ratum::bitcoin::transaction::TxOut;
+use ratum::datum::messages::abw::ASSIGNMENT_SLOTS;
 use ratum::datum::messages::coinbaser::CoinbaserResponse;
+use ratum::datum::messages::share;
 use ratum::datum::messages::share::{
     COINBASE_ID_SUBSIDY_ONLY, CoinbaseSection, JobSection, MAX_COINBASE_SECTION_LEN,
 };
@@ -26,15 +32,25 @@ fn record(v: &mut Verifier, r: &CoinbaserResponse, identities: &[&str], now: u64
         .iter()
         .enumerate()
         .map(|(i, output)| DictatedOutput {
-            identity: identities.get(i).map_or_else(String::new, |id| id.to_string()),
-            output: output.clone(),
+            payout: Payout {
+                identity: identities.get(i).map_or_else(String::new, |id| id.to_string()),
+                sats: output.value,
+            },
+            script_pubkey: output.script_pubkey.clone(),
         })
         .collect();
     v.record_dictated(r.coinbaser_id, outputs, now);
 }
 
-fn verifier() -> Verifier {
-    Verifier::new(policy(), Arc::new(Mutex::new(AcceptedShareHashes::default())))
+/// The policy the helpers below verify against, which outlives every `Verifier` they hand
+/// back. A test that needs another policy owns it and passes `&p`.
+fn shared_policy() -> &'static SharePolicy {
+    static POLICY: std::sync::OnceLock<SharePolicy> = std::sync::OnceLock::new();
+    POLICY.get_or_init(policy)
+}
+
+fn verifier() -> Verifier<'static> {
+    Verifier::new(shared_policy())
 }
 
 const NOW: u64 = 1_760_000_000;
@@ -49,30 +65,30 @@ const HARD_NBITS: [u8; 4] = [0xff, 0xff, 0x00, 0x1c];
 
 const DIFF1_NONCE: u32 = 0x099c_1d0f;
 
-const DIFF1_NTIME_OFFSET: u32 = 0;
-
 const DIFF1_NONCE_HARD: u32 = 0x5823_2ac6;
-
-const DIFF1_NTIME_OFFSET_HARD: u32 = 0;
 
 fn policy() -> SharePolicy {
     SharePolicy {
-        payout_script: p2wpkh(0xee),
-        prime_id: 0x0000_0001,
-        coinbase_tag: "RATUM".to_string(),
-        min_difficulty: 1,
-        ntime_window_secs: DEFAULT_NTIME_WINDOW_SECS,
+        config: ClientConfig {
+            payout_script: p2wpkh(0xee),
+            prime_id: 0x0000_0001,
+            coinbase_tag: "RATUM".to_string(),
+            min_difficulty: 1,
+            v3: None,
+        },
         require_split: true,
+        chain: Some(rpc::Chain::Regtest),
     }
 }
 
 fn coinbase_sections(p: &SharePolicy, outputs: &[TxOut]) -> (CoinbaseSection, usize) {
     let tagging = ScriptSigTags {
-        tag_primary: &p.coinbase_tag,
+        tag_primary: &p.config.coinbase_tag,
         tag_secondary: "",
-        prime_id: p.prime_id as u32,
+        prime_id: p.config.prime_id as u32,
     };
-    fixtures::coinbase(&tagging, &p.payout_script, outputs, COINBASE_VALUE)
+    let built = fixtures::coinbase(&tagging, &p.config.payout_script, outputs, COINBASE_VALUE);
+    (built.section, built.target_byte_index)
 }
 
 fn job_section(target_byte_index: usize) -> JobSection {
@@ -109,7 +125,7 @@ fn section(time_on_wire: u32, nonce: u32) -> share::Blake2bSection {
 }
 
 fn share_on(job: JobSection, cb: CoinbaseSection) -> PowSubmit {
-    let time_on_wire = NOW as u32 + DIFF1_NTIME_OFFSET;
+    let time_on_wire = NOW as u32;
     PowSubmit {
         job_id: 0,
         coinbase_id: 0,
@@ -120,7 +136,7 @@ fn share_on(job: JobSection, cb: CoinbaseSection) -> PowSubmit {
         ntime: time_on_wire,
         nonce: DIFF1_NONCE,
         version: header::V2_FLAG | 0x2000_0000,
-        extranonce: EXTRANONCE.to_vec(),
+        extranonce: EXTRANONCE,
         username: "bc1qexample.worker1".to_string(),
         use_time_offset: false,
         job: Some(job),
@@ -130,32 +146,44 @@ fn share_on(job: JobSection, cb: CoinbaseSection) -> PowSubmit {
     }
 }
 
-fn setup() -> (Verifier, PowSubmit) {
+fn setup() -> (Verifier<'static>, PowSubmit) {
     with_outputs(&split().outputs)
 }
 
-fn setup_hard() -> (Verifier, PowSubmit) {
+fn setup_hard() -> (Verifier<'static>, PowSubmit) {
     let (mut v, mut s) = with_outputs(&split().outputs);
     let mut job = s.job.clone().unwrap();
     job.nbits = HARD_NBITS;
     s.job = Some(job);
-    let time_on_wire = NOW as u32 + DIFF1_NTIME_OFFSET_HARD;
+    let time_on_wire = NOW as u32;
     s.nonce = DIFF1_NONCE_HARD;
     s.ntime = time_on_wire;
     s.blake2b = section(time_on_wire, DIFF1_NONCE_HARD);
-    v.set_next_target(Some(u32::from_le_bytes(HARD_NBITS)));
+    v.set_next_bits(Some(u32::from_le_bytes(HARD_NBITS)));
     (v, s)
 }
 
-fn with_outputs(outputs: &[TxOut]) -> (Verifier, PowSubmit) {
-    let p = policy();
-    let (cb, target_byte_index) = coinbase_sections(&p, outputs);
-    let mut v = Verifier::new(p, Arc::new(Mutex::new(AcceptedShareHashes::default())));
+fn with_outputs(outputs: &[TxOut]) -> (Verifier<'static>, PowSubmit) {
+    let p = shared_policy();
+    let (cb, target_byte_index) = coinbase_sections(p, outputs);
+    let mut v = Verifier::new(p);
     record(&mut v, &split(), &[], NOW);
-    v.set_next_target(Some(u32::from_le_bytes(NBITS)));
+    v.set_next_bits(Some(u32::from_le_bytes(NBITS)));
     (v, share_on(job_section(target_byte_index), cb))
 }
 
 fn built_header(rebuilt: &RebuiltShare) -> BlockHeaderV2 {
     BlockHeaderV2::deserialize(&rebuilt.header).expect("a version 2 header")
+}
+
+impl Verifier<'_> {
+    /// `verify` with the refusal reduced to its reason.
+    fn checked(
+        &mut self,
+        s: &PowSubmit,
+        abw: Option<&AbwSlotState>,
+        now: u64,
+    ) -> Result<RebuiltShare, RejectReason> {
+        self.verify(s, abw, now).map_err(|refusal| refusal.reason)
+    }
 }

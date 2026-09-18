@@ -1,14 +1,18 @@
+//! The split a coinbase must pay: the outputs it must carry, in order, and the cases where a
+//! coinbase paying the pool alone is still accepted.
+
 use super::*;
 
 #[test]
 fn a_coinbase_without_the_split_is_refused_after_the_grace() {
+    let required = policy();
+    let not_required = SharePolicy { require_split: false, ..policy() };
     let build = |coinbaser_id: u8, require_split: bool| {
-        let mut p = policy();
-        p.require_split = require_split;
-        let (cb, target_byte_index) = coinbase_sections(&p, &[]);
-        let mut v = Verifier::new(p, Arc::new(Mutex::new(AcceptedShareHashes::default())));
+        let p = if require_split { &required } else { &not_required };
+        let (cb, target_byte_index) = coinbase_sections(p, &[]);
+        let mut v = Verifier::new(p);
         record(&mut v, &split(), &[], NOW);
-        v.set_next_target(Some(u32::from_le_bytes(HARD_NBITS)));
+        v.set_next_bits(Some(u32::from_le_bytes(HARD_NBITS)));
         let mut job = job_section(target_byte_index);
         job.coinbaser_id = coinbaser_id;
         (v, share_on(job, cb))
@@ -17,26 +21,26 @@ fn a_coinbase_without_the_split_is_refused_after_the_grace() {
     let no_split = Err(RejectReason::NoSplit);
 
     let (mut v, s) = build(1, true);
-    assert!(v.rebuild_checked_ignoring_target(&s, NOW).is_ok(), "inside the grace");
-    assert_eq!(v.rebuild_checked_ignoring_target(&s, late), no_split, "past the grace");
-    assert_eq!(v.rebuild_checked(&s, late), no_split, "past the grace, through rebuild");
+    assert!(v.rebuild_checked_ignoring_target(&s, None, NOW).is_ok(), "inside the grace");
+    assert_eq!(v.rebuild_checked_ignoring_target(&s, None, late), no_split, "past the grace");
+    assert_eq!(v.checked(&s, None, late), no_split, "past the grace, through rebuild");
 
-    let (v, s) = build(0, true);
-    assert!(v.rebuild_checked_ignoring_target(&s, late).is_ok(), "id 0 names no coinbaser");
+    let (mut v, s) = build(0, true);
+    assert!(v.rebuild_checked_ignoring_target(&s, None, late).is_ok(), "id 0 names no coinbaser");
 
-    let (v, s) = build(5, true);
-    assert!(v.rebuild_checked_ignoring_target(&s, late).is_ok(), "id 5 was never recorded");
+    let (mut v, s) = build(5, true);
+    assert!(v.rebuild_checked_ignoring_target(&s, None, late).is_ok(), "id 5 was never recorded");
 
-    let (v, s) = build(1, false);
-    assert!(v.rebuild_checked_ignoring_target(&s, late).is_ok(), "require_split off");
+    let (mut v, s) = build(1, false);
+    assert!(v.rebuild_checked_ignoring_target(&s, None, late).is_ok(), "require_split off");
 }
 
 #[test]
 fn the_dictated_outputs_a_coinbase_leaves_out_are_reported_with_their_identities() {
     let (mut v, s) = setup();
     record(&mut v, &split(), NAMES, NOW);
-    let rebuilt = v.rebuild_checked_ignoring_target(&s, NOW).unwrap();
-    assert!(rebuilt.unpaid_output_indexes.is_empty());
+    let rebuilt = v.rebuild_checked_ignoring_target(&s, None, NOW).unwrap();
+    assert!(rebuilt.unpaid_outputs.is_empty());
     assert_eq!(
         (rebuilt.paid_to_split, rebuilt.paid_to_pool),
         (150_000_000, COINBASE_VALUE - 150_000_000)
@@ -44,9 +48,8 @@ fn the_dictated_outputs_a_coinbase_leaves_out_are_reported_with_their_identities
 
     let (mut v, s) = with_outputs(&split().outputs[..1]);
     record(&mut v, &split(), NAMES, NOW);
-    let rebuilt = v.rebuild_checked_ignoring_target(&s, NOW).unwrap();
-    assert_eq!(rebuilt.unpaid_output_indexes, vec![1]);
-    assert_eq!(v.unpaid_outputs(&rebuilt), vec![payout("bob", 50_000_000)]);
+    let rebuilt = v.rebuild_checked_ignoring_target(&s, None, NOW).unwrap();
+    assert_eq!(rebuilt.unpaid_outputs, vec![payout("bob", 50_000_000)]);
     assert_eq!(
         (rebuilt.paid_to_split, rebuilt.paid_to_pool),
         (100_000_000, COINBASE_VALUE - 100_000_000)
@@ -54,41 +57,27 @@ fn the_dictated_outputs_a_coinbase_leaves_out_are_reported_with_their_identities
 
     let (mut v, s) = with_outputs(&[]);
     record(&mut v, &split(), NAMES, NOW);
-    let rebuilt = v.rebuild_checked_ignoring_target(&s, NOW).unwrap();
-    assert_eq!(rebuilt.unpaid_output_indexes, vec![0, 1]);
+    let rebuilt = v.rebuild_checked_ignoring_target(&s, None, NOW).unwrap();
     assert_eq!(
-        v.unpaid_outputs(&rebuilt),
+        rebuilt.unpaid_outputs,
         vec![payout("alice", 100_000_000), payout("bob", 50_000_000)]
     );
     assert_eq!(rebuilt.paid_to_pool, COINBASE_VALUE);
 
-    record(&mut v, &CoinbaserResponse { coinbaser_id: 3, ..split() }, NAMES, NOW);
-    assert_eq!(v.unpaid_outputs(&rebuilt).len(), 2, "recorded under another id still");
-    v.restore_splits(Splits::new());
-    assert!(v.unpaid_outputs(&rebuilt).is_empty());
-
-    let (mut v, s) = with_outputs(&split().outputs[..1]);
-    record(&mut v, &split(), &[], NOW);
-    let rebuilt = v.rebuild_checked_ignoring_target(&s, NOW).unwrap();
-    assert_eq!(
-        v.unpaid_outputs(&rebuilt),
-        vec![payout(&format!("script {}", hex::encode(p2wpkh(0x02))), 50_000_000)]
-    );
-
     let (mut v, mut s) = with_outputs(&[]);
     record(&mut v, &split(), NAMES, NOW);
     s.job.as_mut().unwrap().coinbaser_id = 0;
-    assert!(v.rebuild_checked_ignoring_target(&s, NOW).unwrap().unpaid_output_indexes.is_empty());
+    assert!(v.rebuild_checked_ignoring_target(&s, None, NOW).unwrap().unpaid_outputs.is_empty());
 
     let (mut v, s) = with_outputs(&[]);
-    let fallback = CoinbaserResponse {
+    let to_the_pool_script = CoinbaserResponse {
         value: COINBASE_VALUE - 1,
         coinbaser_id: 1,
         outputs: vec![TxOut { value: COINBASE_VALUE - 1, script_pubkey: p2wpkh(0xee) }],
     };
-    record(&mut v, &fallback, &[""], NOW);
-    let rebuilt = v.rebuild_checked_ignoring_target(&s, NOW).unwrap();
-    assert!(rebuilt.unpaid_output_indexes.is_empty(), "{:?}", rebuilt.unpaid_output_indexes);
+    record(&mut v, &to_the_pool_script, &["a miner mining to the pool's own address"], NOW);
+    let rebuilt = v.rebuild_checked_ignoring_target(&s, None, NOW).unwrap();
+    assert!(rebuilt.unpaid_outputs.is_empty(), "{:?}", rebuilt.unpaid_outputs);
     assert_eq!((rebuilt.paid_to_split, rebuilt.paid_to_pool), (0, COINBASE_VALUE));
 }
 
@@ -101,8 +90,8 @@ fn check_split_refuses_no_split_past_the_grace_and_passes_each_exemption() {
         &[],
         NOW,
     );
-    let mut rebuilt = v.rebuild_checked_ignoring_target(&s, NOW).unwrap();
-    assert!(!v.meets_network_target(&rebuilt));
+    let mut rebuilt = v.rebuild_checked_ignoring_target(&s, None, NOW).unwrap();
+    assert!(!rebuilt.is_block);
     rebuilt.paid_to_split = 0;
     let late = NOW + SPLIT_GRACE_SECS + 1;
     let no_split = Err(RejectReason::NoSplit);
@@ -111,10 +100,8 @@ fn check_split_refuses_no_split_past_the_grace_and_passes_each_exemption() {
     assert_eq!(v.check_split(&s, &rebuilt, NOW + SPLIT_GRACE_SECS), Ok(()), "at the grace");
     assert_eq!(v.check_split(&s, &rebuilt, NOW), Ok(()), "inside the grace");
 
-    let mut off = Verifier::new(
-        SharePolicy { require_split: false, ..policy() },
-        Arc::new(Mutex::new(AcceptedShareHashes::default())),
-    );
+    let off_policy = SharePolicy { require_split: false, ..policy() };
+    let mut off = Verifier::new(&off_policy);
     record(&mut off, &split(), &[], NOW);
     assert_eq!(off.check_split(&s, &rebuilt, late), Ok(()), "require_split off");
 
@@ -133,10 +120,12 @@ fn check_split_refuses_no_split_past_the_grace_and_passes_each_exemption() {
     let id2 = RebuiltShare { coinbaser_id: 2, ..rebuilt.clone() };
     assert_eq!(v.check_split(&s, &id2, late), Ok(()), "id 2 dictated nothing");
 
-    let (v, s) = setup();
-    let block =
-        RebuiltShare { paid_to_split: 0, ..v.rebuild_checked_ignoring_target(&s, NOW).unwrap() };
-    assert!(v.meets_network_target(&block));
+    let (mut v, s) = setup();
+    let block = RebuiltShare {
+        paid_to_split: 0,
+        ..v.rebuild_checked_ignoring_target(&s, None, NOW).unwrap()
+    };
+    assert!(block.is_block);
     assert_eq!(v.check_split(&s, &block, late), Ok(()), "a block");
 }
 
@@ -146,13 +135,10 @@ fn rejects_a_coinbase_paying_someone_else() {
     let mut redirected = split();
     redirected.outputs[1].script_pubkey = p2wpkh(0x99);
     let (cb, target_byte_index) = coinbase_sections(&p, &redirected.outputs);
-    let mut v = Verifier::new(p, Arc::new(Mutex::new(AcceptedShareHashes::default())));
+    let mut v = Verifier::new(&p);
     record(&mut v, &split(), &[], NOW);
-    let (_, base) = setup();
-    let mut share = base.clone();
-    share.coinbase = Some(cb);
-    share.job = Some(job_section(target_byte_index));
-    assert_eq!(v.rebuild_checked(&share, NOW), Err(RejectReason::BadCoinbaseOutputs));
+    let share = share_on(job_section(target_byte_index), cb);
+    assert_eq!(v.checked(&share, None, NOW), Err(RejectReason::BadCoinbaseOutputs));
 }
 
 #[test]
@@ -169,24 +155,21 @@ fn rejects_a_coinbase_whose_outputs_total_less_than_the_job_value() {
         .expect("remainder output value");
     cb.coinb2[pos..pos + 8].copy_from_slice(&(remainder - 1).to_le_bytes());
 
-    let mut v = Verifier::new(p, Arc::new(Mutex::new(AcceptedShareHashes::default())));
+    let mut v = Verifier::new(&p);
     record(&mut v, &sp, &[], NOW);
-    let (_, base) = setup();
-    let mut share = base.clone();
-    share.coinbase = Some(cb);
-    share.job = Some(job_section(target_byte_index));
-    assert_eq!(v.rebuild_checked(&share, NOW), Err(RejectReason::BadCoinbase));
+    let share = share_on(job_section(target_byte_index), cb);
+    assert_eq!(v.checked(&share, None, NOW), Err(RejectReason::BadCoinbase));
 }
 
 #[test]
 fn accepts_a_split_the_gateway_could_not_fit_entirely() {
-    let (v, s) = with_outputs(&split().outputs[..1]);
-    let rebuilt = v.rebuild_checked_ignoring_target(&s, NOW).unwrap();
+    let (mut v, s) = with_outputs(&split().outputs[..1]);
+    let rebuilt = v.rebuild_checked_ignoring_target(&s, None, NOW).unwrap();
     assert_eq!(rebuilt.paid_to_split, 100_000_000);
     assert_eq!(rebuilt.paid_to_pool, COINBASE_VALUE - 100_000_000);
 
-    let (v, s) = with_outputs(&split().outputs[1..]);
-    let rebuilt = v.rebuild_checked_ignoring_target(&s, NOW).unwrap();
+    let (mut v, s) = with_outputs(&split().outputs[1..]);
+    let rebuilt = v.rebuild_checked_ignoring_target(&s, None, NOW).unwrap();
     assert_eq!(rebuilt.paid_to_split, 50_000_000);
 }
 
@@ -195,7 +178,7 @@ fn a_share_is_checked_against_the_split_its_job_used() {
     let p = policy();
     let old_split = split();
     let (cb, target_byte_index) = coinbase_sections(&p, &old_split.outputs);
-    let mut v = Verifier::new(p.clone(), Arc::new(Mutex::new(AcceptedShareHashes::default())));
+    let mut v = Verifier::new(&p);
     record(&mut v, &old_split, &[], NOW);
     record(
         &mut v,
@@ -208,20 +191,17 @@ fn a_share_is_checked_against_the_split_its_job_used() {
         NOW,
     );
 
-    let (_, base) = setup();
-    let mut share = base.clone();
-    share.coinbase = Some(cb);
     let mut job = job_section(target_byte_index);
     job.coinbaser_id = old_split.coinbaser_id;
-    share.job = Some(job);
-    let rebuilt = v.rebuild_checked(&share, NOW).unwrap();
+    let share = share_on(job, cb);
+    let rebuilt = v.checked(&share, None, NOW).unwrap();
     assert_eq!(rebuilt.paid_to_split, 150_000_000);
 
     let mut wrong = share.clone();
     let mut job = wrong.job.clone().unwrap();
     job.coinbaser_id = old_split.coinbaser_id + 1;
     wrong.job = Some(job);
-    assert_eq!(v.rebuild_checked(&wrong, NOW), Err(RejectReason::BadCoinbaseOutputs));
+    assert_eq!(v.checked(&wrong, None, NOW), Err(RejectReason::BadCoinbaseOutputs));
 }
 
 #[test]
@@ -229,7 +209,7 @@ fn rejects_split_outputs_in_the_wrong_order() {
     let mut reordered = split().outputs;
     reordered.swap(0, 1);
     let (mut v, s) = with_outputs(&reordered);
-    assert_eq!(v.rebuild_checked(&s, NOW), Err(RejectReason::BadCoinbaseOutputs));
+    assert_eq!(v.checked(&s, None, NOW), Err(RejectReason::BadCoinbaseOutputs));
 }
 
 #[test]
@@ -242,14 +222,14 @@ fn ignores_zero_value_outputs() {
         sequence: 0xffff_ffff,
         outputs: vec![
             TxOut { value: 0, script_pubkey: vec![0x6a, 0x0e] },
-            TxOut { value: COINBASE_VALUE, script_pubkey: p.payout_script.clone() },
+            TxOut { value: COINBASE_VALUE, script_pubkey: p.config.payout_script.clone() },
         ],
         lock_time: 0,
         has_witness: false,
     };
     let (_, s) = setup();
-    let Payments { paid_to_split, paid_to_pool, unpaid_output_indexes } =
-        check_outputs(&p, &HashMap::new(), &job_section(0), &tx, &s).unwrap();
+    let Payments { paid_to_split, paid_to_pool, unpaid_outputs } =
+        verifier().check_outputs(&job_section(0), &tx, &s).unwrap();
     assert_eq!((paid_to_split, paid_to_pool), (0, COINBASE_VALUE));
-    assert!(unpaid_output_indexes.is_empty(), "nothing was dictated, so nothing was left out");
+    assert!(unpaid_outputs.is_empty(), "nothing was dictated, so nothing was left out");
 }

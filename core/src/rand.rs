@@ -1,3 +1,5 @@
+//! Random bytes from the libsodium generator.
+
 pub fn fill(buf: &mut [u8]) {
     dryoc::rng::copy_randombytes(buf);
 }

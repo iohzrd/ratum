@@ -1,5 +1,11 @@
+//! The thread watching the node: it waits for each new block, re-reads the tip and the template on
+//! it, resizes the share window to the new difficulty, and wakes every gateway connection when the
+//! work they should build on changed.
+
+use crate::server::Server;
 use log::{debug, error, info, warn};
 use mio::Waker;
+use ratum::mining_info::LatestMiningInfo;
 use ratum::{lock, rpc};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -11,14 +17,19 @@ struct TipObservation {
     observed_at: u64,
 }
 
+/// The node's tip, the summary of the template on it and the recent tips, written together
+/// so a reader never pairs a tip with the template of another.
 #[derive(Default)]
-pub struct NodeView {
-    tip: Mutex<Option<rpc::Tip>>,
-    coinbase_value: Mutex<Option<u64>>,
-    next_bits: Mutex<Option<u32>>,
-    tip_history: Mutex<VecDeque<TipObservation>>,
-    network_hashps: Mutex<Option<f64>>,
-    warnings: Mutex<Vec<String>>,
+struct NodeView {
+    tip: Option<rpc::Tip>,
+    template: Option<rpc::TemplateSummary>,
+    tip_history: VecDeque<TipObservation>,
+}
+
+#[derive(Default)]
+pub struct NodeState {
+    view: Mutex<NodeView>,
+    pub mining: LatestMiningInfo,
     wakers: Mutex<Vec<Arc<Waker>>>,
 }
 
@@ -26,30 +37,24 @@ const MINING_INFO_INTERVAL: Duration = Duration::from_secs(ratum::SECS_PER_MINUT
 
 pub const TIP_HISTORY_CAP: usize = 64;
 
-impl NodeView {
+impl NodeState {
     pub fn tip(&self) -> Option<rpc::Tip> {
-        *lock(&self.tip)
+        lock(&self.view).tip
     }
 
     pub fn coinbase_value(&self) -> Option<u64> {
-        *lock(&self.coinbase_value)
+        lock(&self.view).template.map(|t| t.coinbase_value)
     }
 
-    pub fn next_bits(&self) -> Option<u32> {
-        *lock(&self.next_bits)
-    }
-
-    pub fn network_hashps(&self) -> Option<f64> {
-        *lock(&self.network_hashps)
-    }
-
-    pub fn warnings(&self) -> Vec<String> {
-        lock(&self.warnings).clone()
+    /// The tip and the template summary on it, read under one lock.
+    pub fn tip_and_template(&self) -> (Option<rpc::Tip>, Option<rpc::TemplateSummary>) {
+        let v = lock(&self.view);
+        (v.tip, v.template)
     }
 
     pub fn observed_block_seconds(&self) -> Option<f64> {
-        let tips = lock(&self.tip_history);
-        match (tips.front(), tips.back()) {
+        let v = lock(&self.view);
+        match (v.tip_history.front(), v.tip_history.back()) {
             (Some(first), Some(last))
                 if last.height > first.height && last.observed_at > first.observed_at =>
             {
@@ -70,19 +75,31 @@ impl NodeView {
         lock(&self.wakers).retain(|w| !Arc::ptr_eq(w, waker));
     }
 
-    fn record_tip(&self, t: &rpc::Tip) {
-        info!(
-            "node tip: height {} difficulty {} {} (chain {})",
-            t.height,
-            t.difficulty,
-            ratum::bitcoin::hash_to_display_hex(&t.hash),
-            t.chain.name()
-        );
-        let mut history = lock(&self.tip_history);
-        history.push_back(TipObservation { height: t.height, observed_at: ratum::unix_now() });
-        while history.len() > TIP_HISTORY_CAP {
-            history.pop_front();
+    /// Whether the node's tip is one other than the tip held. `watch_node` asks before it
+    /// reads a template, which it must not do while holding the view, and `update` asks again
+    /// when it writes; both read the answer from `is_new_tip` so the two cannot drift.
+    pub fn is_new_tip(&self, hash: &[u8; 32]) -> bool {
+        is_new_tip(&lock(&self.view), hash)
+    }
+
+    /// Writes the tip and, when `template` is given, the template summary read for it;
+    /// returns whether the tip or the next block's bits changed.
+    fn update(&self, t: rpc::Tip, template: Option<Option<rpc::TemplateSummary>>) -> bool {
+        let mut v = lock(&self.view);
+        let tip_changed = is_new_tip(&v, &t.hash);
+        let previous_bits = v.template.map(|s| s.bits);
+        if tip_changed {
+            v.tip_history
+                .push_back(TipObservation { height: t.height, observed_at: ratum::unix_now() });
+            while v.tip_history.len() > TIP_HISTORY_CAP {
+                v.tip_history.pop_front();
+            }
         }
+        if let Some(template) = template {
+            v.template = template;
+        }
+        v.tip = Some(t);
+        tip_changed || v.template.map(|s| s.bits) != previous_bits
     }
 
     fn wake_connections(&self) {
@@ -92,6 +109,10 @@ impl NodeView {
             }
         }
     }
+}
+
+fn is_new_tip(view: &NodeView, hash: &[u8; 32]) -> bool {
+    view.tip.map(|held| held.hash).as_ref() != Some(hash)
 }
 
 fn exit_on_wrong_chain(t: &rpc::Tip, expected: Option<rpc::Chain>) {
@@ -109,78 +130,79 @@ fn exit_on_wrong_chain(t: &rpc::Tip, expected: Option<rpc::Chain>) {
     std::process::exit(1);
 }
 
-fn refresh_mining_info(node: &rpc::Client, view: &NodeView) {
-    let info = match node.mining_info() {
-        Ok(info) => info,
+fn refresh_mining_info(node: &rpc::Client, view: &NodeState) {
+    let refreshed = match ratum::mining_info::refresh(node, &view.mining) {
+        Ok(r) => r,
         Err(e) => {
             warn!("could not read getmininginfo: {e}");
             return;
         }
     };
-    *lock(&view.network_hashps) = (info.network_hashps > 0.0).then_some(info.network_hashps);
-    let mut held = lock(&view.warnings);
-    if *held == info.warnings {
+    if !refreshed.warnings_changed {
         return;
     }
-    for warning in &info.warnings {
+    for warning in &refreshed.warnings {
         warn!("the node reports: {warning}");
     }
-    if info.warnings.is_empty() {
+    if refreshed.warnings.is_empty() {
         info!("the node reports no warnings");
     }
-    *held = info.warnings;
 }
 
-fn refresh_template_summary(node: &rpc::Client, view: &NodeView) -> bool {
+fn read_template_summary(node: &rpc::Client) -> Option<rpc::TemplateSummary> {
     match node.template_summary() {
         Ok(n) => {
             info!(
                 "node template: the next coinbase may pay {} sats at bits {:#010x}",
                 n.coinbase_value, n.bits
             );
-            *lock(&view.coinbase_value) = Some(n.coinbase_value);
-            *lock(&view.next_bits) = Some(n.bits);
-            true
+            Some(n)
         }
         Err(e) => {
             warn!("could not read a template: {e}");
-            *lock(&view.coinbase_value) = None;
-            *lock(&view.next_bits) = None;
-            false
+            None
         }
     }
 }
 
-pub fn watch_node(
-    node: rpc::Client,
-    view: Arc<NodeView>,
-    interval: Duration,
-    expected_chain: Option<rpc::Chain>,
-) {
-    let mut last: Option<[u8; 32]> = None;
+/// Reads the node's tip, template and mining info into the server's node state, waking
+/// the gateway connections on a change and resizing the share window on each new tip.
+pub fn watch_node(server: &Server, expected_chain: Option<rpc::Chain>) {
+    let (node, view, interval) = (&server.node, &server.node_state, server.settings.poll);
     let mut have_template = false;
     let mut wait_for_blocks = true;
     let mut last_mining_info: Option<Instant> = None;
     loop {
         if last_mining_info.is_none_or(|t| t.elapsed() >= MINING_INFO_INTERVAL) {
             last_mining_info = Some(Instant::now());
-            refresh_mining_info(&node, &view);
+            refresh_mining_info(node, view);
         }
         let height = match node.tip() {
             Ok(t) => {
                 exit_on_wrong_chain(&t, expected_chain);
-                let tip_changed = last != Some(t.hash);
-                let previous_bits = *lock(&view.next_bits);
+                let tip_changed = view.is_new_tip(&t.hash);
                 if tip_changed {
-                    view.record_tip(&t);
-                    last = Some(t.hash);
-                    have_template = false;
+                    info!(
+                        "node tip: height {} difficulty {} {} (chain {})",
+                        t.height,
+                        t.difficulty,
+                        ratum::bitcoin::hash_to_display_hex(&t.hash),
+                        t.chain.name()
+                    );
+                    let re_read = lock(&server.ledger).set_network_difficulty(t.difficulty);
+                    if re_read != 0 {
+                        info!(
+                            "difficulty rose; the wider window re-read {re_read} share(s) from \
+                             the ledger"
+                        );
+                    }
                 }
-                if !have_template {
-                    have_template = refresh_template_summary(&node, &view);
-                }
-                *lock(&view.tip) = Some(t);
-                if tip_changed || *lock(&view.next_bits) != previous_bits {
+                let template = (tip_changed || !have_template).then(|| {
+                    let read = read_template_summary(node);
+                    have_template = read.is_some();
+                    read
+                });
+                if view.update(t, template) {
                     view.wake_connections();
                 }
                 Some(t.height)

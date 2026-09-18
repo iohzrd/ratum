@@ -1,7 +1,10 @@
+//! Targets and difficulties: the compact (nBits) encoding a header carries, the exact power of two
+//! a share's target byte names, and the conversions between the two.
+
 pub type Target = [u8; 32];
 
 const TARGET_BYTES: usize = 32;
-pub const DIFF1_EXPONENT: u32 = 224;
+pub(crate) const DIFF1_EXPONENT: u32 = 224;
 
 const COMPACT_TARGET_SIZE_SHIFT: u32 = 24;
 const COMPACT_TARGET_MANTISSA_MASK: u32 = 0x007f_ffff;

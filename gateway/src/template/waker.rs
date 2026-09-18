@@ -1,3 +1,7 @@
+//! What interrupts the template thread's wait: a block notification, from the node, the pool,
+//! SIGUSR1 or /NOTIFY, and a request to rebuild the current work. A wait reports which of them
+//! arrived.
+
 use ratum::lock;
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
@@ -31,7 +35,12 @@ impl PendingBlock {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Wake {
-    Block(Option<String>),
+    /// A block notification: the tip it names, none when any pending notification named no
+    /// tip, and whether a rebuild was requested with it.
+    Block {
+        hash: Option<String>,
+        rebuild: bool,
+    },
     Rebuild,
     Timeout,
 }
@@ -66,14 +75,11 @@ impl TemplateWaker {
             .signal
             .wait_timeout_while(g, d, |p| p.block.is_none() && !p.rebuild_requested)
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(pending) = g.block.take() {
-            g.rebuild_requested = false;
-            Wake::Block(pending.hash())
-        } else if g.rebuild_requested {
-            g.rebuild_requested = false;
-            Wake::Rebuild
-        } else {
-            Wake::Timeout
+        let rebuild = std::mem::take(&mut g.rebuild_requested);
+        match g.block.take() {
+            Some(pending) => Wake::Block { hash: pending.hash(), rebuild },
+            None if rebuild => Wake::Rebuild,
+            None => Wake::Timeout,
         }
     }
 }
@@ -87,13 +93,25 @@ mod tests {
         let n = TemplateWaker::default();
         assert_eq!(n.wait(Duration::from_millis(1)), Wake::Timeout);
         n.raise_for("aa");
-        assert_eq!(n.wait(Duration::from_millis(1)), Wake::Block(Some("aa".into())));
+        assert_eq!(
+            n.wait(Duration::from_millis(1)),
+            Wake::Block { hash: Some("aa".into()), rebuild: false }
+        );
         n.raise_for("aa");
         n.raise();
         n.raise_for("bb");
-        assert_eq!(n.wait(Duration::from_millis(1)), Wake::Block(None));
+        assert_eq!(n.wait(Duration::from_millis(1)), Wake::Block { hash: None, rebuild: false });
         n.rebuild();
         assert_eq!(n.wait(Duration::from_millis(1)), Wake::Rebuild);
         assert_eq!(n.wait(Duration::from_millis(1)), Wake::Timeout);
+    }
+
+    #[test]
+    fn a_rebuild_requested_with_a_block_notification_is_carried_by_it() {
+        let n = TemplateWaker::default();
+        n.rebuild();
+        n.raise();
+        assert_eq!(n.wait(Duration::from_millis(1)), Wake::Block { hash: None, rebuild: true });
+        assert_eq!(n.wait(Duration::from_millis(1)), Wake::Timeout, "delivered once");
     }
 }

@@ -1,3 +1,6 @@
+//! A non-blocking socket registered with a poller: reads and writes that respect an idle limit and
+//! a deadline rather than blocking, and a waker another thread raises to interrupt the wait.
+
 use mio::net::TcpStream;
 use mio::{Events, Interest, Poll, Token, Waker};
 use std::io::{self, Read, Write};
@@ -9,13 +12,6 @@ const WAKE: Token = Token(1);
 const EVENT_CAPACITY: usize = 8;
 
 pub const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Fill {
-    Complete,
-    Partial,
-    Closed,
-}
 
 pub struct PolledSocket {
     stream: TcpStream,
@@ -67,16 +63,7 @@ impl PolledSocket {
         }
     }
 
-    pub fn fill(&mut self, buf: &mut [u8], filled: &mut usize) -> io::Result<Fill> {
-        match self.read(&mut buf[*filled..])? {
-            Some(0) => return Ok(Fill::Closed),
-            Some(n) => *filled += n,
-            None => {}
-        }
-        Ok(if *filled == buf.len() { Fill::Complete } else { Fill::Partial })
-    }
-
-    pub fn read_exact(
+    pub(crate) fn read_exact(
         &mut self,
         buf: &mut [u8],
         idle: Duration,
@@ -112,6 +99,17 @@ impl PolledSocket {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn read_vec(
+        &mut self,
+        n: usize,
+        idle: Duration,
+        total: Duration,
+    ) -> io::Result<Vec<u8>> {
+        let mut buf = vec![0u8; n];
+        self.read_exact(&mut buf, idle, total)?;
+        Ok(buf)
     }
 
     pub fn write_all(&mut self, data: &[u8], timeout: Duration) -> io::Result<()> {

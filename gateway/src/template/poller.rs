@@ -1,22 +1,25 @@
-use super::waker::{TemplateWaker, Wake};
-use super::{ReportedTemplateRefusal, Template, TemplateError, parse};
-use crate::config::Config;
+//! The thread that asks the node for a template and decides whether it starts a new block, rebuilds
+//! the work already held, or is skipped, passing the templates work is built on to the publisher.
+
+use super::waker::Wake;
+use super::{Template, TemplateError, parse};
+use crate::gateway::Gateway;
 use log::{debug, error, info, warn};
-use ratum::{lock, rpc};
-use std::sync::{Arc, Mutex};
+use ratum::bitcoin::hash_to_display_hex;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const FALLBACK_NOTIFY_INTERVAL: Duration = Duration::from_secs(1);
 
-pub fn fallback_notifier(node: rpc::Client, template_waker: Arc<TemplateWaker>) {
+pub fn fallback_notifier(gateway: &Gateway) {
     let mut last: Option<String> = None;
     loop {
-        match node.call("getbestblockhash", serde_json::json!([])) {
+        match gateway.node.call("getbestblockhash", serde_json::json!([])) {
             Ok(v) => {
                 if let Some(h) = v.as_str() {
                     if last.as_deref().is_some_and(|l| l != h) {
                         debug!("getbestblockhash changed to {h}");
-                        template_waker.raise_for(h);
+                        gateway.template_waker.raise_for(h);
                     }
                     last = Some(h.to_string());
                 }
@@ -39,75 +42,58 @@ enum Action {
     Retry,
 }
 
-#[derive(Default)]
-pub struct LastError(Mutex<Option<String>>);
-
-impl LastError {
-    pub fn set(&self, message: Option<String>) {
-        *lock(&self.0) = message;
-    }
-
-    pub fn get(&self) -> Option<String> {
-        lock(&self.0).clone()
-    }
-}
-
+/// What the poller carries between templates: the tip it last built on, the block
+/// notification it is waiting to see a template for, and the rebuild a caller asked for. It
+/// holds nothing of the gateway, so `classify` decides from these alone.
 struct Poller {
-    config: Arc<Config>,
-    last_error: Arc<LastError>,
-    refusal: ReportedTemplateRefusal,
-    last_prev_hash_hex: Option<String>,
+    last_prev_hash: Option<[u8; 32]>,
     no_blake2b_rule_reported: Option<u32>,
     was_notified: bool,
     notified_at: Instant,
     last_block_change_at: Option<Instant>,
     force_clean: bool,
-    last_logged_refusal: Option<String>,
 }
 
 impl Poller {
-    fn new(config: Arc<Config>, last_error: Arc<LastError>) -> Self {
+    fn new() -> Self {
         Self {
-            config,
-            last_error,
-            refusal: ReportedTemplateRefusal::default(),
-            last_prev_hash_hex: None,
+            last_prev_hash: None,
             no_blake2b_rule_reported: None,
             was_notified: false,
             notified_at: Instant::now(),
             last_block_change_at: None,
             force_clean: false,
-            last_logged_refusal: None,
         }
     }
 
-    fn poll(&mut self, node: &rpc::Client, payout_script: &[u8]) -> Option<Template> {
-        let raw = match node.block_template() {
+    fn poll(gateway: &Gateway, payout_script: &[u8]) -> Option<Template> {
+        let work_error = &gateway.work_error;
+        let raw = match gateway.node.block_template() {
             Ok(v) => v,
             Err(e) => {
-                self.last_error.set(Some("Could not fetch new template!".into()));
-                error!("Could not fetch new template from {}! ({e})", self.config.bitcoind.rpcurl);
+                work_error.set(Some("Could not fetch new template!".into()));
+                error!(
+                    "Could not fetch new template from {}! ({e})",
+                    gateway.config.bitcoind.rpcurl
+                );
                 return None;
             }
         };
-        match parse(&raw, payout_script, &mut self.refusal) {
+        match parse(&raw, payout_script) {
             Ok(t) => {
-                self.last_error.set(None);
-                self.last_logged_refusal = None;
+                work_error.set(None);
                 Some(t)
             }
             Err(TemplateError::Refused(why)) => {
-                self.last_error.set(Some(why.clone()));
-                if self.last_logged_refusal.as_deref() == Some(why.as_str()) {
-                    debug!("template refused: {why}");
-                } else {
+                if work_error.set(Some(why.clone())) {
                     error!("template refused: {why}");
-                    self.last_logged_refusal = Some(why);
+                } else {
+                    debug!("template refused: {why}");
                 }
                 None
             }
             Err(e) => {
-                self.last_error.set(Some(e.to_string()));
+                work_error.set(Some(e.to_string()));
                 error!("{e}");
                 None
             }
@@ -115,8 +101,7 @@ impl Poller {
     }
 
     fn classify(&mut self, template: &Template) -> Action {
-        let tip_changed =
-            self.last_prev_hash_hex.as_deref() != Some(template.prev_hash_hex.as_str());
+        let tip_changed = self.last_prev_hash != Some(template.prev_hash);
         let new_block = tip_changed || self.force_clean;
         self.force_clean = false;
         if !template.blake2b_rule {
@@ -127,13 +112,17 @@ impl Poller {
                     template.height
                 );
             }
-            self.last_prev_hash_hex = Some(template.prev_hash_hex.clone());
+            self.last_prev_hash = Some(template.prev_hash);
             self.was_notified = false;
             return Action::Skip;
         }
         if tip_changed {
-            info!("NEW NETWORK BLOCK: {} ({})", template.prev_hash_hex, template.height);
-            self.last_prev_hash_hex = Some(template.prev_hash_hex.clone());
+            info!(
+                "NEW NETWORK BLOCK: {} ({})",
+                hash_to_display_hex(&template.prev_hash),
+                template.height
+            );
+            self.last_prev_hash = Some(template.prev_hash);
             self.last_block_change_at = Some(Instant::now());
             self.was_notified = false;
         } else if new_block {
@@ -153,45 +142,57 @@ impl Poller {
 
     fn on_wake(&mut self, wake: Wake) {
         match wake {
-            Wake::Block(Some(hash))
-                if self.last_prev_hash_hex.as_deref() == Some(hash.as_str()) =>
+            Wake::Block { hash, rebuild } => {
+                if rebuild {
+                    self.on_rebuild();
+                }
+                self.on_block_notification(hash);
+            }
+            Wake::Rebuild => self.on_rebuild(),
+            Wake::Timeout => {}
+        }
+    }
+
+    fn on_rebuild(&mut self) {
+        debug!("Urgent work update triggered");
+        self.force_clean = true;
+    }
+
+    fn on_block_notification(&mut self, hash: Option<String>) {
+        match hash {
+            Some(hash)
+                if self.last_prev_hash.map(|h| hash_to_display_hex(&h)).as_deref()
+                    == Some(hash.as_str()) =>
             {
                 debug!("block notification for the tip already served ({hash}); ignored");
             }
-            Wake::Block(_)
-                if self.last_block_change_at.is_some_and(|t| t.elapsed() < REPEAT_WINDOW) =>
-            {
+            _ if self.last_block_change_at.is_some_and(|t| t.elapsed() < REPEAT_WINDOW) => {
                 debug!(
                     "block notification within {:.1} s of the last block change; ignored",
                     REPEAT_WINDOW.as_secs_f64()
                 );
             }
-            Wake::Block(_) => {
+            _ => {
                 info!("NEW NETWORK BLOCK NOTIFICATION RECEIVED");
                 self.was_notified = true;
                 self.notified_at = Instant::now();
             }
-            Wake::Rebuild => {
-                debug!("Urgent work update triggered");
-                self.force_clean = true;
-            }
-            Wake::Timeout => {}
         }
     }
 }
 
-pub fn run(
-    node: rpc::Client,
-    config: Arc<Config>,
-    template_waker: Arc<TemplateWaker>,
-    last_error: Arc<LastError>,
-    payout_script: impl Fn() -> Vec<u8>,
-    mut on_template: impl FnMut(Arc<Template>, bool),
-) {
-    let interval = Duration::from_secs(config.bitcoind.work_update_seconds);
-    let mut p = Poller::new(config, last_error);
+/// Polls the node for templates and hands each one work is built on to the publisher, with
+/// whether it starts a new block and the pool configuration it was checked against.
+pub fn run(gateway: &Arc<Gateway>) {
+    let interval = Duration::from_secs(gateway.config.bitcoind.work_update_seconds);
+    let mut p = Poller::new();
+    // The stratum listener starts once the first template has been built from: until the node
+    // has served a template there is nothing to answer a miner with.
+    let mut listener_started = false;
     loop {
-        let Some(template) = p.poll(&node, &payout_script()) else {
+        let pool_config = gateway.pool.pool_config();
+        let payout_script = gateway.config.payout_script(pool_config.as_ref());
+        let Some(template) = Poller::poll(gateway, payout_script) else {
             std::thread::sleep(POLL_RETRY_DELAY);
             continue;
         };
@@ -211,36 +212,28 @@ pub fn run(
                     t.txns.len(),
                     t.totals.size
                 );
-                on_template(t, new_block);
+                crate::publish::on_template(gateway, t, new_block, pool_config);
+                if !std::mem::replace(&mut listener_started, true) {
+                    crate::stratum::spawn_listener(Arc::clone(gateway));
+                }
             }
         }
-        p.on_wake(template_waker.wait(interval));
+        p.on_wake(gateway.template_waker.wait(interval));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixtures::{config, template};
+    use crate::fixtures::template;
 
-    fn poller() -> Poller {
-        Poller {
-            config: Arc::new(config()),
-            last_error: Arc::default(),
-            refusal: ReportedTemplateRefusal::default(),
-            last_prev_hash_hex: None,
-            no_blake2b_rule_reported: None,
-            was_notified: false,
-            notified_at: Instant::now(),
-            last_block_change_at: None,
-            force_clean: false,
-            last_logged_refusal: None,
-        }
+    fn block(hash: Option<String>) -> Wake {
+        Wake::Block { hash, rebuild: false }
     }
 
     #[test]
     fn a_new_tip_builds_clean_and_the_same_tip_builds_standard() {
-        let mut p = poller();
+        let mut p = Poller::new();
         let t = template();
         assert_eq!(p.classify(&t), Action::Build { new_block: true });
         assert_eq!(p.classify(&t), Action::Build { new_block: false });
@@ -253,13 +246,13 @@ mod tests {
 
     #[test]
     fn a_notification_for_an_unseen_tip_retries_until_it_arrives_or_expires() {
-        let mut p = poller();
+        let mut p = Poller::new();
         let t = template();
         p.classify(&t);
-        p.on_wake(Wake::Block(Some(t.prev_hash_hex.clone())));
+        p.on_wake(block(Some(hash_to_display_hex(&t.prev_hash))));
         assert_eq!(p.classify(&t), Action::Build { new_block: false }, "the tip served: ignored");
         p.last_block_change_at = Some(Instant::now() - Duration::from_secs(10));
-        p.on_wake(Wake::Block(None));
+        p.on_wake(block(None));
         assert_eq!(p.classify(&t), Action::Retry);
         p.notified_at = Instant::now() - NOTIFY_PATIENCE - Duration::from_secs(1);
         assert_eq!(
@@ -269,10 +262,21 @@ mod tests {
         );
         assert_eq!(p.classify(&t), Action::Build { new_block: false });
         let mut next = template();
-        next.prev_hash_hex = "11".repeat(32);
-        p.on_wake(Wake::Block(None));
+        next.prev_hash = [0x11; 32];
+        p.on_wake(block(None));
         assert_eq!(p.classify(&next), Action::Build { new_block: true });
-        p.on_wake(Wake::Block(None));
+        p.on_wake(block(None));
         assert_eq!(p.classify(&next), Action::Build { new_block: false }, "within 2.5 s: ignored");
+    }
+
+    #[test]
+    fn a_rebuild_carried_by_an_ignored_block_notification_still_builds_clean() {
+        let mut p = Poller::new();
+        let t = template();
+        p.classify(&t);
+        p.on_wake(Wake::Block { hash: Some(hash_to_display_hex(&t.prev_hash)), rebuild: true });
+        assert_eq!(p.classify(&t), Action::Build { new_block: true }, "the tip served");
+        p.on_wake(Wake::Block { hash: None, rebuild: true });
+        assert_eq!(p.classify(&t), Action::Build { new_block: true }, "within 2.5 s");
     }
 }

@@ -1,33 +1,25 @@
+//! The anti-block-withholding messages from the pool: a slot assignment and its key hash, and
+//! the reveal of a key, which is checked against the hash committed to.
+
 use super::Session;
 use log::{debug, error};
-use ratum::datum::messages::abw::{self, Activation, AssignmentNotice, Reveal};
-use ratum::lock;
+use ratum::datum::messages::abw::{AssignmentNotice, Reveal};
 
 impl Session<'_> {
     pub(super) fn on_abw_notice(&self, plain: &[u8]) {
         let Some(notice) = decoded("assignment notice", AssignmentNotice::decode(plain)) else {
             return;
         };
-        lock(&self.pool.abw).install(notice.slot, notice.key_hash, notice.active);
+        self.gateway.pool.session().abw.install(notice.slot, notice.key_hash, notice.active);
         debug!("ABW assignment for slot {} (active {})", notice.slot, notice.active);
         if notice.active {
-            self.pool.template_waker.rebuild();
-        }
-    }
-
-    pub(super) fn on_abw_activation(&self, plain: &[u8]) {
-        let Some(act) = decoded("activation", Activation::decode(plain)) else { return };
-        if lock(&self.pool.abw).activate(act.slot) {
-            debug!("ABW slot {} activated", act.slot);
-            self.pool.template_waker.rebuild();
-        } else {
-            error!("ABW activation for slot {} that was not seeded", act.slot);
+            self.gateway.template_waker.rebuild();
         }
     }
 
     pub(super) fn on_abw_reveal(&self, plain: &[u8]) {
         let Some(reveal) = decoded("reveal", Reveal::decode(plain)) else { return };
-        if !lock(&self.pool.abw).reveal(reveal.slot, &reveal.xor_key) {
+        if !self.gateway.pool.session().abw.reveal(reveal.slot, &reveal.xor_key) {
             error!("ABW reveal for slot {} does not match its commitment; ignored", reveal.slot);
             return;
         }
@@ -35,6 +27,6 @@ impl Session<'_> {
     }
 }
 
-fn decoded<T>(what: &str, decoded: Result<T, abw::Error>) -> Option<T> {
+fn decoded<T>(what: &str, decoded: Result<T, ratum::datum::messages::Error>) -> Option<T> {
     decoded.inspect_err(|e| error!("malformed ABW {what}: {e}")).ok()
 }

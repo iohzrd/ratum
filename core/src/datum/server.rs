@@ -1,31 +1,25 @@
-use super::channel::{Channel, ChannelKeys, Error, Signature};
-use super::framing::{self, FrameHeader, HeaderKeyRatchet, HeaderKeys, SessionNonces};
+//! The pool's end of the handshake: it opens the gateway's sealed hello, answers with a fresh
+//! session key pair signed by the pool's long-term key, and holds the channel every later frame
+//! runs through.
+
+use super::channel::{Channel, Error, open_sealed, seal_signed, split_signed, verify};
+use super::framing::{self, FrameHeader, HeaderKeys, SessionNonces};
 use super::handshake::{
-    DRS_FLAG_AT, DRS_MARKER, DRS_TOKEN_AT, HELLO_PUBKEYS_LEN, ProtocolVersion,
-    RESPONSE_PUBKEYS_LEN, RESUME_TOKEN_LEN, ResumeToken, pubkey_at,
+    DRS_FLAG_AT, DRS_MARKER, DRS_TOKEN_AT, ProtocolVersion, RESUME_TOKEN_LEN, ResumeToken,
 };
-use super::keys::KeyPairs;
+use super::keys::{KeyPairs, PUBLIC_KEYS_LEN, PublicKeys};
 use super::messages::STRUCT_END;
-use dryoc::classic::crypto_box::{
-    PublicKey as BoxPublicKey, crypto_box_beforenm, crypto_box_keypair, crypto_box_seal,
-    crypto_box_seal_open,
-};
-use dryoc::classic::crypto_sign::{
-    PublicKey as SignPublicKey, SecretKey as SignSecretKey, crypto_sign_detached,
-    crypto_sign_keypair, crypto_sign_verify_detached,
-};
-use dryoc::constants::{CRYPTO_BOX_SEALBYTES, CRYPTO_SIGN_BYTES};
+use dryoc::classic::crypto_box::crypto_box_beforenm;
+use dryoc::classic::crypto_sign::SecretKey as SignSecretKey;
 
 const MAX_USER_AGENT_LEN: usize = 256;
 const AFTER_UA_LEN: usize = 1 + size_of::<u32>();
-pub const MAX_MOTD_LEN: usize = 511;
+pub(crate) const MAX_MOTD_LEN: usize = 511;
 
 #[derive(Clone, Debug)]
 pub struct Hello {
-    pub client_sign_pk: SignPublicKey,
-    pub client_box_pk: BoxPublicKey,
-    pub session_sign_pk: SignPublicKey,
-    pub session_box_pk: BoxPublicKey,
+    pub client: PublicKeys,
+    pub session: PublicKeys,
     pub user_agent: String,
     pub nk: u32,
     pub protocol_version: ProtocolVersion,
@@ -39,26 +33,12 @@ pub fn open_hello(header: FrameHeader, payload: &[u8], pool: &KeyPairs) -> Resul
     {
         return Err(Error::BadHeader(header));
     }
-    if payload.len() < CRYPTO_BOX_SEALBYTES {
-        return Err(Error::Truncated);
-    }
-    let mut plain = vec![0u8; payload.len() - CRYPTO_BOX_SEALBYTES];
-    crypto_box_seal_open(&mut plain, payload, &pool.box_pk, &pool.box_sk)
-        .map_err(|_| Error::Unseal)?;
+    let plain = open_sealed(&pool.box_pk, &pool.box_sk, payload)?;
+    let (signed, sig) = split_signed(&plain)?;
+    let (client, rest) = PublicKeys::split_from(signed).ok_or(Error::Truncated)?;
+    let (session, rest) = PublicKeys::split_from(rest).ok_or(Error::Truncated)?;
+    verify(&sig, signed, &client.sign_pk)?;
 
-    if plain.len() < HELLO_PUBKEYS_LEN + CRYPTO_SIGN_BYTES {
-        return Err(Error::Truncated);
-    }
-    let (signed, sig) = plain.split_at(plain.len() - CRYPTO_SIGN_BYTES);
-    let sig: Signature = sig.try_into().map_err(|_| Error::Truncated)?;
-    let client_sign_pk: SignPublicKey = pubkey_at(signed, 0);
-    crypto_sign_verify_detached(&sig, signed, &client_sign_pk).map_err(|_| Error::BadSignature)?;
-
-    let client_box_pk: BoxPublicKey = pubkey_at(signed, 1);
-    let session_sign_pk: SignPublicKey = pubkey_at(signed, 2);
-    let session_box_pk: BoxPublicKey = pubkey_at(signed, 3);
-
-    let rest = &signed[HELLO_PUBKEYS_LEN..];
     let nul = rest.iter().position(|&b| b == 0).ok_or(Error::Malformed("no UA terminator"))?;
     let user_agent = String::from_utf8_lossy(&rest[..nul.min(MAX_USER_AGENT_LEN)]).into_owned();
     let after = &rest[nul + 1..];
@@ -87,15 +67,7 @@ pub fn open_hello(header: FrameHeader, payload: &[u8], pool: &KeyPairs) -> Resul
         ProtocolVersion::V1
     };
 
-    Ok(Hello {
-        client_sign_pk,
-        client_box_pk,
-        session_sign_pk,
-        session_box_pk,
-        user_agent,
-        nk,
-        protocol_version,
-    })
+    Ok(Hello { client, session, user_agent, nk, protocol_version })
 }
 
 pub struct ServerChannel {
@@ -119,7 +91,7 @@ impl ServerChannel {
                 "client message is not a channel-encrypted frame (sealed or plain)",
             ));
         }
-        self.channel.decrypt(header, ciphertext, Some(&self.hello.session_sign_pk))
+        self.channel.decrypt(header, ciphertext, Some(&self.hello.session.sign_pk))
     }
 }
 
@@ -128,68 +100,43 @@ pub fn accept(
     pool: &KeyPairs,
     motd: &str,
 ) -> Result<(Vec<u8>, ServerChannel), Error> {
-    let (session_sign_pk, session_sign_sk) = crypto_sign_keypair();
-    let (session_box_pk, session_box_sk) = crypto_box_keypair();
+    let session_keys = KeyPairs::generate();
 
-    let mut body = Vec::with_capacity(RESPONSE_PUBKEYS_LEN + motd.len() + 1);
-    body.extend_from_slice(&hello.client_sign_pk);
-    body.extend_from_slice(&hello.client_box_pk);
-    body.extend_from_slice(&hello.session_sign_pk);
-    body.extend_from_slice(&hello.session_box_pk);
-    body.extend_from_slice(&session_sign_pk);
-    body.extend_from_slice(&session_box_pk);
+    let mut body = Vec::with_capacity(3 * PUBLIC_KEYS_LEN + motd.len() + 1);
+    body.extend_from_slice(&hello.client.to_bytes());
+    body.extend_from_slice(&hello.session.to_bytes());
+    body.extend_from_slice(&session_keys.public().to_bytes());
     let motd_bytes = motd.as_bytes();
     let motd_bytes = &motd_bytes[..motd_bytes.len().min(MAX_MOTD_LEN)];
     body.extend_from_slice(motd_bytes);
     body.push(0);
 
-    let mut sig: Signature = [0u8; CRYPTO_SIGN_BYTES];
-    crypto_sign_detached(&mut sig, &body, &pool.sign_sk).map_err(|_| Error::Sign)?;
-    body.extend_from_slice(&sig);
-
-    let mut sealed = vec![0u8; body.len() + CRYPTO_BOX_SEALBYTES];
-    crypto_box_seal(&mut sealed, &body, &hello.session_box_pk).map_err(|_| Error::Seal)?;
+    let sealed = seal_signed(&pool.sign_sk, &hello.session.box_pk, body)?;
     if sealed.len() > framing::MAX_CMD_LEN {
         return Err(Error::TooLarge(sealed.len()));
     }
 
+    let precomp = crypto_box_beforenm(&hello.session.box_pk, &session_keys.box_sk)
+        .map_err(|_| Error::Malformed("bad session key"))?;
     let keys = HeaderKeys::from_nk(hello.nk);
-    let mut tx_header_key = HeaderKeyRatchet::new(keys.server_to_client);
+    let nonces = SessionNonces::derive(hello.nk, &hello.session.sign_pk);
+    let mut channel = Channel::server(keys, nonces, precomp);
+
     let header = FrameHeader {
-        cmd_len: sealed.len() as u32,
         is_signed: true,
         is_encrypted_pubkey: true,
         proto_cmd: framing::cmd::HANDSHAKE_RESPONSE,
         ..Default::default()
     };
-    let mut out = Vec::with_capacity(framing::HEADER_LEN + sealed.len());
-    out.extend_from_slice(&tx_header_key.mask(header));
-    out.extend_from_slice(&sealed);
-
-    let precomp = crypto_box_beforenm(&hello.session_box_pk, &session_box_sk)
-        .map_err(|_| Error::Malformed("bad session key"))?;
-    let nonces = SessionNonces::derive(hello.nk, &hello.session_sign_pk);
-
-    Ok((
-        out,
-        ServerChannel {
-            channel: Channel::new(ChannelKeys {
-                tx_header_key,
-                rx_header_key: HeaderKeyRatchet::new(keys.client_to_server),
-                tx_nonce: nonces.client_receiver,
-                rx_nonce: nonces.client_sender,
-                precomp: Some(precomp),
-            }),
-            session_sign_sk,
-            hello,
-        },
-    ))
+    let out = channel.frame(header, &sealed);
+    Ok((out, ServerChannel { channel, session_sign_sk: session_keys.sign_sk, hello }))
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use crate::datum::client::ClientChannel;
+    use crate::datum::framing::HeaderKeyRatchet;
 
     pub(crate) fn client_with_generated_keys(nk: u32) -> ClientChannel {
         ClientChannel::with_key_pairs(KeyPairs::generate(), KeyPairs::generate(), nk)
@@ -209,20 +156,14 @@ pub(crate) mod tests {
         let nk: u32 = 0x1122_3344;
 
         let mut body = Vec::new();
-        body.extend_from_slice(&long_term.sign_pk);
-        body.extend_from_slice(&long_term.box_pk);
-        body.extend_from_slice(&session.sign_pk);
-        body.extend_from_slice(&session.box_pk);
+        body.extend_from_slice(&long_term.public().to_bytes());
+        body.extend_from_slice(&session.public().to_bytes());
         body.extend_from_slice(b"v0.4.1-beta/deadbeef");
         body.push(0);
         body.push(STRUCT_END);
         body.extend_from_slice(&nk.to_le_bytes());
         body.extend_from_slice(&[0xAB; 17]);
-        let mut sig: Signature = [0u8; CRYPTO_SIGN_BYTES];
-        crypto_sign_detached(&mut sig, &body, &long_term.sign_sk).unwrap();
-        body.extend_from_slice(&sig);
-        let mut sealed = vec![0u8; body.len() + CRYPTO_BOX_SEALBYTES];
-        crypto_box_seal(&mut sealed, &body, &pool.box_pk).unwrap();
+        let sealed = seal_signed(&long_term.sign_sk, &pool.box_pk, body).unwrap();
 
         let header = FrameHeader {
             cmd_len: sealed.len() as u32,
@@ -234,7 +175,7 @@ pub(crate) mod tests {
         let hello = open_hello(header, &sealed, &pool).expect("pad bytes are not checked");
         assert_eq!(hello.user_agent, "v0.4.1-beta/deadbeef");
         assert_eq!(hello.nk, nk);
-        assert_eq!(hello.session_sign_pk, session.sign_pk);
+        assert_eq!(hello.session, session.public());
     }
 
     #[test]
@@ -242,7 +183,7 @@ pub(crate) mod tests {
         let pool = KeyPairs::generate();
         let other = KeyPairs::generate();
         let mut client = client_with_generated_keys(7);
-        let wire = client.hello(&other.box_pk, "v0.4.1-beta");
+        let wire = client.hello(&other.box_pk, "v0.4.1-beta", ProtocolVersion::V1);
         assert!(matches!(server_read_hello(&wire, &pool), Err(Error::Unseal)));
     }
 
@@ -250,7 +191,7 @@ pub(crate) mod tests {
     fn rejects_hello_whose_sealed_bytes_are_altered() {
         let pool = KeyPairs::generate();
         let mut client = client_with_generated_keys(7);
-        let mut bad = client.hello(&pool.box_pk, "v0.4.1-beta");
+        let mut bad = client.hello(&pool.box_pk, "v0.4.1-beta", ProtocolVersion::V1);
         let n = bad.len();
         bad[n - 1] ^= 0x01;
         assert!(matches!(server_read_hello(&bad, &pool), Err(Error::Unseal)));

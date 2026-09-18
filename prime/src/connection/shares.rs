@@ -1,14 +1,24 @@
+//! A submitted share: its verdict, the receipt an anti-block-withholding slot gets, the block
+//! relayed when the share is one, and the credit recorded to the ledger.
+
 use super::Connection;
-use crate::abw::AbwSlotState;
-use crate::relay::{self, RelayOutcome};
-use crate::verify::{AcceptedShare, Verifier};
+use crate::accounting;
+use crate::payout;
+use crate::relay;
+use crate::verify::{RebuiltShare, Refusal, Verifier};
 use log::{debug, error, info, warn};
-use ratum::datum::coinbase::TARGET_BYTE_PLACEHOLDER;
-use ratum::datum::messages::abw::{ShareRef, raw_pow_hash_le};
-use ratum::datum::messages::share::{self, PowSubmit, SharePrefix};
+use ratum::datum::messages;
+use ratum::datum::messages::abw::CandidateRef;
+use ratum::datum::messages::share::PowSubmit;
 use ratum::datum::messages::share_response::{RejectReason, ShareResponse, ShareVerdict};
 use ratum::datum::messages::validation::{self, TxnList};
+use ratum::username::address_of;
 use std::io;
+
+/// The distinct unpayable identities one connection names at warn level. Past this the rest
+/// are left at debug, so a gateway sending an unbounded number of bad usernames cannot fill
+/// the log.
+pub(super) const MAX_REPORTED_UNPAYABLE: usize = 4096;
 
 struct ShareOutcome {
     verdict: ShareVerdict,
@@ -22,12 +32,14 @@ impl Connection<'_> {
         let (response, followup_request) = match PowSubmit::decode(plain) {
             Ok(s) => {
                 debug!("[{peer}]   -> share {}", describe_share(&s));
-                self.with_abw(AbwSlotState::note_share);
+                if let Some(v3) = &mut self.v3 {
+                    v3.abw.note_share();
+                }
                 let outcome = self.share_outcome(&s, ratum::unix_now())?;
-                let abw_ref =
-                    outcome.raw_pow_hash.zip(s.abw_slot).filter(|_| self.v3.is_some()).map(
-                        |(hash, slot)| ShareRef { slot, raw_pow_hash_le: raw_pow_hash_le(&hash) },
-                    );
+                let abw_ref = outcome
+                    .raw_pow_hash
+                    .zip(self.abw_slot_of(&s))
+                    .map(|(hash, slot)| CandidateRef::new(slot, &hash));
                 let response = ShareResponse {
                     verdict: outcome.verdict,
                     nonce: s.nonce,
@@ -41,9 +53,9 @@ impl Connection<'_> {
                 warn!("[{peer}]   !! could not decode share: {e}");
                 if matches!(
                     e,
-                    share::Error::BadBlake2bSection
-                        | share::Error::MissingBlake2bSection
-                        | share::Error::BadExtranonceSize(_)
+                    messages::Error::BadBlake2bSection
+                        | messages::Error::MissingBlake2bSection
+                        | messages::Error::BadExtranonceSize(_)
                 ) {
                     warn!(
                         "[{peer}]      a share this pool cannot read indicates a gateway \
@@ -52,14 +64,7 @@ impl Connection<'_> {
                          are released together"
                     );
                 }
-                let prefix = PowSubmit::prefix(plain).unwrap_or(SharePrefix {
-                    job_id: 0,
-                    coinbase_id: 0,
-                    flags: 0,
-                    target_byte: TARGET_BYTE_PLACEHOLDER,
-                    ntime: 0,
-                    nonce: 0,
-                });
+                let prefix = PowSubmit::prefix(plain).unwrap_or_default();
                 let response = ShareResponse {
                     verdict: ShareVerdict::Rejected(Verifier::reason_for_decode_error(&e)),
                     nonce: prefix.nonce,
@@ -79,39 +84,43 @@ impl Connection<'_> {
     }
 
     fn share_outcome(&mut self, s: &PowSubmit, now: u64) -> io::Result<ShareOutcome> {
-        match self.verifier.verify(s, now) {
-            Ok(a) => self.on_accepted(s, &a, now),
-            Err(reason) => self.on_refused(s, reason),
+        // Not `self.abw()`: the borrow must stay on `v3` alone, beside `verifier` under &mut.
+        let abw = self.v3.as_ref().map(|v| &v.abw);
+        let verified = self.verifier.verify(s, abw, now);
+        match verified.and_then(|rebuilt| accounting::claim(&self.server.accepted_hashes, rebuilt))
+        {
+            Ok(rebuilt) => self.on_accepted(s, &rebuilt, now),
+            Err(refusal) => self.on_refused(s, refusal),
         }
     }
 
     fn on_accepted(
         &mut self,
         s: &PowSubmit,
-        a: &AcceptedShare,
+        rebuilt: &RebuiltShare,
         now: u64,
     ) -> io::Result<ShareOutcome> {
         let peer = self.peer;
-        let raw_pow_hash = Some(a.rebuilt.raw_pow_hash);
-        let candidate = self.verifier.block_candidate(&a.rebuilt);
-        if a.is_block {
+        let raw_pow_hash = Some(rebuilt.raw_pow_hash);
+        let candidate = rebuilt.is_block_candidate();
+        if rebuilt.is_block {
             warn!(
                 "[{peer}]   ** BLOCK at height {}: {}",
-                a.rebuilt.height,
-                hex::encode(a.rebuilt.block_hash)
+                rebuilt.height,
+                hex::encode(rebuilt.block_hash)
             );
         } else if candidate {
             info!(
                 "[{peer}]      share meets its job's bits {:#010x} but not the node's \
                  next target; not relayed",
-                a.rebuilt.job_bits
+                rebuilt.job_bits
             );
         }
         if candidate {
-            self.send_abw_receipt(s, &a.rebuilt)?;
+            self.send_abw_receipt(s, rebuilt)?;
         }
-        let followup_request = if a.is_block {
-            self.relay_and_record(s, a, now)
+        let followup_request = if rebuilt.is_block {
+            self.relay_and_record(s, rebuilt, now)
         } else {
             if s.is_block {
                 warn!(
@@ -121,11 +130,11 @@ impl Connection<'_> {
             }
             None
         };
-        if self.credit.refuse_if_unpayable(self.server, &s.username) {
+        if self.refuse_if_unpayable(&s.username) {
             let verdict = ShareVerdict::Rejected(RejectReason::BadUsername);
             return Ok(ShareOutcome { verdict, followup_request, raw_pow_hash });
         }
-        if let Err(e) = self.credit.record_and_credit(self.server, s, a, now) {
+        if let Err(e) = accounting::credit_share(self.server, peer, &s.username, rebuilt, now) {
             error!(
                 "[{peer}]   !! could not record the share to the ledger ({e}); it is \
                  not credited and its hash was removed from the accepted share hashes so a \
@@ -135,35 +144,73 @@ impl Connection<'_> {
         Ok(ShareOutcome { verdict: ShareVerdict::Accepted, followup_request, raw_pow_hash })
     }
 
-    fn relay_and_record(&mut self, s: &PowSubmit, a: &AcceptedShare, now: u64) -> Option<Vec<u8>> {
+    fn refuse_if_unpayable(&mut self, username: &str) -> bool {
+        let chain = self.server.share_policy.chain;
+        let identity = address_of(username);
+        if payout::address_script(identity, chain).is_some() {
+            return false;
+        }
+        let reason = payout::unpayable_reason(chain);
+        // The identity is named the first time it is seen, and the explanation of what a
+        // username must look like follows it once per connection rather than once per
+        // identity: an operator needs to see every miner that is being rejected, not the
+        // same paragraph repeated for each of them.
+        let explain = self.reported_unpayable.is_empty();
+        let unreported = self.reported_unpayable.len() < MAX_REPORTED_UNPAYABLE
+            && self.reported_unpayable.insert(identity.to_string());
+        if unreported {
+            warn!(
+                "[{}]   <- rejecting shares from {identity:?}, which cannot be paid: it is \
+                 {reason}",
+                self.peer
+            );
+            if explain {
+                warn!(
+                    "[{}]      The gateway sends the miner's own stratum username when \
+                     pool_pass_full_users is set; that username must be such an address, \
+                     optionally followed by '.workername'.",
+                    self.peer
+                );
+            }
+        } else {
+            debug!("[{}]   <- rejected: {identity:?} cannot be paid ({reason})", self.peer);
+        }
+        true
+    }
+
+    fn relay_and_record(
+        &mut self,
+        s: &PowSubmit,
+        rebuilt: &RebuiltShare,
+        now: u64,
+    ) -> Option<Vec<u8>> {
         let peer = self.peer;
         let mut followup_request = None;
-        if relay::submit_if_complete(peer, &self.server.node, a, s.subsidy_only)
-            == RelayOutcome::AwaitingTxns
-        {
-            if let Some(prev) = self.awaiting_txns.insert(s.job_id, a.clone()) {
+        if !s.subsidy_only && rebuilt.txn_count != 0 {
+            info!(
+                "[{peer}]      block has {} more transactions; requesting them",
+                rebuilt.txn_count
+            );
+            if let Some(prev) = self.awaiting_txns.insert(s.job_id, rebuilt.clone()) {
                 error!(
                     "[{peer}]   !! a block on job {} was still awaiting its transactions \
                      and is abandoned: {}",
                     s.job_id,
-                    hex::encode(prev.rebuilt.block_hash)
+                    hex::encode(prev.block_hash)
                 );
             }
             followup_request = Some(validation::request_block_txns(s.job_id));
+        } else {
+            relay::submit(peer, &self.server.node, s.job_id, rebuilt, &[]);
         }
-        self.record_found_block(a, s, now);
-        if !a.rebuilt.unpaid_output_indexes.is_empty() {
-            self.record_unpaid_outputs(a, now);
-        } else if a.rebuilt.paid_to_split == 0 {
-            self.record_owed_block(a, now);
-        }
+        accounting::record_block(self.server, peer, &s.username, rebuilt, now);
         followup_request
     }
 
-    fn on_refused(&mut self, s: &PowSubmit, reason: RejectReason) -> io::Result<ShareOutcome> {
+    fn on_refused(&mut self, s: &PowSubmit, refusal: Refusal) -> io::Result<ShareOutcome> {
         let peer = self.peer;
+        let Refusal { reason, rebuilt } = refusal;
         debug!("[{peer}]   <- rejected: {reason:?}");
-        let rebuilt = self.verifier.rebuild_refused(s);
         if let Some(r) = &rebuilt
             && s.is_block
         {
@@ -173,9 +220,9 @@ impl Connection<'_> {
                 hex::encode(&r.coinbase_tx)
             );
         }
-        let rebuilt = rebuilt.filter(|_| self.v3.is_some());
+        let rebuilt = rebuilt.filter(|_| self.abw_slot_of(s).is_some());
         if let Some(r) = &rebuilt
-            && self.verifier.block_candidate(r)
+            && r.is_block_candidate()
         {
             warn!(
                 "[{peer}]   ** the refused share ({reason:?}) meets a block \
@@ -210,7 +257,7 @@ impl Connection<'_> {
             list.status,
             list.txns.len()
         );
-        let Some(a) = self.awaiting_txns.remove(&list.job_index) else {
+        let Some(rebuilt) = self.awaiting_txns.remove(&list.job_index) else {
             warn!(
                 "[{peer}]      transactions for job {} that nothing is waiting on",
                 list.job_index
@@ -221,7 +268,7 @@ impl Connection<'_> {
             error!("[{peer}]      cannot assemble the block: {}", list.status);
             return;
         }
-        relay::submit_with_txns(peer, &self.server.node, list.job_index, &a, &list.txns);
+        relay::submit(peer, &self.server.node, list.job_index, &rebuilt, &list.txns);
     }
 }
 

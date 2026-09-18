@@ -1,57 +1,32 @@
-use super::STRUCT_END;
-use crate::header::{XorKey, xor_key_hash};
-use crate::reader::{ByteReader, Truncated};
+//! The anti-block-withholding messages. The pool assigns a slot and commits to its XOR key by the
+//! key's hash; a gateway mining under the commitment cannot tell a block from a share. The pool
+//! acknowledges each candidate by its raw BLAKE2b hash and discloses the key once the slot is
+//! retired, which is what lets the gateway check afterwards that every block it found was
+//! acknowledged.
+
+use super::{Error, STRUCT_END, open_message, read_final_terminator};
+use crate::header::XorKey;
+use crate::reader::ByteReader;
 use bytes::BufMut as _;
 
-pub const DRAFT_REVISION: u8 = 0;
+pub(crate) const DRAFT_REVISION: u8 = 0;
 pub const ASSIGNMENT_SLOTS: u8 = 16;
-pub const SHARE_TARGET_BASE_BITS: u8 = 32;
-pub const ASSIGNMENT_ACTIVE: u8 = 0x01;
-
-pub type SlotKeys = [Option<XorKey>; ASSIGNMENT_SLOTS as usize];
+pub(crate) const SHARE_TARGET_BASE_BITS: u8 = 32;
+pub(crate) const ASSIGNMENT_ACTIVE: u8 = 0x01;
 
 pub mod subcmd {
     pub const CANDIDATE_RECEIPT: u8 = 0xA5;
-    pub const ACTIVATION: u8 = 0xA6;
+    /// Reserved: the draft's separate activation message. The pool activates a slot with
+    /// an `AssignmentNotice` carrying `active`, so nothing sends this and the gateway has no
+    /// handler for it.
+    pub const RESERVED_ACTIVATION: u8 = 0xA6;
     pub const CANDIDATE_RELEASE: u8 = 0xA7;
     pub const ASSIGNMENT_NOTICE: u8 = 0xA8;
     pub const REVEAL: u8 = 0xA9;
 }
 
-pub fn clear_bits(target_byte: u8) -> u8 {
+pub(crate) fn clear_bits(target_byte: u8) -> u8 {
     (u32::from(SHARE_TARGET_BASE_BITS) + u32::from(target_byte)).min(u32::from(u8::MAX)) as u8
-}
-
-pub fn key_matches_hash(xor_key: &XorKey, hash: &[u8; 32]) -> bool {
-    xor_key_hash(xor_key) == *hash
-}
-
-pub fn random_key() -> XorKey {
-    crate::rand::bytes()
-}
-
-pub fn raw_pow_hash_le(raw_pow_hash: &[u8; 32]) -> [u8; 32] {
-    crate::bitcoin::reversed(raw_pow_hash)
-}
-
-#[derive(Debug, PartialEq, Eq, thiserror::Error)]
-pub enum Error {
-    #[error("truncated ABW message: {0}")]
-    Truncated(&'static str),
-    #[error("bad ABW revision {0}")]
-    BadRevision(u8),
-    #[error("ABW slot {0} out of range")]
-    BadSlot(u8),
-    #[error("unknown ABW flags {0:#04x}")]
-    BadFlags(u8),
-    #[error("missing 0xFE terminator or trailing bytes")]
-    BadShape,
-}
-
-impl From<Truncated> for Error {
-    fn from(t: Truncated) -> Self {
-        Self::Truncated(t.0)
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,12 +37,7 @@ pub struct AssignmentNotice {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Activation {
-    pub slot: u8,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ShareRef {
+pub struct CandidateRef {
     pub slot: u8,
     pub raw_pow_hash_le: [u8; 32],
 }
@@ -90,11 +60,10 @@ fn message(subcmd: u8, body: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
 }
 
 fn open(data: &[u8], subcmd: u8) -> Result<ByteReader<'_>, Error> {
-    let mut c = ByteReader::new(data);
-    c.skip_if(subcmd);
+    let mut c = open_message(data, subcmd)?;
     let rev = c.u8("revision")?;
     if rev != DRAFT_REVISION {
-        return Err(Error::BadRevision(rev));
+        return Err(Error::BadVersion(rev));
     }
     Ok(c)
 }
@@ -104,13 +73,6 @@ fn slot_checked(slot: u8) -> Result<u8, Error> {
         return Err(Error::BadSlot(slot));
     }
     Ok(slot)
-}
-
-fn close(c: &mut ByteReader<'_>) -> Result<(), Error> {
-    if c.u8("terminator")? != STRUCT_END || !c.at_end() {
-        return Err(Error::BadShape);
-    }
-    Ok(())
 }
 
 impl AssignmentNotice {
@@ -130,25 +92,17 @@ impl AssignmentNotice {
         }
         let slot = slot_checked(c.u8("slot")?)?;
         let key_hash: [u8; 32] = c.arr("key hash")?;
-        close(&mut c)?;
+        read_final_terminator(&mut c)?;
         Ok(Self { active: flags & ASSIGNMENT_ACTIVE != 0, slot, key_hash })
     }
 }
 
-impl Activation {
-    pub fn encode(&self) -> Vec<u8> {
-        message(subcmd::ACTIVATION, |out| out.put_u8(self.slot))
+impl CandidateRef {
+    /// The reference to the share whose BLAKE2b output is `raw_pow_hash`: the output reversed.
+    pub fn new(slot: u8, raw_pow_hash: &[u8; 32]) -> Self {
+        Self { slot, raw_pow_hash_le: crate::bitcoin::reversed(raw_pow_hash) }
     }
 
-    pub fn decode(data: &[u8]) -> Result<Self, Error> {
-        let mut c = open(data, subcmd::ACTIVATION)?;
-        let slot = slot_checked(c.u8("slot")?)?;
-        close(&mut c)?;
-        Ok(Self { slot })
-    }
-}
-
-impl ShareRef {
     pub fn encode_candidate(&self, subcmd: u8) -> Vec<u8> {
         debug_assert!(matches!(subcmd, subcmd::CANDIDATE_RECEIPT | subcmd::CANDIDATE_RELEASE));
         message(subcmd, |out| {
@@ -161,7 +115,7 @@ impl ShareRef {
         let mut c = open(data, subcmd)?;
         let slot = slot_checked(c.u8("slot")?)?;
         let raw_pow_hash_le: [u8; 32] = c.arr("raw pow hash")?;
-        close(&mut c)?;
+        read_final_terminator(&mut c)?;
         Ok(Self { slot, raw_pow_hash_le })
     }
 }
@@ -178,7 +132,7 @@ impl Reveal {
         let mut c = open(data, subcmd::REVEAL)?;
         let slot = slot_checked(c.u8("slot")?)?;
         let xor_key: XorKey = c.arr("xor key")?;
-        close(&mut c)?;
+        read_final_terminator(&mut c)?;
         Ok(Self { slot, xor_key })
     }
 }
@@ -186,7 +140,7 @@ impl Reveal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::header::{BlockHeaderV2, PowHashes, xor_key_mask};
+    use crate::header::{BlockHeaderV2, PowHashes, xor_key_hash, xor_key_mask};
 
     #[test]
     fn clear_bits_matches_the_c_vectors() {
@@ -204,10 +158,6 @@ mod tests {
         }
         let h = BlockHeaderV2 { xor_key: key, ..Default::default() };
         assert_eq!(h.hash_stages(), h.hash_stages_with_key_hash(xor_key_hash(&key)));
-        assert!(key_matches_hash(&key, &xor_key_hash(&key)));
-        let mut wrong = xor_key_hash(&key);
-        wrong[0] ^= 1;
-        assert!(!key_matches_hash(&key, &wrong));
     }
 
     #[test]
@@ -250,10 +200,7 @@ mod tests {
 
         let mut gw = pool.clone();
         gw.xor_key = [0u8; 16];
-        let gw_pre = gw.hash_stages_with_key_hash(xor_key_hash(&key));
-
-        let gw_asic = gw.asic_input_with(&gw_pre.work_root, &gw_pre.h2);
-        let gw_raw = crate::header::blake2b_256(&gw_asic);
+        let gw_raw = gw.raw_pow_hash(&gw.hash_stages_with_key_hash(xor_key_hash(&key)));
         assert_eq!(gw_raw, pool_pow, "raw hash must not depend on holding the key");
 
         let cleared_bytes = (cb / 8) as usize;
@@ -262,12 +209,12 @@ mod tests {
     }
 
     #[test]
-    fn raw_pow_hash_le_reverses_the_blake2b_output() {
+    fn a_candidate_ref_reverses_the_blake2b_output() {
         let raw_pow_hash: [u8; 32] = std::array::from_fn(|i| i as u8);
-        let le = raw_pow_hash_le(&raw_pow_hash);
-        assert_eq!(le[0], 31);
-        assert_eq!(le[31], 0);
-        assert_eq!(raw_pow_hash_le(&le), raw_pow_hash);
+        let c = CandidateRef::new(3, &raw_pow_hash);
+        assert_eq!(c.slot, 3);
+        assert_eq!(c.raw_pow_hash_le[0], 31);
+        assert_eq!(c.raw_pow_hash_le[31], 0);
     }
 
     #[test]
@@ -279,19 +226,14 @@ mod tests {
         assert_eq!(b[36], STRUCT_END);
         assert_eq!(AssignmentNotice::decode(&b).unwrap(), notice);
 
-        let act = Activation { slot: 3 };
-        let b = act.encode();
-        assert_eq!(b, vec![0xA6, 0, 3, 0xFE]);
-        assert_eq!(Activation::decode(&b).unwrap(), act);
-
-        let cand = ShareRef { slot: 3, raw_pow_hash_le: [0x80; 32] };
+        let cand = CandidateRef { slot: 3, raw_pow_hash_le: [0x80; 32] };
         let b = cand.encode_candidate(subcmd::CANDIDATE_RECEIPT);
         assert_eq!(b.len(), 36);
         assert_eq!(b[0], 0xA5);
-        assert_eq!(ShareRef::decode_candidate(&b, subcmd::CANDIDATE_RECEIPT).unwrap(), cand);
+        assert_eq!(CandidateRef::decode_candidate(&b, subcmd::CANDIDATE_RECEIPT).unwrap(), cand);
         let b = cand.encode_candidate(subcmd::CANDIDATE_RELEASE);
         assert_eq!(b[0], 0xA7);
-        assert_eq!(ShareRef::decode_candidate(&b, subcmd::CANDIDATE_RELEASE).unwrap(), cand);
+        assert_eq!(CandidateRef::decode_candidate(&b, subcmd::CANDIDATE_RELEASE).unwrap(), cand);
 
         let reveal = Reveal { slot: 3, xor_key: [0x11; 16] };
         let b = reveal.encode();
@@ -304,7 +246,7 @@ mod tests {
         let good = AssignmentNotice { active: false, slot: 0, key_hash: [1; 32] }.encode();
         let mut bad = good.clone();
         bad[1] = 1;
-        assert!(matches!(AssignmentNotice::decode(&bad), Err(Error::BadRevision(1))));
+        assert!(matches!(AssignmentNotice::decode(&bad), Err(Error::BadVersion(1))));
         let mut bad = good.clone();
         bad[2] = 0x02;
         assert!(matches!(AssignmentNotice::decode(&bad), Err(Error::BadFlags(2))));
@@ -313,12 +255,12 @@ mod tests {
         assert!(matches!(AssignmentNotice::decode(&bad), Err(Error::BadSlot(16))));
         let mut bad = good.clone();
         bad[36] = 0;
-        assert!(matches!(AssignmentNotice::decode(&bad), Err(Error::BadShape)));
+        assert!(matches!(AssignmentNotice::decode(&bad), Err(Error::BadTerminator)));
         let mut bad = good;
         bad.push(0x00);
-        assert!(matches!(AssignmentNotice::decode(&bad), Err(Error::BadShape)));
+        assert!(matches!(AssignmentNotice::decode(&bad), Err(Error::Malformed(_))));
         let mut bad = Reveal { slot: 3, xor_key: [2; 16] }.encode();
         bad[19] = 0;
-        assert!(matches!(Reveal::decode(&bad), Err(Error::BadShape)));
+        assert!(matches!(Reveal::decode(&bad), Err(Error::BadTerminator)));
     }
 }

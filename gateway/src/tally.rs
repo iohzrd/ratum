@@ -1,3 +1,6 @@
+//! Share counters: a count and the difficulty summed over it, kept per client and for the pool
+//! connection.
+
 use serde_json::json;
 
 #[derive(Clone, Debug, Default)]

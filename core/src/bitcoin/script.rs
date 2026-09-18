@@ -1,30 +1,33 @@
+//! Script opcodes, the pushes a coinbase scriptSig is assembled from and read back through, and the
+//! consensus limit on the size of an output script.
+
 use bytes::BufMut as _;
 
 pub mod opcode {
-    pub const OP_0: u8 = 0x00;
-    pub const OP_PUSHDATA1: u8 = 0x4c;
-    pub const OP_PUSHDATA2: u8 = 0x4d;
-    pub const OP_PUSHDATA4: u8 = 0x4e;
-    pub const OP_1: u8 = 0x51;
-    pub const OP_16: u8 = 0x60;
+    pub(crate) const OP_0: u8 = 0x00;
+    pub(crate) const OP_PUSHDATA1: u8 = 0x4c;
+    pub(crate) const OP_PUSHDATA2: u8 = 0x4d;
+    pub(crate) const OP_PUSHDATA4: u8 = 0x4e;
+    pub(crate) const OP_1: u8 = 0x51;
+    pub(crate) const OP_16: u8 = 0x60;
     pub const OP_RETURN: u8 = 0x6a;
-    pub const OP_DUP: u8 = 0x76;
-    pub const OP_EQUAL: u8 = 0x87;
-    pub const OP_EQUALVERIFY: u8 = 0x88;
-    pub const OP_HASH160: u8 = 0xa9;
-    pub const OP_CHECKSIG: u8 = 0xac;
-    pub const OP_CHECKSIGVERIFY: u8 = 0xad;
-    pub const OP_CHECKMULTISIG: u8 = 0xae;
-    pub const OP_CHECKMULTISIGVERIFY: u8 = 0xaf;
+    pub(crate) const OP_DUP: u8 = 0x76;
+    pub(crate) const OP_EQUAL: u8 = 0x87;
+    pub(crate) const OP_EQUALVERIFY: u8 = 0x88;
+    pub(crate) const OP_HASH160: u8 = 0xa9;
+    pub(crate) const OP_CHECKSIG: u8 = 0xac;
+    pub(crate) const OP_CHECKSIGVERIFY: u8 = 0xad;
+    pub(crate) const OP_CHECKMULTISIG: u8 = 0xae;
+    pub(crate) const OP_CHECKMULTISIGVERIFY: u8 = 0xaf;
 
-    pub const MAX_DIRECT_PUSH: usize = OP_PUSHDATA1 as usize - 1;
-    pub const MAX_DIRECT_PUSH_OPCODE: u8 = MAX_DIRECT_PUSH as u8;
+    pub(crate) const MAX_DIRECT_PUSH: usize = OP_PUSHDATA1 as usize - 1;
+    pub(crate) const MAX_DIRECT_PUSH_OPCODE: u8 = MAX_DIRECT_PUSH as u8;
 
-    pub const OP_N_BASE: u8 = OP_1 - 1;
+    pub(crate) const OP_N_BASE: u8 = OP_1 - 1;
 }
 
 pub const MAX_OUTPUT_SCRIPT_SIZE: usize = 34;
-pub const MAX_OUTPUT_DATA_SIZE: usize = 83;
+pub(crate) const MAX_OUTPUT_DATA_SIZE: usize = 83;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScriptPush<'a> {
@@ -33,12 +36,12 @@ pub struct ScriptPush<'a> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ScriptOp<'a> {
+pub(crate) struct ScriptOp<'a> {
     pub opcode: u8,
     pub push: Option<ScriptPush<'a>>,
 }
 
-pub fn script_ops(script: &[u8]) -> impl Iterator<Item = ScriptOp<'_>> {
+pub(crate) fn script_ops(script: &[u8]) -> impl Iterator<Item = ScriptOp<'_>> {
     ScriptOps { script, at: 0 }
 }
 
@@ -90,7 +93,32 @@ pub fn output_script_size_is_valid(script: &[u8]) -> bool {
     script.len() <= limit
 }
 
-pub fn encode_push(data: &[u8]) -> Vec<u8> {
+/// The BIP34 height push: OP_0, OP_1..OP_16, or a minimally encoded little-endian number.
+pub(crate) fn height_push(height: u32) -> Vec<u8> {
+    const SIGN_BIT: u8 = 0x80;
+    const SMALL_INT_MAX: u32 = (opcode::OP_16 - opcode::OP_N_BASE) as u32;
+
+    match height {
+        0 => vec![opcode::OP_0],
+        1..=SMALL_INT_MAX => vec![opcode::OP_N_BASE + height as u8],
+        h => {
+            let mut bytes = Vec::new();
+            let mut v = h;
+            while v > 0 {
+                bytes.push(v as u8);
+                v >>= u8::BITS;
+            }
+            if bytes.last().is_some_and(|b| b & SIGN_BIT != 0) {
+                bytes.push(0);
+            }
+            let mut out = vec![bytes.len() as u8];
+            out.extend_from_slice(&bytes);
+            out
+        }
+    }
+}
+
+pub(crate) fn encode_push(data: &[u8]) -> Vec<u8> {
     debug_assert!(u8::try_from(data.len()).is_ok());
     let mut out = Vec::with_capacity(2 + data.len());
     if data.len() > opcode::MAX_DIRECT_PUSH {
@@ -104,6 +132,16 @@ pub fn encode_push(data: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn height_pushes_match_bip34() {
+        assert_eq!(height_push(0), vec![0x00]);
+        assert_eq!(height_push(1), vec![0x51]);
+        assert_eq!(height_push(16), vec![0x60]);
+        assert_eq!(height_push(17), vec![0x01, 0x11]);
+        assert_eq!(height_push(128), vec![0x02, 0x80, 0x00]);
+        assert_eq!(height_push(840_000), vec![0x03, 0x40, 0xd1, 0x0c]);
+    }
 
     #[test]
     fn encodes_a_direct_push_and_a_pushdata1_push() {

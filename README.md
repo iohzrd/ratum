@@ -58,9 +58,12 @@ ignored. `RUST_LOG` overrides `logger.log_level_console`.
   for miners without a node of their own sets `mining.coinbase_tag_secondary` to the pool's
   `--public-gateway-tag`, and the pool charges its shares `--public-gateway-fee-bps` (see
   "Public gateway fee" under Prime).
-- One thread per stratum connection; `stratum.max_clients` limits the total and the
-  per-thread settings size the duplicate-share table and share queue. `empty_thread`
-  disconnects every client; `/threads` is not served.
+- One thread per stratum connection, so `stratum.max_clients` alone limits the total and
+  sizes the duplicate-share table and the share queue: each holds the shares
+  `stratum.vardiff_target_shares_min` gives every client over the stale window, with
+  headroom. `stratum.max_clients_per_thread` and `stratum.max_threads` bound nothing here
+  and are read only for the C gateway's check that their product covers `max_clients`.
+  `empty_thread` disconnects every client; `/threads` is not served.
 - New stratum connections are refused while the gateway's own miners measure above
   `stratum.max_network_share_bps` of the network hashrate (not a C key; 1000 basis points,
   10%, by default; 0 refuses none). The limit keeps a gateway open to the public from
@@ -75,11 +78,22 @@ ignored. `RUST_LOG` overrides `logger.log_level_console`.
   gateway has no such limit.
 - The extranonce1 session id is the 32-bit connection counter, so it never repeats for a live
   connection.
-- A new tip builds three immutable jobs (empty, priority, coinbaser) where C rewrites one, so
-  `datum.protocol_job_slots` must leave two extra slots.
+- A new tip builds two immutable jobs (priority and coinbaser) where C rewrites one, so
+  `datum.protocol_job_slots` must leave one extra slot. The priority job is served twice: as
+  subsidy-only empty work, then, after a 50 ms hold, as the pooled work its coinbase pays.
+  Both notifies name the same job, because under the version 2 header the mining machine never
+  receives the coinbase, so only the notify's prefix and coinbase id separate them.
 - The type 2 coinbase puts every output after the OP_RETURN extranonce output and keeps that
   output with an empty split; it pays the same, the txid differs from C's.
-- `mining.pool_address` and `datum.pool_pubkey` are checked at startup.
+- `mining.pool_address`, `datum.pool_pubkey` and every address in
+  `stratum.username_modifiers` are checked at startup.
+- `stratum.require_address_username` (not a C key; off by default) refuses the authorization,
+  and every share, of a username the pool would not credit to an address: the username up
+  to its first `.`, after removing a `~name` suffix that names a configured
+  `stratum.username_modifiers` entry. A suffix that names none is sent to the pool as part of
+  the username, so it is not removed. The address is decoded as `ratum-prime` decodes it, with
+  the prefixes of every chain accepted: the gateway does not read the node's chain for this
+  check, so an address of another chain passes it and `ratum-prime` refuses its shares.
 - The node's `getmininginfo` is read once a minute, for the network hashrate the connection
   limit above applies to and for the node's `warnings`, which the status page shows one line
   each (a node before Bitcoin Core 29 answers a single string in place of the array; both
@@ -153,9 +167,9 @@ format are byte-coupled between the pool and the gateway, so they are one releas
 cargo build --workspace --release        # target/release/ratum-prime, ratum-gateway, sia-test-miner
 cargo test --workspace
 cargo test --workspace --release -- --ignored  # searches ~2^32 hashes for the test nonces
-e2e/full_stack.sh                        # the activation block
-e2e/multi_miner.sh                       # three miners, two gateways: credit and payout split
-e2e/public_gateway_fee.sh                # a tagged gateway's shares charged, the fee paid to the other's miner
+e2e/e2e.py full-stack                    # the activation block
+e2e/e2e.py multi-miner                   # three miners, two gateways: credit and payout split
+e2e/e2e.py public-gateway-fee            # a tagged gateway's shares charged, the fee paid to the other's miner
 ```
 
 `core/tests/header_vectors.rs` reproduces the five version 2 header vectors in
@@ -164,12 +178,15 @@ the tagged SHA-256 chain, the BLAKE2b work root, the ASIC input of each of the f
 and the XOR mask. `core/tests/decoders.rs` feeds every decoder random and damaged input and
 requires that none panics and that whatever decodes re-encodes to a fixed point.
 
-The e2e scripts need a Knots build with the BLAKE2b change (`BITCOIND`, `BITCOIN_CLI`);
-`DATUM_GATEWAY` runs another gateway build instead of this workspace's.
+The e2e runs need a Knots build with the BLAKE2b change (`BITCOIND`, `BITCOIN_CLI`);
+`DATUM_GATEWAY` or `--gateway` runs another gateway build instead of this workspace's, and
+`e2e/e2e.py <run> --help` lists each run's own options (share counts, timeouts, `--keep`).
 
-The `gateway` GitHub Actions workflow builds `ratum-gateway` for x86_64 and aarch64 Linux
-(static musl) and x86_64 Windows on every push and pull request (each an artifact of the
-run) and attaches the archives and their SHA-256 sums to a release on a `v*` tag.
+The `ci` GitHub Actions workflow runs `cargo fmt --check`, `cargo clippy -D warnings` and
+`cargo test --workspace --all-targets` on every push and pull request. The `gateway`
+workflow builds `ratum-gateway` for x86_64 and aarch64 Linux (static musl) and x86_64
+Windows on the same events (each an artifact of the run) and attaches the archives and their
+SHA-256 sums to a release on a `v*` tag.
 
 `git config core.hooksPath .githooks` enables the pre-commit hook that bumps the workspace
 version's patch component (and `Cargo.lock`) on every commit; a reword-only amend, a commit
@@ -182,8 +199,8 @@ flags' names without the dashes, and a flag given as well overrides the file.
 
 ```toml
 rpc = "http://127.0.0.1:8332"   # the node, on this host or a private link
-rpc-user = "ratum"
-rpc-pass = "..."                # or --rpc-cookie <file>
+rpc-user = "ratum"              # or --rpc-cookie <file>, or "user:pass@" in the url above
+rpc-pass = "..."                # the credential is taken in that order of precedence
 min-diff = 16384                # smallest share difficulty credited, a power of two
 min-payout = 546                # smallest output written; a miner under it leaves the split
 ```
@@ -252,14 +269,33 @@ activation height Knots resets the target to the previous target shifted left by
 `Blake2bTargetShift` bits (22 on mainnet, 20 elsewhere), so set `--window-floor` to hold
 the intended span of work and keep the whole ledger across the fork.
 
+The window holds at most `2^20` shares whatever their difficulties sum to, which bounds it
+to roughly 150 MiB. That count covers `--window` times the network difficulty while the
+difficulty stays under `2^20 ÷ --window` times the average assigned share difficulty:
+`2^31` at a window of 8 and the default `--min-diff` of 16384, and higher as vardiff
+assigns more than the floor. The BLAKE2b chain starts at the pre-fork difficulty divided by
+`2^Blake2bTargetShift`, near `2^25` on mainnet, so the count has room at first. Past that
+ceiling the window ends at the newest `2^20` shares and spans less work than `--window`
+asks for, which raises payout variance; the pool warns the first time it trims on the
+count. Raise `--min-diff` and the gateways' `stratum.vardiff_min` (both 16384 by default)
+to lift the ceiling.
+
 ### The split
 
 One ledger serves every gateway; a block found by any pays the miners of all, in proportion
 to their work in the window. A miner's identity is its stratum username up to the first `.`,
-and it must be an address the node's `validateaddress` accepts whose script fits a coinbase
-output (34 bytes, or 83 beginning OP_RETURN); other shares are rejected with `BadUsername`.
-An identity past the 512 outputs a gateway accepts, under `--min-payout`, or unpayable when
-the split is built is left out and its amount goes to the pool's payout script.
+and it must be a P2PKH, P2SH, P2WPKH, P2WSH or P2TR address with the prefixes of the chain the
+node reported at startup (`bc`, `tb` or `bcrt` for a segwit address); other shares are rejected
+with `BadUsername`. The pool decodes the address itself, with the decoder `ratum-gateway` uses
+for `stratum.require_address_username`, so a witness version above 1, the pay-to-anchor
+address and an address of another chain are refused. A pool that started without an answer
+from the node, which only a memory-only ledger does, accepts the prefixes of every chain, for
+identities and for `--payout-address`. An identity past the 512 outputs a gateway accepts, or
+one whose amount would fall under `--min-payout`, is dropped before the split's denominator is
+summed, so the miners that remain divide the whole value between them. An identity in the
+window that is not such an address when the split is built (a share an earlier version of the
+pool credited) is dropped after the amounts are computed, so its amount stays in the coinbase
+value that reaches the pool's payout script as the remainder.
 
 `--fee-bps` (0 to 100, default 0) is deducted from the coinbase before the split and paid to
 the pool's payout script as the remainder.
@@ -360,6 +396,14 @@ given no estimate). `node_warnings` carries the node's `warnings`, one entry eac
 when it reports none; a change is logged as it happens, since on a chain that has just
 hardforked this is where a node that does not know the new rules says so, which decides
 whether the blocks the pool relays are accepted.
+
+`hashrate.history` is the pool's hashrate over the last 24 hours as `[unix time, hashes per
+second]` pairs, oldest first, one taken every `hashrate.interval_seconds` (60). With
+`--data-dir` the samples are written to `hashrate.json` in it whenever one is taken and read
+back at startup, so a restart keeps the history rather than starting from an empty chart; a
+sample more than 24 hours old is discarded as the file is read, and a file that cannot be
+read or parsed is reported and replaced at the next sample. Without a data directory the
+history is in memory only.
 
 The response carries `X-Robots-Tag: noindex`, so the snapshot is not a search result of its
 own. Rendering it is the job of a separate frontend project, which serves the snapshot from

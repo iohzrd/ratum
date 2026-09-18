@@ -110,8 +110,8 @@ poll(() => "stats.json", s => {
   // The C page's colours: green connected or non-pooled by configuration, yellow while a
   // configured pool is unreachable or before the first job, red for an error or Not Ready.
   const st = document.getElementById("status");
-  const bad = s.status.startsWith("ERROR") || s.status === "Not Ready";
-  const good = s.status === "Connected and Ready" || s.status === "Non-Pooled Mode";
+  const bad = s.state === "error" || s.state === "not_ready";
+  const good = s.state === "ready" || s.state === "non_pooled";
   st.textContent = s.status;
   st.className = "chain " + (bad ? "bad" : good ? "good" : "stale");
   const tags = [s.pool_tag, s.secondary_tag].filter(t => t).map(esc).join(" / ");
@@ -129,9 +129,9 @@ poll(() => "stats.json", s => {
   // One line for what needs attention: a template error, a pool that is not reached, a
   // stratum listener that is not up.
   const notes = [];
-  if (s.status.startsWith("ERROR")) notes.push(esc(s.status));
-  if (s.status === "Not Ready") notes.push("The pool is not connected and datum.pooled_mining_only is set: no work is served until it is reached.");
-  if (s.status.startsWith("Non-Pooled Mode (")) notes.push("The pool is unreachable; the work served pays the gateway's address alone.");
+  if (s.state === "error") notes.push(esc(s.status));
+  if (s.state === "not_ready") notes.push("The pool is not connected and datum.pooled_mining_only is set: no work is served until it is reached.");
+  if (s.state === "non_pooled_unreachable") notes.push("The pool is unreachable; the work served pays the gateway's address alone.");
   if (s.job && !s.stratum.listening) notes.push("The stratum listener is not up.");
   for (const w of s.node_warnings || []) notes.push("The node reports: " + esc(w));
   const share = s.stratum.network_share, maxShare = s.stratum.max_network_share;

@@ -1,10 +1,16 @@
-use crate::bitcoin::encode_compact_size;
-use crate::bitcoin::script::encode_push;
-use crate::bitcoin::transaction::{TxOut, encode_output};
+//! Test values both binaries' tests build on: hashes, output scripts, and a coinbase assembled the
+//! way the gateway assembles one. Compiled under `cfg(test)` and behind the `test-support` feature.
+
+use crate::bitcoin::transaction::TxOut;
 use crate::datum::coinbase::{
-    EXTRANONCE_PUSH_OPCODE, UNIQUE_ID_PUSH_TARGET_BYTE_AT, tag_push_data, unique_id_push,
+    BlockLimits, BuiltCoinbase, CoinbaseSpec, ScriptSigInputs, build, script_sig,
 };
-use crate::datum::messages::share::{self, CoinbaseSection};
+
+pub fn hash(n: u64) -> [u8; 32] {
+    let mut h = [0u8; 32];
+    h[..8].copy_from_slice(&n.to_be_bytes());
+    h
+}
 
 pub fn ramp(start: u8) -> [u8; 32] {
     std::array::from_fn(|i| start.wrapping_add(i as u8))
@@ -29,42 +35,42 @@ pub struct ScriptSigTags<'a> {
     pub prime_id: u32,
 }
 
+const HEIGHT: u32 = 2_544_140;
 const UNIQUE_ID: u16 = 0x1234;
-const ENPREFIX: [u8; 2] = [0xab, 0xcd];
+const ENPREFIX: u16 = 0xabcd;
+const WITNESS_COMMITMENT_HEADER: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
 
+/// A coinbase built the way the gateway builds one, with every output included and a
+/// zero witness commitment.
 pub fn coinbase(
     tagging: &ScriptSigTags<'_>,
     payout_script: &[u8],
     outputs: &[TxOut],
     coinbase_value: u64,
-) -> (CoinbaseSection, usize) {
-    let mut script = encode_push(&[0x0c, 0xd2, 0x26]);
-    let tag = tag_push_data(tagging.tag_primary.as_bytes(), tagging.tag_secondary.as_bytes());
-    script.extend_from_slice(&encode_push(&tag));
-    let target_byte_index_in_script = script.len() + UNIQUE_ID_PUSH_TARGET_BYTE_AT;
-    script.extend_from_slice(&unique_id_push(UNIQUE_ID, &tagging.prime_id.to_le_bytes()));
-    script.push(EXTRANONCE_PUSH_OPCODE);
-    script.extend_from_slice(&ENPREFIX);
-
-    let mut coinb1 = vec![0x01, 0x00, 0x00, 0x00, 0x01];
-    coinb1.extend_from_slice(&[0u8; 32]);
-    coinb1.extend_from_slice(&[0xff; 4]);
-    coinb1.extend_from_slice(&encode_compact_size((script.len() + share::EXTRANONCE_SIZE) as u64));
-    let script_sig_offset = coinb1.len();
-    coinb1.extend_from_slice(&script);
-    let target_byte_index = script_sig_offset + target_byte_index_in_script;
-
-    let mut coinb2 = vec![0xff, 0xff, 0xff, 0xff];
-    let paid: u64 = outputs.iter().map(|o| o.value).sum();
-    coinb2.extend_from_slice(&encode_compact_size((outputs.len() + 2) as u64));
-    for o in outputs {
-        coinb2.extend_from_slice(&encode_output(o.value, &o.script_pubkey));
-    }
-    coinb2.extend_from_slice(&encode_output(coinbase_value - paid, payout_script));
-    let mut commitment = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+) -> BuiltCoinbase {
+    let (script, target_byte_index_in_script) = script_sig(&ScriptSigInputs {
+        height: HEIGHT,
+        tag_primary: tagging.tag_primary,
+        tag_secondary: tagging.tag_secondary,
+        unique_id: UNIQUE_ID,
+        prime_id: u64::from(tagging.prime_id),
+        wide_prime: false,
+        datum_active: true,
+    })
+    .expect("the fixture tags fit");
+    let mut commitment = WITNESS_COMMITMENT_HEADER.to_vec();
     commitment.extend_from_slice(&[0x00; 32]);
-    coinb2.extend_from_slice(&encode_output(0, &commitment));
-    coinb2.extend_from_slice(&[0u8; 4]);
-
-    (CoinbaseSection { coinbase_id: 0, coinb1, coinb2 }, target_byte_index)
+    let (built, _) = build(&CoinbaseSpec {
+        coinbase_id: 0,
+        script_sig: &script,
+        target_byte_index_in_script,
+        enprefix: ENPREFIX,
+        witness_commitment: Some(&commitment),
+        pool_payout_script: payout_script,
+        coinbase_value,
+        outputs,
+        limits: BlockLimits::UNLIMITED,
+        sigop_budget: u64::MAX,
+    });
+    built
 }

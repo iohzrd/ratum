@@ -1,85 +1,79 @@
-use crate::ledger::blocks::{FoundBlock, OwedBlock};
-use crate::ledger::split::Payout;
-use crate::ledger::{IdentityWork, Ledger, Share};
-use crate::node::NodeView;
-use crate::payout::PayoutPolicy;
-use crate::payout::resolver::{AddressResolver, Unpayable};
+//! Test values the pool's own tests build on: two regtest addresses, a server whose window holds
+//! given shares, and the ledger records.
+
+use crate::cli::Options;
+use crate::ledger::blocks::{BlockRecords, FoundBlock, OwedBlock};
+use crate::ledger::split::{Payout, PublicGateway, SplitPolicy};
+use crate::ledger::{Ledger, Share, WindowRule};
 use crate::server::Server;
-use crate::sessions::SessionStore;
-use crate::verify::{AcceptedShareHashes, SharePolicy};
+use crate::settings::Resolved;
+use crate::verify::SharePolicy;
 use ratum::datum::keys::KeyPairs;
 use ratum::datum::messages::config::ClientConfig;
 use ratum::rpc;
-use std::sync::atomic::AtomicUsize;
-use std::sync::{Arc, Mutex};
 
-pub fn server_with(
-    shares: &[(&str, u64)],
-    resolved: &[(&str, Result<Vec<u8>, Unpayable>)],
-    min_payout: u64,
-) -> Server {
-    server_with_fee(shares, resolved, min_payout, 0)
+/// A regtest address whose script is `ratum::fixtures::p2wpkh(0xa1)`.
+pub const ALICE: &str = "bcrt1q5xs6rgdp5xs6rgdp5xs6rgdp5xs6rgdpa854mc";
+/// A regtest address whose script is `ratum::fixtures::p2wpkh(0xb2)`.
+pub const BOB: &str = "bcrt1qk2et9v4jk2et9v4jk2et9v4jk2et9v4jldyv0a";
+
+/// A server on regtest whose window holds `shares`, each an identity and its difficulty.
+pub fn server_with(shares: &[(&str, u64)], min_payout: u64) -> Server {
+    server_with_fee(shares, min_payout, 0)
 }
 
-pub fn server_with_fee(
-    shares: &[(&str, u64)],
-    resolved: &[(&str, Result<Vec<u8>, Unpayable>)],
-    min_payout: u64,
-    fee_bps: u16,
-) -> Server {
-    let mut ledger = Ledger::new(u128::MAX);
+pub fn server_with_fee(shares: &[(&str, u64)], min_payout: u64, fee_bps: u16) -> Server {
+    let policy = SplitPolicy { fee_bps, min_payout, public_gateway: None };
+    let mut ledger = Ledger::new(WindowRule::fixed(u128::MAX), policy);
     for (i, (identity, difficulty)) in shares.iter().enumerate() {
         let mut hash = [0u8; 32];
         hash[0] = i as u8;
         ledger.record(share(1_000 + i as u64, identity, *difficulty, hash, "")).unwrap();
     }
-    let resolver = AddressResolver::new();
-    for (address, script) in resolved {
-        resolver.remember(address, script.clone());
-    }
-    let config = ClientConfig {
-        payout_script: POOL.to_vec(),
-        prime_id: 1,
-        coinbase_tag: "RATUM".into(),
-        min_difficulty: 1,
-    };
-    Server {
-        pool_keys: KeyPairs::generate(),
-        motd: String::new(),
-        allowed_agents: Vec::new(),
-        require_v3: false,
-        sessions: Mutex::new(SessionStore::default()),
-        abw_reveal_after: crate::abw::DEFAULT_REVEAL_AFTER,
-        node: rpc::Client::new("http://127.0.0.1:1", "u", "p").unwrap(),
-        node_view: Arc::new(NodeView::default()),
-        accepted_hashes: Arc::new(Mutex::new(AcceptedShareHashes::default())),
-        ledger: Mutex::new(ledger),
-        resolver,
-        payout_policy: PayoutPolicy {
-            min_payout,
-            window_multiple: 8.0,
-            window_floor: 1,
-            fee_bps,
-            public_gateway_fee_bps: 0,
-            public_gateway_fee_subsidy_bps: 0,
+    let Resolved { mut settings, .. } = crate::settings::resolve(&Options::default()).unwrap();
+    settings.motd = String::new();
+    settings.listen = "0.0.0.0:28915".into();
+    settings.max_connections = 8;
+    let share_policy = SharePolicy {
+        config: ClientConfig {
+            payout_script: POOL.to_vec(),
+            prime_id: 1,
+            coinbase_tag: "RATUM".into(),
+            min_difficulty: 1,
+            v3: None,
         },
-        config_payload: config.encode().unwrap(),
-        share_policy: SharePolicy::from_config(&config),
-        open_connections: AtomicUsize::new(0),
-        max_connections: 8,
-        datum_port: 28915,
-        advertise_address: None,
-        public_gateway: None,
+        require_split: true,
+        chain: Some(rpc::Chain::Regtest),
+    };
+    let node = rpc::Client::new("http://127.0.0.1:1", "u", "p", None).unwrap();
+    Server::new(
+        settings,
+        share_policy,
+        KeyPairs::generate(),
+        node,
+        (ledger, BlockRecords::default()),
+    )
+    .unwrap()
+}
+
+/// A server whose window holds 100 work from `ALICE` on the public gateway (tag "public") and
+/// 100 from `BOB` on an own gateway.
+pub fn server_with_public_gateway_fee(fee_bps: u16, subsidy_bps: u16) -> Server {
+    let server = server_with(&[], 0);
+    let gateway = PublicGateway { tag: "public".into(), fee_bps, subsidy_bps };
+    let policy = SplitPolicy { public_gateway: Some(gateway), ..SplitPolicy::default() };
+    let mut l = ratum::lock(&server.ledger);
+    *l = Ledger::new(WindowRule::fixed(u128::MAX), policy);
+    for (i, (identity, tag)) in [(ALICE, "public"), (BOB, "own")].iter().enumerate() {
+        l.record(share(1_000 + i as u64, identity, 100, [i as u8 + 0x10; 32], tag)).unwrap();
     }
+    drop(l);
+    server
 }
 
 pub const POOL: [u8; 4] = [0x00, 0x14, 0xee, 0xee];
 
-pub fn hash(n: u64) -> [u8; 32] {
-    let mut h = [0u8; 32];
-    h[..8].copy_from_slice(&n.to_be_bytes());
-    h
-}
+pub use ratum::fixtures::hash;
 
 pub struct Scratch(std::path::PathBuf);
 
@@ -122,16 +116,11 @@ pub fn payout(identity: &str, sats: u64) -> Payout {
     Payout { identity: identity.to_string(), sats }
 }
 
-pub fn identity_work(identity: &str, work: u128) -> IdentityWork {
-    IdentityWork { identity: identity.to_string(), work }
-}
-
 pub fn owed(n: u64, settled: Option<u64>) -> OwedBlock {
     OwedBlock {
         found_at: 100 + n,
         height: 961_640 + n as u32,
         block_hash: hash(0xb10c_0000 + n),
-        total: 300 + n,
         settled_at: settled,
         entries: vec![payout("alice", 200 + n), payout("bob", 100)],
     }

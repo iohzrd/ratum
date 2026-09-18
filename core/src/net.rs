@@ -1,3 +1,6 @@
+//! Binding a listener. With no address configured it tries the IPv6 wildcard first and the IPv4
+//! wildcard second, so a host with either stack serves.
+
 fn bind_candidates(addr: &str, port: u16) -> Vec<String> {
     if addr.is_empty() {
         vec![format!("[::]:{port}"), format!("0.0.0.0:{port}")]

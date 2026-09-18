@@ -1,54 +1,33 @@
-use super::{STRUCT_END, client_subcmd::SUBMIT_POW};
-use crate::header::BlockHeaderV2;
-use crate::reader::{ByteReader, Truncated};
+//! The share a gateway submits (0x27) and the job, coinbase and BLAKE2b sections it carries. A
+//! section is sent once per connection and reused by every later share on the job.
+//! `PowSubmit::header` rebuilds the header the share was mined on, which is how the pool reaches
+//! the hash the gateway computed.
+
+use super::{Error, STRUCT_END, abw, client_subcmd::SUBMIT_POW, open_message};
+use crate::header::{self, BlockHeaderV2, SIA_WORDS_LEN, XorKey};
+use crate::reader::ByteReader;
 use bytes::BufMut as _;
 
-pub const SECTION_JOB: u8 = 0x01;
-pub const SECTION_COINBASE: u8 = 0x02;
-pub const SECTION_BLAKE2B: u8 = 0x03;
-pub const SECTION_ABW_SLOT: u8 = 0x05;
-pub const BLAKE2B_ALGORITHM: u8 = 0x01;
-pub const BLAKE2B_TIME: u8 = 0x04;
-pub const FLAG_IS_BLOCK: u8 = 0x01;
-pub const FLAG_SUBSIDY_ONLY: u8 = 0x02;
-pub const FLAG_QUICKDIFF: u8 = 0x04;
-pub const FLAG_BLAKE2B: u8 = 0x08;
-pub const RESERVED_USE_TIME_OFFSET: u8 = 0x01;
+pub(crate) const SECTION_JOB: u8 = 0x01;
+pub(crate) const SECTION_COINBASE: u8 = 0x02;
+pub(crate) const SECTION_BLAKE2B: u8 = 0x03;
+pub(crate) const SECTION_ABW_SLOT: u8 = 0x05;
+pub(crate) const BLAKE2B_ALGORITHM: u8 = 0x01;
+pub(crate) const BLAKE2B_TIME: u8 = 0x04;
+pub(crate) const FLAG_IS_BLOCK: u8 = 0x01;
+pub(crate) const FLAG_SUBSIDY_ONLY: u8 = 0x02;
+pub(crate) const FLAG_QUICKDIFF: u8 = 0x04;
+pub(crate) const FLAG_BLAKE2B: u8 = 0x08;
+pub(crate) const RESERVED_USE_TIME_OFFSET: u8 = 0x01;
 pub const EXTRANONCE_SIZE: usize = 12;
 pub const HEADER_EXTRANONCE_SIZE: usize = 16;
 pub const HEADER_EXTRANONCE_PAD: usize = HEADER_EXTRANONCE_SIZE - EXTRANONCE_SIZE;
-pub const SIA_FIELD_SIZE: usize = 2 * size_of::<u32>();
-pub const SIA_FIELD_HALF: usize = size_of::<u32>();
-pub const RESERVED_SIZE: usize = 4;
+pub(crate) const RESERVED_SIZE: usize = 4;
 pub const COINBASE_ID_SUBSIDY_ONLY: u8 = 0xFF;
 pub const MAX_JOBS: usize = 256;
 pub const MAX_COINBASE_SECTION_LEN: usize = super::coinbaser::MAX_COINBASER_BLOB_LEN + 1024;
 pub const MAX_MERKLE_BRANCHES: usize = 24;
 pub const MAX_USERNAME_LEN: usize = 384;
-
-#[derive(Debug, PartialEq, Eq, thiserror::Error)]
-pub enum Error {
-    #[error("truncated share: {0}")]
-    Truncated(&'static str),
-    #[error("extranonce size {0}, expected 12")]
-    BadExtranonceSize(u8),
-    #[error("username not terminated")]
-    BadUsername,
-    #[error("merkle branch count {0} too large")]
-    BadMerkleCount(u8),
-    #[error("unknown section marker {0:#04x}")]
-    UnknownSection(u8),
-    #[error("malformed BLAKE2b section")]
-    BadBlake2bSection,
-    #[error("no BLAKE2b section")]
-    MissingBlake2bSection,
-}
-
-impl From<Truncated> for Error {
-    fn from(t: Truncated) -> Self {
-        Self::Truncated(t.0)
-    }
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JobSection {
@@ -63,6 +42,53 @@ pub struct JobSection {
     pub txn_total_size: u32,
     pub txn_total_sigops: u32,
     pub merkle_branches: Vec<[u8; 32]>,
+}
+
+/// What a share on a job commits to, computed the same way by the gateway that builds the
+/// work and the pool that verifies it.
+impl JobSection {
+    /// The coinbase transaction: the section assembled with a zero extranonce (the header
+    /// carries the miner's) and `target_byte` written at the job's target byte index. None
+    /// when the index is outside the transaction.
+    pub fn coinbase_tx(&self, cb: &CoinbaseSection, target_byte: u8) -> Option<Vec<u8>> {
+        let mut tx = cb.assemble(&[0u8; EXTRANONCE_SIZE]);
+        *tx.get_mut(usize::from(self.target_byte_index))? = target_byte;
+        Some(tx)
+    }
+
+    /// The merkle root over `coinbase_tx` and the job's transactions; a subsidy-only block
+    /// holds the coinbase alone.
+    pub fn merkle_root(&self, coinbase_tx: &[u8], subsidy_only: bool) -> [u8; 32] {
+        let branches: &[[u8; 32]] = if subsidy_only { &[] } else { &self.merkle_branches };
+        crate::bitcoin::merkle_root_from_branches(&crate::bitcoin::sha256d(coinbase_tx), branches)
+    }
+
+    /// The header fields the job and its coinbase decide, with the nonces, extranonce, time
+    /// offset, flags and XOR key zero. `abw` sets the XOR key mask clear bits `target_byte`
+    /// sizes, for work under an anti-block-withholding assignment. None when the transaction
+    /// count does not fit the header's 16-bit count.
+    pub fn header(
+        &self,
+        version: i32,
+        time: u32,
+        merkle_root: [u8; 32],
+        subsidy_only: bool,
+        target_byte: u8,
+        abw: bool,
+    ) -> Option<BlockHeaderV2> {
+        let tx_count = if subsidy_only { 1 } else { u64::from(self.txn_count) + 1 };
+        Some(BlockHeaderV2 {
+            version,
+            prev_block: self.prev_hash,
+            merkle_root,
+            time,
+            bits: u32::from_le_bytes(self.nbits),
+            txcount: u16::try_from(tx_count).ok()?,
+            xor_key_mask_clear_bits: if abw { abw::clear_bits(target_byte) } else { 0 },
+            height: self.height as i32,
+            ..Default::default()
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -84,46 +110,49 @@ impl CoinbaseSection {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Blake2bSection {
-    pub sia_ntime: [u8; SIA_FIELD_SIZE],
-    pub sia_nonce: [u8; SIA_FIELD_SIZE],
+    pub sia_ntime: [u8; SIA_WORDS_LEN],
+    pub sia_nonce: [u8; SIA_WORDS_LEN],
     pub time_on_wire: u32,
 }
 
-pub fn header_extranonce(extranonce: &[u8]) -> Option<[u8; HEADER_EXTRANONCE_SIZE]> {
-    if extranonce.len() != EXTRANONCE_SIZE {
-        return None;
-    }
+pub fn header_extranonce(extranonce: &[u8; EXTRANONCE_SIZE]) -> [u8; HEADER_EXTRANONCE_SIZE] {
     let mut out = [0u8; HEADER_EXTRANONCE_SIZE];
     out[HEADER_EXTRANONCE_PAD..].copy_from_slice(extranonce);
-    Some(out)
+    out
 }
 
-pub fn share_extranonce(field: &[u8; HEADER_EXTRANONCE_SIZE]) -> Option<Vec<u8>> {
-    if field[..HEADER_EXTRANONCE_PAD] != [0u8; HEADER_EXTRANONCE_PAD] {
+pub fn share_extranonce(field: &[u8; HEADER_EXTRANONCE_SIZE]) -> Option<[u8; EXTRANONCE_SIZE]> {
+    let (pad, extranonce) = field.split_at(HEADER_EXTRANONCE_PAD);
+    if pad != [0u8; HEADER_EXTRANONCE_PAD] {
         return None;
     }
-    Some(field[HEADER_EXTRANONCE_PAD..].to_vec())
+    extranonce.try_into().ok()
 }
 
-pub fn sia_field(low: u32, high: u32) -> [u8; SIA_FIELD_SIZE] {
-    let mut f = [0u8; SIA_FIELD_SIZE];
-    let mut w = &mut f[..];
-    w.put_u32_le(low);
-    w.put_u32_le(high);
-    f
-}
-
-pub fn sia_halves(field: &[u8; SIA_FIELD_SIZE]) -> (u32, u32) {
-    let (low, high) = field.split_at(SIA_FIELD_HALF);
+/// The two words a sia field packs, the inverse of `header::sia_words`.
+fn sia_halves(field: &[u8; SIA_WORDS_LEN]) -> (u32, u32) {
+    let (low, high) = field.split_at(header::SIA_WORD_LEN);
     let le32 = |b: &[u8]| u32::from_le_bytes(b.try_into().expect("four bytes"));
     (le32(low), le32(high))
+}
+
+/// Writes the sia fields into the header fields they carry: `sia_nonce` into `nonce` and
+/// `nonce2`, `sia_ntime` into `time_offset` and `nonce3`. The inverse of
+/// `Blake2bSection::from_header`.
+pub fn set_sia_fields(
+    h: &mut BlockHeaderV2,
+    sia_ntime: &[u8; SIA_WORDS_LEN],
+    sia_nonce: &[u8; SIA_WORDS_LEN],
+) {
+    (h.nonce, h.nonce2) = sia_halves(sia_nonce);
+    (h.time_offset, h.nonce3) = sia_halves(sia_ntime);
 }
 
 impl Blake2bSection {
     pub fn from_header(h: &BlockHeaderV2) -> Self {
         Self {
-            sia_ntime: sia_field(h.time_offset, h.nonce3),
-            sia_nonce: sia_field(h.nonce, h.nonce2),
+            sia_ntime: header::sia_words(h.time_offset, h.nonce3),
+            sia_nonce: header::sia_words(h.nonce, h.nonce2),
             time_on_wire: h.time_on_wire(),
         }
     }
@@ -211,8 +240,8 @@ fn decode_blake2b_section(r: &mut ByteReader<'_>) -> Result<Blake2bSection, Erro
     if r.u8("algorithm")? != BLAKE2B_ALGORITHM {
         return Err(Error::BadBlake2bSection);
     }
-    let sia_ntime: [u8; SIA_FIELD_SIZE] = r.arr("sia ntime")?;
-    let sia_nonce: [u8; SIA_FIELD_SIZE] = r.arr("sia nonce")?;
+    let sia_ntime: [u8; SIA_WORDS_LEN] = r.arr("sia ntime")?;
+    let sia_nonce: [u8; SIA_WORDS_LEN] = r.arr("sia nonce")?;
     if r.u8("time marker")? != BLAKE2B_TIME {
         return Err(Error::BadBlake2bSection);
     }
@@ -239,17 +268,35 @@ pub struct SharePrefix {
     pub nonce: u32,
 }
 
+impl Default for SharePrefix {
+    /// The prefix a share whose bytes did not decode is answered under: the placeholder
+    /// target byte, which the gateway reads as a difficulty the pool could not name, and
+    /// zero in every other field.
+    fn default() -> Self {
+        Self {
+            job_id: 0,
+            coinbase_id: 0,
+            flags: 0,
+            target_byte: crate::datum::coinbase::TARGET_BYTE_PLACEHOLDER,
+            ntime: 0,
+            nonce: 0,
+        }
+    }
+}
+
 impl SharePrefix {
-    fn read(r: &mut ByteReader<'_>) -> Result<Self, Truncated> {
-        r.skip_if(SUBMIT_POW);
-        Ok(Self {
+    /// The prefix and a reader past it.
+    fn read(data: &[u8]) -> Result<(Self, ByteReader<'_>), Error> {
+        let mut r = open_message(data, SUBMIT_POW)?;
+        let prefix = Self {
             job_id: r.u8("job id")?,
             coinbase_id: r.u8("coinbase id")?,
             flags: r.u8("flags")?,
             target_byte: r.u8("target byte")?,
             ntime: r.u32("ntime")?,
             nonce: r.u32("nonce")?,
-        })
+        };
+        Ok((prefix, r))
     }
 }
 
@@ -264,7 +311,7 @@ pub struct PowSubmit {
     pub ntime: u32,
     pub nonce: u32,
     pub version: u32,
-    pub extranonce: Vec<u8>,
+    pub extranonce: [u8; EXTRANONCE_SIZE],
     pub username: String,
     pub use_time_offset: bool,
     pub job: Option<JobSection>,
@@ -274,28 +321,63 @@ pub struct PowSubmit {
 }
 
 impl PowSubmit {
-    pub fn target_byte_index_of(&self, job: &JobSection) -> u16 {
-        self.job.as_ref().map_or(job.target_byte_index, |j| j.target_byte_index)
-    }
-
     pub fn difficulty(&self) -> u64 {
         crate::target::difficulty_for_exponent(self.target_byte)
     }
 
+    /// The block time the header carries: the time on the wire, plus the header's time
+    /// offset when the share sets the time offset flag.
+    pub fn block_time(&self) -> u32 {
+        let b = &self.blake2b;
+        if self.use_time_offset {
+            let (time_offset, _) = b.time_fields();
+            b.time_on_wire.wrapping_add(time_offset)
+        } else {
+            b.time_on_wire
+        }
+    }
+
+    /// The header this share was mined on: `JobSection::header` with the share's version,
+    /// time and nonces, the inverse of `Blake2bSection::from_header`. `merkle_root` is
+    /// `JobSection::merkle_root` of the rebuilt coinbase and `abw_key` the slot key an
+    /// anti-block-withholding session assigned. None when the job's transaction count does not
+    /// fit the header's 16-bit count.
+    pub fn header(
+        &self,
+        job: &JobSection,
+        merkle_root: &[u8; 32],
+        abw_key: Option<XorKey>,
+    ) -> Option<BlockHeaderV2> {
+        let mut h = job.header(
+            (self.version & !header::V2_FLAG) as i32,
+            self.block_time(),
+            *merkle_root,
+            self.subsidy_only,
+            self.target_byte,
+            abw_key.is_some(),
+        )?;
+        set_sia_fields(&mut h, &self.blake2b.sia_ntime, &self.blake2b.sia_nonce);
+        h.extranonce = header_extranonce(&self.extranonce);
+        if self.use_time_offset {
+            h.flags = header::FLAG_USE_TIME_OFFSET;
+        }
+        h.xor_key = abw_key.unwrap_or_default();
+        Some(h)
+    }
+
     pub fn prefix(data: &[u8]) -> Option<SharePrefix> {
-        SharePrefix::read(&mut ByteReader::new(data)).ok()
+        SharePrefix::read(data).ok().map(|(prefix, _)| prefix)
     }
 
     pub fn decode(data: &[u8]) -> Result<Self, Error> {
-        let mut r = ByteReader::new(data);
-        let SharePrefix { job_id, coinbase_id, flags, target_byte, ntime, nonce } =
-            SharePrefix::read(&mut r)?;
+        let (SharePrefix { job_id, coinbase_id, flags, target_byte, ntime, nonce }, mut r) =
+            SharePrefix::read(data)?;
         let version = r.u32("version")?;
         let en_size = r.u8("extranonce size")?;
         if en_size as usize != EXTRANONCE_SIZE {
             return Err(Error::BadExtranonceSize(en_size));
         }
-        let extranonce = r.take(en_size as usize, "extranonce")?.to_vec();
+        let extranonce = r.arr("extranonce")?;
 
         let rest = r.rest();
         let nul = rest
@@ -360,7 +442,7 @@ impl PowSubmit {
         out.put_u32_le(self.ntime);
         out.put_u32_le(self.nonce);
         out.put_u32_le(self.version);
-        out.put_u8(self.extranonce.len() as u8);
+        out.put_u8(EXTRANONCE_SIZE as u8);
         out.put_slice(&self.extranonce);
         out.put_slice(self.username.as_bytes());
         out.put_u8(0);
@@ -400,7 +482,7 @@ mod tests {
             ntime: 0x6543_2100,
             nonce: 0xdead_beef,
             version: 0x2000_0000,
-            extranonce: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+            extranonce: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
             username: "bc1qexample.worker1".to_string(),
             use_time_offset: false,
             job: None,
@@ -486,7 +568,7 @@ mod tests {
     #[test]
     fn blake2b_section_layout_is_exact() {
         let mut s = minimal();
-        s.extranonce = vec![0x33; EXTRANONCE_SIZE];
+        s.extranonce = [0x33; EXTRANONCE_SIZE];
         let bytes = s.encode();
         let at = bytes.len() - 24;
         assert_eq!(bytes[bytes.len() - 1], STRUCT_END);
@@ -621,12 +703,10 @@ mod tests {
 
     #[test]
     fn the_header_extranonce_is_the_twelve_left_padded() {
-        let twelve: Vec<u8> = (1..=12u8).collect();
-        let field = header_extranonce(&twelve).unwrap();
+        let twelve: [u8; EXTRANONCE_SIZE] = std::array::from_fn(|i| i as u8 + 1);
+        let field = header_extranonce(&twelve);
         assert_eq!(&field[..HEADER_EXTRANONCE_PAD], &[0u8; 4]);
         assert_eq!(&field[HEADER_EXTRANONCE_PAD..], &twelve[..]);
-        assert_eq!(header_extranonce(&[0u8; 16]), None, "the field is not what is sent");
-        assert_eq!(header_extranonce(&[]), None);
     }
 
     #[test]
@@ -648,7 +728,7 @@ mod tests {
         let mut field = [0u8; HEADER_EXTRANONCE_SIZE];
         field[4..].copy_from_slice(&[9u8; 12]);
         let twelve = share_extranonce(&field).unwrap();
-        assert_eq!(header_extranonce(&twelve), Some(field));
+        assert_eq!(header_extranonce(&twelve), field);
         field[0] = 1;
         assert_eq!(share_extranonce(&field), None);
     }
@@ -687,5 +767,65 @@ mod tests {
         assert_eq!(&tx[..2], &[0xaa, 0xbb]);
         assert_eq!(&tx[2..14], &[9u8; 12]);
         assert_eq!(tx[14], 0xcc);
+    }
+
+    #[test]
+    fn a_share_rebuilds_the_header_its_section_was_taken_from() {
+        let mut extranonce = [0u8; 16];
+        extranonce[4..].copy_from_slice(&[7u8; 12]);
+        let h = BlockHeaderV2 {
+            version: 0x2000_0000,
+            prev_block: [0xaa; 32],
+            merkle_root: [0xbb; 32],
+            time: 1_700_000_100,
+            bits: 0x207f_ffff,
+            nonce: 1,
+            nonce2: 2,
+            nonce3: 3,
+            extranonce,
+            time_offset: 4,
+            txcount: 1,
+            flags: crate::header::FLAG_USE_TIME_OFFSET,
+            height: 21,
+            ..Default::default()
+        };
+        let job = JobSection {
+            prev_hash: h.prev_block,
+            target_byte_index: 0,
+            nbits: h.bits.to_le_bytes(),
+            coinbaser_id: 0,
+            height: 21,
+            coinbase_value: 0,
+            txn_count: 0,
+            txn_total_weight: 0,
+            txn_total_size: 0,
+            txn_total_sigops: 0,
+            merkle_branches: vec![],
+        };
+        let b = Blake2bSection::from_header(&h);
+        let s = PowSubmit {
+            subsidy_only: true,
+            target_byte: 10,
+            ntime: b.time_on_wire,
+            nonce: h.nonce,
+            version: crate::header::V2_FLAG | h.version as u32,
+            extranonce: share_extranonce(&h.extranonce).unwrap(),
+            use_time_offset: true,
+            blake2b: b,
+            ..minimal()
+        };
+        assert_eq!(s.header(&job, &h.merkle_root, None), Some(h.clone()));
+
+        let key = [0x5a; 16];
+        let masked = s.header(&job, &h.merkle_root, Some(key)).unwrap();
+        assert_eq!(masked.xor_key, key);
+        assert_eq!(masked.xor_key_mask_clear_bits, abw::clear_bits(10));
+
+        let pooled = PowSubmit { subsidy_only: false, ..s.clone() };
+        let with_txns = JobSection { txn_count: 2, ..job.clone() };
+        assert_eq!(pooled.header(&with_txns, &h.merkle_root, None).unwrap().txcount, 3);
+        assert_eq!(s.header(&with_txns, &h.merkle_root, None).unwrap().txcount, 1);
+        let too_many = JobSection { txn_count: u32::MAX, ..job.clone() };
+        assert_eq!(pooled.header(&too_many, &h.merkle_root, None), None);
     }
 }

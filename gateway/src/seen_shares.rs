@@ -1,3 +1,6 @@
+//! The hashes of the shares this gateway has already accepted, so a repeat is refused. A full table
+//! first drops the shares of jobs past the stale window, and grows only when that frees too little.
+
 use log::info;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};

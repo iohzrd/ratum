@@ -1,11 +1,19 @@
-pub const HEADER_LEN: usize = size_of::<u32>();
+//! The frame on the wire: a four-byte header masked by a ratchet both sides advance in step, the
+//! body whose length it gives, and the nonces and header keys both sides derive from the `nk` the
+//! hello carries. `read_next_frame` and `read_frame` take one frame off a socket.
 
-pub const CMD_LEN_BITS: u32 = 22;
+use crate::poll::PolledSocket;
+use std::io;
+use std::time::{Duration, Instant};
+
+pub(crate) const HEADER_LEN: usize = size_of::<u32>();
+
+pub(crate) const CMD_LEN_BITS: u32 = 22;
 const CMD_LEN_MASK: u32 = (1 << CMD_LEN_BITS) - 1;
 pub const MAX_CMD_LEN: usize = CMD_LEN_MASK as usize;
 pub const MAX_MINING_PAD_LEN: usize = 100;
-pub const INITIAL_HEADER_KEY: u32 = 0xDC87_1829;
-pub const NONCE_LEN: usize = 24;
+pub(crate) const INITIAL_HEADER_KEY: u32 = 0xDC87_1829;
+pub(crate) const NONCE_LEN: usize = 24;
 const WORD_SIZE: usize = size_of::<u32>();
 const NONCE_SEED_AT: usize = 7;
 const NONCE_STEP: u32 = 42;
@@ -13,7 +21,7 @@ const SENDER_MASK: u32 = 0x5757_5757;
 
 pub mod cmd {
     pub const HELLO_OR_PING: u8 = 1;
-    pub const HANDSHAKE_RESPONSE: u8 = 2;
+    pub(crate) const HANDSHAKE_RESPONSE: u8 = 2;
     pub const MINING: u8 = 5;
     pub const BULK: u8 = 6;
     pub const INFO: u8 = 7;
@@ -61,7 +69,7 @@ impl FrameHeader {
     }
 }
 
-pub fn feedback(i: u32) -> u32 {
+pub(crate) fn feedback(i: u32) -> u32 {
     let mut h: u32 = 0xb10c_feed;
     let mut k = i;
     k = k.wrapping_mul(0xcc9e_2d51);
@@ -113,7 +121,7 @@ pub struct HeaderKeys {
 }
 
 impl HeaderKeys {
-    pub fn from_nk(nk: u32) -> Self {
+    pub(crate) fn from_nk(nk: u32) -> Self {
         Self { client_to_server: feedback(nk), server_to_client: feedback(!nk) }
     }
 }
@@ -143,7 +151,7 @@ impl SessionNonces {
     }
 }
 
-pub fn increment_nonce(nonce: &mut [u8; NONCE_LEN]) {
+pub(crate) fn increment_nonce(nonce: &mut [u8; NONCE_LEN]) {
     for word in nonce.as_chunks_mut::<WORD_SIZE>().0 {
         let raised = u32::from_le_bytes(*word).wrapping_add(1);
         *word = raised.to_le_bytes();
@@ -151,6 +159,65 @@ pub fn increment_nonce(nonce: &mut [u8; NONCE_LEN]) {
             return;
         }
     }
+}
+
+/// How long a frame header may stay partially received before the peer is given up on.
+pub(crate) const PARTIAL_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FrameRead {
+    Complete(FrameHeader, Vec<u8>),
+    /// No byte of a header was waiting; the caller waits on its own schedule.
+    Empty,
+    Closed,
+}
+
+/// Reads the next frame from the socket: its header, unmasked by `unmask`, and the `cmd_len`
+/// bytes that follow, which may stall for `body_idle` and take `body_total` in all. Once the
+/// header's first byte has arrived the read waits for the rest, up to
+/// `PARTIAL_HEADER_TIMEOUT`: a header or body that does not complete in time is an
+/// `io::ErrorKind::TimedOut` error, and a peer that closes before it completes is an
+/// `io::ErrorKind::UnexpectedEof` error.
+pub fn read_next_frame(
+    socket: &mut PolledSocket,
+    unmask: impl FnOnce([u8; HEADER_LEN]) -> FrameHeader,
+    body_idle: Duration,
+    body_total: Duration,
+) -> io::Result<FrameRead> {
+    let mut head = [0u8; HEADER_LEN];
+    let got = match socket.read(&mut head)? {
+        None => return Ok(FrameRead::Empty),
+        Some(0) => return Ok(FrameRead::Closed),
+        Some(n) => n,
+    };
+    socket.read_exact(&mut head[got..], PARTIAL_HEADER_TIMEOUT, PARTIAL_HEADER_TIMEOUT)?;
+    let header = unmask(head);
+    let body = socket.read_vec(header.cmd_len as usize, body_idle, body_total)?;
+    Ok(FrameRead::Complete(header, body))
+}
+
+/// Reads one whole frame by `deadline`: its header, unmasked by `unmask`, and the `cmd_len`
+/// bytes that follow. A header announcing more than `max_len` bytes is an
+/// `io::ErrorKind::InvalidData` error, returned before the body is read.
+pub fn read_frame(
+    socket: &mut PolledSocket,
+    unmask: impl FnOnce([u8; HEADER_LEN]) -> FrameHeader,
+    max_len: usize,
+    deadline: Instant,
+) -> io::Result<(FrameHeader, Vec<u8>)> {
+    let left = || deadline.saturating_duration_since(Instant::now());
+    let mut head = [0u8; HEADER_LEN];
+    socket.read_exact(&mut head, left(), left())?;
+    let header = unmask(head);
+    let len = header.cmd_len as usize;
+    if len > max_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("frame of {len} bytes, over the {max_len} allowed"),
+        ));
+    }
+    let body = socket.read_vec(len, left(), left())?;
+    Ok((header, body))
 }
 
 #[cfg(test)]
@@ -272,6 +339,36 @@ mod tests {
         let mut n = [0xffu8; NONCE_LEN];
         increment_nonce(&mut n);
         assert_eq!(hex::encode(n), "000000000000000000000000000000000000000000000000");
+    }
+
+    #[test]
+    fn a_frame_split_across_reads_completes_and_a_close_between_frames_is_closed() {
+        use std::io::Write as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let mut socket = PolledSocket::new(listener.accept().unwrap().0).unwrap();
+        let limit = Duration::from_secs(5);
+        let read = |socket: &mut PolledSocket| {
+            read_next_frame(socket, FrameHeader::from_bytes, limit, limit).unwrap()
+        };
+        assert_eq!(read(&mut socket), FrameRead::Empty, "nothing sent yet");
+
+        let header = FrameHeader { cmd_len: 2, proto_cmd: cmd::MINING, ..Default::default() };
+        let wire = header.to_bytes();
+        client.write_all(&wire[..2]).unwrap();
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            client.write_all(&wire[2..]).unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            client.write_all(&[7, 8]).unwrap();
+            client
+        });
+        socket.wait(Some(limit)).unwrap();
+        assert_eq!(read(&mut socket), FrameRead::Complete(header, vec![7, 8]));
+
+        drop(sender.join().unwrap());
+        socket.wait(Some(limit)).unwrap();
+        assert_eq!(read(&mut socket), FrameRead::Closed);
     }
 
     #[test]

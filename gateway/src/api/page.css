@@ -13,13 +13,6 @@
            padding-bottom: .75rem; margin-bottom: 1rem; }
   .motd { color: var(--muted); }
   .right { text-align: right; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-          gap: .75rem; margin-bottom: 1.25rem; }
-  .card { background: var(--card); border: 1px solid var(--line); border-radius: 8px;
-          padding: .75rem .9rem; }
-  .card .label { color: var(--muted); font-size: .8rem; text-transform: uppercase;
-                 letter-spacing: .04em; }
-  .card .value { font-size: 1.15rem; margin-top: .2rem; word-break: break-all; }
   table { width: 100%; border-collapse: collapse; }
   th, td { text-align: left; padding: .45rem .6rem; border-bottom: 1px solid var(--line);
            vertical-align: top; }
@@ -28,10 +21,6 @@
   td.mono { word-break: break-all; }
   section { margin: 1.5rem 0; }
   h2 { font-size: 1rem; color: var(--muted); margin: 0 0 .6rem; }
-  p { margin: .4rem 0; color: var(--muted); }
-  pre { background: var(--card); border: 1px solid var(--line); border-radius: 8px;
-        padding: .8rem; overflow-x: auto; margin: .5rem 0 0; color: var(--fg); }
-  code { color: var(--accent); }
   a { color: var(--accent); }
   .nav a { margin-left: .75rem; }
   footer { color: var(--muted); margin-top: 1rem; font-size: .8rem; }

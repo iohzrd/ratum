@@ -1,5 +1,7 @@
-use crate::ledger::Ledger;
-use crate::ledger::blocks::{ConfirmationReading, OwedBlock};
+//! The thread that re-reads each accepted block's confirmations from the node every five minutes,
+//! until the block is deep enough, and reports one that leaves the best chain.
+
+use crate::ledger::blocks::{BlockRecords, ConfirmationReading, OwedBlock};
 use crate::server::Server;
 use log::{error, info, warn};
 use ratum::lock;
@@ -21,12 +23,12 @@ pub fn watch(server: Arc<Server>) {
     });
 }
 
-fn due(ledger: &Ledger) -> Vec<[u8; 32]> {
-    ledger
+fn due(records: &BlockRecords) -> Vec<[u8; 32]> {
+    records
         .blocks()
         .iter()
         .filter(|b| {
-            ledger.confirmations(&b.block_hash).is_none_or(|s| s.confirmations < CONFIRMED_DEPTH)
+            records.confirmations(&b.block_hash).is_none_or(|s| s.confirmations < CONFIRMED_DEPTH)
         })
         .map(|b| b.block_hash)
         .take(MAX_PER_PASS)
@@ -34,14 +36,14 @@ fn due(ledger: &Ledger) -> Vec<[u8; 32]> {
 }
 
 fn check_once(server: &Server) {
-    check_blocks(&server.ledger, |display| server.node.block_confirmations(display));
+    check_blocks(&server.records, |display| server.node.block_confirmations(display));
 }
 
 fn check_blocks<E: std::fmt::Display>(
-    ledger: &Mutex<Ledger>,
+    records: &Mutex<BlockRecords>,
     read: impl Fn(&str) -> Result<Option<i64>, E>,
 ) {
-    let pending = due(&lock(ledger));
+    let pending = due(&lock(records));
     for hash in pending {
         let display = hex::encode(hash);
         let confirmations = match read(&display) {
@@ -59,16 +61,16 @@ fn check_blocks<E: std::fmt::Display>(
             }
         };
         let state = ConfirmationReading { checked_at: ratum::unix_now(), confirmations };
-        let mut l = lock(ledger);
-        let previous = match l.record_confirmations(hash, state) {
+        let mut r = lock(records);
+        let previous = match r.record_confirmations(hash, state) {
             Ok(previous) => previous,
             Err(e) => {
                 warn!("could not record the chain state of block {display} ({e})");
                 continue;
             }
         };
-        let owed = l.owed().iter().find(|o| o.block_hash == hash).cloned();
-        drop(l);
+        let owed = r.owed().iter().find(|o| o.block_hash == hash).cloned();
+        drop(r);
         report(&display, state, previous, owed);
     }
 }
@@ -93,12 +95,12 @@ fn report(
         Some(o) if o.settled_at.is_some() => format!(
             ", and its {} sats across {} miner(s) were already settled: that payout is not \
              recoverable from this block",
-            o.total,
+            o.total(),
             o.entries.len()
         ),
         Some(o) => format!(
             ", so the {} sats owed across {} miner(s) against it are not owed; --void-block {display} removes that record",
-            o.total,
+            o.total(),
             o.entries.len()
         ),
         None => String::new(),
@@ -120,8 +122,8 @@ mod tests {
         [n; 32]
     }
 
-    fn with_blocks(states: &[(u8, Option<i64>)]) -> Ledger {
-        let mut l = Ledger::new(u128::MAX);
+    fn with_blocks(states: &[(u8, Option<i64>)]) -> BlockRecords {
+        let mut l = BlockRecords::default();
         for (n, confirmations) in states {
             l.record_block(FoundBlock {
                 found_at: 1_000 + u64::from(*n),
@@ -173,29 +175,19 @@ mod tests {
     }
 
     #[test]
-    fn a_negative_confirmation_count_is_off_the_best_chain() {
-        assert!(
-            ConfirmationReading { checked_at: 1, confirmations: 0 }.on_best_chain(),
-            "the tip itself"
-        );
-        assert!(ConfirmationReading { checked_at: 1, confirmations: 6 }.on_best_chain());
-        assert!(!ConfirmationReading { checked_at: 1, confirmations: -1 }.on_best_chain());
-    }
-
-    #[test]
-    fn a_pass_records_every_reading_and_does_not_hold_the_ledger_lock_across_the_loop() {
-        let ledger = Arc::new(Mutex::new(with_blocks(&[(1, None), (2, Some(3))])));
+    fn a_pass_records_every_reading_and_does_not_hold_the_records_lock_across_the_loop() {
+        let records = Arc::new(Mutex::new(with_blocks(&[(1, None), (2, Some(3))])));
         let (finished, done) = std::sync::mpsc::channel();
-        let shared = Arc::clone(&ledger);
+        let shared = Arc::clone(&records);
         std::thread::spawn(move || {
             check_blocks(&shared, |_| Ok::<_, String>(Some(7)));
             finished.send(()).unwrap();
         });
         done.recv_timeout(Duration::from_secs(5)).expect(
-            "the pass did not finish: it locks the ledger inside the loop, so holding the lock \
+            "the pass did not finish: it locks the records inside the loop, so holding the lock \
              across the loop deadlocks the thread",
         );
-        let l = lock(&ledger);
+        let l = lock(&records);
         assert_eq!(l.confirmations(&hash(1)).map(|s| s.confirmations), Some(7));
         assert_eq!(l.confirmations(&hash(2)).map(|s| s.confirmations), Some(7));
     }

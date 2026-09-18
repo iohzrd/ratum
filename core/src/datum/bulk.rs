@@ -1,17 +1,21 @@
+//! Bulk transfers (DBF/DBA): a payload too large for one frame is sent as 16 KiB fragments at
+//! increasing offsets, each acknowledged, and reassembled in order. A fragment that does not
+//! continue the transfer in progress is refused.
+
 use crate::reader::{ByteReader, Truncated};
 use bytes::BufMut as _;
 
-pub const ACK_MARKER: [u8; 4] = *b"DBA\x01";
-pub const DBF_MARKER: [u8; 4] = *b"DBF\x01";
-pub const FRAGMENT_DATA_SIZE: usize = 16 * 1024;
-pub const MAX_TRANSFER_SIZE: usize = 1 << super::framing::CMD_LEN_BITS;
+pub(crate) const ACK_MARKER: [u8; 4] = *b"DBA\x01";
+pub(crate) const DBF_MARKER: [u8; 4] = *b"DBF\x01";
+pub(crate) const FRAGMENT_DATA_SIZE: usize = 16 * 1024;
+pub(crate) const MAX_TRANSFER_SIZE: usize = 1 << super::framing::CMD_LEN_BITS;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
     #[error("not a bulk fragment")]
     BadMarker,
     #[error("bulk fragment shorter than its header")]
-    Truncated,
+    Truncated(#[from] Truncated),
     #[error("bulk fragment data length {0} out of range")]
     BadChunk(usize),
     #[error("bulk transfer id 0")]
@@ -26,12 +30,6 @@ pub enum Error {
     SizeChanged { want: u32, got: u32 },
     #[error("first fragment does not start at offset 0")]
     NotAtStart,
-}
-
-impl From<Truncated> for Error {
-    fn from(_: Truncated) -> Self {
-        Self::Truncated
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,7 +63,7 @@ pub struct Ack {
     pub next_offset: u32,
 }
 
-pub const ACK_LEN: usize = ACK_MARKER.len() + 2 * size_of::<u32>();
+pub(crate) const ACK_LEN: usize = ACK_MARKER.len() + 2 * size_of::<u32>();
 
 impl Ack {
     pub fn encode(&self) -> [u8; ACK_LEN] {

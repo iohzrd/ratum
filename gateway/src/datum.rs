@@ -1,203 +1,193 @@
+//! The gateway's end of the DATUM protocol: what it holds about the pool across connections, and
+//! the loop that opens a connection again after every disconnect.
+
 pub mod abw;
-mod coinbaser;
 mod session;
 mod validation_replies;
 
-use crate::config::Config;
+use crate::gateway::Gateway;
 use crate::job::Job;
+use crate::stratum::notify_id::NotifyPrefix;
 use crate::tally::ShareTallies;
-use crate::template::waker::TemplateWaker;
+use crate::template::Template;
 use log::{debug, error, info, warn};
 use mio::Waker;
-use ratum::datum::handshake::PUBKEY_LEN;
-use ratum::datum::handshake::ResumeToken;
-use ratum::datum::keys::KeyPairs;
-use ratum::datum::messages::config::{ClientConfig, ClientConfigV3};
-use ratum::datum::messages::share;
-use ratum::datum::messages::validation::{JOB_INDEX_INVALID, TxnListStatus};
+use ratum::datum::keys::{KeyPairs, PublicKeys};
+use ratum::datum::messages::config::ClientConfig;
 use ratum::header::BlockHeaderV2;
 use ratum::{lock, target};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 const MIN_QUEUE_CAPACITY: usize = 64;
+const FAILURES_BEFORE_SHUTDOWN: u32 = 2;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PoolConfig {
-    pub payout_script: Vec<u8>,
-    pub prime_id: u64,
-    pub coinbase_tag: String,
-    pub min_difficulty: u64,
-    pub protocol_v3: bool,
-    pub abw_disabled: bool,
+/// The value under which the pool dictates no split, so no request is made for it.
+const MIN_COINBASER_VALUE: u64 = 31_250_000;
+
+/// How long a coinbaser request waits for its answer before the job is built without a split.
+pub const COINBASER_WAIT: Duration = Duration::from_secs(5);
+
+/// A coinbaser request the template thread left for the session thread to send, carrying the
+/// template the job answering it is built from. Holding them together is what makes a
+/// response impossible to apply to another template: a newer template's request replaces
+/// this one, so only the newest template's request is ever held.
+pub struct PendingCoinbaser {
+    pub value: u64,
+    pub prev_hash: [u8; 32],
+    pub template: Arc<Template>,
+    /// Whether the template started a new block, which decides what an unanswered request
+    /// does: on a new block the priority job stays the work served, otherwise a job with no
+    /// split is built.
+    pub new_block: bool,
+    pub requested_at: Instant,
 }
 
-fn rounded_min_difficulty(min_difficulty: u64) -> u64 {
-    let rounded = target::pow2_ceil(min_difficulty);
-    if rounded != min_difficulty {
-        warn!("pool minimum difficulty {min_difficulty} is not a power of two; using {rounded}");
+/// The pool's configuration with its minimum difficulty rounded up to a power of two.
+fn with_rounded_min_difficulty(c: ClientConfig) -> ClientConfig {
+    let rounded = target::pow2_ceil(c.min_difficulty);
+    if rounded != c.min_difficulty {
+        warn!(
+            "pool minimum difficulty {} is not a power of two; using {rounded}",
+            c.min_difficulty
+        );
     }
-    rounded
+    ClientConfig { min_difficulty: rounded, ..c }
 }
 
-impl PoolConfig {
-    fn from_client_config(c: ClientConfig) -> Self {
-        Self {
-            payout_script: c.payout_script,
-            prime_id: u64::from(c.prime_id),
-            coinbase_tag: c.coinbase_tag,
-            min_difficulty: rounded_min_difficulty(c.min_difficulty),
-            protocol_v3: false,
-            abw_disabled: false,
-        }
-    }
-
-    fn from_client_config_v3(c: ClientConfigV3) -> Self {
-        Self {
-            payout_script: c.payout_script,
-            prime_id: c.prime_id,
-            coinbase_tag: c.coinbase_tag,
-            min_difficulty: rounded_min_difficulty(c.min_difficulty),
-            protocol_v3: true,
-            abw_disabled: c.abw_disabled,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SlotLookupFailure {
-    pub job_index: u8,
-    pub status: TxnListStatus,
+pub fn abw_disabled(c: &ClientConfig) -> bool {
+    c.v3.is_some_and(|v3| v3.abw_disabled)
 }
 
 #[derive(Clone)]
 pub struct QueuedShare {
     pub job: Arc<Job>,
-    pub coinbase_id: u8,
+    pub prefix: NotifyPrefix,
     pub is_block: bool,
-    pub subsidy_only: bool,
-    pub quickdiff: bool,
     pub target_byte: u8,
     pub header: BlockHeaderV2,
     pub username: String,
 }
 
-pub struct PoolConnectionState {
-    pool_config: Mutex<Option<PoolConfig>>,
-    min_difficulty: AtomicU64,
-    pub tallies: Mutex<ShareTallies>,
-    pub motd: Mutex<String>,
-    queue: Mutex<VecDeque<QueuedShare>>,
-    queue_capacity: usize,
-    coinbaser_request: Mutex<Option<Arc<coinbaser::CoinbaserRequestState>>>,
-    job_slots: Mutex<Vec<Option<Arc<Job>>>>,
-    abw: Mutex<abw::AbwAssignments>,
-    resume_token: Mutex<Option<ResumeToken>>,
-    node: ratum::rpc::Client,
-    pub template_waker: Arc<TemplateWaker>,
-    pub connect_failures: AtomicU32,
-    session_waker: Mutex<Option<Arc<Waker>>>,
+/// What one DATUM connection has told the gateway, reset as a whole when it closes.
+#[derive(Default)]
+struct SessionView {
+    config: Option<ClientConfig>,
+    motd: String,
+    abw: abw::AbwAssignments,
+    coinbaser_request: Option<PendingCoinbaser>,
+    waker: Option<Waker>,
 }
 
-impl PoolConnectionState {
-    pub fn new(
-        slots: usize,
-        queue_capacity: usize,
-        template_waker: Arc<TemplateWaker>,
-        node: ratum::rpc::Client,
-    ) -> Self {
+/// Whether new work must commit to an anti-block-withholding assignment, and which.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AbwState {
+    NotRequired,
+    Awaiting,
+    Assigned(abw::AbwAssignment),
+}
+
+/// What the gateway holds about the pool between and across DATUM connections: the
+/// connection's own view under one lock, and what outlives a connection (the share tallies
+/// and the queued shares) beside it.
+pub struct PoolState {
+    session: Mutex<SessionView>,
+    tallies: Mutex<ShareTallies>,
+    queue: Mutex<VecDeque<QueuedShare>>,
+    queue_capacity: usize,
+}
+
+impl PoolState {
+    pub fn new(queue_capacity: usize) -> Self {
         Self {
-            pool_config: Mutex::new(None),
-            min_difficulty: AtomicU64::new(0),
+            session: Mutex::new(SessionView::default()),
             tallies: Mutex::new(ShareTallies::default()),
-            motd: Mutex::new(String::new()),
             queue: Mutex::new(VecDeque::new()),
             queue_capacity: queue_capacity.max(MIN_QUEUE_CAPACITY),
-            coinbaser_request: Mutex::new(None),
-            job_slots: Mutex::new(vec![None; slots]),
-            abw: Mutex::new(abw::AbwAssignments::default()),
-            resume_token: Mutex::new(None),
-            node,
-            template_waker,
-            connect_failures: AtomicU32::new(0),
-            session_waker: Mutex::new(None),
         }
     }
 
+    fn session(&self) -> MutexGuard<'_, SessionView> {
+        lock(&self.session)
+    }
+
     fn wake(&self) {
-        if let Some(w) = lock(&self.session_waker).as_ref()
+        if let Some(w) = self.session().waker.as_ref()
             && let Err(e) = w.wake()
         {
             debug!("could not wake the DATUM session thread: {e}");
         }
     }
 
-    pub fn require_abw(&self) -> bool {
-        lock(&self.pool_config).as_ref().is_some_and(|c| c.protocol_v3 && !c.abw_disabled)
+    pub fn abw_state(&self) -> AbwState {
+        let s = self.session();
+        if !s.config.as_ref().is_some_and(|c| c.v3.is_some() && !abw_disabled(c)) {
+            return AbwState::NotRequired;
+        }
+        s.abw.assignment().map_or(AbwState::Awaiting, AbwState::Assigned)
     }
 
-    pub fn abw_assignment(&self) -> Option<abw::AbwAssignment> {
-        lock(&self.abw).assignment()
+    pub fn motd(&self) -> String {
+        self.session().motd.clone()
     }
 
-    pub fn resume_token(&self) -> Option<ResumeToken> {
-        *lock(&self.resume_token)
+    pub fn tallies(&self) -> ShareTallies {
+        lock(&self.tallies).clone()
+    }
+
+    fn tally(&self, accepted: bool, diff: u64) {
+        let mut t = lock(&self.tallies);
+        if accepted { &mut t.accepted } else { &mut t.rejected }.add(diff);
     }
 
     pub fn is_active(&self) -> bool {
-        lock(&self.pool_config).is_some()
+        self.session().config.is_some()
     }
 
-    pub fn pool_config(&self) -> Option<PoolConfig> {
-        lock(&self.pool_config).clone()
+    pub fn pool_config(&self) -> Option<ClientConfig> {
+        self.session().config.clone()
     }
 
-    pub fn payout_script(&self) -> Option<Vec<u8>> {
-        lock(&self.pool_config).as_ref().map(|c| c.payout_script.clone())
-    }
-
+    /// The pool's minimum share difficulty; 0 while no pool configuration is held.
     pub fn min_difficulty(&self) -> u64 {
-        self.min_difficulty.load(Ordering::Relaxed)
+        self.session().config.as_ref().map_or(0, |c| c.min_difficulty)
     }
 
-    fn set_config(&self, config: PoolConfig) -> Option<PoolConfig> {
-        self.min_difficulty.store(config.min_difficulty, Ordering::Relaxed);
-        lock(&self.pool_config).replace(config)
+    /// Leaves a coinbaser request for the session thread to send, replacing any request an
+    /// older template left unsent. Returns whether one was left: under
+    /// `MIN_COINBASER_VALUE` the pool dictates no split, and with no pool configuration
+    /// received there is no session to send it on.
+    pub fn request_coinbaser(&self, template: &Arc<Template>, new_block: bool) -> bool {
+        if template.coinbase_value < MIN_COINBASER_VALUE {
+            return false;
+        }
+        let mut s = self.session();
+        if s.config.is_none() {
+            return false;
+        }
+        s.coinbaser_request = Some(PendingCoinbaser {
+            value: template.coinbase_value,
+            prev_hash: template.prev_hash,
+            template: Arc::clone(template),
+            new_block,
+            requested_at: Instant::now(),
+        });
+        drop(s);
+        self.wake();
+        true
     }
 
+    /// Resets the connection's view, dropping any coinbaser request it had not yet sent.
+    /// Returns whether the connection had received a pool configuration.
     fn clear_after_disconnect(&self) -> bool {
-        *lock(&self.session_waker) = None;
-        let was_active = lock(&self.pool_config).take().is_some();
-        let waiting = lock(&self.coinbaser_request).take();
-        if let Some(state) = waiting {
-            state.done.notify_all();
-        }
+        let closed = std::mem::take(&mut *self.session());
         lock(&self.queue).clear();
-        *lock(&self.abw) = abw::AbwAssignments::default();
-        was_active
+        closed.config.is_some()
     }
 
-    pub fn install_job(&self, job: &Arc<Job>) {
-        let mut slots = lock(&self.job_slots);
-        let i = job.datum_slot as usize;
-        if i < slots.len() {
-            slots[i] = Some(Arc::clone(job));
-        }
-    }
-
-    fn job_slot(&self, index: u8) -> Result<Arc<Job>, SlotLookupFailure> {
-        let slots = lock(&self.job_slots);
-        if index as usize >= slots.len() {
-            return Err(SlotLookupFailure {
-                job_index: JOB_INDEX_INVALID,
-                status: TxnListStatus::BadJobIndex,
-            });
-        }
-        slots[index as usize]
-            .clone()
-            .ok_or(SlotLookupFailure { job_index: index, status: TxnListStatus::JobEmpty })
+    fn take_queued_shares(&self) -> VecDeque<QueuedShare> {
+        std::mem::take(&mut *lock(&self.queue))
     }
 
     pub fn queue_share(&self, share: QueuedShare) {
@@ -216,89 +206,39 @@ impl PoolConnectionState {
     }
 }
 
-#[derive(Clone)]
-pub struct PoolConnectionSettings {
-    pub host: String,
-    pub port: u16,
-    pub pool_sign_pk: [u8; 32],
-    pub pool_box_pk: [u8; 32],
-    pub global_timeout: Duration,
-    pub user_agent: String,
-    pub pass_full_users: bool,
-    pub pass_workers: bool,
-    pub pool_address: String,
-    pub protocol_v3: bool,
-}
-
-impl PoolConnectionSettings {
-    pub fn from_config(config: &Config) -> Self {
-        let (pool_sign_pk, pool_box_pk) =
-            parse_pool_pubkey(&config.datum.pool_pubkey).expect("validated");
-        Self {
-            host: config.datum.pool_host.clone(),
-            port: config.datum.pool_port,
-            pool_sign_pk,
-            pool_box_pk,
-            global_timeout: Duration::from_secs(config.datum.protocol_global_timeout),
-            user_agent: user_agent(),
-            pass_full_users: config.datum.pool_pass_full_users,
-            pass_workers: config.datum.pool_pass_workers,
-            pool_address: config.mining.pool_address.clone(),
-            protocol_v3: config.datum.protocol_v3,
-        }
-    }
-
-    pub fn wire_username(&self, username: &str) -> String {
-        let full = if (!self.pass_full_users && !self.pass_workers) || username.is_empty() {
-            self.pool_address.clone()
-        } else if self.pass_full_users && !username.starts_with('.') {
-            username.to_string()
-        } else {
-            let dot = if username.starts_with('.') { "" } else { "." };
-            format!("{}{dot}{username}", self.pool_address)
-        };
-        let mut end = full.len().min(share::MAX_USERNAME_LEN);
-        while !full.is_char_boundary(end) {
-            end -= 1;
-        }
-        full[..end].to_string()
-    }
-}
-
-pub fn parse_pool_pubkey(s: &str) -> Result<([u8; PUBKEY_LEN], [u8; PUBKEY_LEN]), String> {
-    const HEX_CHARS: usize = 2 * (2 * PUBKEY_LEN);
-    if s.len() != HEX_CHARS {
-        return Err(format!("pool_pubkey must be {HEX_CHARS} hex characters, got {}", s.len()));
-    }
-    let bytes = hex::decode(s).map_err(|e| format!("pool_pubkey is not hex: {e}"))?;
-    let (sign, boxed) = bytes.split_at(PUBKEY_LEN);
-    Ok((sign.try_into().unwrap(), boxed.try_into().unwrap()))
-}
-
 pub fn user_agent() -> String {
-    format!("ratum-gateway/{}/{}", env!("CARGO_PKG_VERSION"), ratum::GIT_COMMIT)
+    format!("ratum-gateway/{}/{}", env!("CARGO_PKG_VERSION"), crate::GIT_COMMIT)
 }
 
 const RECONNECT_DELAY_MIN: Duration = Duration::from_secs(5);
 const RECONNECT_DELAY_SPREAD: Duration = Duration::from_secs(15);
 
-pub fn run_forever(
-    settings: PoolConnectionSettings,
-    pool: Arc<PoolConnectionState>,
-    identity: KeyPairs,
-) {
+/// Connects to the pool again after every disconnect. With `datum.pooled_mining_only` set,
+/// new stratum connections are refused from startup and from each disconnect until a
+/// session receives the pool's configuration, and every stratum client is disconnected on
+/// the second failed attempt in a row (a session that received a configuration counts as
+/// the first).
+pub fn run_forever(gateway: &Gateway, pool_pubkey: PublicKeys, identity: KeyPairs) {
+    let pool = &gateway.pool;
+    let d = &gateway.config.datum;
+    let mut failures = 0u32;
+    let mut resume_token = None;
     loop {
-        info!("connecting to DATUM pool {}:{}", settings.host, settings.port);
-        let outcome = session::run(&settings, &pool, &identity);
+        info!("connecting to DATUM pool {}:{}", d.pool_host, d.pool_port);
+        let outcome = session::run(gateway, pool_pubkey, &identity, &mut resume_token);
         let was_active = pool.clear_after_disconnect();
         if let Err(e) = outcome {
             error!("DATUM connection ended: {e}");
         }
+        failures = if was_active { 1 } else { failures.saturating_add(1) };
+        if d.pooled_mining_only && failures == FAILURES_BEFORE_SHUTDOWN {
+            warn!(
+                "The DATUM pool is unreachable and datum.pooled_mining_only is set: disconnecting stratum clients until it is reached again"
+            );
+            gateway.stratum.shutdown_all();
+        }
         if was_active {
-            pool.connect_failures.store(1, Ordering::Relaxed);
-            pool.template_waker.rebuild();
-        } else {
-            pool.connect_failures.fetch_add(1, Ordering::Relaxed);
+            gateway.template_waker.rebuild();
         }
         let delay = RECONNECT_DELAY_MIN
             + Duration::from_millis(u64::from(

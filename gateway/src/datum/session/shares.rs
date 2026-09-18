@@ -1,60 +1,62 @@
+//! Sending queued shares to the pool and reading the verdicts back. Each job's sections are sent
+//! once per connection, and a share whose job or anti-block-withholding commitment this connection
+//! no longer holds is not sent at all.
+
 use super::{Session, SessionError};
-use crate::datum::QueuedShare;
+use crate::datum::{AbwState, QueuedShare};
+use crate::job::CoinbaseKind;
+use crate::stratum::notify_id::NotifyPrefix;
 use log::{debug, warn};
 use ratum::datum::coinbase::TARGET_BYTE_PLACEHOLDER;
 use ratum::datum::messages::coinbaser::CoinbaserRequest;
 use ratum::datum::messages::share::{self, Blake2bSection, CoinbaseSection, JobSection, PowSubmit};
 use ratum::datum::messages::share_response::{RejectReason, ShareResponse, ShareVerdict};
 use ratum::header::{FLAG_USE_TIME_OFFSET, V2_FLAG};
-use ratum::{lock, target};
-use std::sync::Arc;
+use ratum::target;
 use std::time::{Duration, Instant};
 
 const SHARE_ACK_GRACE: Duration = Duration::from_secs(25);
 
-const TRACKED_COINBASE_IDS: usize = 8;
-
+/// Which sections of a job the pool has already received on this connection, so a share
+/// carries each once.
 #[derive(Clone, Copy)]
 pub(super) struct SentSections {
-    serial: u64,
+    /// The `Job::serial` these were sent for; a slot reused by a newer job starts again.
+    job_serial: u64,
     job_section_sent: bool,
-    coinbase_sent: [bool; TRACKED_COINBASE_IDS],
+    pooled_coinbase_sent: bool,
     subsidy_only_coinbase_sent: bool,
 }
 
 impl SentSections {
-    fn new(serial: u64) -> Self {
+    fn new(job_serial: u64) -> Self {
         Self {
-            serial,
+            job_serial,
             job_section_sent: false,
-            coinbase_sent: [false; TRACKED_COINBASE_IDS],
+            pooled_coinbase_sent: false,
             subsidy_only_coinbase_sent: false,
         }
     }
 
-    fn mark_coinbase_sent(&mut self, coinbase_id: u8) -> bool {
-        let slot = if coinbase_id == share::COINBASE_ID_SUBSIDY_ONLY {
-            &mut self.subsidy_only_coinbase_sent
-        } else {
-            &mut self.coinbase_sent[coinbase_id as usize % TRACKED_COINBASE_IDS]
+    fn mark_coinbase_sent(&mut self, kind: CoinbaseKind) -> bool {
+        let sent = match kind {
+            CoinbaseKind::Pooled => &mut self.pooled_coinbase_sent,
+            CoinbaseKind::SubsidyOnly => &mut self.subsidy_only_coinbase_sent,
         };
-        std::mem::replace(slot, true)
+        std::mem::replace(sent, true)
     }
 }
 
 impl Session<'_> {
     pub(super) fn on_share_response(&mut self, r: ShareResponse) {
         let diff = if r.target_byte == TARGET_BYTE_PLACEHOLDER {
-            self.pool.min_difficulty().max(1)
+            self.gateway.pool.min_difficulty().max(1)
         } else {
             target::difficulty_for_exponent(r.target_byte)
         };
         let accepted =
             matches!(r.verdict, ShareVerdict::Accepted | ShareVerdict::AcceptedTentatively);
-        {
-            let mut st = lock(&self.pool.tallies);
-            if accepted { &mut st.accepted } else { &mut st.rejected }.add(diff);
-        }
+        self.gateway.pool.tally(accepted, diff);
         let what = format!("job {} nonce {:08x} diff {diff}", r.job_id, r.nonce);
         match r.verdict {
             ShareVerdict::Accepted => debug!("DATUM share accepted: {what}"),
@@ -76,22 +78,20 @@ impl Session<'_> {
     }
 
     pub(super) fn send_pending(&mut self) -> Result<(), SessionError> {
-        let request = lock(&self.pool.coinbaser_request).clone();
-        if let Some(state) = request
-            && !self.coinbaser_request_sent.as_ref().is_some_and(|r| Arc::ptr_eq(r, &state))
-        {
-            let req = CoinbaserRequest { value: state.value, prev_hash: state.prev_hash };
-            debug!("coinbaser request: {} sats", state.value);
+        let pending = self.gateway.pool.session().coinbaser_request.take();
+        if let Some(p) = pending {
+            let req = CoinbaserRequest { value: p.value, prev_hash: p.prev_hash };
+            debug!("coinbaser request: {} sats", p.value);
             self.send_mining(&req.encode())?;
-            self.coinbaser_request_sent = Some(state);
+            self.awaiting_coinbaser = Some(p);
         }
-        if self.settings.protocol_v3
-            && (!self.pool.is_active()
-                || (self.pool.require_abw() && self.pool.abw_assignment().is_none()))
+        if self.gateway.config.datum.protocol_v3
+            && (!self.gateway.pool.is_active()
+                || self.gateway.pool.abw_state() == AbwState::Awaiting)
         {
             return Ok(());
         }
-        let batch = std::mem::take(&mut *lock(&self.pool.queue));
+        let batch = self.gateway.pool.take_queued_shares();
         for share in &batch {
             self.send_share(share)?;
         }
@@ -103,46 +103,31 @@ impl Session<'_> {
         share: &QueuedShare,
     ) -> (Option<JobSection>, Option<CoinbaseSection>) {
         let job = &share.job;
-        let sent = self.sent_sections[job.datum_slot as usize]
+        let sent = self.sent_sections[job.slot as usize]
             .get_or_insert_with(|| SentSections::new(job.serial));
-        if sent.serial != job.serial {
+        if sent.job_serial != job.serial {
             *sent = SentSections::new(job.serial);
         }
         let job_section =
-            (!std::mem::replace(&mut sent.job_section_sent, true)).then(|| JobSection {
-                prev_hash: job.template.prev_hash,
-                target_byte_index: job.pooled_coinbase.target_byte_index as u16,
-                nbits: job.template.nbits.to_le_bytes(),
-                coinbaser_id: job.coinbaser_id,
-                height: job.template.height,
-                coinbase_value: job.template.coinbase_value,
-                txn_count: job.template.txns.len() as u32,
-                txn_total_weight: job.template.totals.weight,
-                txn_total_size: job.template.totals.size,
-                txn_total_sigops: job.template.totals.sigops,
-                merkle_branches: job.merkle_branches.clone(),
-            });
-        let coinbase_section = (!sent.mark_coinbase_sent(share.coinbase_id)).then(|| {
-            let c = job.coinbase(share.coinbase_id);
-            CoinbaseSection {
-                coinbase_id: share.coinbase_id,
-                coinb1: c.coinb1.clone(),
-                coinb2: c.coinb2.clone(),
-            }
-        });
+            (!std::mem::replace(&mut sent.job_section_sent, true)).then(|| job.job_section.clone());
+        let kind = share.prefix.coinbase();
+        let coinbase_section =
+            (!sent.mark_coinbase_sent(kind)).then(|| job.coinbase(kind).section.clone());
         (job_section, coinbase_section)
     }
 
     fn send_share(&mut self, share: &QueuedShare) -> Result<(), SessionError> {
         let job = &share.job;
-        let current =
-            lock(&self.pool.job_slots)[job.datum_slot as usize].as_ref().map(|j| j.serial);
-        if current != Some(job.serial) {
-            debug!("share for job {} whose DATUM slot was reused; not sent", job.serial);
+        if self.gateway.jobs.at(job.slot).is_none_or(|held| held.serial != job.serial) {
+            debug!(
+                "share for job {} that the table no longer holds (its slot was reused, or the \
+                 job aged out of it); not sent",
+                job.serial
+            );
             return Ok(());
         }
         if let Some(a) = job.abw
-            && !lock(&self.pool.abw).holds(a)
+            && !self.gateway.pool.session().abw.holds(a)
         {
             warn!(
                 "share on ABW slot {} whose commitment this session does not hold (revealed, \
@@ -157,29 +142,14 @@ impl Session<'_> {
             return Ok(());
         };
         let (job_section, coinbase_section) = self.sections_for(share);
-        let blake2b = Blake2bSection::from_header(h);
-        let submit = PowSubmit {
-            job_id: job.datum_slot,
-            coinbase_id: share.coinbase_id,
-            is_block: share.is_block,
-            subsidy_only: share.subsidy_only,
-            quickdiff: share.quickdiff,
-            target_byte: share.target_byte,
-            ntime: blake2b.time_fields().0,
-            nonce: h.nonce,
-            version: V2_FLAG | h.version as u32,
-            extranonce,
-            username: self.settings.wire_username(&share.username),
-            use_time_offset: h.flags & FLAG_USE_TIME_OFFSET != 0,
-            job: job_section,
-            coinbase: coinbase_section,
-            blake2b,
-            abw_slot: job.abw.map(|a| a.slot),
-        };
+        let cfg = &self.gateway.config;
+        let username =
+            crate::username::for_wire(&cfg.datum, &cfg.mining.pool_address, &share.username);
+        let submit = pow_submit(share, extranonce, username, job_section, coinbase_section);
         debug!(
             "DATUM share: slot {} coinbase {} diff 2^{} user {:?}{}",
-            job.datum_slot,
-            share.coinbase_id,
+            job.slot,
+            share.prefix.coinbase().wire_id(),
             share.target_byte,
             share.username,
             if share.is_block { " BLOCK" } else { "" }
@@ -191,5 +161,108 @@ impl Session<'_> {
         }
         self.last_share_sent_at = Some(now);
         Ok(())
+    }
+}
+
+/// The share message for a queued share: `extranonce` is the twelve bytes of its header's
+/// extranonce field and `job`, `coinbase` the sections the pool has not yet received.
+fn pow_submit(
+    share: &QueuedShare,
+    extranonce: [u8; share::EXTRANONCE_SIZE],
+    username: String,
+    job: Option<JobSection>,
+    coinbase: Option<CoinbaseSection>,
+) -> PowSubmit {
+    let h = &share.header;
+    let blake2b = Blake2bSection::from_header(h);
+    PowSubmit {
+        job_id: share.job.slot,
+        coinbase_id: share.prefix.coinbase().wire_id(),
+        is_block: share.is_block,
+        subsidy_only: share.prefix == NotifyPrefix::EmptyWork,
+        quickdiff: share.prefix == NotifyPrefix::Quickdiff,
+        target_byte: share.target_byte,
+        ntime: blake2b.time_fields().0,
+        nonce: h.nonce,
+        version: V2_FLAG | h.version as u32,
+        extranonce,
+        username,
+        use_time_offset: h.flags & FLAG_USE_TIME_OFFSET != 0,
+        job,
+        coinbase,
+        blake2b,
+        abw_slot: share.job.abw.map(|a| a.slot),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::datum::abw::AbwAssignment;
+    use crate::fixtures::{config, template};
+    use crate::job::Job;
+    use crate::job::builder::{JobInputs, build};
+    use ratum::header::{sia_words, xor_key_hash};
+    use std::sync::Arc;
+
+    /// Rebuilds the share the way the pool does, from the message alone.
+    fn pool_raw_pow_hash(submit: &PowSubmit, abw_key: Option<[u8; 16]>) -> [u8; 32] {
+        let job = submit.job.as_ref().expect("the first share carries the job");
+        let cb = submit.coinbase.as_ref().expect("and the coinbase");
+        let tx = job.coinbase_tx(cb, submit.target_byte).expect("the index is in the coinbase");
+        let merkle_root = job.merkle_root(&tx, submit.subsidy_only);
+        submit.header(job, &merkle_root, abw_key).expect("a header").pow_hashes().raw_pow_hash
+    }
+
+    fn raw_pow_hashes(
+        job: &Arc<Job>,
+        prefix: NotifyPrefix,
+        abw_key: Option<[u8; 16]>,
+    ) -> [[u8; 32]; 2] {
+        let kind = prefix.coinbase();
+        let target_byte = 14;
+        let mut extranonce = [0u8; share::HEADER_EXTRANONCE_SIZE];
+        extranonce[share::HEADER_EXTRANONCE_PAD..].fill(0x5a);
+        let header = job
+            .header(kind, target_byte, extranonce, sia_words(7, 8), sia_words(9, 10))
+            .expect("a header");
+        let gateway = job.raw_pow_hash(&header);
+        let queued = QueuedShare {
+            job: Arc::clone(job),
+            prefix,
+            is_block: false,
+            target_byte,
+            header,
+            username: "bcrt1qexample".into(),
+        };
+        let submit = pow_submit(
+            &queued,
+            share::share_extranonce(&extranonce).unwrap(),
+            queued.username.clone(),
+            Some(job.job_section.clone()),
+            Some(job.coinbase(kind).section.clone()),
+        );
+        let decoded = PowSubmit::decode(&submit.encode()).expect("the message decodes");
+        [gateway, pool_raw_pow_hash(&decoded, abw_key)]
+    }
+
+    fn build_job(abw: Option<AbwAssignment>) -> Arc<Job> {
+        let mut t = template();
+        t.txns = vec![crate::template::Txn { raw: vec![1], txid: [3; 32], witness_hash: [4; 32] }];
+        let inputs = JobInputs { abw, ..JobInputs::new(0, Arc::new(t)) };
+        Arc::new(build(&config(), inputs).unwrap())
+    }
+
+    #[test]
+    fn the_pool_rebuilds_the_hash_the_gateway_computed_for_every_kind_of_work() {
+        let key = [0x21u8; 16];
+        let assignment = AbwAssignment { slot: 2, key_hash: xor_key_hash(&key) };
+        for (abw, abw_key) in [(None, None), (Some(assignment), Some(key))] {
+            let job = build_job(abw);
+            for prefix in [NotifyPrefix::Plain, NotifyPrefix::Quickdiff, NotifyPrefix::EmptyWork] {
+                let [gateway, pool] = raw_pow_hashes(&job, prefix, abw_key);
+                assert_eq!(gateway, pool, "{prefix:?}, ABW {}", abw.is_some());
+            }
+        }
     }
 }

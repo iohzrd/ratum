@@ -1,3 +1,7 @@
+//! The job and coinbase sections one connection has sent: which of them a share is rebuilt on, when
+//! a new job replaces them, and the eviction of the jobs whose tip is no longer one the pool
+//! credits.
+
 use super::Verifier;
 use ratum::datum::messages::share::{
     COINBASE_ID_SUBSIDY_ONLY, CoinbaseSection, JobSection, MAX_COINBASE_SECTION_LEN, PowSubmit,
@@ -41,7 +45,7 @@ fn parent_is_kept(
     tip == Some(prev_hash) || recent_tips.iter().any(|t| t.hash == prev_hash)
 }
 
-impl Verifier {
+impl Verifier<'_> {
     pub fn set_tip(&mut self, tip: Option<[u8; 32]>, now: u64) {
         if self.tip != tip {
             if let Some(replaced) = self.tip {
@@ -94,26 +98,32 @@ impl Verifier {
         })
     }
 
+    /// Refuses a coinbase id the share's work cannot carry: subsidy-only work carries
+    /// `COINBASE_ID_SUBSIDY_ONLY`, other work an id under `MAX_COINBASE_TYPES`.
+    pub(super) fn check_coinbase_id(s: &PowSubmit) -> Result<(), RejectReason> {
+        let valid = if s.subsidy_only {
+            s.coinbase_id == COINBASE_ID_SUBSIDY_ONLY
+        } else {
+            s.coinbase_id < MAX_COINBASE_TYPES
+        };
+        if valid { Ok(()) } else { Err(RejectReason::BadCoinbaseId) }
+    }
+
+    /// Whether the share names an evicted job, rather than bringing a new job on another tip
+    /// into the evicted slot.
+    pub(super) fn names_evicted_job(&self, s: &PowSubmit) -> bool {
+        self.jobs[s.job_id as usize].as_ref().is_some_and(|st| {
+            st.evicted && s.job.as_ref().is_none_or(|job| job.prev_hash == st.job.prev_hash)
+        })
+    }
+
+    /// The job and coinbase sections the share is rebuilt on: the ones it carries, or the
+    /// ones installed in its slot. An evicted job still resolves.
     pub(super) fn resolve<'a>(
         &'a self,
         s: &'a PowSubmit,
-        allow_evicted: bool,
     ) -> Result<(&'a JobSection, &'a CoinbaseSection), RejectReason> {
-        if s.subsidy_only {
-            if s.coinbase_id != COINBASE_ID_SUBSIDY_ONLY {
-                return Err(RejectReason::BadCoinbaseId);
-            }
-        } else if s.coinbase_id >= MAX_COINBASE_TYPES {
-            return Err(RejectReason::BadCoinbaseId);
-        }
         let slot = self.jobs[s.job_id as usize].as_ref();
-        if let Some(st) = slot
-            && st.evicted
-            && !allow_evicted
-            && s.job.as_ref().is_none_or(|job| job.prev_hash == st.job.prev_hash)
-        {
-            return Err(RejectReason::StaleBlock);
-        }
         let new_job = self.brings_new_job(s);
         let job = match (&s.job, slot) {
             (Some(job), _) if new_job => job,
@@ -138,29 +148,27 @@ impl Verifier {
         Ok((job, cb))
     }
 
+    /// Installs the share's job and coinbase sections into its slot. A new job releases
+    /// the slot's coinbases; a coinbase replaces the one of its id. The projected total of
+    /// installed coinbase bytes must stay under the cap, or nothing is installed.
     pub(super) fn install_sections(&mut self, s: &PowSubmit) -> Result<(), RejectReason> {
         let idx = s.job_id as usize;
         let new_job = self.brings_new_job(s);
-        let released =
-            if new_job { self.jobs[idx].as_ref().map_or(0, JobState::coinbase_bytes) } else { 0 };
-        if let Some(cb) = &s.coinbase {
-            let replaced = if new_job {
-                0
-            } else {
-                self.jobs[idx]
-                    .as_ref()
-                    .and_then(|st| st.coinbases.get(&cb.coinbase_id))
-                    .map_or(0, coinbase_bytes)
-            };
-            let projected = self.installed_coinbase_bytes.saturating_sub(released + replaced)
-                + coinbase_bytes(cb);
-            if projected > self.installed_coinbase_bytes_cap {
-                return Err(RejectReason::CoinbaseTooLarge);
+        let slot = self.jobs[idx].as_ref();
+        let released = if new_job { slot.map_or(0, JobState::coinbase_bytes) } else { 0 };
+        let replaced = match &s.coinbase {
+            Some(cb) if !new_job => {
+                slot.and_then(|st| st.coinbases.get(&cb.coinbase_id)).map_or(0, coinbase_bytes)
             }
+            _ => 0,
+        };
+        let added = s.coinbase.as_ref().map_or(0, coinbase_bytes);
+        let projected = self.installed_coinbase_bytes.saturating_sub(released + replaced) + added;
+        if s.coinbase.is_some() && projected > self.installed_coinbase_bytes_cap {
+            return Err(RejectReason::CoinbaseTooLarge);
         }
         if new_job {
             let job = s.job.as_ref().expect("new_job requires a job section");
-            self.installed_coinbase_bytes = self.installed_coinbase_bytes.saturating_sub(released);
             self.jobs[idx] = Some(JobState {
                 job: job.clone(),
                 coinbases: HashMap::new(),
@@ -170,11 +178,9 @@ impl Verifier {
         }
         if let Some(cb) = &s.coinbase {
             let state = self.jobs[idx].as_mut().expect("resolved against this slot");
-            let replaced = state.coinbases.get(&cb.coinbase_id).map_or(0, coinbase_bytes);
-            self.installed_coinbase_bytes =
-                self.installed_coinbase_bytes.saturating_sub(replaced) + coinbase_bytes(cb);
             state.coinbases.insert(cb.coinbase_id, cb.clone());
         }
+        self.installed_coinbase_bytes = projected;
         Ok(())
     }
 }

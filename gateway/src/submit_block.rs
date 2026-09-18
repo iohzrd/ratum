@@ -1,7 +1,9 @@
-use crate::job::Job;
-use crate::stratum::Server;
+//! A block a miner found: assembled from its job and header, submitted to the node twice and to
+//! every extra node, saved where configured, and checked against the best chain two minutes later.
+
+use crate::gateway::Gateway;
+use crate::job::{CoinbaseKind, Job};
 use log::{debug, error, info, warn};
-use ratum::datum::messages::share::COINBASE_ID_SUBSIDY_ONLY;
 use ratum::rpc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,37 +11,37 @@ use std::time::Duration;
 const CONFIRM_AFTER: Duration = Duration::from_secs(2 * ratum::SECS_PER_MINUTE);
 
 pub fn found_block(
-    server: &Server,
+    gateway: &Arc<Gateway>,
     job: &Job,
-    coinbase_id: u8,
+    kind: CoinbaseKind,
     target_byte: u8,
     header: &[u8; ratum::header::HEADER_V2_SIZE],
     hash_hex: &str,
 ) {
-    let Some(block) = assemble(job, coinbase_id, target_byte, header) else {
+    let Some(block) = assemble(job, kind, target_byte, header) else {
         error!("could not assemble the block for {hash_hex}");
         return;
     };
     debug!("Block Payload: {}", hex::encode(&block));
     let block = Arc::new(block);
-    spawn_redundant(server, Arc::clone(&block), hash_hex);
-    let dir = &server.config.mining.save_submitblocks_dir;
+    spawn_redundant(gateway, Arc::clone(&block), hash_hex);
+    let dir = &gateway.config.mining.save_submitblocks_dir;
     if !dir.is_empty() {
         save_to_dir(dir, hash_hex, &block);
     }
-    if submit_to(&server.node, "upstream node", &block, hash_hex) {
-        server.template_waker.raise_for(hash_hex);
-        spawn_confirmation(server.node.clone(), hash_hex);
+    if submit_to(&gateway.node, "upstream node", &block, hash_hex) {
+        gateway.template_waker.raise_for(hash_hex);
+        spawn_confirmation(gateway.node.clone(), hash_hex);
     }
 }
 
 fn spawn_confirmation(node: rpc::Client, hash_hex: &str) {
     let hash_hex = hash_hex.to_string();
-    let spawned = ratum::thread::try_spawn("block-confirm", move || {
+    ratum::thread::spawn_or_warn("block-confirm", move || {
         std::thread::sleep(CONFIRM_AFTER);
         let secs = CONFIRM_AFTER.as_secs();
         match node.block_confirmations(&hash_hex) {
-            Ok(Some(confirmations)) if confirmations >= 0 => {
+            Ok(Some(confirmations)) if rpc::on_best_chain(confirmations) => {
                 info!(
                     "Block {hash_hex} is on the best chain {secs}s later ({confirmations} confirmations)"
                 )
@@ -53,21 +55,19 @@ fn spawn_confirmation(node: rpc::Client, hash_hex: &str) {
             Err(e) => warn!("could not check block {hash_hex} against the best chain: {e}"),
         }
     });
-    if let Err(e) = spawned {
-        warn!("could not start the block confirmation thread: {e}");
-    }
 }
 
 fn assemble(
     job: &Job,
-    coinbase_id: u8,
+    kind: CoinbaseKind,
     target_byte: u8,
     header: &[u8; ratum::header::HEADER_V2_SIZE],
 ) -> Option<Vec<u8>> {
-    let coinbase = job.full_coinbase(coinbase_id, target_byte)?;
-    let empty = coinbase_id == COINBASE_ID_SUBSIDY_ONLY;
-    let others: Vec<Vec<u8>> =
-        if empty { Vec::new() } else { job.template.txns.iter().map(|t| t.raw.clone()).collect() };
+    let coinbase = job.full_coinbase(kind, target_byte)?;
+    let others: Vec<Vec<u8>> = match kind {
+        CoinbaseKind::SubsidyOnly => Vec::new(),
+        CoinbaseKind::Pooled => job.template.txns.iter().map(|t| t.raw.clone()).collect(),
+    };
     Some(ratum::bitcoin::serialize_block(header, &coinbase, &others))
 }
 
@@ -97,20 +97,16 @@ fn submit_to(node: &rpc::Client, what: &str, block: &[u8], hash_hex: &str) -> bo
     accepted
 }
 
-fn spawn_redundant(server: &Server, block: Arc<Vec<u8>>, hash_hex: &str) {
-    let (node, extras) = (server.node.clone(), server.extra_nodes.clone());
-    let (template_waker, hash_hex) = (Arc::clone(&server.template_waker), hash_hex.to_string());
-    let spawned = ratum::thread::try_spawn("submitblock", move || {
-        if submit_to(&node, "upstream node (redundant)", &block, &hash_hex) {
-            template_waker.raise_for(&hash_hex);
+fn spawn_redundant(gateway: &Arc<Gateway>, block: Arc<Vec<u8>>, hash_hex: &str) {
+    let (gateway, hash_hex) = (Arc::clone(gateway), hash_hex.to_string());
+    ratum::thread::spawn_or_warn("submitblock", move || {
+        if submit_to(&gateway.node, "upstream node (redundant)", &block, &hash_hex) {
+            gateway.template_waker.raise_for(&hash_hex);
         }
-        for (i, extra) in extras.iter().enumerate() {
+        for (i, extra) in gateway.extra_nodes.iter().enumerate() {
             submit_to(extra, &format!("extra node {i}"), &block, &hash_hex);
         }
     });
-    if let Err(e) = spawned {
-        warn!("could not start the redundant submitblock thread: {e}");
-    }
 }
 
 fn save_to_dir(dir: &str, hash_hex: &str, block: &[u8]) {

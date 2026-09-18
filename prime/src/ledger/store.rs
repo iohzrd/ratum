@@ -1,36 +1,26 @@
-use super::blocks::{ConfirmationReading, FoundBlock, OwedBlock};
-use super::split::Payout;
+//! The share rows on disk, each under a sequence number, and the metadata beside them: the chain
+//! the ledger serves and the running total of credited work.
+
+use super::db::{DbResult as _, NAME_SEPARATOR, create_database, split_at_separator, write};
 use super::{MAX_SHARES, ReadBack, SHARES_PER_KEEP_UNIT, Share};
 use bytes::BufMut as _;
-use log::warn;
 use ratum::bitcoin::HASH_SIZE;
 use ratum::reader::ByteReader;
-use redb::{
-    Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
-};
+use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 
 const SHARES: TableDefinition<u64, &[u8]> = TableDefinition::new("shares");
-const BY_HASH: TableDefinition<&[u8], u64> = TableDefinition::new("by_hash");
-const BLOCKS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("blocks");
-const OWED: TableDefinition<&[u8], &[u8]> = TableDefinition::new("owed");
-const CHAIN_STATE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("chain_state");
+/// A hash index earlier versions kept beside `SHARES`; deleted when a ledger is opened, since
+/// `accounting::claim` refuses a duplicate share before it reaches the store.
+const RETIRED_BY_HASH: TableDefinition<&[u8], u64> = TableDefinition::new("by_hash");
 
 const META: TableDefinition<&str, &str> = TableDefinition::new("meta");
 const META_CHAIN: &str = "chain";
 const META_CUMULATIVE_WORK: &str = "cumulative_work";
 
-const NAME_SEPARATOR: u8 = 0x00;
-
 const SHARE_PREFIX_LEN: usize = 2 * size_of::<u64>() + HASH_SIZE;
-const SHARE_HASH_AT: std::ops::Range<usize> = SHARE_PREFIX_LEN - HASH_SIZE..SHARE_PREFIX_LEN;
-const OWED_PREFIX_LEN: usize =
-    size_of::<u64>() + size_of::<u32>() + 2 * size_of::<u64>() + size_of::<u16>();
-const OWED_ENTRY_PREFIX_LEN: usize = size_of::<u16>() + size_of::<u64>();
-const BLOCK_PREFIX_LEN: usize =
-    size_of::<u64>() + size_of::<u32>() + 3 * size_of::<u64>() + size_of::<u128>();
-const CONFIRMATION_READING_LEN: usize = size_of::<u64>() + size_of::<i64>();
 
 fn pack(share: &Share) -> Vec<u8> {
     let mut v =
@@ -59,169 +49,24 @@ fn unpack(bytes: &[u8]) -> Option<Share> {
     })
 }
 
-fn split_at_separator(rest: &[u8]) -> (&[u8], &[u8]) {
-    match rest.iter().position(|&b| b == NAME_SEPARATOR) {
-        Some(i) => (&rest[..i], &rest[i + 1..]),
-        None => (rest, [].as_slice()),
-    }
-}
-
-fn pack_owed(o: &OwedBlock) -> Vec<u8> {
-    let entries: usize = o.entries.iter().map(|p| OWED_ENTRY_PREFIX_LEN + p.identity.len()).sum();
-    let mut v = Vec::with_capacity(OWED_PREFIX_LEN + entries);
-    v.put_u64_le(o.found_at);
-    v.put_u32_le(o.height);
-    v.put_u64_le(o.total);
-    v.put_u64_le(o.settled_at.unwrap_or(0));
-    v.put_u16_le(o.entries.len() as u16);
-    for p in &o.entries {
-        v.put_u16_le(p.identity.len() as u16);
-        v.put_slice(p.identity.as_bytes());
-        v.put_u64_le(p.sats);
-    }
-    v
-}
-
-fn unpack_owed(hash: &[u8], bytes: &[u8]) -> Option<OwedBlock> {
-    let block_hash: [u8; HASH_SIZE] = hash.try_into().ok()?;
-    let mut c = ByteReader::new(bytes);
-    let found_at = c.u64("found_at").ok()?;
-    let height = c.u32("height").ok()?;
-    let total = c.u64("total").ok()?;
-    let settled = c.u64("settled_at").ok()?;
-    let count = c.u16("entry count").ok()?;
-    let mut entries = Vec::with_capacity(count as usize);
-    for _ in 0..count {
-        let len = c.u16("identity length").ok()? as usize;
-        let identity = String::from_utf8_lossy(c.take(len, "identity").ok()?).into_owned();
-        entries.push(Payout { identity, sats: c.u64("sats").ok()? });
-    }
-    Some(OwedBlock {
-        found_at,
-        height,
-        block_hash,
-        total,
-        settled_at: (settled != 0).then_some(settled),
-        entries,
-    })
-}
-
-fn pack_block(b: &FoundBlock) -> Vec<u8> {
-    let mut v = Vec::with_capacity(BLOCK_PREFIX_LEN + 1 + b.finder.len() + b.tag_secondary.len());
-    v.put_u64_le(b.found_at);
-    v.put_u32_le(b.height);
-    v.put_u64_le(b.paid_to_split);
-    v.put_u64_le(b.paid_to_pool);
-    v.put_f64_le(b.network_difficulty);
-    v.put_u128_le(b.cumulative_work);
-    v.put_slice(b.finder.as_bytes());
-    v.put_u8(NAME_SEPARATOR);
-    v.put_slice(b.tag_secondary.as_bytes());
-    v
-}
-
-fn unpack_block(hash: &[u8], bytes: &[u8]) -> Option<FoundBlock> {
-    let block_hash: [u8; HASH_SIZE] = hash.try_into().ok()?;
-    let mut c = ByteReader::new(bytes);
-    let found_at = c.u64("found_at").ok()?;
-    let height = c.u32("height").ok()?;
-    let paid_to_split = c.u64("paid_to_split").ok()?;
-    let paid_to_pool = c.u64("paid_to_pool").ok()?;
-    let network_difficulty = f64::from_le_bytes(c.arr("network difficulty").ok()?);
-    let cumulative_work = u128::from_le_bytes(c.arr("cumulative work").ok()?);
-    let (finder, tag) = split_at_separator(c.rest());
-    Some(FoundBlock {
-        found_at,
-        height,
-        block_hash,
-        paid_to_split,
-        paid_to_pool,
-        network_difficulty,
-        cumulative_work,
-        finder: String::from_utf8_lossy(finder).into_owned(),
-        tag_secondary: String::from_utf8_lossy(tag).into_owned(),
-    })
-}
-
-fn pack_confirmations(c: &ConfirmationReading) -> Vec<u8> {
-    let mut v = Vec::with_capacity(CONFIRMATION_READING_LEN);
-    v.put_u64_le(c.checked_at);
-    v.put_i64_le(c.confirmations);
-    v
-}
-
-fn unpack_confirmations(
-    hash: &[u8],
-    bytes: &[u8],
-) -> Option<([u8; HASH_SIZE], ConfirmationReading)> {
-    let block_hash: [u8; HASH_SIZE] = hash.try_into().ok()?;
-    let mut c = ByteReader::new(bytes);
-    let checked_at = c.u64("checked_at").ok()?;
-    let confirmations = i64::from_le_bytes(c.arr("confirmations").ok()?);
-    Some((block_hash, ConfirmationReading { checked_at, confirmations }))
-}
-
-trait DbResult<T> {
-    fn db(self) -> io::Result<T>;
-}
-
-impl<T, E: std::fmt::Display> DbResult<T> for Result<T, E> {
-    fn db(self) -> io::Result<T> {
-        self.map_err(|e| io::Error::other(e.to_string()))
-    }
-}
-
 pub(super) struct Store {
-    db: Database,
+    db: Arc<Database>,
     next_seq: u64,
     retain_bound: Option<u64>,
+    /// The counter as the store held it when it was opened; the ledger carries it on.
     pub(super) cumulative_work: u128,
     pub(super) stamped: bool,
 }
 
 impl Store {
-    fn write<T>(&self, f: impl FnOnce(&redb::WriteTransaction) -> io::Result<T>) -> io::Result<T> {
-        let mut w = self.db.begin_write().db()?;
-        w.set_durability(Durability::Immediate).db()?;
-        let out = f(&w)?;
-        w.commit().db()?;
-        Ok(out)
-    }
-
-    fn read_packed<T>(
-        &self,
-        table: TableDefinition<'static, &'static [u8], &'static [u8]>,
-        what: &str,
-        unpack: impl Fn(&[u8], &[u8]) -> Option<T>,
-    ) -> io::Result<Vec<T>> {
-        let r = self.db.begin_read().db()?;
-        let table = r.open_table(table).db()?;
-        let mut out = Vec::new();
-        for entry in table.iter().db()? {
-            let (key, value) = entry.db()?;
-            match unpack(key.value(), value.value()) {
-                Some(row) => out.push(row),
-                None => warn!(
-                    "skipping {what} row ({}) that did not unpack, which an uncorrupted \
-                     database never produces",
-                    hex::encode(key.value())
-                ),
-            }
-        }
-        Ok(out)
-    }
-
     pub(super) fn open(path: &Path, keep: Option<usize>, chain: Option<&str>) -> io::Result<Self> {
-        let db = Database::create(path).db()?;
+        let db = create_database(path)?;
         let w = db.begin_write().db()?;
         let mut stamped = false;
         let cumulative_work: u128;
         {
             let held_shares = !w.open_table(SHARES).db()?.is_empty().db()?;
-            w.open_table(BY_HASH).db()?;
-            w.open_table(OWED).db()?;
-            w.open_table(BLOCKS).db()?;
-            w.open_table(CHAIN_STATE).db()?;
+            w.delete_table(RETIRED_BY_HASH).db()?;
             let mut meta = w.open_table(META).db()?;
             if let Some(chain) = chain {
                 let stored = meta.get(META_CHAIN).db()?.map(|v| v.value().to_string());
@@ -260,28 +105,23 @@ impl Store {
         Ok(Self { db, next_seq, retain_bound: retain, cumulative_work, stamped })
     }
 
-    pub(super) fn insert(&mut self, share: &Share) -> io::Result<bool> {
-        let hash = share.block_hash;
-        let cumulative = self.cumulative_work + u128::from(share.difficulty);
-        let inserted = self.write(|w| {
-            let mut by_hash = w.open_table(BY_HASH).db()?;
-            if by_hash.get(hash.as_slice()).db()?.is_some() {
-                return Ok(false);
-            }
-            let seq = self.next_seq;
-            w.open_table(SHARES).db()?.insert(seq, pack(share).as_slice()).db()?;
-            by_hash.insert(hash.as_slice(), seq).db()?;
+    pub(super) fn database(&self) -> Arc<Database> {
+        Arc::clone(&self.db)
+    }
+
+    /// Stores the share under the next sequence number with `cumulative_work`, the
+    /// ledger's counter as it stands with this share.
+    pub(super) fn insert(&mut self, share: &Share, cumulative_work: u128) -> io::Result<()> {
+        write(&self.db, |w| {
+            w.open_table(SHARES).db()?.insert(self.next_seq, pack(share).as_slice()).db()?;
             w.open_table(META)
                 .db()?
-                .insert(META_CUMULATIVE_WORK, cumulative.to_string().as_str())
+                .insert(META_CUMULATIVE_WORK, cumulative_work.to_string().as_str())
                 .db()?;
-            Ok(true)
+            Ok(())
         })?;
-        if inserted {
-            self.next_seq += 1;
-            self.cumulative_work = cumulative;
-        }
-        Ok(inserted)
+        self.next_seq += 1;
+        Ok(())
     }
 
     pub(super) fn read_back(&self, window: u128) -> io::Result<(Vec<Share>, ReadBack)> {
@@ -322,126 +162,45 @@ impl Store {
         if surplus == 0 {
             return Ok(0);
         }
-        self.write(|w| {
+        write(&self.db, |w| {
             let mut shares = w.open_table(SHARES).db()?;
-            let mut by_hash = w.open_table(BY_HASH).db()?;
-            let oldest: Vec<(u64, [u8; 32])> = shares
+            let oldest = shares
                 .iter()
                 .db()?
                 .take(surplus as usize)
-                .filter_map(|entry| {
-                    let (seq, value) = entry.ok()?;
-                    let hash = value.value().get(SHARE_HASH_AT)?.try_into().ok()?;
-                    Some((seq.value(), hash))
-                })
-                .collect();
-            let mut removed = 0usize;
-            for (seq, hash) in oldest {
-                shares.remove(seq).db()?;
-                by_hash.remove(hash.as_slice()).db()?;
-                removed += 1;
+                .map(|entry| entry.map(|(seq, _)| seq.value()).db())
+                .collect::<io::Result<Vec<u64>>>()?;
+            for seq in &oldest {
+                shares.remove(*seq).db()?;
             }
-            Ok(removed)
+            Ok(oldest.len())
         })
     }
+}
 
-    pub(super) fn insert_block(&self, block: &FoundBlock) -> io::Result<bool> {
-        self.write(|w| {
-            let mut table = w.open_table(BLOCKS).db()?;
-            if table.get(block.block_hash.as_slice()).db()?.is_some() {
-                return Ok(false);
-            }
-            table.insert(block.block_hash.as_slice(), pack_block(block).as_slice()).db()?;
-            Ok(true)
-        })
-    }
+/// `Database::open` rather than `ReadOnlyDatabase::open`: a pool stopped by a signal leaves
+/// the file not closed cleanly, which only a writable open repairs.
+pub(super) fn dump_file(path: &Path) -> io::Result<Vec<Share>> {
+    dump(&Database::open(path).db()?)
+}
 
-    pub(super) fn read_blocks(&self) -> io::Result<Vec<FoundBlock>> {
-        let mut out = self.read_packed(BLOCKS, "a block", unpack_block)?;
-        out.sort_by_key(|b| (b.found_at, b.height));
-        Ok(out)
-    }
-
-    pub(super) fn write_owed(&self, owed: &OwedBlock) -> io::Result<()> {
-        self.write(|w| {
-            w.open_table(OWED)
-                .db()?
-                .insert(owed.block_hash.as_slice(), pack_owed(owed).as_slice())
-                .db()?;
-            Ok(())
-        })
-    }
-
-    pub(super) fn remove_owed(&self, hash: &[u8; 32]) -> io::Result<()> {
-        self.write(|w| {
-            w.open_table(OWED).db()?.remove(hash.as_slice()).db()?;
-            Ok(())
-        })
-    }
-
-    pub(super) fn read_owed(&self) -> io::Result<Vec<OwedBlock>> {
-        let mut out = self.read_packed(OWED, "an owed", unpack_owed)?;
-        out.sort_by_key(|o| (o.found_at, o.height));
-        Ok(out)
-    }
-
-    pub(super) fn write_confirmations(
-        &self,
-        hash: &[u8; HASH_SIZE],
-        state: &ConfirmationReading,
-    ) -> io::Result<()> {
-        self.write(|w| {
-            w.open_table(CHAIN_STATE)
-                .db()?
-                .insert(hash.as_slice(), pack_confirmations(state).as_slice())
-                .db()?;
-            Ok(())
-        })
-    }
-
-    pub(super) fn read_confirmations(
-        &self,
-    ) -> io::Result<Vec<([u8; HASH_SIZE], ConfirmationReading)>> {
-        self.read_packed(CHAIN_STATE, "a confirmation reading", unpack_confirmations)
-    }
-
-    pub(super) fn dump(&self) -> io::Result<Vec<Share>> {
-        let r = self.db.begin_read().db()?;
-        let shares = r.open_table(SHARES).db()?;
-        let mut out = Vec::new();
-        for entry in shares.iter().db()? {
-            let (_seq, value) = entry.db()?;
-            if let Some(share) = unpack(value.value()) {
-                out.push(share);
-            }
+fn dump(db: &impl ReadableDatabase) -> io::Result<Vec<Share>> {
+    let r = db.begin_read().db()?;
+    let shares = r.open_table(SHARES).db()?;
+    let mut out = Vec::new();
+    for entry in shares.iter().db()? {
+        let (_seq, value) = entry.db()?;
+        if let Some(share) = unpack(value.value()) {
+            out.push(share);
         }
-        Ok(out)
     }
+    Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixtures::{Scratch, found, hash, owed};
-
-    #[test]
-    fn packs_and_unpacks_a_confirmation_reading() {
-        for confirmations in [-1i64, 0, 1, 100, i64::MAX, i64::MIN] {
-            let state = ConfirmationReading { checked_at: 1_750_000_000, confirmations };
-            let packed = pack_confirmations(&state);
-            assert_eq!(packed.len(), CONFIRMATION_READING_LEN);
-            assert_eq!(unpack_confirmations(&hash(3), &packed), Some((hash(3), state)));
-        }
-        assert_eq!(unpack_confirmations(&hash(3), &[]), None, "a truncated row does not unpack");
-        assert_eq!(
-            unpack_confirmations(
-                &[0u8; 4],
-                &pack_confirmations(&ConfirmationReading { checked_at: 1, confirmations: 1 })
-            ),
-            None,
-            "a key that is not a block hash does not unpack"
-        );
-    }
+    use crate::fixtures::{Scratch, hash};
 
     #[test]
     fn packs_and_unpacks_a_share() {
@@ -459,31 +218,22 @@ mod tests {
         assert_eq!(unpack(&bytes), Some(untagged));
         assert_eq!(unpack(&[0u8; 16]), None);
     }
+
     #[test]
-    fn an_owed_block_round_trips_through_pack() {
-        for o in
-            [owed(1, None), owed(2, Some(4_000)), OwedBlock { entries: vec![], ..owed(3, None) }]
+    fn opening_a_ledger_deletes_the_retired_hash_index() {
+        let scratch = Scratch::new("retired-index");
+        let path = scratch.join("regtest.redb");
         {
-            assert_eq!(unpack_owed(&o.block_hash, &pack_owed(&o)), Some(o));
+            let db = create_database(&path).unwrap();
+            write(&db, |w| {
+                w.open_table(RETIRED_BY_HASH).db()?.insert([7u8; 32].as_slice(), 0).db()?;
+                Ok(())
+            })
+            .unwrap();
         }
-    }
-    #[test]
-    fn a_found_block_round_trips_through_pack() {
-        for b in [
-            found(1, 0),
-            found(2, u128::MAX),
-            FoundBlock { finder: String::new(), ..found(3, 7) },
-            FoundBlock { tag_secondary: String::new(), ..found(4, 9) },
-        ] {
-            assert_eq!(unpack_block(&b.block_hash, &pack_block(&b)), Some(b));
-        }
-    }
-    #[test]
-    fn a_block_row_without_the_tag_separator_reads_back_with_an_empty_tag() {
-        let b = FoundBlock { tag_secondary: String::new(), ..found(1, 48) };
-        let mut bytes = pack_block(&b);
-        assert_eq!(bytes.pop(), Some(0x00), "the separator is the last byte when the tag is empty");
-        assert_eq!(unpack_block(&b.block_hash, &bytes), Some(b));
+        let store = Store::open(&path, None, None).unwrap();
+        let r = store.db.begin_read().unwrap();
+        assert!(r.open_table(RETIRED_BY_HASH).is_err(), "the table is gone");
     }
 
     #[test]
@@ -499,23 +249,12 @@ mod tests {
                 block_hash: hash(i),
                 tag_secondary: String::new(),
             };
-            store.insert(&share).unwrap();
+            store.insert(&share, 16 * (i + 1) as u128).unwrap();
             store.retain().unwrap();
         }
-        let dumped = store.dump().unwrap();
+        let dumped = dump(&*store.db).unwrap();
         assert_eq!(dumped.len(), 5, "only the five most recent are retained");
         assert_eq!(dumped.first().unwrap().accepted_at, 7, "the oldest kept");
         assert_eq!(dumped.last().unwrap().accepted_at, 11, "through the newest");
-        assert!(
-            store
-                .insert(&Share {
-                    accepted_at: 0,
-                    identity: "m".into(),
-                    difficulty: 16,
-                    block_hash: hash(0),
-                    tag_secondary: String::new(),
-                })
-                .unwrap()
-        );
     }
 }

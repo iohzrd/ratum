@@ -1,15 +1,15 @@
+//! One stratum client, on its own thread: the requests it sends, the work sent back to it, and the
+//! idle limits that end it.
+
 mod shares;
 
-use super::notify_id::{NotifyId, NotifyPrefix};
-use super::{ClientEntry, ClientStats, CurrentJob, Server};
-use crate::coinbase::COINBASE_ID_POOLED;
-use crate::job::Job;
-use crate::username;
-use crate::vardiff::{self, Vardiff, VardiffEvent, VardiffUpdate};
+use super::notify_id::NotifyPrefix;
+use super::{ClientEntry, ClientStats};
+use crate::gateway::Gateway;
+use crate::job::{Job, Publication};
+use crate::vardiff::{self, NotifyDifficulty, Vardiff};
 use log::{debug, info};
-use ratum::datum::messages::share::{
-    COINBASE_ID_SUBSIDY_ONLY, HEADER_EXTRANONCE_PAD, HEADER_EXTRANONCE_SIZE, MAX_JOBS,
-};
+use ratum::datum::messages::share::{HEADER_EXTRANONCE_PAD, HEADER_EXTRANONCE_SIZE, MAX_JOBS};
 use ratum::lock;
 use ratum::poll::{PolledSocket, WRITE_TIMEOUT};
 use ratum::target;
@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use std::io;
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 const CLIENT_BUFFER: usize = 16384 * 3 + 1024;
@@ -32,14 +32,6 @@ const SESSION_ID_XOR: u32 = 0xB10C_F00D;
 const HASHRATE_WINDOW: Duration = Duration::from_secs(60);
 const EXTRANONCE1_SIZE: usize = HEADER_EXTRANONCE_PAD + size_of::<u32>();
 const EXTRANONCE2_SIZE: usize = HEADER_EXTRANONCE_SIZE - EXTRANONCE1_SIZE;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum NotifyKind {
-    FirstJob,
-    JobUpdate,
-    EmptyWork,
-    Quickdiff,
-}
 
 #[derive(Clone, Copy)]
 struct StratumError {
@@ -68,52 +60,50 @@ pub(super) enum Disconnect {
 }
 
 pub(super) struct Connection {
-    server: Arc<Server>,
+    gateway: Arc<Gateway>,
     entry: Arc<ClientEntry>,
     socket: PolledSocket,
-    peer: String,
     sid: u32,
-    subscribed: bool,
-    username: String,
     vardiff: Vardiff,
+    /// The difficulty each job slot was last served at. It spans `MAX_JOBS`, not
+    /// `datum.protocol_job_slots`, because a submitted job id resolves to any slot under
+    /// `MAX_JOBS`, which is what lets both sides index it directly.
     job_diffs: Vec<Option<u64>>,
-    sent_generation: u64,
+    /// The `Publication::sequence` last sent, not the `Job::serial`: one job published
+    /// under both coinbases must be sent twice.
+    sent_sequence: Option<u64>,
     connected_at: Instant,
-    last_accepted_at: Option<Instant>,
     diff_since_window_start: u64,
     window_started_at: Instant,
     next_idle_check: Instant,
 }
 
 impl Connection {
-    pub(super) fn run(server: Arc<Server>, stream: TcpStream) -> Result<(), Disconnect> {
+    pub(super) fn run(gateway: Arc<Gateway>, stream: TcpStream) -> Result<(), Disconnect> {
         let peer = stream.peer_addr().map_or_else(|_| "?".to_string(), |a| a.to_string());
         stream.set_nodelay(true)?;
         let socket = PolledSocket::new(stream)?;
-        let waker = Arc::new(socket.waker()?);
-        let unique_id = server.next_unique_id.fetch_add(1, Ordering::Relaxed);
+        let waker = socket.waker()?;
+        let unique_id = gateway.stratum.next_unique_id.fetch_add(1, Ordering::Relaxed);
         let sid = (unique_id as u32) ^ SESSION_ID_XOR;
         let entry = Arc::new(ClientEntry {
             kill_requested: AtomicBool::new(false),
             waker,
+            unique_id,
             stats: Mutex::new(ClientStats {
-                peer: peer.clone(),
-                unique_id,
-                current_diff: server.config.stratum.vardiff_min,
+                peer,
+                current_diff: gateway.config.stratum.vardiff_min,
                 ..Default::default()
             }),
         });
-        lock(&server.clients).push(Arc::clone(&entry));
-        debug!("New Stratum client connected. {peer} ({unique_id})");
+        lock(&gateway.stratum.clients).insert(unique_id, Arc::clone(&entry));
+        debug!("New Stratum client connected. {} ({unique_id})", lock(&entry.stats).peer);
         let now = Instant::now();
-        let s = &server.config.stratum;
+        let s = &gateway.config.stratum;
         let mut c = Self {
             entry: Arc::clone(&entry),
             socket,
-            peer,
             sid,
-            subscribed: false,
-            username: String::new(),
             vardiff: Vardiff::new(
                 vardiff::VardiffParams {
                     min: s.vardiff_min,
@@ -124,16 +114,15 @@ impl Connection {
                 now,
             ),
             job_diffs: vec![None; MAX_JOBS],
-            sent_generation: 0,
+            sent_sequence: None,
             connected_at: now,
-            last_accepted_at: None,
             diff_since_window_start: 0,
             window_started_at: now,
             next_idle_check: now + FIRST_IDLE_CHECK_DELAY,
-            server: Arc::clone(&server),
+            gateway: Arc::clone(&gateway),
         };
         let result = c.serve();
-        lock(&server.clients).retain(|e| !Arc::ptr_eq(e, &entry));
+        lock(&gateway.stratum.clients).remove(&unique_id);
         debug!("Stratum client connection closed. ({:?})", result.as_ref().err());
         result
     }
@@ -145,10 +134,11 @@ impl Connection {
             if self.entry.kill_requested.load(Ordering::Relaxed) {
                 return Err(Disconnect::Killed);
             }
-            if self.subscribed
-                && self.server.generation.load(Ordering::Acquire) != self.sent_generation
+            if self.stats().subscribed()
+                && let Some(published) = self.gateway.jobs.current()
+                && self.sent_sequence != Some(published.sequence)
             {
-                self.send_current_job()?;
+                self.send_job(&published)?;
             }
             self.idle_checks()?;
             self.roll_window();
@@ -183,20 +173,18 @@ impl Connection {
         due.saturating_duration_since(Instant::now())
     }
 
-    fn with_stats(&self, f: impl FnOnce(&mut ClientStats)) {
-        f(&mut lock(&self.entry.stats));
+    fn stats(&self) -> MutexGuard<'_, ClientStats> {
+        lock(&self.entry.stats)
     }
 
     fn roll_window(&mut self) {
-        if self.window_started_at.elapsed() < HASHRATE_WINDOW {
+        let window = self.window_started_at.elapsed();
+        if window < HASHRATE_WINDOW {
             return;
         }
-        let (diff, window) = (self.diff_since_window_start, self.window_started_at.elapsed());
-        self.with_stats(|s| {
-            s.window_diff = diff;
-            s.window_length = window;
-            s.window_ended_at = Some(Instant::now());
-        });
+        let hashes_per_second =
+            ratum::hashrate::from_work(self.diff_since_window_start.into(), window);
+        self.stats().hashrate = Some((Instant::now(), hashes_per_second));
         self.diff_since_window_start = 0;
         self.window_started_at = Instant::now();
     }
@@ -206,19 +194,19 @@ impl Connection {
             return Ok(());
         }
         self.next_idle_check = Instant::now() + IDLE_CHECK_INTERVAL;
-        let s = &self.server.config.stratum;
+        let s = &self.gateway.config.stratum;
         let idle =
             |limit: u64, since: Instant| limit != 0 && since.elapsed() > Duration::from_secs(limit);
-        let accepted = lock(&self.entry.stats).shares.accepted.count;
-        let reason = if !self.subscribed && idle(s.idle_timeout_no_subscribe, self.connected_at) {
+        let st = self.stats();
+        let reason = if !st.subscribed() && idle(s.idle_timeout_no_subscribe, self.connected_at) {
             Some(("not subscribing", s.idle_timeout_no_subscribe))
-        } else if self.subscribed
-            && accepted == 0
+        } else if st.subscribed()
+            && st.shares.accepted.count == 0
             && idle(s.idle_timeout_no_shares, self.connected_at)
         {
             Some(("submitting no accepted share", s.idle_timeout_no_shares))
-        } else if self.subscribed
-            && let Some(last) = self.last_accepted_at
+        } else if st.subscribed()
+            && let Some(last) = st.last_accepted_at
             && idle(s.idle_timeout_max_last_work, last)
         {
             Some(("submitting no share", s.idle_timeout_max_last_work))
@@ -228,16 +216,18 @@ impl Connection {
         if let Some((what, secs)) = reason {
             debug!(
                 "Kicking client {} ({}) for {what} for more than {secs} seconds",
-                self.peer, self.username
+                st.peer, st.username
             );
             return Err(Disconnect::Idle(what));
         }
         Ok(())
     }
 
-    fn send_line(&mut self, line: &str) -> io::Result<()> {
-        self.socket.write_all(line.as_bytes(), WRITE_TIMEOUT)?;
-        self.socket.write_all(b"\n", WRITE_TIMEOUT)
+    /// Writes the line and its terminator in one write: the socket has `TCP_NODELAY` set, so
+    /// a separate write of the newline would be its own segment.
+    fn send_line(&mut self, mut line: String) -> io::Result<()> {
+        line.push('\n');
+        self.socket.write_all(line.as_bytes(), WRITE_TIMEOUT)
     }
 
     fn reply(&mut self, id: &str, error: Option<StratumError>, result: Value) -> io::Result<()> {
@@ -245,7 +235,7 @@ impl Connection {
             Some(StratumError { code, message }) => format!("[{code},\"{message}\",null]"),
             None => "null".to_string(),
         };
-        self.send_line(&format!("{{\"error\":{error},\"id\":{id},\"result\":{result}}}"))
+        self.send_line(format!("{{\"error\":{error},\"id\":{id},\"result\":{result}}}"))
     }
 
     fn reply_result(&mut self, id: &str, result: Value) -> io::Result<()> {
@@ -290,10 +280,10 @@ impl Connection {
     }
 
     fn on_subscribe(&mut self, id: &str, params: &Value) -> io::Result<()> {
-        if self.subscribed {
+        if self.stats().subscribed() {
             return Ok(());
         }
-        let s = &self.server.config.stratum;
+        let s = &self.gateway.config.stratum;
         let user_agent: String =
             params.get(0).and_then(Value::as_str).map_or_else(String::new, |ua| {
                 ua.chars()
@@ -317,35 +307,31 @@ impl Connection {
                 EXTRANONCE2_SIZE
             ]),
         )?;
-        self.send_difficulty()?;
-        self.subscribed = true;
-        self.with_stats(|st| {
-            st.user_agent = user_agent;
-            st.subscribed = true;
-            st.subscribed_at = Some(Instant::now());
-        });
+        let d = self.vardiff.mark_sent();
+        self.send_difficulty(d)?;
+        let mut st = self.stats();
+        st.user_agent = user_agent;
+        st.subscribed_at = Some(Instant::now());
+        drop(st);
         self.vardiff.reset_snapshot(Instant::now());
-        let CurrentJob { job, generation } = self.server.current_for_send();
-        self.sent_generation = generation;
-        if let Some(job) = job {
-            self.notify(&job, NotifyKind::FirstJob)?;
+        if let Some(published) = self.gateway.jobs.current() {
+            self.send_job(&published)?;
         }
         Ok(())
     }
 
     fn on_authorize(&mut self, id: &str, params: &Value) -> io::Result<()> {
         let username = params.get(0).and_then(Value::as_str).unwrap_or("NULL");
-        self.username = username.chars().take(MAX_USERNAME_CHARS).collect();
-        let name = self.username.clone();
-        self.with_stats(|st| st.username = name);
-        if self.server.config.stratum.require_address_username && !username::is_payable(username) {
+        let name: String = username.chars().take(MAX_USERNAME_CHARS).collect();
+        self.stats().username = name;
+        if self.gateway.config.stratum.refuses_username(username) {
             let shown: String = username
                 .chars()
                 .map(|c| if c.is_ascii_graphic() || c == ' ' { c } else { '?' })
                 .collect();
             info!(
                 "Refusing authorization of \"{shown}\" from {}: stratum.require_address_username is set and the username does not begin with an address a coinbase output can pay.",
-                self.peer
+                self.stats().peer
             );
             return self.reply(id, Some(UNAUTHORIZED_WORKER), Value::Bool(false));
         }
@@ -368,92 +354,69 @@ impl Connection {
         Ok(self.reply_result(id, Value::Object(result))?)
     }
 
-    fn send_difficulty(&mut self) -> io::Result<()> {
-        let d = self.vardiff.mark_sent();
-        self.with_stats(|st| st.current_diff = d);
-        self.send_line(&format!(
+    fn send_difficulty(&mut self, d: u64) -> io::Result<()> {
+        self.stats().current_diff = d;
+        self.send_line(format!(
             "{{\"id\":null,\"method\":\"mining.set_difficulty\",\"params\":[{d}]}}"
         ))
     }
 
-    fn send_current_job(&mut self) -> io::Result<()> {
-        let CurrentJob { job, generation } = self.server.current_for_send();
-        self.sent_generation = generation;
-        match job {
-            Some(job) => {
-                let kind =
-                    if job.is_empty_work { NotifyKind::EmptyWork } else { NotifyKind::JobUpdate };
-                self.notify(&job, kind)
-            }
-            None => Ok(()),
-        }
+    fn send_job(&mut self, published: &Publication) -> io::Result<()> {
+        self.sent_sequence = Some(published.sequence);
+        let prefix = NotifyPrefix::from(published.kind);
+        self.notify(&published.job, prefix, prefix == NotifyPrefix::EmptyWork)
     }
 
-    fn notify(&mut self, job: &Arc<Job>, kind: NotifyKind) -> io::Result<()> {
-        let quickdiff = kind == NotifyKind::Quickdiff;
-        let empty_work = kind == NotifyKind::EmptyWork;
+    fn notify(&mut self, job: &Arc<Job>, prefix: NotifyPrefix, clean: bool) -> io::Result<()> {
+        let quickdiff = prefix == NotifyPrefix::Quickdiff;
+        let floor = if job.is_datum_job { self.gateway.pool.min_difficulty() } else { 0 };
+        let NotifyDifficulty { announce, diff } =
+            self.vardiff.on_notify(floor, quickdiff, Instant::now());
+        if let Some(d) = announce {
+            self.send_difficulty(d)?;
+        }
         if !quickdiff {
-            let _: VardiffUpdate = self.vardiff.update(VardiffEvent::JobSent, Instant::now());
+            self.job_diffs[job.slot as usize] = Some(diff);
         }
-        if job.is_datum_job {
-            self.vardiff.hold_at_least(self.server.pool.min_difficulty());
-        }
-        if self.vardiff.change_pending() {
-            self.send_difficulty()?;
-        }
-        let diff = self.vardiff.job_sent(quickdiff);
-        if !quickdiff {
-            self.job_diffs[job.global_index as usize] = Some(diff);
-        }
-        let r = NotifyId {
-            global_index: job.global_index,
-            prefix: match kind {
-                NotifyKind::Quickdiff => NotifyPrefix::Quickdiff,
-                NotifyKind::EmptyWork => NotifyPrefix::EmptyWork,
-                NotifyKind::FirstJob | NotifyKind::JobUpdate => NotifyPrefix::Plain,
-            },
-            coinbase_id: if empty_work { COINBASE_ID_SUBSIDY_ONLY } else { COINBASE_ID_POOLED },
-        };
         let target_byte = target::floor_log2(diff.max(1));
-        let Some(commitment) = job.commitment(r.coinbase_id, target_byte) else {
+        let Some(commitment) = job.commitment(prefix.coinbase(), target_byte) else {
             return Err(io::Error::other("job has no coinbase for the selection"));
         };
-        let clean_flag = kind != NotifyKind::JobUpdate;
         let coinb1 = format!(
             "{}{}",
             "00".repeat(ratum::header::COINB1_LEADING_ZEROS),
             hex::encode(commitment.h2)
         );
         let line = format!(
-            "{{\"id\":null,\"method\":\"mining.notify\",\"params\":[\"{}\",\"{}\",\"{coinb1}\",\"\",[],\"\",\"{:08x}\",\"{}\",{clean_flag}]}}",
-            r.encode(job),
+            "{{\"id\":null,\"method\":\"mining.notify\",\"params\":[\"{}\",\"{}\",\"{coinb1}\",\"\",[],\"\",\"{:08x}\",\"{}\",{clean}]}}",
+            prefix.notify_id(job),
             hex::encode(job.prevblock_hidden),
             target::share_nbits(target_byte),
-            job.ntime_hex,
+            job.ntime_hex(),
         );
-        self.send_line(&line)
+        self.send_line(line)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixtures::{template, test_server};
-    use crate::job::JobKind;
-    use crate::job::builder::JobBuilder;
+    use crate::fixtures::{template, test_gateway};
+    use crate::job::CoinbaseKind;
+    use crate::job::builder::{JobInputs, build};
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
     use std::thread::JoinHandle;
 
     const DEADLINE: Duration = Duration::from_millis(250);
 
-    fn a_job(server: &Server) -> Arc<Job> {
-        let mut builder = JobBuilder::new(Arc::clone(&server.config));
-        Arc::new(builder.build(Arc::new(template()), JobKind::Full, None, None, None).unwrap())
+    fn a_job(gateway: &Gateway) -> Arc<Job> {
+        let job = build(&gateway.config, JobInputs::new(0, Arc::new(template())));
+        Arc::new(job.unwrap())
     }
 
     struct Client {
-        server: Arc<Server>,
+        gateway: Arc<Gateway>,
         lines: BufReader<TcpStream>,
         writer: TcpStream,
         thread: Option<JoinHandle<Result<(), Disconnect>>>,
@@ -465,11 +428,11 @@ mod tests {
             let writer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
             let (served, _) = listener.accept().unwrap();
             writer.set_read_timeout(Some(DEADLINE)).unwrap();
-            let server = test_server();
-            let s = Arc::clone(&server);
-            let thread = std::thread::spawn(move || Connection::run(s, served));
+            let gateway = test_gateway(|_| {});
+            let g = Arc::clone(&gateway);
+            let thread = std::thread::spawn(move || Connection::run(g, served));
             let lines = BufReader::new(writer.try_clone().unwrap());
-            Client { server, lines, writer, thread: Some(thread) }
+            Client { gateway, lines, writer, thread: Some(thread) }
         }
 
         fn send(&mut self, line: &str) {
@@ -491,7 +454,7 @@ mod tests {
         }
 
         fn unique_id(&self) -> u64 {
-            self.server.client_stats().first().expect("one client").unique_id
+            self.gateway.stratum.client_stats().first().expect("one client").0
         }
 
         fn ended(&mut self, what: &str) -> Disconnect {
@@ -507,7 +470,7 @@ mod tests {
 
     impl Drop for Client {
         fn drop(&mut self) {
-            self.server.shutdown_all();
+            self.gateway.stratum.shutdown_all();
             if let Some(t) = self.thread.take() {
                 let _ = t.join();
             }
@@ -518,24 +481,53 @@ mod tests {
     fn a_publication_reaches_a_subscriber_at_once() {
         let mut c = Client::connect();
         c.subscribe();
-        let job = a_job(&c.server);
+        let job = a_job(&c.gateway);
         let published = Instant::now();
-        c.server.publish(Arc::clone(&job));
+        c.gateway.publish(Arc::clone(&job), CoinbaseKind::Pooled);
         let notify = c.line("mining.notify");
         assert!(published.elapsed() < DEADLINE, "the job waited for a timed check");
         assert_eq!(notify["method"], "mining.notify");
         let params = notify["params"].as_array().unwrap();
         assert_eq!(
             params[0].as_str().unwrap(),
-            format!("{}{COINBASE_ID_POOLED:02x}", job.stratum_job_id),
+            format!("{}{:02x}", job.stratum_job_id, CoinbaseKind::Pooled.wire_id()),
             "the notify names the published job and its pooled coinbase"
+        );
+    }
+
+    /// A new tip serves empty work and then the work its coinbase pays. Both are one job,
+    /// built once: the hardware never receives the coinbase, so only the notify's prefix and
+    /// coinbase id separate them.
+    #[test]
+    fn a_new_tips_empty_work_and_pooled_work_are_one_job_notified_twice() {
+        let mut c = Client::connect();
+        c.subscribe();
+        let job = a_job(&c.gateway);
+        let notify_id = |c: &mut Client| {
+            c.line("mining.notify")["params"][0].as_str().expect("a job id").to_string()
+        };
+
+        c.gateway.publish(Arc::clone(&job), CoinbaseKind::SubsidyOnly);
+        let empty_work = notify_id(&mut c);
+        c.gateway.publish(Arc::clone(&job), CoinbaseKind::Pooled);
+        let pooled = notify_id(&mut c);
+
+        assert_eq!(
+            empty_work,
+            format!("N{}{:02x}", job.stratum_job_id, CoinbaseKind::SubsidyOnly.wire_id())
+        );
+        assert_eq!(pooled, format!("{}{:02x}", job.stratum_job_id, CoinbaseKind::Pooled.wire_id()));
+        assert_eq!(
+            c.gateway.jobs.at(job.slot).map(|held| held.serial),
+            Some(job.serial),
+            "both publications are the one job, in the one slot"
         );
     }
 
     #[test]
     fn a_publication_sends_nothing_before_a_subscription() {
         let mut c = Client::connect();
-        c.server.publish(a_job(&c.server));
+        c.gateway.publish(a_job(&c.gateway), CoinbaseKind::Pooled);
         c.subscribe();
         assert_eq!(c.line("mining.notify")["method"], "mining.notify");
     }
@@ -545,16 +537,19 @@ mod tests {
         let mut c = Client::connect();
         c.subscribe();
         let id = c.unique_id();
-        assert!(c.server.kill_client(id));
+        assert!(c.gateway.stratum.kill_client(id));
         assert!(matches!(c.ended("the kill request"), Disconnect::Killed));
-        assert!(!c.server.kill_client(id), "the connection removed itself from the client list");
+        assert!(
+            !c.gateway.stratum.kill_client(id),
+            "the connection removed itself from the client list"
+        );
     }
 
     #[test]
     fn shutdown_all_ends_the_connection_at_once() {
         let mut c = Client::connect();
         c.subscribe();
-        c.server.shutdown_all();
+        c.gateway.stratum.shutdown_all();
         assert!(matches!(c.ended("the shutdown"), Disconnect::Killed));
     }
 

@@ -1,8 +1,17 @@
-use super::{STRUCT_END, client_subcmd::VALIDATION};
+//! The job validation exchange (0x50). The pool asks a gateway for the short transaction list of a
+//! job, for named transactions from it, for all of them, which is how a block is assembled, or for
+//! the parent block; the gateway answers from the template the job was built on. The short ids are
+//! SipHash-2-4 under a key both sides derive from their signing keys.
+
+use super::{Error, STRUCT_END, open_message, read_terminator};
 use crate::datum::codes::wire_codes;
-use crate::reader::{ByteReader, Truncated};
+use crate::reader::ByteReader;
 use crate::siphash::siphash24;
 use bytes::BufMut as _;
+
+/// The validation message's subcommand: the pool's request and the gateway's response carry
+/// the same byte, which `request` and `response` below then select within.
+pub const SUBCMD: u8 = 0x50;
 
 pub mod request {
     pub const SHORT_TXN_LIST: u8 = 0x10;
@@ -48,33 +57,13 @@ impl std::fmt::Display for TxnListStatus {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, thiserror::Error)]
-pub enum Error {
-    #[error("truncated validation message: {0}")]
-    Truncated(&'static str),
-    #[error("expected response {want:#04x}, got {got:#04x}")]
-    WrongMessage { want: u8, got: u8 },
-    #[error("transaction size exceeds the message")]
-    BadTxnSize,
-    #[error("missing 0xFE terminator")]
-    MissingTerminator,
-    #[error("message states {stated} transactions but holds {found}")]
-    TxnCountMismatch { stated: usize, found: usize },
-}
-
-impl From<Truncated> for Error {
-    fn from(t: Truncated) -> Self {
-        Self::Truncated(t.0)
-    }
-}
-
 pub const SELECTOR_AT: usize = 1;
 pub const JOB_INDEX_AT: usize = 2;
 pub const REQUEST_HEADER_LEN: usize = JOB_INDEX_AT + 1;
 pub const PARENT_FETCH_REQUEST_LEN: usize = REQUEST_HEADER_LEN + crate::bitcoin::HASH_SIZE;
 
 pub fn request_block_txns(job_index: u8) -> Vec<u8> {
-    vec![VALIDATION, request::BLOCK_TXNS, job_index]
+    vec![SUBCMD, request::BLOCK_TXNS, job_index]
 }
 
 wire_codes! {
@@ -97,7 +86,7 @@ pub struct ParentFetchReply {
     pub block: Vec<u8>,
 }
 
-pub const PARENT_FETCH_REPLY_OVERHEAD: usize =
+pub(crate) const PARENT_FETCH_REPLY_OVERHEAD: usize =
     (REQUEST_HEADER_LEN + 1) + crate::bitcoin::HASH_SIZE + size_of::<u32>() + 1;
 
 pub const MAX_PARENT_FETCH_BLOCK_LEN: usize = crate::datum::channel::MAX_PLAINTEXT_LEN
@@ -107,7 +96,7 @@ pub const MAX_PARENT_FETCH_BLOCK_LEN: usize = crate::datum::channel::MAX_PLAINTE
 impl ParentFetchReply {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(PARENT_FETCH_REPLY_OVERHEAD + self.block.len());
-        out.put_u8(VALIDATION);
+        out.put_u8(SUBCMD);
         out.put_u8(response::PARENT_FETCH);
         out.put_u8(self.job_index);
         out.put_u8(self.status.code());
@@ -123,32 +112,30 @@ impl ParentFetchReply {
 pub struct ShortTxnList {
     pub job_index: u8,
     pub status: TxnListStatus,
-    pub txn_count: u16,
     pub short_ids: Vec<u64>,
     pub crosscheck: Option<[u8; 32]>,
 }
 
-pub const SHORT_ID_SIZE: usize = size_of::<u32>() + size_of::<u16>();
+pub(crate) const SHORT_ID_SIZE: usize = size_of::<u32>() + size_of::<u16>();
 const SHORT_ID_MASK: u64 = (1u64 << (8 * SHORT_ID_SIZE)) - 1;
 
-pub const CROSSCHECK_SEED: [u8; 32] = [
+pub(crate) const CROSSCHECK_SEED: [u8; 32] = [
     0xA3, 0x4F, 0xC1, 0x9C, 0x5E, 0x88, 0x76, 0x12, 0x0A, 0x79, 0x3E, 0xF1, 0x6C, 0x93, 0x54, 0xAF,
     0xB8, 0x1D, 0xE8, 0x5A, 0x20, 0xC7, 0x94, 0x38, 0x6F, 0xA1, 0x02, 0xD9, 0x4A, 0x7B, 0xF0, 0x11,
 ];
 
 impl ShortTxnList {
     pub fn empty(job_index: u8, status: TxnListStatus) -> Self {
-        Self { job_index, status, txn_count: 0, short_ids: Vec::new(), crosscheck: None }
+        Self { job_index, status, short_ids: Vec::new(), crosscheck: None }
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut out =
-            vec![VALIDATION, response::SHORT_TXN_LIST, self.job_index, self.status.code()];
+        let mut out = vec![SUBCMD, response::SHORT_TXN_LIST, self.job_index, self.status.code()];
         if self.status != TxnListStatus::Ok {
             return out;
         }
-        out.put_u16_le(self.txn_count);
-        if self.txn_count == 0 {
+        out.put_u16_le(self.short_ids.len() as u16);
+        if self.short_ids.is_empty() {
             return out;
         }
         for id in &self.short_ids {
@@ -187,20 +174,14 @@ impl TxnList {
         let mut txns = Vec::with_capacity(stated.min(1024));
         for _ in 0..stated {
             let len = decode_txn_size(&mut c)?;
-            let tx = c.take(len, "txn").map_err(|_| Error::BadTxnSize)?;
-            txns.push(tx.to_vec());
+            txns.push(c.take(len, "txn")?.to_vec());
         }
-        if txns.len() != stated {
-            return Err(Error::TxnCountMismatch { stated, found: txns.len() });
-        }
-        if c.u8("terminator")? != STRUCT_END {
-            return Err(Error::MissingTerminator);
-        }
+        read_terminator(&mut c)?;
         Ok(Self { selector, job_index, status, txns })
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = vec![VALIDATION, self.selector, self.job_index, self.status.code()];
+        let mut out = vec![SUBCMD, self.selector, self.job_index, self.status.code()];
         if self.status != TxnListStatus::Ok {
             return out;
         }
@@ -227,8 +208,7 @@ fn encode_txn_size(out: &mut Vec<u8>, len: usize) {
 }
 
 fn body_of(data: &[u8], want: u8) -> Result<ByteReader<'_>, Error> {
-    let mut c = ByteReader::new(data);
-    c.skip_if(VALIDATION);
+    let mut c = open_message(data, SUBCMD)?;
     let got = c.u8("response selector")?;
     if got != want {
         return Err(Error::WrongMessage { want, got });
@@ -310,7 +290,6 @@ mod tests {
         ShortTxnList {
             job_index: 4,
             status: TxnListStatus::Ok,
-            txn_count: 3,
             short_ids: hashes.iter().map(|h| short_id(h, &KEY)).collect(),
             crosscheck: Some(crosscheck(&hashes)),
         }
@@ -336,7 +315,6 @@ mod tests {
         let empty = ShortTxnList {
             job_index: 1,
             status: TxnListStatus::Ok,
-            txn_count: 0,
             short_ids: vec![],
             crosscheck: None,
         };
@@ -351,7 +329,6 @@ mod tests {
             let e = ShortTxnList {
                 job_index: JOB_INDEX_INVALID,
                 status,
-                txn_count: 0,
                 short_ids: vec![],
                 crosscheck: None,
             };
@@ -418,7 +395,10 @@ mod tests {
         oversize[6] = 0xff;
         oversize[7] = 0xff;
         oversize[8] = 0xff;
-        assert_eq!(TxnList::decode(&oversize, response::BLOCK_TXNS), Err(Error::BadTxnSize));
+        assert!(matches!(
+            TxnList::decode(&oversize, response::BLOCK_TXNS),
+            Err(Error::Truncated(_))
+        ));
         let mut miscount = bytes.clone();
         miscount[4] = 9;
         assert!(TxnList::decode(&miscount, response::BLOCK_TXNS).is_err());

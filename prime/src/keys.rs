@@ -1,3 +1,5 @@
+//! The pool's long-term key pair, generated on first start into a file only its owner can read.
+
 use log::info;
 use ratum::datum::keys::{KEY_PAIRS_LEN, KeyPairs};
 use std::io;

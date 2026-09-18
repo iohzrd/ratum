@@ -1,3 +1,6 @@
+//! The header hash stages against tests/data/block_header_v2.json, whose vectors name a header and
+//! every intermediate hash it produces, so a change to any stage is caught.
+
 use ratum::bitcoin::{hash_from_display_hex, hash_to_display_hex};
 use ratum::header::*;
 use serde_json::Value;
@@ -146,6 +149,34 @@ fn profile0_is_sia_header() {
     sia.extend_from_slice(&h.nonce3.to_le_bytes());
     sia.extend_from_slice(&stages.work_root);
     assert_eq!(sia, h.asic_input_with(&stages.work_root, &stages.h2));
+}
+
+/// `asic_input_body` is the profile 0 input, and profiles 2 and 3 carry the same body after
+/// their leading zeros. The test miner builds its work with it from the stratum fields rather
+/// than from a header, so this is what keeps the two in step.
+#[test]
+fn every_profile_but_1_is_the_same_body() {
+    for v in load().iter().filter(|v| v.asic_profile != 1) {
+        let h = &v.header;
+        let stages = h.hash_stages();
+        let head = if v.asic_profile == 0 { prevblock_hidden(&h.prev_block) } else { stages.h2 };
+        let body = asic_input_body(
+            &head,
+            &sia_words(h.nonce, h.nonce2),
+            &sia_words(h.time_offset, h.nonce3),
+            &stages.work_root,
+        );
+        let input = h.asic_input_with(&stages.work_root, &stages.h2);
+        let leading_zeros = input.len() - ASIC_INPUT_BODY_LEN;
+        assert!(input[..leading_zeros].iter().all(|&b| b == 0), "{}", v.name);
+        assert_eq!(&input[leading_zeros..], &body[..], "{}", v.name);
+        assert_eq!(
+            &body[ASIC_INPUT_NONCE_AT..ASIC_INPUT_NONCE_AT + size_of::<u32>()],
+            &h.nonce.to_le_bytes(),
+            "{}: the nonce a miner splices",
+            v.name
+        );
+    }
 }
 
 #[test]

@@ -1,3 +1,7 @@
+//! A nonce search across every core: each thread walks the nonce space at a stride and returns when
+//! one of them finds a hash meeting the target or the caller asks them to stop. Used by the test
+//! miner.
+
 use crate::target::{self, Target};
 use std::sync::atomic::{AtomicU64, Ordering};
 

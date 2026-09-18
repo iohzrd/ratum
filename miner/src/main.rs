@@ -1,18 +1,18 @@
-use ratum::datum::messages::share::{self, HEADER_EXTRANONCE_SIZE, SIA_FIELD_SIZE};
-use ratum::header::blake2b_256;
+//! `sia-test-miner`: a stratum client that mines a gateway's work on the CPU. It subscribes, builds
+//! the ASIC input from each mining.notify, searches for a nonce meeting the announced difficulty,
+//! and submits it. It exercises a gateway without hardware.
+
+use ratum::datum::messages::share::HEADER_EXTRANONCE_SIZE;
+use ratum::header::{
+    self, ASIC_INPUT_BODY_LEN, ASIC_INPUT_NONCE_AT, SIA_WORDS_LEN, blake2b_256, sia_words,
+};
 use ratum::target;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
-const WORK_HEADER_LEN: usize = ratum::header::ASIC_INPUT_LEN[0];
-const HEADER_PREVBLOCK_HIDDEN_AT: usize = 0;
-const HEADER_NONCE_AT: usize = 32;
-const HEADER_NTIME_AT: usize = HEADER_NONCE_AT + SIA_FIELD_SIZE;
-const HEADER_ROOT_AT: usize = HEADER_NTIME_AT + SIA_FIELD_SIZE;
 const SUBMIT_ID_BASE: u64 = 100;
-const WORK_ROOT_LEAF_PREFIX: u8 = 0x00;
 
 #[derive(Clone)]
 struct Job {
@@ -20,7 +20,7 @@ struct Job {
     prevblock_hidden: [u8; 32],
     coinb1: Vec<u8>,
     coinb2: Vec<u8>,
-    ntime: [u8; SIA_FIELD_SIZE],
+    ntime: [u8; SIA_WORDS_LEN],
     ntime_hex: String,
 }
 
@@ -40,15 +40,6 @@ impl MinerState {
     }
 }
 
-fn leaf(coinb1: &[u8], extranonce: &[u8], coinb2: &[u8]) -> [u8; 32] {
-    let mut buf = Vec::with_capacity(1 + coinb1.len() + extranonce.len() + coinb2.len());
-    buf.push(WORK_ROOT_LEAF_PREFIX);
-    buf.extend_from_slice(coinb1);
-    buf.extend_from_slice(extranonce);
-    buf.extend_from_slice(coinb2);
-    blake2b_256(&buf)
-}
-
 enum Outcome {
     Found(u32),
     Exhausted,
@@ -56,13 +47,13 @@ enum Outcome {
 }
 
 fn mine(
-    header: &[u8; WORK_HEADER_LEN],
+    header: &[u8; ASIC_INPUT_BODY_LEN],
     target: &target::Target,
     generation: &AtomicU64,
     job_generation: u64,
 ) -> Outcome {
     let superseded = || generation.load(Ordering::Relaxed) != job_generation;
-    match ratum::nonce::search(header, HEADER_NONCE_AT, blake2b_256, target, superseded) {
+    match ratum::nonce::search(header, ASIC_INPUT_NONCE_AT, blake2b_256, target, superseded) {
         Some(nonce) => Outcome::Found(nonce),
         None if generation.load(Ordering::SeqCst) != job_generation => Outcome::Superseded,
         None => Outcome::Exhausted,
@@ -123,7 +114,7 @@ fn read_messages(
                 let ntime_hex = p[7].as_str().unwrap_or_default().to_string();
                 let ntime_raw = hex::decode(&ntime_hex).unwrap_or_default();
                 let (Ok(prevblock_hidden), Ok(ntime)) =
-                    (<[u8; 32]>::try_from(prev), <[u8; SIA_FIELD_SIZE]>::try_from(ntime_raw))
+                    (<[u8; 32]>::try_from(prev), <[u8; SIA_WORDS_LEN]>::try_from(ntime_raw))
                 else {
                     println!(
                         "!! notify has a {}-char ntime or a bad prevblock_hidden",
@@ -220,12 +211,24 @@ fn main() -> std::io::Result<()> {
         let extranonce2 = vec![0x42u8; extranonce2_size];
         let mut extranonce = extranonce1;
         extranonce.extend_from_slice(&extranonce2);
-        let work_root = leaf(&job.coinb1, &extranonce, &job.coinb2);
+        let Some(work_root) = header::work_root_from_stratum(&job.coinb1, &extranonce, &job.coinb2)
+        else {
+            println!(
+                "!! coinb1 ({}B), the extranonce ({}B) and coinb2 ({}B) do not total a work \
+                 root leaf; skipping this job",
+                job.coinb1.len(),
+                extranonce.len(),
+                job.coinb2.len()
+            );
+            continue;
+        };
 
-        let mut header = [0u8; WORK_HEADER_LEN];
-        header[HEADER_PREVBLOCK_HIDDEN_AT..HEADER_NONCE_AT].copy_from_slice(&job.prevblock_hidden);
-        header[HEADER_NTIME_AT..HEADER_ROOT_AT].copy_from_slice(&job.ntime);
-        header[HEADER_ROOT_AT..].copy_from_slice(&work_root);
+        let header = header::asic_input_body(
+            &job.prevblock_hidden,
+            &sia_words(0, 0),
+            &job.ntime,
+            &work_root,
+        );
 
         let t = target::target_for_difficulty(difficulty);
         println!("mining job {} at difficulty {difficulty}...", job.job_id);
@@ -237,7 +240,7 @@ fn main() -> std::io::Result<()> {
                     "found nonce {nonce:#010x} in {secs:.1}s ({:.0} MH/s)",
                     (f64::from(nonce) / secs) / 1e6
                 );
-                let nonce_field = share::sia_field(nonce, 0);
+                let nonce_field = sia_words(nonce, 0);
                 submitted += 1;
                 writeln!(
                     w,

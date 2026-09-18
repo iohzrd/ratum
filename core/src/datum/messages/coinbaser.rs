@@ -1,11 +1,14 @@
+//! The coinbaser exchange: the gateway asks what a coinbase of a given value on a given tip should
+//! pay, and the pool answers with the outputs to write into it.
+
 use super::STRUCT_END;
-use super::{Error, client_subcmd, server_subcmd};
+use super::{Error, client_subcmd, open_message, read_terminator, server_subcmd};
 use crate::bitcoin::transaction::TxOut;
 use crate::reader::ByteReader;
 use bytes::BufMut as _;
 
 pub const MAX_COINBASER_BLOB_LEN: usize = 32767;
-pub const MIN_COINBASER_OUTPUT_SCRIPT_LEN: usize = 2;
+pub(crate) const MIN_COINBASER_OUTPUT_SCRIPT_LEN: usize = 2;
 pub const MAX_COINBASER_OUTPUT_SCRIPT_LEN: usize = 64;
 pub const MAX_COINBASER_OUTPUTS: usize = 512;
 const COINBASER_OUTPUT_FIXED_LEN: usize = size_of::<u64>() + 1;
@@ -19,15 +22,12 @@ pub struct CoinbaserRequest {
 }
 
 impl CoinbaserRequest {
-    pub fn decode(data: &[u8]) -> Option<Self> {
-        let mut c = ByteReader::new(data);
-        c.skip_if(client_subcmd::COINBASER_REQUEST);
-        let value = c.u64("value").ok()?;
-        let prev_hash: [u8; 32] = c.arr("prev hash").ok()?;
-        if c.u8("terminator").ok()? != STRUCT_END {
-            return None;
-        }
-        Some(Self { value, prev_hash })
+    pub fn decode(data: &[u8]) -> Result<Self, Error> {
+        let mut c = open_message(data, client_subcmd::COINBASER_REQUEST)?;
+        let value = c.u64("value")?;
+        let prev_hash: [u8; 32] = c.arr("prev hash")?;
+        read_terminator(&mut c)?;
+        Ok(Self { value, prev_hash })
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -48,19 +48,6 @@ pub struct CoinbaserResponse {
 }
 
 impl CoinbaserResponse {
-    pub fn retain_payable(&mut self) -> usize {
-        let before = self.outputs.len();
-        self.outputs.retain(|o| {
-            o.value > 0
-                && (MIN_COINBASER_OUTPUT_SCRIPT_LEN..=MAX_COINBASER_OUTPUT_SCRIPT_LEN)
-                    .contains(&o.script_pubkey.len())
-        });
-        if self.outputs.len() > MAX_COINBASER_OUTPUTS {
-            self.outputs.truncate(MAX_COINBASER_OUTPUTS);
-        }
-        before - self.outputs.len()
-    }
-
     pub fn encode(&self) -> Result<Vec<u8>, Error> {
         if self.outputs.len() > MAX_COINBASER_OUTPUTS {
             return Err(Error::TooLong { field: "coinbaser outputs", len: self.outputs.len() });
@@ -99,36 +86,35 @@ impl CoinbaserResponse {
         Ok(out)
     }
 
-    pub fn decode(data: &[u8]) -> Option<Self> {
-        let mut c = ByteReader::new(data);
-        c.skip_if(server_subcmd::COINBASER);
-        let value = c.u64("value").ok()?;
-        let blob_len = c.u32("blob length").ok()? as usize;
+    pub fn decode(data: &[u8]) -> Result<Self, Error> {
+        let mut c = open_message(data, server_subcmd::COINBASER)?;
+        let value = c.u64("value")?;
+        let blob_len = c.u32("blob length")? as usize;
         if !(1..=MAX_COINBASER_BLOB_LEN).contains(&blob_len) {
-            return None;
+            return Err(Error::OutOfRange { field: "coinbaser blob", len: blob_len });
         }
-        let mut b = ByteReader::new(c.take(blob_len, "blob").ok()?);
-        let coinbaser_id = b.u8("coinbaser id").ok()?;
+        let mut b = ByteReader::new(c.take(blob_len, "blob")?);
+        let coinbaser_id = b.u8("coinbaser id")?;
         let mut outputs = Vec::new();
         let mut total: u64 = 0;
         while !b.at_end() {
-            let v = b.u64("output value").ok()?;
+            let v = b.u64("output value")?;
             if total.saturating_add(v) > value {
                 break;
             }
-            let slen = b.u8("script length").ok()? as usize;
+            let slen = b.u8("script length")? as usize;
             if !(MIN_COINBASER_OUTPUT_SCRIPT_LEN..=MAX_COINBASER_OUTPUT_SCRIPT_LEN).contains(&slen)
             {
-                return None;
+                return Err(Error::OutOfRange { field: "output script", len: slen });
             }
-            let script = b.take(slen, "output script").ok()?.to_vec();
+            let script = b.take(slen, "output script")?.to_vec();
             total += v;
             outputs.push(TxOut { value: v, script_pubkey: script });
             if outputs.len() >= MAX_COINBASER_OUTPUTS {
                 break;
             }
         }
-        Some(Self { value, coinbaser_id, outputs })
+        Ok(Self { value, coinbaser_id, outputs })
     }
 }
 
@@ -194,45 +180,6 @@ mod tests {
             long_script.encode(),
             Err(Error::OutOfRange { field: "output script", .. })
         ));
-    }
-
-    #[test]
-    fn retain_payable_removes_zero_value_outputs_bad_script_lengths_and_the_overflow() {
-        let mut r = CoinbaserResponse {
-            value: 1_000_000,
-            coinbaser_id: 0,
-            outputs: vec![
-                TxOut { value: 100, script_pubkey: p2wpkh(0x01) },
-                TxOut { value: 100, script_pubkey: vec![0x51] },
-                TxOut { value: 100, script_pubkey: vec![0x51; 65] },
-                TxOut { value: 0, script_pubkey: p2wpkh(0x02) },
-                TxOut { value: 100, script_pubkey: vec![0x51; 64] },
-                TxOut { value: 100, script_pubkey: vec![0x51, 0x52] },
-            ],
-        };
-        assert_eq!(r.retain_payable(), 3);
-        assert_eq!(r.outputs.len(), 3);
-        assert!(r.encode().is_ok());
-
-        let mut valid = CoinbaserResponse {
-            value: 1_000,
-            coinbaser_id: 0,
-            outputs: vec![TxOut { value: 10, script_pubkey: p2wpkh(0) }],
-        };
-        assert_eq!(valid.retain_payable(), 0);
-    }
-
-    #[test]
-    fn retain_payable_caps_the_output_count() {
-        let mut r = CoinbaserResponse {
-            value: u64::MAX,
-            coinbaser_id: 0,
-            outputs: (0..MAX_COINBASER_OUTPUTS + 10)
-                .map(|i| TxOut { value: 1, script_pubkey: p2wpkh(i as u8) })
-                .collect(),
-        };
-        assert_eq!(r.retain_payable(), 10);
-        assert_eq!(r.outputs.len(), MAX_COINBASER_OUTPUTS);
     }
 
     #[test]

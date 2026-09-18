@@ -1,5 +1,9 @@
-use ratum::datum::messages::abw::{ASSIGNMENT_SLOTS, key_matches_hash};
-use ratum::header::XorKey;
+//! The anti-block-withholding commitments this gateway holds: one key hash per slot and which slot
+//! is active. The gateway holds no key until the pool reveals it, so it hashes a header with the
+//! committed hash in place of one.
+
+use ratum::datum::messages::abw::ASSIGNMENT_SLOTS;
+use ratum::header::{XorKey, xor_key_hash};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AbwAssignment {
@@ -30,17 +34,9 @@ impl AbwAssignments {
         }
     }
 
-    pub fn activate(&mut self, slot: u8) -> bool {
-        if self.key_hashes[slot as usize].is_none() {
-            return false;
-        }
-        self.active = Some(slot);
-        true
-    }
-
     pub fn reveal(&mut self, slot: u8, xor_key: &XorKey) -> bool {
         if let Some(hash) = self.key_hashes[slot as usize]
-            && !key_matches_hash(xor_key, &hash)
+            && xor_key_hash(xor_key) != hash
         {
             return false;
         }

@@ -1,14 +1,18 @@
+//! The share window: the newest shares whose difficulty totals the window's work, and the work each
+//! identity holds in it. The window is sized to the network difficulty and is what a block's value
+//! is divided by.
+
 pub mod blocks;
+mod db;
 pub mod split;
 mod store;
 #[cfg(test)]
 mod tests;
 
-use crate::cli::fatal;
-use blocks::{ConfirmationReading, FoundBlock, OwedBlock};
+use blocks::BlockRecords;
 use log::{info, warn};
-use ratum::bitcoin::HASH_SIZE;
 use ratum::rpc;
+use split::SplitPolicy;
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -26,18 +30,6 @@ pub struct Share {
     pub tag_secondary: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct IdentityWork {
-    pub identity: String,
-    pub work: u128,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct RecentWork {
-    pub total: u128,
-    pub by_identity: HashMap<String, u128>,
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ReadBack {
     pub skipped: usize,
@@ -45,63 +37,90 @@ pub struct ReadBack {
     pub stamped: bool,
 }
 
+/// What the window holds for one identity: its work, the part of it from shares carrying
+/// a secondary tag other than the public gateway's, and the tag of its newest share. An
+/// entry exists while the identity has work in the window.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IdentityState {
+    pub work: u128,
+    pub own_gateway_work: u128,
+    pub tag_secondary: String,
+}
+
+/// The work the share window spans: `multiple` times the network difficulty, never under
+/// `floor`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WindowRule {
+    pub multiple: f64,
+    pub floor: u128,
+}
+
+impl WindowRule {
+    /// A window of `window` work at every network difficulty.
+    #[cfg(test)]
+    pub fn fixed(window: u128) -> Self {
+        Self { multiple: 0.0, floor: window }
+    }
+
+    pub fn window_for(&self, network_difficulty: f64) -> u128 {
+        let w = network_difficulty * self.multiple;
+        let scaled = if w.is_finite() && w >= 1.0 { w as u128 } else { 1 };
+        scaled.max(self.floor.max(1))
+    }
+}
+
 pub struct Ledger {
-    removed: usize,
     shares: VecDeque<Share>,
-    work_per_identity: HashMap<String, u128>,
-    own_gateway_work_per_identity: HashMap<String, u128>,
-    public_gateway_tag: Option<String>,
-    tag_secondary_per_identity: HashMap<String, String>,
+    identities: HashMap<String, IdentityState>,
+    window_rule: WindowRule,
+    split_policy: SplitPolicy,
     total_work: u128,
     window: u128,
     store: Option<Store>,
-    owed: Vec<OwedBlock>,
-    blocks: Vec<FoundBlock>,
-    confirmations: HashMap<[u8; HASH_SIZE], ConfirmationReading>,
     cumulative_work: u128,
     count_capped: bool,
 }
 
 impl Ledger {
-    pub fn new(window: u128) -> Self {
+    /// An empty file-less ledger, its window at the rule's floor. A share whose secondary tag
+    /// is not the public gateway's counts as own-gateway work; with no public gateway, no share
+    /// does.
+    pub fn new(window_rule: WindowRule, split_policy: SplitPolicy) -> Self {
         Self {
-            removed: 0,
             shares: VecDeque::new(),
-            work_per_identity: HashMap::new(),
-            own_gateway_work_per_identity: HashMap::new(),
-            public_gateway_tag: None,
-            tag_secondary_per_identity: HashMap::new(),
+            identities: HashMap::new(),
+            window: window_rule.floor.max(1),
+            window_rule,
+            split_policy,
             total_work: 0,
-            window: window.max(1),
             store: None,
-            owed: Vec::new(),
-            blocks: Vec::new(),
-            confirmations: HashMap::new(),
             cumulative_work: 0,
             count_capped: false,
         }
     }
 
-    pub fn open(
-        path: &Path,
-        window: u128,
-        keep: Option<usize>,
-        chain: Option<&str>,
-    ) -> io::Result<(Self, ReadBack)> {
-        let mut ledger = Self::new(window);
-        let store = Store::open(path, keep, chain)?;
-        let (shares, mut read_back) = store.read_back(ledger.window)?;
+    /// Reads the store's share window back into this empty ledger, which records every later
+    /// share to the store.
+    fn attach(&mut self, store: Store) -> io::Result<ReadBack> {
+        let (shares, mut read_back) = store.read_back(self.window)?;
         read_back.stamped = store.stamped;
-        ledger.fill(shares);
-        ledger.owed = store.read_owed()?;
-        ledger.blocks = store.read_blocks()?;
-        ledger.confirmations = store.read_confirmations()?.into_iter().collect();
-        ledger.cumulative_work = store.cumulative_work;
-        ledger.store = Some(store);
-        Ok((ledger, read_back))
+        self.fill(shares);
+        self.cumulative_work = store.cumulative_work;
+        self.store = Some(store);
+        Ok(read_back)
     }
 
-    pub fn set_window(&mut self, window: u128) -> usize {
+    /// Sizes the window to `network_difficulty` by the window rule and returns how many
+    /// shares widening it re-read from the store.
+    pub fn set_network_difficulty(&mut self, network_difficulty: f64) -> usize {
+        let window = self.window_rule.window_for(network_difficulty);
+        if window == self.window {
+            return 0;
+        }
+        self.set_window(window)
+    }
+
+    fn set_window(&mut self, window: u128) -> usize {
         let window = window.max(1);
         let widened = window > self.window;
         self.window = window;
@@ -134,9 +153,7 @@ impl Ledger {
 
     fn fill(&mut self, shares: Vec<Share>) {
         self.shares.clear();
-        self.work_per_identity.clear();
-        self.own_gateway_work_per_identity.clear();
-        self.tag_secondary_per_identity.clear();
+        self.identities.clear();
         self.total_work = 0;
         for share in shares {
             self.push(share);
@@ -144,30 +161,17 @@ impl Ledger {
         }
     }
 
-    pub fn set_public_gateway_tag(&mut self, tag: Option<String>) {
-        self.public_gateway_tag = tag.filter(|t| !t.is_empty());
-        let mut own: HashMap<String, u128> = HashMap::new();
-        for share in &self.shares {
-            if self.is_own_gateway_share(share) {
-                *own.entry(share.identity.clone()).or_insert(0) += u128::from(share.difficulty);
-            }
-        }
-        self.own_gateway_work_per_identity = own;
+    pub fn window_rule(&self) -> WindowRule {
+        self.window_rule
     }
 
-    pub fn public_gateway_tag(&self) -> Option<&str> {
-        self.public_gateway_tag.as_deref()
+    pub fn split_policy(&self) -> &SplitPolicy {
+        &self.split_policy
     }
 
     fn is_own_gateway_share(&self, share: &Share) -> bool {
-        self.public_gateway_tag.as_deref().is_some_and(|public| share.tag_secondary != public)
-    }
-
-    pub fn dump(&self) -> io::Result<Vec<Share>> {
-        match &self.store {
-            Some(store) => store.dump(),
-            None => Ok(Vec::new()),
-        }
+        let public = self.split_policy.public_gateway.as_ref();
+        public.is_some_and(|public| share.tag_secondary != public.tag)
     }
 
     pub fn window(&self) -> u128 {
@@ -187,79 +191,68 @@ impl Ledger {
         self.shares.is_empty()
     }
 
-    pub fn take_removed(&mut self) -> usize {
-        std::mem::replace(&mut self.removed, 0)
-    }
-
     pub fn block_hashes(&self) -> impl Iterator<Item = &[u8; 32]> {
         self.shares.iter().map(|s| &s.block_hash)
     }
 
-    pub fn record(&mut self, share: Share) -> io::Result<()> {
-        if let Some(store) = &mut self.store
-            && !store.insert(&share)?
-        {
-            return Ok(());
+    /// Records the share and returns how many stored shares `--ledger-keep` retention
+    /// removed. A duplicate is refused before it reaches the ledger (`accounting::claim`).
+    pub fn record(&mut self, share: Share) -> io::Result<usize> {
+        let cumulative_work = self.cumulative_work + u128::from(share.difficulty);
+        if let Some(store) = &mut self.store {
+            store.insert(&share, cumulative_work)?;
         }
-        self.cumulative_work += u128::from(share.difficulty);
+        self.cumulative_work = cumulative_work;
         self.push(share);
         self.trim();
-        if let Some(store) = &self.store {
-            match store.retain() {
-                Ok(removed) => self.removed = removed,
-                Err(e) => warn!("ledger retention failed; the share is recorded ({e})"),
-            }
-        }
-        Ok(())
+        let Some(store) = &self.store else { return Ok(0) };
+        Ok(store.retain().unwrap_or_else(|e| {
+            warn!("ledger retention failed; the share is recorded ({e})");
+            0
+        }))
     }
 
     pub fn cumulative_work(&self) -> u128 {
         self.cumulative_work
     }
 
-    pub fn work_since(&self, cutoff: u64) -> RecentWork {
-        let mut recent = RecentWork::default();
-        for s in self.shares.iter().rev() {
-            if s.accepted_at < cutoff {
-                break;
-            }
-            recent.total += u128::from(s.difficulty);
-            *recent.by_identity.entry(s.identity.clone()).or_insert(0) += u128::from(s.difficulty);
+    /// The shares accepted at or after `cutoff`, newest first.
+    fn shares_since(&self, cutoff: u64) -> impl Iterator<Item = &Share> {
+        self.shares.iter().rev().take_while(move |s| s.accepted_at >= cutoff)
+    }
+
+    /// The work of the shares accepted at or after `cutoff`.
+    pub fn work_since(&self, cutoff: u64) -> u128 {
+        self.shares_since(cutoff).map(|s| u128::from(s.difficulty)).sum()
+    }
+
+    /// The work of the shares accepted at or after `cutoff`, by identity. The hashrate
+    /// sampler wants the total alone, so it calls `work_since` and allocates nothing.
+    pub fn work_since_by_identity(&self, cutoff: u64) -> HashMap<String, u128> {
+        let mut by_identity: HashMap<String, u128> = HashMap::new();
+        for s in self.shares_since(cutoff) {
+            *by_identity.entry(s.identity.clone()).or_insert(0) += u128::from(s.difficulty);
         }
-        recent
+        by_identity
     }
 
-    pub fn work_by_identity(&self) -> Vec<IdentityWork> {
-        let mut v: Vec<IdentityWork> = self
-            .work_per_identity
-            .iter()
-            .map(|(identity, work)| IdentityWork { identity: identity.clone(), work: *work })
-            .collect();
-        v.sort_by(|a, b| b.work.cmp(&a.work).then_with(|| a.identity.cmp(&b.identity)));
+    /// Every identity with work in the window and its state, most work first.
+    pub fn identities(&self) -> Vec<(String, IdentityState)> {
+        let mut v: Vec<(String, IdentityState)> =
+            self.identities.iter().map(|(id, state)| (id.clone(), state.clone())).collect();
+        v.sort_by(|(a, x), (b, y)| most_work_first((a, x.work), (b, y.work)));
         v
-    }
-
-    pub fn tag_secondary_by_identity(&self) -> HashMap<String, String> {
-        self.tag_secondary_per_identity.clone()
-    }
-
-    pub fn own_gateway_work_by_identity(&self) -> HashMap<String, u128> {
-        self.own_gateway_work_per_identity.clone()
-    }
-
-    fn own_gateway_work_of(&self, identity: &str) -> u128 {
-        self.own_gateway_work_per_identity.get(identity).copied().unwrap_or(0)
     }
 
     fn push(&mut self, share: Share) {
         self.total_work += u128::from(share.difficulty);
-        *self.work_per_identity.entry(share.identity.clone()).or_insert(0) +=
-            u128::from(share.difficulty);
-        if self.is_own_gateway_share(&share) {
-            *self.own_gateway_work_per_identity.entry(share.identity.clone()).or_insert(0) +=
-                u128::from(share.difficulty);
+        let own = self.is_own_gateway_share(&share);
+        let state = self.identities.entry(share.identity.clone()).or_default();
+        state.work += u128::from(share.difficulty);
+        if own {
+            state.own_gateway_work += u128::from(share.difficulty);
         }
-        self.tag_secondary_per_identity.insert(share.identity.clone(), share.tag_secondary.clone());
+        state.tag_secondary.clone_from(&share.tag_secondary);
         self.shares.push_back(share);
     }
 
@@ -291,32 +284,22 @@ impl Ledger {
     fn drop_oldest(&mut self) {
         let Some(oldest) = self.shares.pop_front() else { return };
         self.total_work -= u128::from(oldest.difficulty);
-        if self.is_own_gateway_share(&oldest)
-            && let Some(d) = self.own_gateway_work_per_identity.get_mut(&oldest.identity)
-        {
-            *d -= u128::from(oldest.difficulty);
-            if *d == 0 {
-                self.own_gateway_work_per_identity.remove(&oldest.identity);
-            }
+        let own = self.is_own_gateway_share(&oldest);
+        let Some(state) = self.identities.get_mut(&oldest.identity) else { return };
+        state.work -= u128::from(oldest.difficulty);
+        if own {
+            state.own_gateway_work -= u128::from(oldest.difficulty);
         }
-        if let Some(d) = self.work_per_identity.get_mut(&oldest.identity) {
-            *d -= u128::from(oldest.difficulty);
-            if *d == 0 {
-                self.work_per_identity.remove(&oldest.identity);
-                self.tag_secondary_per_identity.remove(&oldest.identity);
-            }
+        if state.work == 0 {
+            self.identities.remove(&oldest.identity);
         }
     }
 }
 
-pub fn identity_of(username: &str) -> &str {
-    username.split('.').next().unwrap_or(username)
-}
-
-pub fn window_for_difficulty(network_difficulty: f64, multiple: f64, floor: u128) -> u128 {
-    let w = network_difficulty * multiple;
-    let scaled = if w.is_finite() && w >= 1.0 { w as u128 } else { 1 };
-    scaled.max(floor.max(1))
+/// Most work first; identities with equal work in name order, so a split is the same
+/// whatever order the map yields them in.
+fn most_work_first((a, a_work): (&str, u128), (b, b_work): (&str, u128)) -> std::cmp::Ordering {
+    b_work.cmp(&a_work).then_with(|| a.cmp(b))
 }
 
 pub enum LedgerLocation {
@@ -334,20 +317,23 @@ impl LedgerLocation {
         }
     }
 
-    pub fn file_for(&self, chain: Option<rpc::Chain>) -> Option<PathBuf> {
-        match (self, chain) {
+    /// The ledger file for the chain, or none for a memory-only ledger.
+    pub fn file_for(&self, chain: Option<rpc::Chain>) -> io::Result<Option<PathBuf>> {
+        Ok(match (self, chain) {
             (Self::File(p), _) => Some(p.clone()),
-            (Self::InDir(dir), Some(rpc::Chain::Other)) => fatal!(
-                "the node reports a chain this pool has no name for, so it cannot name the \
-                 ledger in {}; give --ledger a file for it",
-                dir.display()
-            ),
+            (Self::InDir(dir), Some(rpc::Chain::Other)) => {
+                return Err(invalid_input(format!(
+                    "the node reports a chain this pool has no name for, so it cannot name the \
+                     ledger in {}; give --ledger a file for it",
+                    dir.display()
+                )));
+            }
             (Self::InDir(dir), Some(c)) => Some(dir.join(format!("{}.redb", c.name()))),
             (Self::InDir(_), None) => {
                 unreachable!("a data directory waits for the chain")
             }
             (Self::MemoryOnly, _) => None,
-        }
+        })
     }
 
     pub fn existing_file(&self, flag: &str) -> io::Result<PathBuf> {
@@ -355,19 +341,29 @@ impl LedgerLocation {
             Self::File(p) => p.clone(),
             Self::InDir(dir) => match ledger_files_in(dir)?.as_slice() {
                 [one] => one.clone(),
-                [] => fatal!("no ledger (*.redb) in {}", dir.display()),
+                [] => {
+                    return Err(invalid_input(format!("no ledger (*.redb) in {}", dir.display())));
+                }
                 many => {
                     let names: Vec<String> = many.iter().map(|p| p.display().to_string()).collect();
-                    fatal!(
+                    return Err(invalid_input(format!(
                         "{} holds more than one ledger; give --ledger to choose one of: {}",
                         dir.display(),
                         names.join(", ")
-                    )
+                    )));
                 }
             },
-            Self::MemoryOnly => fatal!("{flag} needs a ledger: give --ledger or --data-dir"),
+            Self::MemoryOnly => {
+                return Err(invalid_input(format!(
+                    "{flag} needs a ledger: give --ledger or --data-dir"
+                )));
+            }
         })
     }
+}
+
+fn invalid_input(message: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
 fn ledger_files_in(dir: &Path) -> io::Result<Vec<PathBuf>> {
@@ -379,17 +375,30 @@ fn ledger_files_in(dir: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(found)
 }
 
+/// Every share the existing ledger file stores, oldest first, read in one read transaction
+/// without reading back the share window or opening the block records.
+pub fn dump_file(path: &Path) -> io::Result<Vec<Share>> {
+    store::dump_file(path)
+}
+
+/// `ledger` with the store at `path` attached, and the block records stored beside it; with
+/// no path, `ledger` stays file-less.
 pub fn open_share_ledger(
     path: Option<&Path>,
-    startup_window: u128,
     keep: Option<usize>,
     chain_name: Option<&str>,
-) -> io::Result<Ledger> {
+    mut ledger: Ledger,
+) -> io::Result<(Ledger, BlockRecords)> {
     let Some(path) = path else {
-        warn!("no --ledger file or --data-dir; the share window is lost on restart");
-        return Ok(Ledger::new(startup_window));
+        warn!(
+            "no --ledger file or --data-dir; the share window and the block records are lost on \
+             restart"
+        );
+        return Ok((ledger, BlockRecords::default()));
     };
-    let (ledger, read_back) = Ledger::open(path, startup_window, keep, chain_name)?;
+    let store = Store::open(path, keep, chain_name)?;
+    let records = BlockRecords::open(store.database())?;
+    let read_back = ledger.attach(store)?;
     if read_back.stamped {
         info!(
             "{} carried no chain stamp and is now stamped {}",
@@ -421,5 +430,5 @@ pub fn open_share_ledger(
         ),
         None => info!("every share in {} is kept", path.display()),
     }
-    Ok(ledger)
+    Ok((ledger, records))
 }

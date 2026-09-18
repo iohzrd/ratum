@@ -1,7 +1,9 @@
+//! The block template the node serves, decoded into what a job is built from, with the rules that
+//! decide whether work is served for it at all.
+
 pub mod poller;
 pub mod waker;
 
-use log::error;
 use ratum::datum::messages::validation::MAX_SHORT_LIST_TXNS;
 
 const HASH_HEX_CHARS: std::ops::RangeInclusive<usize> = 64..=64;
@@ -34,7 +36,6 @@ pub struct Template {
     pub sigoplimit: u64,
     pub version: u32,
     pub nbits: u32,
-    pub prev_hash_hex: String,
     pub prev_hash: [u8; 32],
     pub witness_commitment: Vec<u8>,
     pub blake2b_rule: bool,
@@ -51,8 +52,8 @@ impl Template {
 
 #[derive(Debug, thiserror::Error)]
 pub enum TemplateError {
-    #[error("Missing data from GBT JSON ({0})")]
-    Missing(&'static str),
+    #[error("missing or malformed {0} in the GBT JSON")]
+    Field(&'static str),
     #[error("{0}")]
     Refused(String),
     #[error(
@@ -65,7 +66,7 @@ pub enum TemplateError {
 fn u64_field(v: &serde_json::Value, key: &'static str) -> Result<u64, TemplateError> {
     match v[key].as_u64() {
         Some(n) if n != 0 => Ok(n),
-        _ => Err(TemplateError::Missing(key)),
+        _ => Err(TemplateError::Field(key)),
     }
 }
 
@@ -76,55 +77,38 @@ fn str_field<'a>(
 ) -> Result<&'a str, TemplateError> {
     match v[key].as_str() {
         Some(s) if len.contains(&s.len()) => Ok(s),
-        _ => Err(TemplateError::Missing(key)),
+        _ => Err(TemplateError::Field(key)),
     }
 }
 
 fn hash_field(v: &serde_json::Value, key: &'static str) -> Result<[u8; 32], TemplateError> {
     ratum::bitcoin::hash_from_display_hex(str_field(v, key, HASH_HEX_CHARS)?)
-        .ok_or(TemplateError::Missing(key))
+        .ok_or(TemplateError::Field(key))
 }
 
 fn rule_present(v: &serde_json::Value, rule: &str) -> bool {
     v["rules"].as_array().is_some_and(|a| a.iter().any(|r| r.as_str() == Some(rule)))
 }
 
-#[derive(Default)]
-pub struct ReportedTemplateRefusal {
-    payout_script_height: Option<u32>,
-}
-
-pub fn parse(
-    v: &serde_json::Value,
-    payout_script: &[u8],
-    refusal: &mut ReportedTemplateRefusal,
-) -> Result<Template, TemplateError> {
-    let reduced_data = check_rules(v, payout_script, refusal)?;
-    decode(v, reduced_data)
-}
-
-fn check_rules(
-    v: &serde_json::Value,
-    payout_script: &[u8],
-    refusal: &mut ReportedTemplateRefusal,
-) -> Result<bool, TemplateError> {
-    let height = u64_field(v, "height")? as u32;
-    let reduced_data = rule_present(v, "reduced_data");
-    if reduced_data && !ratum::bitcoin::script::output_script_size_is_valid(payout_script) {
-        if refusal.payout_script_height != Some(height) {
-            refusal.payout_script_height = Some(height);
-            error!(
-                "Pool payout output script is {} bytes, but the node enforces the reduced_data rule for block {height}, which limits a non-OP_RETURN coinbase output script to {} bytes. Serving no work for this block.",
-                payout_script.len(),
-                ratum::bitcoin::script::MAX_OUTPUT_SCRIPT_SIZE
-            );
-        }
-        return Err(TemplateError::Refused("payout script over the reduced_data limit".into()));
+/// The template `v` carries, refused when the node enforces the `reduced_data` rule and the
+/// pool's payout output script is longer than that rule admits: a coinbase paying it would be
+/// rejected, so no work is served for the block.
+pub fn parse(v: &serde_json::Value, payout_script: &[u8]) -> Result<Template, TemplateError> {
+    let t = decode(v)?;
+    if t.reduced_data && !ratum::bitcoin::script::output_script_size_is_valid(payout_script) {
+        return Err(TemplateError::Refused(format!(
+            "the pool payout output script is {} bytes, but the node enforces the reduced_data \
+             rule for block {}, which limits a non-OP_RETURN coinbase output script to {} \
+             bytes; serving no work for this block",
+            payout_script.len(),
+            t.height,
+            ratum::bitcoin::script::MAX_OUTPUT_SCRIPT_SIZE
+        )));
     }
-    Ok(reduced_data)
+    Ok(t)
 }
 
-fn decode(v: &serde_json::Value, reduced_data: bool) -> Result<Template, TemplateError> {
+fn decode(v: &serde_json::Value) -> Result<Template, TemplateError> {
     let height = u64_field(v, "height")? as u32;
     let coinbase_value = u64_field(v, "coinbasevalue")?;
     let mintime = u64_field(v, "mintime")?;
@@ -134,15 +118,15 @@ fn decode(v: &serde_json::Value, reduced_data: bool) -> Result<Template, Templat
     let weightlimit = u64_field(v, "weightlimit")?;
     let version = u64_field(v, "version")? as u32;
     let bits = str_field(v, "bits", BITS_HEX_CHARS)?;
-    let prev_hash_hex = str_field(v, "previousblockhash", HASH_HEX_CHARS)?.to_string();
     let wc_hex = str_field(v, "default_witness_commitment", WITNESS_COMMITMENT_HEX_CHARS)?;
     let witness_commitment =
-        hex::decode(wc_hex).map_err(|_| TemplateError::Missing("default_witness_commitment"))?;
-    let nbits = u32::from_str_radix(bits, 16).map_err(|_| TemplateError::Missing("bits"))?;
+        hex::decode(wc_hex).map_err(|_| TemplateError::Field("default_witness_commitment"))?;
+    let nbits = u32::from_str_radix(bits, 16).map_err(|_| TemplateError::Field("bits"))?;
     let prev_hash = hash_field(v, "previousblockhash")?;
     let blake2b_rule = rule_present(v, "!blake2b");
+    let reduced_data = rule_present(v, "reduced_data");
 
-    let list = v["transactions"].as_array().ok_or(TemplateError::Missing("transactions"))?;
+    let list = v["transactions"].as_array().ok_or(TemplateError::Field("transactions"))?;
     if list.len() > usize::from(MAX_SHORT_LIST_TXNS) {
         return Err(TemplateError::TooManyTxns);
     }
@@ -161,8 +145,8 @@ fn decode(v: &serde_json::Value, reduced_data: bool) -> Result<Template, Templat
         }
         sigops += t["sigops"].as_u64().unwrap_or(0);
         weight += t["weight"].as_u64().unwrap_or(0);
-        let raw = hex::decode(t["data"].as_str().ok_or(TemplateError::Missing("data"))?)
-            .map_err(|_| TemplateError::Missing("data"))?;
+        let raw = hex::decode(t["data"].as_str().ok_or(TemplateError::Field("data"))?)
+            .map_err(|_| TemplateError::Field("data"))?;
         size += raw.len() as u64;
         txns.push(Txn { raw, txid, witness_hash });
     }
@@ -177,7 +161,6 @@ fn decode(v: &serde_json::Value, reduced_data: bool) -> Result<Template, Templat
         sigoplimit,
         version,
         nbits,
-        prev_hash_hex,
         prev_hash,
         witness_commitment,
         blake2b_rule,
@@ -212,40 +195,38 @@ mod tests {
 
     #[test]
     fn parses_a_template() {
-        let mut a = ReportedTemplateRefusal::default();
-        let t = parse(&gbt(20, &["segwit", "!blake2b"]), &[0; 22], &mut a).unwrap();
+        let t = parse(&gbt(20, &["segwit", "!blake2b"]), &[0; 22]).unwrap();
         assert_eq!(t.height, 20);
         assert_eq!(t.nbits, 0x207fffff);
         assert_eq!(t.nbits.to_le_bytes(), [0xff, 0xff, 0x7f, 0x20]);
         assert_eq!(t.prev_hash[31], 0x0f);
         assert_eq!(t.witness_commitment.len(), 38);
         assert!(t.blake2b_rule);
-        assert!(!parse(&gbt(20, &["segwit"]), &[0; 22], &mut a).unwrap().blake2b_rule);
+        assert!(!parse(&gbt(20, &["segwit"]), &[0; 22]).unwrap().blake2b_rule);
     }
 
     #[test]
     fn decodes_transactions_without_the_rule_checks() {
-        let mut v = gbt(21, &[]);
+        let mut v = gbt(21, &["reduced_data"]);
         v["transactions"] = serde_json::json!([{
             "txid": "11".repeat(32), "hash": "22".repeat(32), "fee": 1000, "sigops": 4,
             "weight": 400, "data": "0100",
         }]);
-        let t = decode(&v, true).unwrap();
-        assert!(t.reduced_data);
+        let t = decode(&v).unwrap();
+        assert!(t.reduced_data, "the rule is read from the template, not passed in");
         assert_eq!(t.txns.len(), 1);
         assert_eq!(t.totals.fee, 1000);
         assert_eq!(t.totals.sigops, 4);
         assert_eq!(t.totals.weight, 400);
         assert_eq!(t.totals.size, 2);
         v["transactions"][0]["fee"] = serde_json::json!(-1);
-        assert!(matches!(decode(&v, false), Err(TemplateError::Refused(_))));
+        assert!(matches!(decode(&v), Err(TemplateError::Refused(_))));
     }
 
     #[test]
     fn reduced_data_refuses_an_oversized_payout_script() {
-        let mut a = ReportedTemplateRefusal::default();
         let v = gbt(21, &["segwit", "!blake2b", "reduced_data"]);
-        assert!(parse(&v, &[0; 35], &mut a).is_err());
-        assert!(parse(&v, &[0; 34], &mut a).is_ok());
+        assert!(parse(&v, &[0; 35]).is_err());
+        assert!(parse(&v, &[0; 34]).is_ok());
     }
 }

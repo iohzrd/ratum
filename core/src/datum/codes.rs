@@ -1,3 +1,6 @@
+//! The `wire_codes!` macro: an enum over the codes one wire field takes, with an `Unknown(code)`
+//! variant, so a code this build does not name still survives a decode and an encode unchanged.
+
 macro_rules! wire_codes {
     (
         $(#[$meta:meta])*

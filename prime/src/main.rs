@@ -1,9 +1,13 @@
+//! `ratum-prime`: the pool server. It accepts gateway connections, verifies the shares they send
+//! against the jobs they carry, credits them to a share window, dictates the coinbase split of that
+//! window to every gateway, and submits the blocks it verifies to its node. This file resolves the
+//! settings, opens the ledger and starts the threads.
+
 mod abw;
+mod accounting;
 mod admin;
 mod bounded;
 mod cli;
-mod coinbaser;
-mod config;
 mod confirmations;
 mod connection;
 #[cfg(test)]
@@ -19,41 +23,45 @@ mod settings;
 mod stats;
 mod verify;
 
-use cli::fatal;
 use connection::handle;
-use ledger::LedgerLocation;
+use ledger::{Ledger, LedgerLocation};
 use log::{error, info, warn};
-use node::{NodeView, watch_node};
-use ratum::datum::messages::config::ClientConfig;
+use node::watch_node;
 use ratum::rpc;
-use server::{OpenConnectionGuard, Server};
-use settings::Settings;
+use server::Server;
+use settings::{Resolved, Settings};
 use std::io;
 use std::net::TcpListener;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use verify::SharePolicy;
+
+const VERSION: &str = ratum::version!();
 
 fn init_logging() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 }
 
-fn startup_chain_and_window(
+/// The node's tip, read before the ledger opens: its chain names the ledger file and the
+/// address prefixes the payout address and every miner's identity must carry, and its
+/// difficulty sizes the window read back. A memory-only ledger starts without it when the node
+/// does not answer.
+fn startup_tip(
     node: &rpc::Client,
     location: &LedgerLocation,
     s: &Settings,
-) -> (Option<rpc::Chain>, u128) {
-    let tip = loop {
+    window_floor: u128,
+) -> Option<rpc::Tip> {
+    loop {
         match node.tip() {
-            Ok(t) => break Some(t),
+            Ok(t) => return Some(t),
             Err(e) if matches!(location, LedgerLocation::MemoryOnly) => {
                 warn!(
                     "could not read the node difficulty to size the share window ({e}); \
-                     starting from the floor of {}, so shares recorded before this restart \
-                     are credited only as far back as that floor reaches",
-                    s.window_floor
+                     starting from the floor of {window_floor}, so shares recorded before this \
+                     restart are credited only as far back as that floor reaches, and an \
+                     address with the prefixes of any chain is accepted"
                 );
-                break None;
+                return None;
             }
             Err(e) => {
                 warn!(
@@ -64,27 +72,17 @@ fn startup_chain_and_window(
                 std::thread::sleep(s.poll);
             }
         }
-    };
-    let window = match tip {
-        Some(t) => ledger::window_for_difficulty(t.difficulty, s.window_multiple, s.window_floor),
-        None => s.window_floor,
-    };
-    (tip.map(|t| t.chain), window)
+    }
 }
 
-fn watch_node_in_background(
-    node: &rpc::Client,
-    view: &Arc<NodeView>,
-    s: &Settings,
-    chain: Option<rpc::Chain>,
-) {
-    let (watcher, view, poll) = (node.clone(), Arc::clone(view), s.poll);
-    ratum::thread::spawn("node-watch", move || watch_node(watcher, view, poll, chain));
+fn watch_node_in_background(server: &Arc<Server>, chain: Option<rpc::Chain>) {
+    let watched = Arc::clone(server);
+    ratum::thread::spawn("node-watch", move || watch_node(&watched, chain));
     info!(
         "watching the node at {}: waiting on each new block, \
          re-reading the tip at least every {:.3}s",
-        node.url(),
-        s.poll.as_secs_f64()
+        server.node.url(),
+        server.settings.poll.as_secs_f64()
     );
 }
 
@@ -97,20 +95,21 @@ fn accept_connections(listener: TcpListener, server: &Arc<Server>) {
                 continue;
             }
         };
-        if server.open_connections.fetch_add(1, Ordering::Relaxed) >= server.max_connections {
-            server.open_connections.fetch_sub(1, Ordering::Relaxed);
+        let Some(open) = Server::open_connection(server) else {
+            let max_connections = server.settings.max_connections;
             match stream.peer_addr() {
                 Ok(p) => warn!(
-                    "[{p}] refused: already serving {} connections (--max-connections)",
-                    server.max_connections
+                    "[{p}] refused: already serving {max_connections} connections \
+                     (--max-connections)"
                 ),
                 Err(_) => warn!("refused a connection: at --max-connections"),
             }
             continue;
-        }
+        };
         let conn = Arc::clone(server);
+        // `open` moves into the thread, so a thread that does not start drops it here.
         let spawned = ratum::thread::try_spawn("connection", move || {
-            let _open = OpenConnectionGuard(Arc::clone(&conn));
+            let _open = open;
             let peer = stream.peer_addr().ok();
             if let Err(e) = handle(stream, &conn) {
                 match peer {
@@ -120,24 +119,31 @@ fn accept_connections(listener: TcpListener, server: &Arc<Server>) {
             }
         });
         if let Err(e) = spawned {
-            server.open_connections.fetch_sub(1, Ordering::Relaxed);
             error!("could not start a thread for a connection: {e}");
         }
     }
 }
 
-fn report_settings(s: &Settings) {
-    if s.public_gateway_fee_bps > 0 {
+fn report_settings(s: &Settings, share: &SharePolicy, ledger: &Ledger) {
+    let (window, split) = (ledger.window_rule(), ledger.split_policy());
+    info!(
+        "payouts: window {}x network difficulty (floor {}, {} at startup), minimum {} sats, \
+         operator fee {} bps",
+        window.multiple,
+        window.floor,
+        ledger.window(),
+        split.min_payout,
+        split.fee_bps
+    );
+    if let Some(gateway) = split.public_gateway.as_ref().filter(|g| g.fee_bps > 0) {
         info!(
             "public gateway fee: {} bps of the work of shares carrying the secondary coinbase \
              tag {:?}, of which {} bps is reassigned at each split to miners whose shares do \
              not carry it",
-            s.public_gateway_fee_bps,
-            s.public_gateway_tag.as_deref().unwrap_or(""),
-            s.public_gateway_fee_subsidy_bps
+            gateway.fee_bps, gateway.tag, gateway.subsidy_bps
         );
     }
-    if !s.require_split {
+    if !share.require_split {
         info!(
             "--require-split=false: a coinbase paying only the pool script is accepted from any job"
         );
@@ -158,58 +164,44 @@ fn report_settings(s: &Settings) {
 
 fn main() -> io::Result<()> {
     init_logging();
-    let loaded = cli::load();
-    info!("ratum-prime {}", ratum::VERSION);
+    let options = cli::load();
+    info!("ratum-prime {}", VERSION);
 
-    let s = Settings::resolve(&loaded.command_line, loaded.file);
+    let Resolved { settings: s, window, split } =
+        settings::resolve(&options).unwrap_or_else(|e| cli::fatal!("{e}"));
     if let Some(dir) = &s.data_dir {
         std::fs::create_dir_all(dir)?;
     }
     let ledger_location = LedgerLocation::new(s.ledger_path.clone(), s.data_dir.as_deref());
-    if let Some(done) = admin::run_command(&loaded.command_line, &ledger_location) {
+    if let Some(done) = admin::run_command(&options, &ledger_location) {
         return done;
     }
 
     let pool_keys = keys::load_or_create_keys(&s.key_path)?;
-    info!("pool_pubkey: {}", pool_keys.pubkey_hex());
+    info!("pool_pubkey: {}", pool_keys.public().to_hex());
 
-    let node = s.connect_node()?;
-    let payout_script = settings::payout_script(&node, s.payout.as_ref());
-    info!("pool payout script: {}", hex::encode(&payout_script));
+    let node = settings::connect_node(&options).unwrap_or_else(|e| cli::fatal!("{e}"));
+    let tip = startup_tip(&node, &ledger_location, &s, window.floor);
+    let chain = tip.map(|t| t.chain);
+    let share = settings::share_policy(&options, chain).unwrap_or_else(|e| cli::fatal!("{e}"));
+    info!("pool payout script: {}", hex::encode(&share.config.payout_script));
 
-    let (chain, startup_window) = startup_chain_and_window(&node, &ledger_location, &s);
-    let node_view = Arc::new(NodeView::default());
-    watch_node_in_background(&node, &node_view, &s, chain);
-
-    let mut ledger = ledger::open_share_ledger(
-        ledger_location.file_for(chain).as_deref(),
-        startup_window,
+    let mut ledger = Ledger::new(window, split);
+    if let Some(t) = tip {
+        ledger.set_network_difficulty(t.difficulty);
+    }
+    let (ledger, records) = ledger::open_share_ledger(
+        ledger_location.file_for(chain)?.as_deref(),
         s.ledger_keep,
         chain.map(rpc::Chain::name),
+        ledger,
     )?;
-    ledger.set_public_gateway_tag(s.public_gateway_tag.clone());
-    info!(
-        "payouts: window {}x network difficulty (floor {}, {startup_window} at startup), \
-         minimum {} sats, operator fee {} bps",
-        s.window_multiple, s.window_floor, s.min_payout, s.fee_bps
-    );
-    report_settings(&s);
-    let config = ClientConfig {
-        payout_script,
-        prime_id: s.prime_id,
-        coinbase_tag: s.coinbase_tag.clone(),
-        min_difficulty: s.min_difficulty,
-    };
-    let config_payload = match config.encode() {
-        Ok(p) => p,
-        Err(e) => fatal!("cannot build the client config: {e}"),
-    };
-    let mut share_policy = SharePolicy::from_config(&config);
-    share_policy.require_split = s.require_split;
+    report_settings(&s, &share, &ledger);
 
-    let server =
-        Arc::new(Server::new(&s, pool_keys, node, node_view, ledger, share_policy, config_payload));
+    let server = Arc::new(Server::new(s, share, pool_keys, node, (ledger, records))?);
+    let s = &server.settings;
 
+    watch_node_in_background(&server, chain);
     confirmations::watch(Arc::clone(&server));
 
     if let Some(addr) = &s.stats_listen {

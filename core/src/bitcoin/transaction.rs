@@ -1,21 +1,23 @@
-use super::{
-    CompactSizeError, HASH_SIZE, MAX_COMPACT_SIZE_LEN, decode_compact_size, encode_compact_size,
-    sha256d,
-};
+//! Transaction decoding: `txid` over the stripped serialization, since the witness is excluded from
+//! the merkle tree, `parse_coinbase` for the transaction the pool rebuilds a share from, and output
+//! encoding.
+
+use super::{HASH_SIZE, MAX_COMPACT_SIZE_LEN, decode_compact_size, encode_compact_size, sha256d};
 use crate::reader::{ByteReader, Truncated};
 use bytes::BufMut as _;
 
-pub const TX_VERSION_SIZE: usize = 4;
-pub const OUTPOINT_SIZE: usize = HASH_SIZE + 4;
-pub const SEQUENCE_SIZE: usize = 4;
-pub const VALUE_SIZE: usize = 8;
-pub const LOCK_TIME_SIZE: usize = 4;
-pub const MIN_OUTPUT_SIZE: usize = VALUE_SIZE + 1;
+pub(crate) const TX_VERSION_SIZE: usize = 4;
+pub(crate) const OUTPOINT_SIZE: usize = HASH_SIZE + 4;
+pub(crate) const SEQUENCE_SIZE: usize = 4;
+pub(crate) const VALUE_SIZE: usize = 8;
+pub(crate) const LOCK_TIME_SIZE: usize = 4;
+pub(crate) const MIN_OUTPUT_SIZE: usize = VALUE_SIZE + 1;
 const SEGWIT_MARKER_AND_FLAG: (u8, u8) = (0x00, 0x01);
 const SEGWIT_MARKER_AND_FLAG_SIZE: usize = 2;
 
-pub const NULL_OUTPOINT_INDEX: [u8; OUTPOINT_SIZE - HASH_SIZE] = [0xff; OUTPOINT_SIZE - HASH_SIZE];
-pub const SEQUENCE_FINAL: [u8; SEQUENCE_SIZE] = [0xff; SEQUENCE_SIZE];
+pub(crate) const NULL_OUTPOINT_INDEX: [u8; OUTPOINT_SIZE - HASH_SIZE] =
+    [0xff; OUTPOINT_SIZE - HASH_SIZE];
+pub(crate) const SEQUENCE_FINAL: [u8; SEQUENCE_SIZE] = [0xff; SEQUENCE_SIZE];
 
 pub fn txid(tx: &[u8]) -> Result<[u8; 32], TxError> {
     let mut c = ByteReader::new(tx);
@@ -101,7 +103,7 @@ pub struct CoinbaseTx {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum TxError {
     #[error("transaction truncated at {0}")]
-    Truncated(&'static str),
+    Truncated(#[from] Truncated),
     #[error("non-canonical CompactSize")]
     BadCompactSize,
     #[error("input count is not 1")]
@@ -114,21 +116,6 @@ pub enum TxError {
     TrailingBytes(usize),
     #[error("input count is zero")]
     NoInputs,
-}
-
-impl From<Truncated> for TxError {
-    fn from(t: Truncated) -> Self {
-        Self::Truncated(t.0)
-    }
-}
-
-impl From<CompactSizeError> for TxError {
-    fn from(e: CompactSizeError) -> Self {
-        match e {
-            CompactSizeError::Truncated(what) => Self::Truncated(what),
-            CompactSizeError::NonCanonical => Self::BadCompactSize,
-        }
-    }
 }
 
 pub fn parse_coinbase(tx: &[u8]) -> Result<CoinbaseTx, TxError> {
@@ -175,7 +162,7 @@ pub fn parse_coinbase(tx: &[u8]) -> Result<CoinbaseTx, TxError> {
     })
 }
 
-pub fn encode_output(value: u64, script: &[u8]) -> Vec<u8> {
+pub(crate) fn encode_output(value: u64, script: &[u8]) -> Vec<u8> {
     let mut v = Vec::with_capacity(VALUE_SIZE + MAX_COMPACT_SIZE_LEN + script.len());
     v.put_u64_le(value);
     v.put_slice(&encode_compact_size(script.len() as u64));

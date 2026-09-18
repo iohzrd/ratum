@@ -74,7 +74,7 @@ jobs:
 
       - name: Build
         env:
-          # The cc crate reads CC_<target> to compile ring's C for the musl target.
+          # The cc crate reads CC_<target> to compile aws-lc-sys's C for the musl target.
           CC_x86_64_unknown_linux_musl: musl-gcc
           CC_aarch64_unknown_linux_musl: musl-gcc
         run: cargo build --release -p ratum-gateway --target ${{ matrix.target }}

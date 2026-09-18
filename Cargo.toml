@@ -3,7 +3,7 @@ resolver = "3"
 members = ["core", "prime", "gateway", "miner"]
 
 [workspace.package]
-version = "0.1.39"
+version = "0.1.40"
 edition = "2024"
 publish = false
 license = "AGPL-3.0-or-later"
@@ -16,7 +16,7 @@ bech32 = "0.12.0"
 blake2 = "0.11"
 bs58 = { version = "0.5", features = ["check"] }
 bytes = "1"
-clap = { version = "4.6.6", features = ["derive"] }
+clap = { version = "4.6.7", features = ["derive"] }
 dryoc = "1"
 env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
 hex = "0.4"
@@ -24,12 +24,16 @@ libc = "0.2"
 log = { version = "0.4", features = ["std"] }
 minreq = { version = "3.0.0", features = ["https"] }
 mio = { version = "1", features = ["os-poll", "net"] }
-redb = "4.2.0"
+redb = "4.3.0"
 serde = { version = "1", features = ["derive"] }
 # preserve_order: the gateway rewrites its configuration file from the settings page and
-# keeps the keys in the file's order.
+# keeps the keys in the file's order. It is also what orders `stratum.username_modifiers`:
+# config::deserialize_modifiers reads each modifier through serde_json::Map, and
+# username::apply_modifier gives each address a selector range in that iteration order.
+# Without this feature that Map is a BTreeMap, which sorts the ranges by address and so
+# pays a different address for the same share.
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.11"
 thiserror = "2.0.20"
 tiny_http = "0.12"
-toml = "1.1.4"
+toml = "1.1.6"

@@ -2,9 +2,15 @@
 /target
 
 # ratum-prime.key is written to the working directory when ratum-prime runs without --data-dir
-# or --key; shares.redb is the ledger's name inside --data-dir, listed for a data directory set
-# to the working directory (with neither --data-dir nor --ledger no ledger file is written).
-# Runtime state, never committed.
+# or --key; a ledger in --data-dir is named after the node's chain (main.redb, regtest.redb),
+# listed for a data directory set to the working directory (with neither --data-dir nor
+# --ledger no ledger file is written), as is the hashrate history --data-dir keeps in
+# hashrate.json. Runtime state, never committed.
 /ratum-prime.key
-/shares.redb
+/*.redb
+/hashrate.json
+/hashrate.json.tmp
 prime-data/
+
+# e2e/e2e.py and tools/strip-comments.py write these beside themselves.
+__pycache__/

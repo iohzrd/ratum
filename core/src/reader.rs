@@ -1,6 +1,10 @@
+//! A cursor over a byte slice. Every read either returns its field or reports which field the input
+//! ran out of bytes in, so a decoder names the field a short message ends in rather than panicking.
+
 use bytes::Buf as _;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
 pub struct Truncated(pub &'static str);
 
 pub struct ByteReader<'a> {
@@ -21,25 +25,12 @@ impl<'a> ByteReader<'a> {
         self.rest
     }
 
-    pub fn at_end(&self) -> bool {
+    pub(crate) fn at_end(&self) -> bool {
         self.rest.is_empty()
     }
 
-    fn peek(&self) -> Option<u8> {
-        self.rest.first().copied()
-    }
-
-    pub fn peek2(&self) -> Option<(u8, u8)> {
+    pub(crate) fn peek2(&self) -> Option<(u8, u8)> {
         Some((*self.rest.first()?, *self.rest.get(1)?))
-    }
-
-    pub fn skip_if(&mut self, byte: u8) -> bool {
-        if self.peek() == Some(byte) {
-            self.rest.advance(1);
-            true
-        } else {
-            false
-        }
     }
 
     pub fn take(&mut self, n: usize, what: &'static str) -> Result<&'a [u8], Truncated> {
@@ -84,8 +75,7 @@ mod tests {
     fn reads_fields_in_order() {
         let data = [0x27, 0x01, 0x02, 0x03, 0x04, 0x05, 0xaa, 0xbb];
         let mut c = ByteReader::new(&data);
-        assert!(c.skip_if(0x27));
-        assert!(!c.skip_if(0x27));
+        assert_eq!(c.u8("subcommand").unwrap(), 0x27);
         assert_eq!(c.u8("a").unwrap(), 0x01);
         assert_eq!(c.u32("b").unwrap(), 0x0504_0302);
         assert_eq!(c.pos(), 6);
@@ -112,11 +102,10 @@ mod tests {
     #[test]
     fn peeking_does_not_advance() {
         let mut c = ByteReader::new(&[0x00, 0x01]);
-        assert_eq!(c.peek(), Some(0x00));
         assert_eq!(c.peek2(), Some((0x00, 0x01)));
         assert_eq!(c.pos(), 0);
         c.advance(1, "one").unwrap();
         assert_eq!(c.peek2(), None, "one byte left");
-        assert_eq!(c.peek(), Some(0x01));
+        assert_eq!(c.rest(), &[0x01]);
     }
 }

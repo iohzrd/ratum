@@ -47,8 +47,23 @@ fn describe() -> String {
     }
 }
 
+/// The directory of the library crate every binary depends on, relative to the repository root.
+const LIBRARY_DIR: &str = "core";
+
+/// The workspace manifest, the manifest and `src` directory of the binary being built and of
+/// the library, and the git files naming the commit. An edit in another binary's directory
+/// does not rerun this script, so it rebuilds only that binary; the `-dirty` suffix this
+/// binary reports is updated for such an edit at its next rebuild.
 fn rerun_paths() -> Vec<PathBuf> {
-    let mut paths = vec![PathBuf::from("Cargo.toml"), PathBuf::from("src")];
+    let mut paths = Vec::new();
+    if let Some(root) = git(&["rev-parse", "--show-toplevel"]).map(PathBuf::from) {
+        paths.push(root.join("Cargo.toml"));
+        let package = std::env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from);
+        for dir in package.into_iter().chain([root.join(LIBRARY_DIR)]) {
+            paths.push(dir.join("Cargo.toml"));
+            paths.push(dir.join("src"));
+        }
+    }
     let mut git_path = |name: &str| {
         if let Some(p) = git(&["rev-parse", "--git-path", name]) {
             paths.push(PathBuf::from(p));

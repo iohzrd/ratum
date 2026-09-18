@@ -1,3 +1,6 @@
+//! The HTTP server both status interfaces run on: replies with their content types, query and form
+//! parsing, and the listener.
+
 use std::io::Cursor;
 use tiny_http::{Header, Request, Response, Server};
 

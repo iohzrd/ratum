@@ -1,27 +1,29 @@
-use crate::cli::fatal;
-use crate::config::Config;
-use crate::ledger::blocks::{ConfirmationReading, OwedBlock};
+//! The ledger commands, which run against the ledger file of a stopped pool and then exit: printing
+//! the shares, listing and settling what a block owes, voiding a record, and recording amounts owed
+//! by hand.
+
+use crate::cli::{Options, fatal};
+use crate::ledger::blocks::{BlockRecords, ConfirmationReading, OwedBlock};
 use crate::ledger::split::Payout;
-use crate::ledger::{Ledger, LedgerLocation};
+use crate::ledger::{self, LedgerLocation};
 use std::io;
 
-fn open_whole_ledger(location: &LedgerLocation, flag: &str) -> io::Result<Ledger> {
-    let path = location.existing_file(flag)?;
-    Ledger::open(&path, u128::MAX, None, None).map(|(ledger, _)| ledger)
+fn open_records(location: &LedgerLocation, flag: &str) -> io::Result<BlockRecords> {
+    BlockRecords::open_file(&location.existing_file(flag)?)
 }
 
-pub fn run_command(command_line: &Config, location: &LedgerLocation) -> Option<io::Result<()>> {
-    if command_line.dump_ledger {
+pub fn run_command(options: &Options, location: &LedgerLocation) -> Option<io::Result<()>> {
+    if options.dump_ledger {
         return Some(dump_ledger(location));
     }
-    if let Some(arg) = &command_line.settle_block {
+    if let Some(arg) = &options.settle_block {
         return Some(settle_block(location, arg));
     }
-    if let Some(arg) = &command_line.void_block {
+    if let Some(arg) = &options.void_block {
         return Some(void_block(location, arg));
     }
-    if let Some(arg) = &command_line.record_owed {
-        return Some(record_owed(location, arg, &command_line.owed));
+    if let Some(arg) = &options.record_owed {
+        return Some(record_owed(location, arg, &options.owed));
     }
     None
 }
@@ -60,7 +62,7 @@ fn print_owed(o: &OwedBlock, state: Option<ConfirmationReading>) {
         o.height,
         hex::encode(o.block_hash),
         o.found_at,
-        o.total,
+        o.total(),
         confirmations_text(state)
     );
     for Payout { identity, sats } in &o.entries {
@@ -70,9 +72,8 @@ fn print_owed(o: &OwedBlock, state: Option<ConfirmationReading>) {
 
 fn dump_ledger(location: &LedgerLocation) -> io::Result<()> {
     use std::fmt::Write as _;
-    let ledger = open_whole_ledger(location, "--dump-ledger")?;
     let mut out = String::new();
-    for share in ledger.dump()? {
+    for share in ledger::dump_file(&location.existing_file("--dump-ledger")?)? {
         let _ = writeln!(
             out,
             "{} {} {} {} {}",
@@ -107,21 +108,27 @@ fn owed_entries(entries: &[String]) -> Vec<Payout> {
 }
 
 fn record_owed(location: &LedgerLocation, arg: &str, entries: &[String]) -> io::Result<()> {
-    let mut ledger = open_whole_ledger(location, "--record-owed")?;
+    let mut records = open_records(location, "--record-owed")?;
     let hash = block_hash_arg("--record-owed", arg, "");
-    let Some(block) = ledger.blocks().iter().find(|b| b.block_hash == hash).cloned() else {
+    let Some(block) = records.blocks().iter().find(|b| b.block_hash == hash).cloned() else {
         fatal!(
             "no block under {arg} in the ledger's block history; the pool records every block \
              it accepted there"
         )
     };
-    if let Some(existing) = ledger.owed().iter().find(|o| o.block_hash == hash) {
+    if let Some(existing) = records.owed().iter().find(|o| o.block_hash == hash) {
         eprintln!("block {arg} already has an owed record; --void-block removes it first:");
-        print_owed(existing, ledger.confirmations(&hash));
+        print_owed(existing, records.confirmations(&hash));
         std::process::exit(crate::cli::USAGE_EXIT);
     }
-    let entries = owed_entries(entries);
-    let total: u64 = entries.iter().map(|p| p.sats).sum();
+    let owed = OwedBlock {
+        found_at: block.found_at,
+        height: block.height,
+        block_hash: hash,
+        settled_at: None,
+        entries: owed_entries(entries),
+    };
+    let total = owed.total();
     if total > block.paid_to_pool {
         fatal!(
             "the entries total {total} sats, more than the {} sats the block's coinbase paid to \
@@ -130,34 +137,26 @@ fn record_owed(location: &LedgerLocation, arg: &str, entries: &[String]) -> io::
             block.paid_to_pool
         );
     }
-    let owed = OwedBlock {
-        found_at: block.found_at,
-        height: block.height,
-        block_hash: hash,
-        total,
-        settled_at: None,
-        entries,
-    };
-    ledger.record_owed(owed.clone())?;
-    print_owed(&owed, ledger.confirmations(&hash));
+    records.record_owed(owed.clone())?;
+    print_owed(&owed, records.confirmations(&hash));
     Ok(())
 }
 
 fn settle_block(location: &LedgerLocation, arg: &str) -> io::Result<()> {
-    let mut ledger = open_whole_ledger(location, "--settle-block")?;
+    let mut records = open_records(location, "--settle-block")?;
     if arg == "list" {
-        if ledger.owed().is_empty() {
+        if records.owed().is_empty() {
             println!("no owed blocks");
         }
-        for o in ledger.owed() {
-            print_owed(o, ledger.confirmations(&o.block_hash));
+        for o in records.owed() {
+            print_owed(o, records.confirmations(&o.block_hash));
         }
         return Ok(());
     }
     let hash = block_hash_arg("--settle-block", arg, " or 'list'");
-    let state = ledger.confirmations(&hash);
+    let state = records.confirmations(&hash);
     if let Some(s) = state.filter(|s| !s.on_best_chain()) {
-        if let Some(owed) = ledger.owed().iter().find(|o| o.block_hash == hash) {
+        if let Some(owed) = records.owed().iter().find(|o| o.block_hash == hash) {
             print_owed(owed, state);
         }
         fatal!(
@@ -169,14 +168,14 @@ fn settle_block(location: &LedgerLocation, arg: &str) -> io::Result<()> {
             s.confirmations
         );
     }
-    print_or_refuse(arg, ledger.settle_owed(&hash, ratum::unix_now())?, state);
+    print_or_refuse(arg, records.settle_owed(&hash, ratum::unix_now())?, state);
     Ok(())
 }
 
 fn void_block(location: &LedgerLocation, arg: &str) -> io::Result<()> {
-    let mut ledger = open_whole_ledger(location, "--void-block")?;
+    let mut records = open_records(location, "--void-block")?;
     let hash = block_hash_arg("--void-block", arg, "");
-    let state = ledger.confirmations(&hash);
-    print_or_refuse(arg, ledger.void_owed(&hash)?, state);
+    let state = records.confirmations(&hash);
+    print_or_refuse(arg, records.void_owed(&hash)?, state);
     Ok(())
 }

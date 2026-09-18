@@ -1,80 +1,86 @@
+//! One DATUM connection from its handshake to its end: the frames it reads, the pool messages it
+//! dispatches, and the timeouts that close it.
+
 mod assignments;
 mod shares;
 
-use super::abw::AbwAssignments;
-use super::coinbaser::CoinbaserRequestState;
-use super::{PoolConfig, PoolConnectionSettings, PoolConnectionState, validation_replies};
+use super::{
+    COINBASER_WAIT, PendingCoinbaser, abw_disabled, user_agent, validation_replies,
+    with_rounded_min_difficulty,
+};
+use crate::config::DatumConfig;
+use crate::gateway::Gateway;
+use crate::publish;
 use log::{debug, error, info, warn};
 use ratum::datum::channel;
 use ratum::datum::client::ClientChannel;
-use ratum::datum::framing::{self, FrameHeader, MAX_MINING_PAD_LEN};
-use ratum::datum::keys::KeyPairs;
-use ratum::datum::messages::abw::{self, ShareRef};
+use ratum::datum::framing::{self, FrameHeader, FrameRead, MAX_MINING_PAD_LEN};
+use ratum::datum::handshake::{ProtocolVersion, ResumeToken};
+use ratum::datum::keys::{KeyPairs, PublicKeys};
+use ratum::datum::messages::abw::{self, CandidateRef};
 use ratum::datum::messages::coinbaser::CoinbaserResponse;
-use ratum::datum::messages::config::{ClientConfig, ClientConfigV3};
+use ratum::datum::messages::config::ClientConfig;
 use ratum::datum::messages::migration::MigrationRequest;
 use ratum::datum::messages::server_subcmd;
 use ratum::datum::messages::share_response::ShareResponse;
-
-use ratum::lock;
-use ratum::poll::{Fill, PolledSocket, WRITE_TIMEOUT};
+use ratum::datum::messages::validation;
+use ratum::poll::{PolledSocket, WRITE_TIMEOUT};
 use std::io;
 use std::net::{TcpStream, ToSocketAddrs};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const SHARE_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Runs one DATUM connection to its end. `resume_token` is the token the last version 3
+/// configuration carried, sent in the hello and replaced by the one this connection receives.
 pub(super) fn run(
-    settings: &PoolConnectionSettings,
-    pool: &PoolConnectionState,
+    gateway: &Gateway,
+    pool_pubkey: PublicKeys,
     identity: &KeyPairs,
+    resume_token: &mut Option<ResumeToken>,
 ) -> Result<(), SessionError> {
-    Session::open(settings, pool, identity).and_then(|mut session| session.run())
+    Session::open(gateway, pool_pubkey, identity, resume_token)
+        .and_then(|mut session| session.run())
 }
 
 #[derive(Debug, thiserror::Error)]
 pub(super) enum SessionError {
     #[error("io: {0}")]
     Io(#[from] io::Error),
-    #[error("handshake: {0}")]
-    Handshake(#[from] channel::Error),
+    #[error("channel: {0}")]
+    Channel(#[from] channel::Error),
     #[error("no message from the pool for {0:?}")]
     GlobalTimeout(Duration),
     #[error("no share accepted for {0:?}")]
     ShareAckTimeout(Duration),
     #[error("could not resolve {0}")]
     Resolve(String),
-    #[error("connect timed out")]
-    ConnectTimeout,
 }
 
 struct Session<'a> {
-    settings: &'a PoolConnectionSettings,
-    pool: &'a PoolConnectionState,
+    gateway: &'a Gateway,
     identity: &'a KeyPairs,
+    resume_token: &'a mut Option<ResumeToken>,
+    pool_sign_pk: [u8; 32],
+    global_timeout: Duration,
     socket: PolledSocket,
     channel: ClientChannel,
     last_server_message_at: Instant,
     last_share_sent_at: Option<Instant>,
     last_share_accepted_at: Option<Instant>,
     sent_sections: Vec<Option<shares::SentSections>>,
-    coinbaser_request_sent: Option<Arc<CoinbaserRequestState>>,
-    pending_frame_header: [u8; framing::HEADER_LEN],
-    pending_frame_header_len: usize,
+    /// The newest coinbaser request sent and not yet answered, with the template whose job it
+    /// is for. Sending a request replaces the one held, since only the newest template's
+    /// work is served.
+    awaiting_coinbaser: Option<PendingCoinbaser>,
 }
 
-fn connect(settings: &PoolConnectionSettings) -> Result<TcpStream, SessionError> {
-    let target = format!("{}:{}", settings.host, settings.port);
-    let addrs: Vec<_> = target
-        .to_socket_addrs()
-        .map_err(|e| SessionError::Resolve(format!("{target}: {e}")))?
-        .collect();
-    if addrs.is_empty() {
-        return Err(SessionError::Resolve(target));
-    }
-    let mut last = SessionError::ConnectTimeout;
+fn connect(d: &DatumConfig) -> Result<TcpStream, SessionError> {
+    let target = format!("{}:{}", d.pool_host, d.pool_port);
+    let addrs =
+        target.to_socket_addrs().map_err(|e| SessionError::Resolve(format!("{target}: {e}")))?;
+    let mut last = None;
     for addr in addrs {
         match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
             Ok(s) => {
@@ -83,60 +89,62 @@ fn connect(settings: &PoolConnectionSettings) -> Result<TcpStream, SessionError>
             }
             Err(e) => {
                 debug!("connect to {addr} failed: {e}");
-                last = SessionError::Io(e);
+                last = Some(e);
             }
         }
     }
-    Err(last)
+    Err(last.map_or(SessionError::Resolve(target), SessionError::Io))
 }
 
 impl<'a> Session<'a> {
     fn open(
-        settings: &'a PoolConnectionSettings,
-        pool: &'a PoolConnectionState,
+        gateway: &'a Gateway,
+        pool_pubkey: PublicKeys,
         identity: &'a KeyPairs,
+        resume_token: &'a mut Option<ResumeToken>,
     ) -> Result<Self, SessionError> {
-        let mut socket = PolledSocket::new(connect(settings)?)?;
+        let pool = &gateway.pool;
+        let config = &gateway.config;
+        let global_timeout = config.protocol_global_timeout();
+        let mut socket = PolledSocket::new(connect(&config.datum)?)?;
         let mut channel = ClientChannel::with_key_pairs(
             identity.clone(),
             KeyPairs::generate(),
             ratum::rand::u32(),
         );
-        let hello = if settings.protocol_v3 {
-            let token = pool.resume_token();
-            channel.hello_resumable(&settings.pool_box_pk, &settings.user_agent, token.as_ref())
+        let protocol_version = if config.datum.protocol_v3 {
+            ProtocolVersion::V3 { resume: *resume_token }
         } else {
-            channel.hello(&settings.pool_box_pk, &settings.user_agent)
+            ProtocolVersion::V1
         };
+        let hello = channel.hello(&pool_pubkey.box_pk, &user_agent(), protocol_version);
         socket.write_all(&hello, WRITE_TIMEOUT)?;
 
-        let started = Instant::now();
-        let left = || settings.global_timeout.saturating_sub(started.elapsed());
-        let mut frame = vec![0u8; framing::HEADER_LEN];
-        socket.read_exact(&mut frame, left(), left())?;
-        let peeked = channel.peek_handshake_header(frame[..].try_into().expect("four bytes"));
-        let mut body = vec![0u8; peeked.cmd_len as usize];
-        socket.read_exact(&mut body, left(), left())?;
-        frame.extend(body);
-        channel.read_handshake_response(&frame, &settings.pool_sign_pk)?;
+        let (header, body) = framing::read_frame(
+            &mut socket,
+            |bytes| channel.unmask_header(bytes),
+            framing::MAX_CMD_LEN,
+            Instant::now() + global_timeout,
+        )?;
+        channel.read_handshake_response(header, &body, &pool_pubkey.sign_pk)?;
         info!("DATUM Server MOTD: {}", channel.motd());
 
-        *lock(&pool.session_waker) = Some(Arc::new(socket.waker()?));
+        pool.session().waker = Some(socket.waker()?);
 
-        let slots = lock(&pool.job_slots).len();
+        let slots = config.datum.protocol_job_slots;
         Ok(Session {
-            settings,
-            pool,
+            gateway,
             identity,
+            resume_token,
+            pool_sign_pk: pool_pubkey.sign_pk,
+            global_timeout,
             socket,
             channel,
             last_server_message_at: Instant::now(),
             last_share_sent_at: None,
             last_share_accepted_at: None,
             sent_sections: vec![None; slots],
-            coinbaser_request_sent: None,
-            pending_frame_header: [0u8; framing::HEADER_LEN],
-            pending_frame_header_len: 0,
+            awaiting_coinbaser: None,
         })
     }
 
@@ -152,37 +160,16 @@ impl<'a> Session<'a> {
                 error!("mining message of {n} bytes exceeds the protocol limit; not sent");
                 return Ok(());
             }
-            Err(e) => return Err(io::Error::other(e.to_string()).into()),
+            Err(e) => return Err(e.into()),
         };
         self.socket.write_all(&wire, WRITE_TIMEOUT)?;
         Ok(())
     }
 
-    fn read_frame_body(&mut self, n: usize) -> io::Result<Vec<u8>> {
-        let left =
-            self.settings.global_timeout.saturating_sub(self.last_server_message_at.elapsed());
-        let mut buf = vec![0u8; n];
-        self.socket.read_exact(&mut buf, left, left)?;
-        Ok(buf)
-    }
-
-    fn poll_frame_header(&mut self) -> Result<Option<FrameHeader>, SessionError> {
-        match self
-            .socket
-            .fill(&mut self.pending_frame_header, &mut self.pending_frame_header_len)?
-        {
-            Fill::Closed => return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into()),
-            Fill::Partial => return Ok(None),
-            Fill::Complete => {}
-        }
-        self.pending_frame_header_len = 0;
-        Ok(Some(self.channel.unmask_header(self.pending_frame_header)))
-    }
-
     fn run(&mut self) -> Result<(), SessionError> {
         loop {
-            if self.last_server_message_at.elapsed() >= self.settings.global_timeout {
-                return Err(SessionError::GlobalTimeout(self.settings.global_timeout));
+            if self.last_server_message_at.elapsed() >= self.global_timeout {
+                return Err(SessionError::GlobalTimeout(self.global_timeout));
             }
             if let (Some(sent), Some(acked)) =
                 (self.last_share_sent_at, self.last_share_accepted_at)
@@ -193,23 +180,28 @@ impl<'a> Session<'a> {
             }
 
             self.send_pending()?;
+            if let Some(unanswered) =
+                self.awaiting_coinbaser.take_if(|p| p.requested_at.elapsed() >= COINBASER_WAIT)
+            {
+                warn!("coinbaser request timed out after {}s", COINBASER_WAIT.as_secs());
+                publish::on_coinbaser(self.gateway, &unanswered, None);
+            }
 
+            let left = self.global_timeout.saturating_sub(self.last_server_message_at.elapsed());
             if !self.socket.readable() {
-                let timeout = self
-                    .settings
-                    .global_timeout
-                    .saturating_sub(self.last_server_message_at.elapsed());
-                self.socket.wait(Some(timeout))?;
+                self.socket.wait(Some(self.until_coinbaser_due(left)))?;
                 continue;
             }
-            let Some(header) = self.poll_frame_header()? else { continue };
-            let body = self.read_frame_body(header.cmd_len as usize)?;
-            let plain = self.channel.decrypt(header, &body).map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("could not decrypt cmd {}: {e}", header.proto_cmd),
-                )
-            })?;
+            let unmask = |bytes| self.channel.unmask_header(bytes);
+            let (header, body) =
+                match framing::read_next_frame(&mut self.socket, unmask, left, left)? {
+                    FrameRead::Closed => {
+                        return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
+                    }
+                    FrameRead::Empty => continue,
+                    FrameRead::Complete(header, body) => (header, body),
+                };
+            let plain = self.channel.decrypt(header, &body)?;
             self.last_server_message_at = Instant::now();
             match header.proto_cmd {
                 framing::cmd::HELLO_OR_PING => {}
@@ -240,75 +232,100 @@ impl<'a> Session<'a> {
                 log_migration_request(plain);
             }
             Some(abw::subcmd::ASSIGNMENT_NOTICE) => self.on_abw_notice(plain),
-            Some(abw::subcmd::ACTIVATION) => self.on_abw_activation(plain),
             Some(abw::subcmd::REVEAL) => self.on_abw_reveal(plain),
             Some(abw::subcmd::CANDIDATE_RECEIPT) => {
-                if let Ok(c) = ShareRef::decode_candidate(plain, abw::subcmd::CANDIDATE_RECEIPT) {
+                if let Ok(c) = CandidateRef::decode_candidate(plain, abw::subcmd::CANDIDATE_RECEIPT)
+                {
                     debug!("ABW candidate receipt for slot {}", c.slot);
                 }
             }
+            // The pool releases a candidate only to say it will not be referenced
+            // again; the gateway keeps no per-candidate state, so there is nothing to undo.
             Some(abw::subcmd::CANDIDATE_RELEASE) => {}
             Some(server_subcmd::COINBASER) => self.on_coinbaser_response(plain),
             Some(server_subcmd::SHARE_RESPONSE) => match ShareResponse::decode(plain) {
-                Some(r) => self.on_share_response(r),
-                None => warn!("malformed share response"),
+                Ok(r) => self.on_share_response(r),
+                Err(e) => warn!("malformed share response: {e}"),
             },
-            Some(server_subcmd::VALIDATION) => self.on_validation(plain)?,
+            Some(validation::SUBCMD) => self.on_validation(plain)?,
             Some(server_subcmd::BLOCKNOTIFY) => {
                 debug!("pool blocknotify");
-                self.pool.template_waker.raise();
+                self.gateway.template_waker.raise();
             }
             other => warn!("unknown DATUM mining sub-command {other:?}"),
         }
         Ok(())
     }
 
-    fn on_coinbaser_response(&self, plain: &[u8]) {
-        let Some(state) = lock(&self.pool.coinbaser_request).clone() else {
-            warn!("coinbaser response with no request waiting");
-            return;
-        };
-        let r = match CoinbaserResponse::decode(plain) {
-            Some(r) => {
+    /// How long until the request held, if any, reaches `COINBASER_WAIT`, so the loop does
+    /// not sleep past that deadline.
+    fn until_coinbaser_due(&self, left: Duration) -> Duration {
+        match &self.awaiting_coinbaser {
+            Some(p) => left.min(COINBASER_WAIT.saturating_sub(p.requested_at.elapsed())),
+            None => left,
+        }
+    }
+
+    /// Serves the work for the template the answered request was made for. The response is
+    /// paired with its request by coinbase value, so a late answer to a request a newer
+    /// template already replaced is not applied to that newer template.
+    fn on_coinbaser_response(&mut self, plain: &[u8]) {
+        let (waiting, split) = match CoinbaserResponse::decode(plain) {
+            Ok(r) => {
                 debug!(
                     "coinbaser response: {} sats, id {}, {} outputs",
                     r.value,
                     r.coinbaser_id,
                     r.outputs.len()
                 );
-                r
+                let Some(waiting) = self.awaiting_coinbaser.take_if(|p| p.value == r.value) else {
+                    debug!(
+                        "coinbaser response for {} sats matches no waiting request (a newer \
+                         request replaced it); not used",
+                        r.value
+                    );
+                    return;
+                };
+                (waiting, Some(r))
             }
-            None => {
-                error!("malformed coinbaser response; the job pays the pool script alone");
-                CoinbaserResponse { value: state.value, coinbaser_id: 0, outputs: Vec::new() }
+            Err(e) => {
+                let Some(waiting) = self.awaiting_coinbaser.take() else {
+                    error!("malformed coinbaser response ({e}) with no request waiting");
+                    return;
+                };
+                error!("malformed coinbaser response ({e}); the job pays the pool script alone");
+                let empty =
+                    CoinbaserResponse { value: waiting.value, coinbaser_id: 0, outputs: vec![] };
+                (waiting, Some(empty))
             }
         };
-        *lock(&state.response) = Some(r);
-        state.done.notify_all();
+        publish::on_coinbaser(self.gateway, &waiting, split);
     }
 
-    fn on_config_message(&self, plain: &[u8]) {
-        if self.settings.protocol_v3
-            && let Some(c) = ClientConfigV3::decode(plain)
-        {
-            *lock(&self.pool.resume_token) = Some(c.resume_token);
-            self.on_config(PoolConfig::from_client_config_v3(c));
-            return;
-        }
-        let Some(c) = ClientConfig::decode(plain) else {
-            error!("malformed pool configuration; ignored");
-            return;
+    fn on_config_message(&mut self, plain: &[u8]) {
+        let c = match ClientConfig::decode(plain) {
+            Ok(c) => c,
+            Err(e) => {
+                error!("malformed pool configuration ({e}); ignored");
+                return;
+            }
         };
-        if self.settings.protocol_v3 {
-            warn!(
+        match (c.v3, self.gateway.config.datum.protocol_v3) {
+            (Some(v3), true) => *self.resume_token = Some(v3.resume_token),
+            (Some(_), false) => {
+                error!("pool answered the version 1 hello with a version 3 configuration; ignored");
+                return;
+            }
+            (None, true) => warn!(
                 "pool responded to the version 3 hello with a version 1 configuration; this \
                  session runs version 1 (no anti-block-withholding)"
-            );
+            ),
+            (None, false) => {}
         }
-        self.on_config(PoolConfig::from_client_config(c));
+        self.on_config(with_rounded_min_difficulty(c));
     }
 
-    fn on_config(&self, config: PoolConfig) {
+    fn on_config(&self, config: ClientConfig) {
         info!(
             "DATUM pool configuration: prime_id {:#010x}, tag {:?}, min diff {}, payout script {}",
             config.prime_id,
@@ -316,26 +333,33 @@ impl<'a> Session<'a> {
             config.min_difficulty,
             hex::encode(&config.payout_script)
         );
-        let previous = self.pool.set_config(config.clone());
+        let mut s = self.gateway.pool.session();
+        let previous = s.config.replace(config.clone());
         if previous.is_none() {
-            *lock(&self.pool.motd) = self.channel.motd().to_string();
+            s.motd = self.channel.motd().to_string();
         }
-        if config.protocol_v3 {
+        if previous.as_ref().is_some_and(|p| abw_disabled(p) != abw_disabled(&config)) {
+            s.abw = Default::default();
+        }
+        drop(s);
+        if config.v3.is_some() {
             info!(
                 "DATUM pool anti-block-withholding: {}",
-                if config.abw_disabled { "disabled by the pool" } else { "enabled" }
+                if abw_disabled(&config) { "disabled by the pool" } else { "enabled" }
             );
         }
-        if previous.as_ref().is_some_and(|p| p.abw_disabled != config.abw_disabled) {
-            *lock(&self.pool.abw) = AbwAssignments::default();
-        }
         if previous.as_ref() != Some(&config) {
-            self.pool.template_waker.rebuild();
+            self.gateway.template_waker.rebuild();
         }
     }
 
     fn on_validation(&mut self, plain: &[u8]) -> Result<(), SessionError> {
-        match validation_replies::response_to(self.pool, self.settings, self.identity, plain) {
+        match validation_replies::response_to(
+            self.gateway,
+            &self.pool_sign_pk,
+            self.identity,
+            plain,
+        ) {
             Some(response) => self.send_mining(&response),
             None => Ok(()),
         }
@@ -344,16 +368,16 @@ impl<'a> Session<'a> {
 
 fn log_migration_request(plain: &[u8]) {
     match MigrationRequest::decode(plain) {
-        Some(MigrationRequest::Redirect(t)) => warn!(
+        Ok(MigrationRequest::Redirect(t)) => warn!(
             "pool requested migration to {:?} port {} (pool key {}); not supported, staying \
              on the configured pool",
             t.host,
             t.port,
-            &hex::encode(t.pubkey)[..16]
+            &t.pubkey.to_hex()[..16]
         ),
-        Some(MigrationRequest::ReturnHome) => {
+        Ok(MigrationRequest::ReturnHome) => {
             warn!("pool requested a return to the configured pool; this gateway is on it");
         }
-        None => error!("malformed migration request; ignored"),
+        Err(e) => error!("malformed migration request ({e}); ignored"),
     }
 }

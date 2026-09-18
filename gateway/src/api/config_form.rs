@@ -1,11 +1,14 @@
+//! The settings page's fields and what saving them does: each field names one key of the
+//! configuration file, an edit is written into the file with the other keys and their order kept,
+//! and the result is validated as at startup before it is written.
+
 use crate::config::{
-    Config, DatumConfig, GLOBAL_TIMEOUT_MARGIN_SECS, MAX_CONFIGURED_TAG_LEN,
-    MAX_CONFIGURED_TAGS_TOTAL_LEN, WORK_UPDATE_SECONDS_RANGE,
+    COINBASE_UNIQUE_ID_RANGE, Config, DatumConfig, GLOBAL_TIMEOUT_MARGIN_SECS,
+    MAX_CONFIGURED_TAG_LEN, MAX_CONFIGURED_TAGS_TOTAL_LEN, MAX_NETWORK_SHARE_BPS_RANGE, PORT_RANGE,
+    VARDIFF_MIN_RANGE, WORK_UPDATE_SECONDS_RANGE,
 };
 use serde_json::{Value, json};
-
-const MAX_PORT: i64 = u16::MAX as i64;
-const MAX_COINBASE_UNIQUE_ID: i64 = u16::MAX as i64;
+use std::ops::RangeInclusive;
 
 struct Field {
     name: &'static str,
@@ -23,138 +26,52 @@ enum FieldKind {
     Password,
 }
 
+/// The form's bound for a configuration range, so a field's limits are declared once, in
+/// `config.rs`, and both the page and the startup checks read them from there.
+const fn int(range: &RangeInclusive<u64>) -> FieldKind {
+    // A form field is submitted and parsed as an i64, so a range wider than that is offered
+    // up to i64::MAX; the startup check still applies the range's own end.
+    let end = *range.end();
+    let max = if end > i64::MAX as u64 { i64::MAX } else { end as i64 };
+    FieldKind::Int { min: *range.start() as i64, max }
+}
+
+/// A field named `<section>_<key>` for the key `section.key` of the file, whose current
+/// value is read from the same field of `Config`.
+macro_rules! field {
+    ($section:ident . $key:ident, $label:literal, $kind:expr) => {
+        Field {
+            name: concat!(stringify!($section), "_", stringify!($key)),
+            label: $label,
+            section: stringify!($section),
+            key: stringify!($key),
+            kind: $kind,
+            current: |c| json!(c.$section.$key),
+        }
+    };
+}
+
 const FIELDS: &[Field] = &[
-    Field {
-        name: "mining_pool_address",
-        label: "Bitcoin address",
-        section: "mining",
-        key: "pool_address",
-        kind: FieldKind::Text,
-        current: |c| json!(c.mining.pool_address),
-    },
-    Field {
-        name: "mining_coinbase_tag_secondary",
-        label: "Coinbase tag",
-        section: "mining",
-        key: "coinbase_tag_secondary",
-        kind: FieldKind::Text,
-        current: |c| json!(c.mining.coinbase_tag_secondary),
-    },
-    Field {
-        name: "mining_coinbase_unique_id",
-        label: "Unique gateway ID",
-        section: "mining",
-        key: "coinbase_unique_id",
-        kind: FieldKind::Int { min: 0, max: MAX_COINBASE_UNIQUE_ID },
-        current: |c| json!(c.mining.coinbase_unique_id),
-    },
-    Field {
-        name: "datum_pool_port",
-        label: "Pool port",
-        section: "datum",
-        key: "pool_port",
-        kind: FieldKind::Int { min: 1, max: MAX_PORT },
-        current: |c| json!(c.datum.pool_port),
-    },
-    Field {
-        name: "datum_pool_pubkey",
-        label: "Pool public key",
-        section: "datum",
-        key: "pool_pubkey",
-        kind: FieldKind::Text,
-        current: |c| json!(c.datum.pool_pubkey),
-    },
-    Field {
-        name: "datum_pool_url",
-        label: "Pool web page",
-        section: "datum",
-        key: "pool_url",
-        kind: FieldKind::Text,
-        current: |c| json!(c.datum.pool_url),
-    },
-    Field {
-        name: "datum_protocol_v3",
-        label: "Version 3 protocol",
-        section: "datum",
-        key: "protocol_v3",
-        kind: FieldKind::Bool,
-        current: |c| json!(c.datum.protocol_v3),
-    },
-    Field {
-        name: "stratum_listen_port",
-        label: "Stratum port",
-        section: "stratum",
-        key: "listen_port",
-        kind: FieldKind::Int { min: 1, max: MAX_PORT },
-        current: |c| json!(c.stratum.listen_port),
-    },
-    Field {
-        name: "stratum_vardiff_min",
-        label: "Minimum difficulty",
-        section: "stratum",
-        key: "vardiff_min",
-        kind: FieldKind::Int { min: 1, max: i64::MAX },
-        current: |c| json!(c.stratum.vardiff_min),
-    },
-    Field {
-        name: "stratum_max_network_share_bps",
-        label: "Network hashrate limit",
-        section: "stratum",
-        key: "max_network_share_bps",
-        kind: FieldKind::Int { min: 0, max: ratum::BASIS_POINTS_PER_UNIT as i64 },
-        current: |c| json!(c.stratum.max_network_share_bps),
-    },
-    Field {
-        name: "stratum_fingerprint_miners",
-        label: "Fingerprint miners",
-        section: "stratum",
-        key: "fingerprint_miners",
-        kind: FieldKind::Bool,
-        current: |c| json!(c.stratum.fingerprint_miners),
-    },
-    Field {
-        name: "stratum_require_address_username",
-        label: "Require an address as the username",
-        section: "stratum",
-        key: "require_address_username",
-        kind: FieldKind::Bool,
-        current: |c| json!(c.stratum.require_address_username),
-    },
-    Field {
-        name: "bitcoind_work_update_seconds",
-        label: "Job update interval",
-        section: "bitcoind",
-        key: "work_update_seconds",
-        kind: FieldKind::Int {
-            min: *WORK_UPDATE_SECONDS_RANGE.start() as i64,
-            max: *WORK_UPDATE_SECONDS_RANGE.end() as i64,
-        },
-        current: |c| json!(c.bitcoind.work_update_seconds),
-    },
-    Field {
-        name: "bitcoind_rpcurl",
-        label: "bitcoind RPC URL",
-        section: "bitcoind",
-        key: "rpcurl",
-        kind: FieldKind::Text,
-        current: |c| json!(c.bitcoind.rpcurl),
-    },
-    Field {
-        name: "bitcoind_rpcuser",
-        label: "bitcoind RPC user",
-        section: "bitcoind",
-        key: "rpcuser",
-        kind: FieldKind::Text,
-        current: |c| json!(c.bitcoind.rpcuser),
-    },
-    Field {
-        name: "bitcoind_rpcpassword",
-        label: "bitcoind RPC password",
-        section: "bitcoind",
-        key: "rpcpassword",
-        kind: FieldKind::Password,
-        current: |_| Value::Null,
-    },
+    field!(mining.pool_address, "Bitcoin address", FieldKind::Text),
+    field!(mining.coinbase_tag_secondary, "Coinbase tag", FieldKind::Text),
+    field!(mining.coinbase_unique_id, "Unique gateway ID", int(&COINBASE_UNIQUE_ID_RANGE)),
+    field!(datum.pool_port, "Pool port", int(&PORT_RANGE)),
+    field!(datum.pool_pubkey, "Pool public key", FieldKind::Text),
+    field!(datum.pool_url, "Pool web page", FieldKind::Text),
+    field!(datum.protocol_v3, "Version 3 protocol", FieldKind::Bool),
+    field!(stratum.listen_port, "Stratum port", int(&PORT_RANGE)),
+    field!(stratum.vardiff_min, "Minimum difficulty", int(&VARDIFF_MIN_RANGE)),
+    field!(
+        stratum.max_network_share_bps,
+        "Network hashrate limit",
+        int(&MAX_NETWORK_SHARE_BPS_RANGE)
+    ),
+    field!(stratum.fingerprint_miners, "Fingerprint miners", FieldKind::Bool),
+    field!(stratum.require_address_username, "Require an address as the username", FieldKind::Bool),
+    field!(bitcoind.work_update_seconds, "Job update interval", int(&WORK_UPDATE_SECONDS_RANGE)),
+    field!(bitcoind.rpcurl, "bitcoind RPC URL", FieldKind::Text),
+    field!(bitcoind.rpcuser, "bitcoind RPC user", FieldKind::Text),
+    field!(bitcoind.rpcpassword, "bitcoind RPC password", FieldKind::Password),
 ];
 
 const OLD_POOL_HOST: &str = "pool_host(old)";
@@ -430,6 +347,83 @@ pub fn write_file(path: &str, text: &str) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use crate::config::Config;
+
+    /// The `name` and the attribute `attr` of every `<input>` and `<select>` on the page.
+    fn form_controls<'a>(html: &'a str, attr: &str) -> Vec<(&'a str, Option<&'a str>)> {
+        let value = |tag: &'a str, key: &str| -> Option<&'a str> {
+            let at = tag.find(&format!(" {key}=\""))? + key.len() + 3;
+            let rest = &tag[at..];
+            Some(&rest[..rest.find('"')?])
+        };
+        let mut out = Vec::new();
+        let mut rest = html;
+        while let Some(at) = rest.find('<') {
+            rest = &rest[at + 1..];
+            let Some(end) = rest.find('>') else { break };
+            let (tag, after) = rest.split_at(end);
+            rest = after;
+            if !tag.starts_with("input ") && !tag.starts_with("select ") {
+                continue;
+            }
+            if let Some(name) = value(tag, "name") {
+                out.push((name, value(tag, attr)));
+            }
+        }
+        out
+    }
+
+    /// The settings page's controls and `FIELDS` name the same configuration keys, with the
+    /// same input types. A name in one and not the other fails silently at runtime: `apply`
+    /// skips a submitted name `FIELDS` does not carry, and the page script skips a `FIELDS`
+    /// entry with no element of that name, so the field renders as editable and never saves.
+    #[test]
+    fn every_control_on_the_settings_page_is_a_field_of_the_matching_type() {
+        /// The controls the page handles on its own, outside `FIELDS`: the two selects, and
+        /// the pool host that `apply_reward_sharing` parks and restores.
+        const HANDLED_ON_THE_PAGE: [&str; 3] =
+            ["datum_pool_host", "reward_sharing", "username_behaviour"];
+
+        let controls = form_controls(include_str!("config.html"), "type");
+        for f in FIELDS {
+            let found = controls.iter().find(|(name, _)| *name == f.name);
+            let Some((_, input_type)) = found else {
+                panic!("{} is in FIELDS with no control on the settings page", f.name);
+            };
+            let want = match f.kind {
+                FieldKind::Bool => Some("checkbox"),
+                FieldKind::Password => Some("password"),
+                FieldKind::Text | FieldKind::Int { .. } => None,
+            };
+            assert_eq!(*input_type, want, "{} has the wrong input type on the page", f.name);
+        }
+        for (name, _) in &controls {
+            assert!(
+                FIELDS.iter().any(|f| f.name == *name) || HANDLED_ON_THE_PAGE.contains(name),
+                "the settings page has a control named {name} that FIELDS does not carry"
+            );
+        }
+    }
+
+    /// An integer field's `maxlength` must admit every value its range allows, or the browser
+    /// truncates input the startup check would have accepted. The range is declared once, in
+    /// `config.rs`; this is what keeps the page's attribute following it.
+    #[test]
+    fn an_integer_fields_maxlength_admits_its_whole_range() {
+        let controls = form_controls(include_str!("config.html"), "maxlength");
+        for f in FIELDS {
+            let FieldKind::Int { max, .. } = f.kind else { continue };
+            let Some((_, Some(maxlength))) = controls.iter().find(|(n, _)| *n == f.name) else {
+                continue;
+            };
+            let digits = max.to_string().len();
+            let allowed: usize = maxlength.parse().expect("maxlength is a number");
+            assert!(
+                allowed >= digits,
+                "{}: maxlength {allowed} is shorter than the {digits} digits of its maximum {max}",
+                f.name
+            );
+        }
+    }
     const FILE: &str = r#"{
     "bitcoind": {"rpcuser": "u", "rpcpassword": "p", "rpcurl": "http://127.0.0.1:18443"},
     "mining": {"pool_address": "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"},

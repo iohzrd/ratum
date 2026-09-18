@@ -1,3 +1,5 @@
+//! SipHash-2-4, which the short transaction ids of the validation exchange are taken from.
+
 pub fn siphash24(key: &[u8; 16], data: &[u8]) -> u64 {
     let [k0, k1] = key.as_chunks::<8>().0 else { unreachable!("16 bytes hold two words") };
     let (k0, k1) = (u64::from_le_bytes(*k0), u64::from_le_bytes(*k1));

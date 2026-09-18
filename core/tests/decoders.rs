@@ -1,3 +1,7 @@
+//! Every decoder against random and damaged input. Each message type is encoded, then a byte is
+//! flipped or the message is cut, and the decoder must either refuse it or decode it into something
+//! that re-encodes to the same bytes. No input may panic.
+
 use ratum::bitcoin;
 use ratum::datum::messages::coinbaser::{CoinbaserRequest, CoinbaserResponse};
 use ratum::datum::messages::config::ClientConfig;
@@ -47,6 +51,11 @@ fn feed_everything(blob: &[u8]) {
     let _ = bitcoin::transaction::parse_coinbase(blob);
     let _ = bitcoin::transaction::txid(blob);
     let _ = bitcoin::script::script_pushes(blob);
+    let _ = bitcoin::address::output_script_to_display(blob);
+    let text = String::from_utf8_lossy(blob);
+    for chain in [None, Some(bitcoin::address::MAIN)] {
+        let _ = bitcoin::address::to_output_script(&text, chain);
+    }
     if blob.len() >= 4 {
         let bits = u32::from_le_bytes(blob[..4].try_into().unwrap());
         let _ = target::bits_to_target(bits);
@@ -140,7 +149,7 @@ fn random_share(rng: &mut Rng) -> PowSubmit {
         ntime: rng.next() as u32,
         nonce: rng.next() as u32,
         version: rng.next() as u32,
-        extranonce: rng.bytes(12),
+        extranonce: rng.bytes(12).try_into().unwrap(),
         username: format!("bc1q{}.rig{}", rng.below(1_000_000), rng.below(100)),
         job: rng.bool().then(|| JobSection {
             prev_hash: rng.bytes(32).try_into().unwrap(),
@@ -208,10 +217,11 @@ fn a_damaged_config_is_refused_or_reproduces_itself() {
         prime_id: 0xdead_beef,
         coinbase_tag: "RATUM".to_string(),
         min_difficulty: 16384,
+        v3: None,
     };
     let valid = config.encode().unwrap();
     truncations_and_flips(&valid, |bytes| {
-        ClientConfig::decode(bytes).and_then(|c| c.encode().ok())
+        ClientConfig::decode(bytes).ok().and_then(|c| c.encode().ok())
     });
 }
 
@@ -229,7 +239,7 @@ fn a_damaged_coinbaser_response_is_refused_or_reproduces_itself() {
     };
     let valid = response.encode().unwrap();
     truncations_and_flips(&valid, |bytes| {
-        CoinbaserResponse::decode(bytes).and_then(|r| r.encode().ok())
+        CoinbaserResponse::decode(bytes).ok().and_then(|r| r.encode().ok())
     });
 }
 
@@ -256,7 +266,7 @@ fn a_damaged_share_response_is_refused_or_reproduces_itself() {
         abw_ref: None,
     };
     truncations_and_flips(&response.encode(), |bytes| {
-        ShareResponse::decode(bytes).map(|r| r.encode())
+        ShareResponse::decode(bytes).ok().map(|r| r.encode())
     });
 }
 

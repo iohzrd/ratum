@@ -1,12 +1,14 @@
+//! The status and settings interfaces: the admin port serving the status page, /stats.json, the
+//! settings page and the commands, and the miner lookup port serving one unauthenticated endpoint.
+
 mod auth;
 mod config_form;
 mod snapshot;
 
-use crate::stratum::Server;
+use crate::gateway::Gateway;
 use auth::{admin_access, authorized, secure_eq, settings_access, unauthorized};
 use log::{error, info, warn};
 use ratum::http::{self, Reply};
-use ratum::lock;
 use serde_json::{Value, json};
 use std::io::Read as _;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -24,25 +26,14 @@ static INDEX_HTML: LazyLock<String> = LazyLock::new(|| assemble(include_str!("ap
 static CONFIG_HTML: LazyLock<String> = LazyLock::new(|| assemble(include_str!("api/config.html")));
 
 pub struct Context {
-    pub server: Arc<Server>,
-    pub template_error: Arc<crate::template::poller::LastError>,
+    pub gateway: Arc<Gateway>,
     pub started_at: std::time::Instant,
     pub csrf_token: String,
     pub config_path: String,
-    pub hashrate_history: Mutex<ratum::hashrate::HashrateHistory>,
-}
-
-fn sample_hashrate(ctx: &Context) {
-    let hashes_per_second = ctx.server.summary().hashrate_ths * ratum::HASHES_PER_TERAHASH;
-    lock(&ctx.hashrate_history)
-        .push(ratum::hashrate::HashrateSample { sampled_at: ratum::unix_now(), hashes_per_second });
+    pub hashrate_history: Arc<Mutex<ratum::hashrate::HashrateHistory>>,
 }
 
 const CSRF_TOKEN_BYTES: usize = 16;
-
-pub fn csrf_token() -> String {
-    hex::encode(ratum::rand::bytes::<CSRF_TOKEN_BYTES>())
-}
 
 fn redirect(to: &str) -> Reply {
     http::text(302, "").with_header(http::header("Location", to))
@@ -67,7 +58,7 @@ fn with_fields(mut base: Value, fields: impl IntoIterator<Item = (&'static str, 
 }
 
 fn settings_json(ctx: &Context) -> Value {
-    let cfg = &ctx.server.config;
+    let cfg = &ctx.gateway.config;
     let doc = std::fs::read_to_string(&ctx.config_path)
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
@@ -82,21 +73,14 @@ fn settings_json(ctx: &Context) -> Value {
     )
 }
 
-struct SettingsResponse {
-    reply: Reply,
-    restart_requested: bool,
-}
-
-impl SettingsResponse {
-    fn without_restart(reply: Reply) -> Self {
-        Self { reply, restart_requested: false }
-    }
-}
+/// The reply to a settings post, and whether it wrote a new configuration file, which the
+/// caller restarts on once the reply has been sent.
+type SettingsResponse = (Reply, bool);
 
 fn save_settings(ctx: &Context, body: &str) -> SettingsResponse {
     let form = http::pairs(body);
     let errors = |code, errors: Vec<String>| {
-        SettingsResponse::without_restart(json_status(code, json!({"ok": false, "errors": errors})))
+        (json_status(code, json!({"ok": false, "errors": errors})), false)
     };
     if !form.iter().any(|(k, v)| k == "csrf" && secure_eq(v, &ctx.csrf_token)) {
         return errors(403, vec!["Missing or stale form token.".into()]);
@@ -105,18 +89,13 @@ fn save_settings(ctx: &Context, body: &str) -> SettingsResponse {
         Ok(t) => t,
         Err(e) => return errors(500, vec![format!("could not read {}: {e}", ctx.config_path)]),
     };
-    match config_form::apply(&ctx.server.config, &text, &form) {
+    match config_form::apply(&ctx.gateway.config, &text, &form) {
         Err(e) => errors(400, e),
-        Ok(None) => {
-            SettingsResponse::without_restart(http::json(json!({"ok": true, "restart": false})))
-        }
+        Ok(None) => (http::json(json!({"ok": true, "restart": false})), false),
         Ok(Some(new_text)) => match config_form::write_file(&ctx.config_path, &new_text) {
             Ok(()) => {
                 info!("Wrote the new configuration to {}", ctx.config_path);
-                SettingsResponse {
-                    reply: http::json(json!({"ok": true, "restart": true})),
-                    restart_requested: true,
-                }
+                (http::json(json!({"ok": true, "restart": true})), true)
             }
             Err(e) => {
                 warn!("could not write {}: {e}", ctx.config_path);
@@ -127,13 +106,11 @@ fn save_settings(ctx: &Context, body: &str) -> SettingsResponse {
 }
 
 fn post_settings(ctx: &Context, req: &mut Request) -> SettingsResponse {
-    if !ctx.server.config.api.modify_conf {
-        return SettingsResponse::without_restart(auth::forbidden(
-            "Saving settings requires api.modify_conf to be set.",
-        ));
+    if !ctx.gateway.config.api.modify_conf {
+        return (auth::forbidden("Saving settings requires api.modify_conf to be set."), false);
     }
     if let Err(reply) = settings_access(ctx, req) {
-        return SettingsResponse::without_restart(reply);
+        return (reply, false);
     }
     let body = read_body(req);
     save_settings(ctx, &body)
@@ -148,32 +125,26 @@ fn post_command(ctx: &Context, req: &mut Request) -> Reply {
         return auth::forbidden("Missing or stale form token.");
     }
     if let Some(id) = http::param(&body, "kill_client").and_then(|v| v.parse::<u64>().ok()) {
-        if ctx.server.kill_client(id) {
+        if ctx.gateway.stratum.kill_client(id) {
             info!("API kill request for client {id}");
         }
     } else if http::param(&body, "empty_thread").is_some() {
-        ctx.server.shutdown_all();
+        ctx.gateway.stratum.shutdown_all();
     }
     redirect("/")
 }
 
 fn serve_admin(ctx: &Context, mut req: Request) {
-    let (path, query) = http::path_and_query(&req);
+    let (path, _) = http::path_and_query(&req);
     let method = req.method().clone();
     let mut restart_requested = false;
     let response = match (method, path.as_str()) {
-        (Method::Get, "/") => {
-            if http::param(&query, "format").as_deref() == Some("json") {
-                http::json(snapshot::status_json(ctx, authorized(ctx, &req)))
-            } else {
-                http::html(INDEX_HTML.clone())
-            }
-        }
+        (Method::Get, "/") => http::html(INDEX_HTML.clone()),
         (Method::Get, "/stats.json") => {
             http::json(snapshot::status_json(ctx, authorized(ctx, &req)))
         }
         (Method::Get | Method::Post, "/NOTIFY") => {
-            ctx.server.template_waker.raise();
+            ctx.gateway.template_waker.raise();
             http::html("OK".to_string())
         }
         (Method::Get, "/login") => {
@@ -192,9 +163,9 @@ fn serve_admin(ctx: &Context, mut req: Request) {
             Err(reply) => reply,
         },
         (Method::Post, "/config") => {
-            let response = post_settings(ctx, &mut req);
-            restart_requested = response.restart_requested;
-            response.reply
+            let (reply, restart) = post_settings(ctx, &mut req);
+            restart_requested = restart;
+            reply
         }
         (Method::Post, "/cmd") => post_command(ctx, &mut req),
         (Method::Get | Method::Post, _) => http::not_found(),
@@ -229,23 +200,35 @@ fn bind(what: &str, addr: &str, port: u16) -> Option<tiny_http::Server> {
     }
 }
 
-pub fn start(ctx: Arc<Context>) {
-    let cfg = Arc::clone(&ctx.server.config);
-    if cfg.api.listen_port == 0 {
+pub fn start(gateway: Arc<Gateway>, config_path: String) {
+    let ctx = Arc::new(Context {
+        gateway,
+        started_at: std::time::Instant::now(),
+        csrf_token: hex::encode(ratum::rand::bytes::<CSRF_TOKEN_BYTES>()),
+        config_path,
+        hashrate_history: Arc::default(),
+    });
+    let api = &ctx.gateway.config.api;
+    if api.listen_port == 0 {
         info!("No API port configured. API disabled.");
-    } else if let Some(server) = bind("API", &cfg.api.listen_addr, cfg.api.listen_port) {
-        info!("API listening on port {}", cfg.api.listen_port);
-        let sampler = Arc::clone(&ctx);
-        ratum::hashrate::sample_periodically("api-sampler", move || sample_hashrate(&sampler));
-        let ctx = Arc::clone(&ctx);
-        http::serve("api", server, move |req| serve_admin(&ctx, req));
+    } else if let Some(server) = bind("API", &api.listen_addr, api.listen_port) {
+        info!("API listening on port {}", api.listen_port);
+        let sampled = Arc::clone(&ctx.gateway);
+        ratum::hashrate::sample_every(
+            "api-sampler",
+            Arc::clone(&ctx.hashrate_history),
+            move || sampled.stratum.summary().hashrate_hs,
+        );
+        let admin = Arc::clone(&ctx);
+        http::serve("api", server, move |req| serve_admin(&admin, req));
     }
-    if cfg.api.miner_listen_port != 0
+    if api.miner_listen_port != 0
         && let Some(server) =
-            bind("miner lookup API", &cfg.api.miner_listen_addr, cfg.api.miner_listen_port)
+            bind("miner lookup API", &api.miner_listen_addr, api.miner_listen_port)
     {
-        info!("Miner lookup API listening on port {}", cfg.api.miner_listen_port);
-        http::serve("api-miner", server, move |req| serve_miner(&ctx, req));
+        info!("Miner lookup API listening on port {}", api.miner_listen_port);
+        let miner = Arc::clone(&ctx);
+        http::serve("api-miner", server, move |req| serve_miner(&miner, req));
     }
 }
 

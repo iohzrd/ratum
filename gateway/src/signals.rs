@@ -1,4 +1,8 @@
-use crate::template::waker::TemplateWaker;
+//! SIGUSR1 as a block notification, as the C gateway takes it (`blocknotify=kill -USR1 <pid>`). The
+//! handler writes one byte to a pipe and a thread reading that pipe raises the template waker, so
+//! the handler itself only writes.
+
+use crate::gateway::Gateway;
 use log::{info, warn};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -12,7 +16,7 @@ extern "C" fn on_usr1(_: libc::c_int) {
     }
 }
 
-pub fn install(template_waker: Arc<TemplateWaker>) {
+pub fn install(gateway: Arc<Gateway>) {
     let mut fds = [0i32; 2];
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
         warn!("could not create the SIGUSR1 pipe; SIGUSR1 is not handled");
@@ -32,7 +36,7 @@ pub fn install(template_waker: Arc<TemplateWaker>) {
         loop {
             let n = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), buf.len()) };
             if n > 0 {
-                template_waker.raise();
+                gateway.template_waker.raise();
             } else if n == 0 {
                 return;
             }

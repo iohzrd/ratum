@@ -1,8 +1,10 @@
-use super::STRUCT_END;
-use super::abw::{ASSIGNMENT_SLOTS, ShareRef};
-use super::server_subcmd;
+//! The pool's answer to a share (0x8F): accepted, accepted tentatively, or rejected with a reason
+//! code, followed by the anti-block-withholding reference when the share was mined under an
+//! assignment.
+
+use super::abw::{ASSIGNMENT_SLOTS, CandidateRef};
+use super::{Error, STRUCT_END, open_message, server_subcmd};
 use crate::datum::codes::wire_codes;
-use crate::reader::ByteReader;
 use bytes::BufMut as _;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,13 +47,13 @@ wire_codes! {
     unknown Unknown;
 }
 
-pub mod share_status {
-    pub const ACCEPTED: u8 = 0x50;
-    pub const ACCEPTED_TENTATIVELY: u8 = 0x55;
-    pub const REJECTED: u8 = 0x66;
+pub(crate) mod share_status {
+    pub(crate) const ACCEPTED: u8 = 0x50;
+    pub(crate) const ACCEPTED_TENTATIVELY: u8 = 0x55;
+    pub(crate) const REJECTED: u8 = 0x66;
 }
 
-pub const SHARE_RESPONSE_ABW_MARKER: u8 = 0x06;
+pub(crate) const SHARE_RESPONSE_ABW_MARKER: u8 = 0x06;
 
 const SHARE_RESPONSE_LEN: usize = 1 + 1 + size_of::<u16>() + size_of::<u32>() + 1 + 1;
 const ABW_REF_TAIL_LEN: usize = crate::bitcoin::HASH_SIZE + 1;
@@ -63,7 +65,7 @@ pub struct ShareResponse {
     pub nonce: u32,
     pub target_byte: u8,
     pub job_id: u8,
-    pub abw_ref: Option<ShareRef>,
+    pub abw_ref: Option<CandidateRef>,
 }
 
 impl ShareResponse {
@@ -93,33 +95,32 @@ impl ShareResponse {
         out
     }
 
-    pub fn decode(data: &[u8]) -> Option<Self> {
-        let mut c = ByteReader::new(data);
-        c.skip_if(server_subcmd::SHARE_RESPONSE);
-        let status = c.u8("status").ok()?;
-        let reason = c.u16("reason").ok()?;
+    pub fn decode(data: &[u8]) -> Result<Self, Error> {
+        let mut c = open_message(data, server_subcmd::SHARE_RESPONSE)?;
+        let status = c.u8("status")?;
+        let reason = c.u16("reason")?;
         let verdict = match status {
             share_status::ACCEPTED => ShareVerdict::Accepted,
             share_status::ACCEPTED_TENTATIVELY => ShareVerdict::AcceptedTentatively,
             share_status::REJECTED => ShareVerdict::Rejected(RejectReason::from_code(reason)),
-            _ => return None,
+            other => return Err(Error::BadStatus(other)),
         };
-        let nonce = c.u32("nonce").ok()?;
-        let target_byte = c.u8("target byte").ok()?;
-        let job_id = c.u8("job id").ok()?;
+        let nonce = c.u32("nonce")?;
+        let target_byte = c.u8("target byte")?;
+        let job_id = c.u8("job id")?;
         let abw_ref = match c.rest() {
             [SHARE_RESPONSE_ABW_MARKER, slot, tail @ ..]
                 if tail.len() == ABW_REF_TAIL_LEN && *slot < ASSIGNMENT_SLOTS =>
             {
                 let (hash, end) = tail.split_at(crate::bitcoin::HASH_SIZE);
-                (end == [STRUCT_END]).then(|| ShareRef {
+                (end == [STRUCT_END]).then(|| CandidateRef {
                     slot: *slot,
                     raw_pow_hash_le: hash.try_into().expect("HASH_SIZE bytes"),
                 })
             }
             _ => None,
         };
-        Some(Self { verdict, nonce, target_byte, job_id, abw_ref })
+        Ok(Self { verdict, nonce, target_byte, job_id, abw_ref })
     }
 }
 
@@ -147,22 +148,25 @@ mod tests {
         assert_eq!(verdicts.len(), 2 + 26, "every reject reason is covered");
         for verdict in verdicts {
             let r = ShareResponse { verdict, ..base };
-            assert_eq!(ShareResponse::decode(&r.encode()), Some(r), "{verdict:?}");
-            assert_eq!(ShareResponse::decode(&r.encode()[1..]), Some(r), "{verdict:?} unprefixed");
+            assert_eq!(ShareResponse::decode(&r.encode()), Ok(r), "{verdict:?}");
+            assert!(
+                matches!(ShareResponse::decode(&r.encode()[1..]), Err(Error::WrongMessage { .. })),
+                "{verdict:?} without its subcommand"
+            );
         }
 
-        assert_eq!(ShareResponse::decode(&[]), None);
-        assert_eq!(ShareResponse::decode(&base.encode()[..5]), None);
+        assert!(ShareResponse::decode(&[]).is_err());
+        assert!(ShareResponse::decode(&base.encode()[..5]).is_err());
         let mut unknown_status = base.encode();
         unknown_status[1] = 0x11;
-        assert_eq!(ShareResponse::decode(&unknown_status), None);
+        assert_eq!(ShareResponse::decode(&unknown_status), Err(Error::BadStatus(0x11)));
         let mut unknown_reason =
             ShareResponse { verdict: ShareVerdict::Rejected(RejectReason::HighHash), ..base }
                 .encode();
         unknown_reason[2] = 0xfe;
         let decoded = ShareResponse::decode(&unknown_reason).unwrap();
         assert_eq!(decoded.verdict, ShareVerdict::Rejected(RejectReason::Unknown(0xfe)));
-        assert_eq!(ShareResponse::decode(&decoded.encode()), Some(decoded));
+        assert_eq!(ShareResponse::decode(&decoded.encode()), Ok(decoded));
     }
 
     #[test]

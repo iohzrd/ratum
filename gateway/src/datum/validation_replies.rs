@@ -1,15 +1,39 @@
-use super::{PoolConnectionSettings, PoolConnectionState, SlotLookupFailure};
+//! Answering the pool's job validation requests (0x50) from the template a job was built on: its
+//! short transaction list, transactions by index, all of them, or the parent block read from the
+//! node.
+
+use crate::gateway::Gateway;
 use crate::job::Job;
 use log::{info, warn};
+use ratum::bitcoin::hash_to_display_hex;
 use ratum::datum::keys::KeyPairs;
 use ratum::datum::messages::validation::{
     self, ParentFetchReply, ParentFetchStatus, ShortTxnList, TxnList, TxnListStatus,
 };
 use std::sync::Arc;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SlotLookupFailure {
+    job_index: u8,
+    status: TxnListStatus,
+}
+
+fn job_slot(gateway: &Gateway, index: u8) -> Result<Arc<Job>, SlotLookupFailure> {
+    if usize::from(index) >= gateway.config.datum.protocol_job_slots {
+        return Err(SlotLookupFailure {
+            job_index: validation::JOB_INDEX_INVALID,
+            status: TxnListStatus::BadJobIndex,
+        });
+    }
+    gateway
+        .jobs
+        .at(index)
+        .ok_or(SlotLookupFailure { job_index: index, status: TxnListStatus::JobEmpty })
+}
+
 pub(super) fn response_to(
-    pool: &PoolConnectionState,
-    settings: &PoolConnectionSettings,
+    gateway: &Gateway,
+    pool_sign_pk: &[u8; 32],
     identity: &KeyPairs,
     plain: &[u8],
 ) -> Option<Vec<u8>> {
@@ -20,12 +44,12 @@ pub(super) fn response_to(
             job_index: validation::JOB_INDEX_INVALID,
             status: TxnListStatus::BadRequest,
         })
-        .and_then(|i| pool.job_slot(i));
+        .and_then(|i| job_slot(gateway, i));
     let response = match sub {
         validation::request::SHORT_TXN_LIST => {
             info!("pool requested the short transaction list of job {job_index:?}");
             match lookup {
-                Ok(job) => short_txn_list(settings, identity, &job),
+                Ok(job) => short_txn_list(pool_sign_pk, identity, &job),
                 Err(failure) => ShortTxnList::empty(failure.job_index, failure.status),
             }
             .encode()
@@ -50,7 +74,7 @@ pub(super) fn response_to(
                 plain[validation::REQUEST_HEADER_LEN..].try_into().expect("32 bytes");
             let (status, block) = match lookup {
                 Ok(job) if job.template.prev_hash == parent_hash => {
-                    fetch_parent(pool, &job.template.prev_hash_hex)
+                    fetch_parent(&gateway.node, &hash_to_display_hex(&job.template.prev_hash))
                 }
                 _ => (ParentFetchStatus::JobMismatch, Vec::new()),
             };
@@ -68,8 +92,8 @@ pub(super) fn response_to(
     Some(response)
 }
 
-fn fetch_parent(pool: &PoolConnectionState, hash_hex: &str) -> (ParentFetchStatus, Vec<u8>) {
-    match pool.node.call("getblock", serde_json::json!([hash_hex, 0])) {
+fn fetch_parent(node: &ratum::rpc::Client, hash_hex: &str) -> (ParentFetchStatus, Vec<u8>) {
+    match node.call("getblock", serde_json::json!([hash_hex, 0])) {
         Ok(serde_json::Value::String(hex)) => match hex::decode(&hex) {
             Ok(block)
                 if !block.is_empty() && block.len() <= validation::MAX_PARENT_FETCH_BLOCK_LEN =>
@@ -86,20 +110,15 @@ fn fetch_parent(pool: &PoolConnectionState, hash_hex: &str) -> (ParentFetchStatu
     }
 }
 
-fn short_txn_list(
-    settings: &PoolConnectionSettings,
-    identity: &KeyPairs,
-    job: &Job,
-) -> ShortTxnList {
+fn short_txn_list(pool_sign_pk: &[u8; 32], identity: &KeyPairs, job: &Job) -> ShortTxnList {
     let hashes = job.template.witness_hashes();
     if hashes.len() > validation::MAX_SHORT_LIST_TXNS as usize {
-        return ShortTxnList::empty(job.datum_slot, TxnListStatus::TooManyTxns);
+        return ShortTxnList::empty(job.slot, TxnListStatus::TooManyTxns);
     }
-    let key = validation::short_id_key(&identity.sign_pk, &settings.pool_sign_pk);
+    let key = validation::short_id_key(&identity.sign_pk, pool_sign_pk);
     ShortTxnList {
-        job_index: job.datum_slot,
+        job_index: job.slot,
         status: TxnListStatus::Ok,
-        txn_count: hashes.len() as u16,
         short_ids: hashes.iter().map(|h| validation::short_id(h, &key)).collect(),
         crosscheck: if hashes.is_empty() { None } else { Some(validation::crosscheck(&hashes)) },
     }
@@ -116,11 +135,11 @@ fn txn_list(lookup: Result<Arc<Job>, SlotLookupFailure>, plain: &[u8], all: bool
     match ids {
         Some(ids) => TxnList {
             selector,
-            job_index: job.datum_slot,
+            job_index: job.slot,
             status: TxnListStatus::Ok,
             txns: ids.iter().map(|&i| txns[i].raw.clone()).collect(),
         },
-        None => TxnList::empty(selector, job.datum_slot, TxnListStatus::BadRequest),
+        None => TxnList::empty(selector, job.slot, TxnListStatus::BadRequest),
     }
 }
 

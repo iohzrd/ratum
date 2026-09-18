@@ -1,0 +1,46 @@
+# Formatting, lints and the test suite on every push and pull request.
+#
+# The pool and the gateway are one release and their header hash and share format are
+# byte-coupled, which is what `core`'s vectors and the pool-rebuilds-the-gateway's-hash tests
+# check; the release workflow (gateway.yml) builds artifacts and runs none of them, so this
+# runs them. `--all-targets` covers the integration tests in core/tests as well as the unit
+# tests. The `--ignored` tests search ~2^32 hashes and are left to be run by hand.
+
+name: ci
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt, clippy and tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --all-targets

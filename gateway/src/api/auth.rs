@@ -1,3 +1,6 @@
+//! HTTP Basic authentication against `api.admin_password`, compared over the whole string rather
+//! than returning at the first byte that differs.
+
 use super::Context;
 use base64::Engine as _;
 use ratum::http::{self, Reply};
@@ -13,7 +16,7 @@ pub(super) fn secure_eq(a: &str, b: &str) -> bool {
 }
 
 pub(super) fn authorized(ctx: &Context, req: &Request) -> bool {
-    let password = &ctx.server.config.api.admin_password;
+    let password = &ctx.gateway.config.api.admin_password;
     if password.is_empty() {
         return false;
     }
@@ -40,7 +43,7 @@ pub(super) fn admin_access(
     req: &Request,
     without_password: &str,
 ) -> Result<(), Reply> {
-    if ctx.server.config.api.admin_password.is_empty() {
+    if ctx.gateway.config.api.admin_password.is_empty() {
         Err(forbidden(without_password))
     } else if authorized(ctx, req) {
         Ok(())

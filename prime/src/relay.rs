@@ -1,4 +1,7 @@
-use crate::verify::AcceptedShare;
+//! Submitting a verified block to the node, after checking that the transactions the gateway sent
+//! form the merkle root its header commits to.
+
+use crate::verify::RebuiltShare;
 use log::{debug, error, info, warn};
 use ratum::rpc;
 use std::net::SocketAddr;
@@ -7,56 +10,33 @@ use std::time::Duration;
 const SUBMIT_ATTEMPTS: usize = 3;
 const SUBMIT_RETRY_DELAY: Duration = Duration::from_millis(500);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RelayOutcome {
-    Submitted,
-    AwaitingTxns,
-}
-
-pub fn submit_if_complete(
-    peer: SocketAddr,
-    node: &rpc::Client,
-    a: &AcceptedShare,
-    subsidy_only: bool,
-) -> RelayOutcome {
-    let template_txns = a.rebuilt.txn_count;
-    if !subsidy_only && template_txns != 0 {
-        info!("[{peer}]      block has {template_txns} more transactions; requesting them");
-        return RelayOutcome::AwaitingTxns;
-    }
-    submit_with_retries(
-        peer,
-        node,
-        &ratum::bitcoin::serialize_block(&a.rebuilt.header, &a.rebuilt.coinbase_tx, &[]),
-    );
-    RelayOutcome::Submitted
-}
-
-pub fn submit_with_txns(
+/// Submits the block of `rebuilt` with the job's other transactions `txns`, once they form
+/// the merkle root its header commits to.
+pub fn submit(
     peer: SocketAddr,
     node: &rpc::Client,
     job_index: u8,
-    a: &AcceptedShare,
+    rebuilt: &RebuiltShare,
     txns: &[Vec<u8>],
 ) {
-    if let Err(why) = block_matches_header(a, txns) {
+    if let Err(why) = block_matches_header(rebuilt, txns) {
         error!("[{peer}]      not relaying job {job_index}: {why}");
         return;
     }
     submit_with_retries(
         peer,
         node,
-        &ratum::bitcoin::serialize_block(&a.rebuilt.header, &a.rebuilt.coinbase_tx, txns),
+        &ratum::bitcoin::serialize_block(&rebuilt.header, &rebuilt.coinbase_tx, txns),
     );
 }
 
-fn block_matches_header(a: &AcceptedShare, txns: &[Vec<u8>]) -> Result<(), String> {
-    let committed = ratum::header::BlockHeaderV2::deserialize(&a.rebuilt.header)
+fn block_matches_header(rebuilt: &RebuiltShare, txns: &[Vec<u8>]) -> Result<(), String> {
+    let committed = ratum::header::BlockHeaderV2::deserialize(&rebuilt.header)
         .ok_or_else(|| "the header does not deserialize".to_string())?
         .merkle_root;
 
     let mut ids = Vec::with_capacity(txns.len() + 1);
-    ids.push(ratum::bitcoin::sha256d(&a.rebuilt.coinbase_tx));
+    ids.push(ratum::bitcoin::sha256d(&rebuilt.coinbase_tx));
     for (i, raw) in txns.iter().enumerate() {
         match ratum::bitcoin::transaction::txid(raw) {
             Ok(id) => ids.push(id),

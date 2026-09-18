@@ -1,201 +1,127 @@
-use super::{RebuiltShare, SharePolicy, Splits};
+//! Rebuilding the block a share claims, from the job and coinbase sections it was mined on, and
+//! checking that its coinbase pays what the pool dictated and nothing else.
+
+use super::{RebuiltShare, Verifier};
+use crate::ledger::split::Payout;
 use crate::payout::DictatedOutput;
 use ratum::bitcoin;
 use ratum::bitcoin::transaction::CoinbaseTx;
-
-use ratum::datum::coinbase::{
-    TAG_END, TAG_SEPARATOR, UNIQUE_ID_PUSH_DATA_SIZE_NO_PRIME, UNIQUE_ID_PUSH_DATA_SIZE_V1,
-    UNIQUE_ID_PUSH_DATA_SIZE_V3,
-};
-use ratum::datum::messages::abw;
+use ratum::datum::coinbase::{ParsedScriptSig, parse_script_sig};
 use ratum::datum::messages::share::{self, CoinbaseSection, JobSection, PowSubmit};
 use ratum::datum::messages::share_response::RejectReason;
-use ratum::header::{self, BlockHeaderV2, PowHashes, XorKey};
+use ratum::header::{PowHashes, XorKey};
 use ratum::target;
-
-pub(super) fn rebuild_share(
-    policy: &SharePolicy,
-    splits: &Splits,
-    job: &JobSection,
-    cb: &CoinbaseSection,
-    s: &PowSubmit,
-    abw_key: Option<XorKey>,
-) -> Result<RebuiltShare, RejectReason> {
-    if s.target_byte > target::MAX_TARGET_EXPONENT
-        || u64::from(s.target_byte) < u64::from(target::floor_log2(policy.min_difficulty))
-    {
-        return Err(RejectReason::BadTarget);
-    }
-    let mut coinbase_tx = cb.assemble(&[0u8; share::EXTRANONCE_SIZE]);
-
-    let parsed = bitcoin::transaction::parse_coinbase(&coinbase_tx)
-        .map_err(|_| RejectReason::BadCoinbase)?;
-    if parsed.has_witness {
-        return Err(RejectReason::BadCoinbase);
-    }
-
-    let (target_byte_index, tag_secondary) = locate_target_byte(&parsed, policy)?;
-    if usize::from(s.target_byte_index_of(job)) != target_byte_index {
-        return Err(RejectReason::TargetMismatch);
-    }
-    coinbase_tx[target_byte_index] = s.target_byte;
-
-    let Payments { paid_to_split, paid_to_pool, unpaid_output_indexes } =
-        check_outputs(policy, splits, job, &parsed, s)?;
-
-    let branches: &[[u8; 32]] = if s.subsidy_only { &[] } else { job.merkle_branches.as_slice() };
-    let merkle_root = bitcoin::merkle_root_from_branches(&bitcoin::sha256d(&coinbase_tx), branches);
-
-    let h = build_header_v2(job, s, &merkle_root, abw_key)?;
-
-    let PowHashes { raw_pow_hash, block_hash } = h.pow_hashes();
-    Ok(RebuiltShare {
-        difficulty: s.difficulty(),
-        block_hash,
-        raw_pow_hash,
-        prev_hash: job.prev_hash,
-        job_bits: u32::from_le_bytes(job.nbits),
-        header: h.serialize(),
-        coinbase_tx,
-        height: job.height,
-        txn_count: job.txn_count,
-        coinbaser_id: job.coinbaser_id,
-        paid_to_split,
-        paid_to_pool,
-        unpaid_output_indexes,
-        tag_secondary,
-    })
-}
-
-pub(super) fn build_header_v2(
-    job: &JobSection,
-    s: &PowSubmit,
-    merkle_root: &[u8; 32],
-    abw_key: Option<XorKey>,
-) -> Result<BlockHeaderV2, RejectReason> {
-    let b = &s.blake2b;
-    let (nonce, nonce2) = b.nonce_fields();
-    let (time_offset, nonce3) = b.time_fields();
-    let extranonce =
-        share::header_extranonce(&s.extranonce).ok_or(RejectReason::BadExtranonceSize)?;
-    let tx_count = if s.subsidy_only { 1 } else { u64::from(job.txn_count) + 1 };
-    let txcount = u16::try_from(tx_count).map_err(|_| RejectReason::BadCoinbase)?;
-
-    let mut h = BlockHeaderV2 {
-        version: (s.version & !header::V2_FLAG) as i32,
-        prev_block: job.prev_hash,
-        merkle_root: *merkle_root,
-        time: b.time_on_wire,
-        bits: u32::from_le_bytes(job.nbits),
-        nonce,
-        nonce2,
-        nonce3,
-        extranonce,
-        time_offset,
-        txcount,
-        flags: if s.use_time_offset { header::FLAG_USE_TIME_OFFSET } else { 0 },
-        xor_key_mask_clear_bits: abw_key.map_or(0, |_| abw::clear_bits(s.target_byte)),
-        xor_key: abw_key.unwrap_or([0u8; 16]),
-        height: job.height as i32,
-        mm_rhs: [0u8; 32],
-    };
-    if s.use_time_offset {
-        h.time = b.time_on_wire.wrapping_add(time_offset);
-    }
-    Ok(h)
-}
-
-pub(super) fn locate_target_byte(
-    tx: &CoinbaseTx,
-    policy: &SharePolicy,
-) -> Result<(usize, String), RejectReason> {
-    let pushes = bitcoin::script::script_pushes(&tx.script_sig);
-    let prime = policy.prime_id.to_le_bytes();
-    let unique_id_push = pushes
-        .iter()
-        .position(|push| {
-            let Some(id) = push.data.get(UNIQUE_ID_PUSH_DATA_SIZE_NO_PRIME..) else { return false };
-            match push.data.len() {
-                UNIQUE_ID_PUSH_DATA_SIZE_V1 => {
-                    u32::try_from(policy.prime_id).is_ok() && id == &prime[..size_of::<u32>()]
-                }
-                UNIQUE_ID_PUSH_DATA_SIZE_V3 => id == prime,
-                _ => false,
-            }
-        })
-        .ok_or(RejectReason::MissingPoolTag)?;
-
-    let mut tag_secondary = String::new();
-    let tag_push = unique_id_push.checked_sub(1).map(|i| pushes[i].data);
-    if !policy.coinbase_tag.is_empty() {
-        let tag = policy.coinbase_tag.as_bytes();
-        let (marker, rest) = tag_push
-            .and_then(|data| data.strip_prefix(tag))
-            .and_then(|after| after.split_first())
-            .filter(|(marker, _)| matches!(**marker, TAG_END | TAG_SEPARATOR))
-            .ok_or(RejectReason::MissingPoolTag)?;
-        if *marker == TAG_SEPARATOR {
-            tag_secondary = decode_tag(rest);
-        }
-    } else if let Some(rest) = tag_push.and_then(|data| data.strip_prefix(&[TAG_SEPARATOR])) {
-        tag_secondary = decode_tag(rest);
-    }
-
-    Ok((tx.script_sig_offset + pushes[unique_id_push].data_at, tag_secondary))
-}
-
-pub(super) fn decode_tag(bytes: &[u8]) -> String {
-    let bytes = bytes.strip_suffix(&[TAG_END]).unwrap_or(bytes);
-    String::from_utf8_lossy(bytes).chars().filter(|c| !c.is_control()).collect()
-}
 
 pub(super) struct Payments {
     pub(super) paid_to_split: u64,
     pub(super) paid_to_pool: u64,
-    pub(super) unpaid_output_indexes: Vec<usize>,
+    pub(super) unpaid_outputs: Vec<Payout>,
 }
 
-pub(super) fn check_outputs(
-    policy: &SharePolicy,
-    splits: &Splits,
-    job: &JobSection,
-    tx: &CoinbaseTx,
-    s: &PowSubmit,
-) -> Result<Payments, RejectReason> {
-    let recorded = if s.subsidy_only { None } else { splits.get(&job.coinbaser_id) };
-    let dictated: &[DictatedOutput] = recorded.map_or(&[], |d| &d.outputs);
+impl Verifier<'_> {
+    /// Rebuilds the share on `job` and `cb` against this verifier's policy, recorded splits
+    /// and next target.
+    pub(super) fn rebuild_share(
+        &self,
+        job: &JobSection,
+        cb: &CoinbaseSection,
+        s: &PowSubmit,
+        abw_key: Option<XorKey>,
+    ) -> Result<RebuiltShare, RejectReason> {
+        let config = &self.policy.config;
+        if s.target_byte > target::MAX_TARGET_EXPONENT
+            || u64::from(s.target_byte) < u64::from(target::floor_log2(config.min_difficulty))
+        {
+            return Err(RejectReason::BadTarget);
+        }
+        let mut coinbase_tx = cb.assemble(&[0u8; share::EXTRANONCE_SIZE]);
+        let parsed = bitcoin::transaction::parse_coinbase(&coinbase_tx)
+            .map_err(|_| RejectReason::BadCoinbase)?;
+        if parsed.has_witness {
+            return Err(RejectReason::BadCoinbase);
+        }
 
-    let mut next = 0usize;
-    let mut paid = vec![false; dictated.len()];
-    let mut paid_to_split = 0u64;
-    let mut paid_to_pool = 0u64;
-    for out in &tx.outputs {
-        if out.value == 0 {
-            continue;
+        let ParsedScriptSig { target_byte_index, tag_secondary } =
+            parse_script_sig(&parsed, config.prime_id, &config.coinbase_tag)
+                .ok_or(RejectReason::MissingPoolTag)?;
+        if usize::from(job.target_byte_index) != target_byte_index {
+            return Err(RejectReason::TargetMismatch);
         }
-        if let Some(pos) = dictated[next..].iter().position(|d| d.output == *out) {
-            paid_to_split = paid_to_split.saturating_add(out.value);
-            paid[next + pos] = true;
-            next += pos + 1;
-            continue;
-        }
-        if out.script_pubkey == policy.payout_script {
-            paid_to_pool = paid_to_pool.saturating_add(out.value);
-            continue;
-        }
-        return Err(RejectReason::BadCoinbaseOutputs);
+        // `parse_script_sig` read the index out of this transaction, so it is in bounds; this
+        // is `JobSection::coinbase_tx` without assembling the transaction a second time.
+        coinbase_tx[target_byte_index] = s.target_byte;
+
+        let Payments { paid_to_split, paid_to_pool, unpaid_outputs } =
+            self.check_outputs(job, &parsed, s)?;
+
+        let merkle_root = job.merkle_root(&coinbase_tx, s.subsidy_only);
+        let h = s.header(job, &merkle_root, abw_key).ok_or(RejectReason::BadCoinbase)?;
+
+        let PowHashes { raw_pow_hash, block_hash } = h.pow_hashes();
+        Ok(RebuiltShare {
+            is_block: self.next_target().is_some_and(|t| target::meets_target(&block_hash, &t)),
+            difficulty: s.difficulty(),
+            block_hash,
+            raw_pow_hash,
+            prev_hash: job.prev_hash,
+            job_bits: u32::from_le_bytes(job.nbits),
+            header: h.serialize(),
+            coinbase_tx,
+            height: job.height,
+            txn_count: job.txn_count,
+            coinbaser_id: job.coinbaser_id,
+            paid_to_split,
+            paid_to_pool,
+            unpaid_outputs,
+            tag_secondary,
+        })
     }
 
-    if !s.subsidy_only && paid_to_split.saturating_add(paid_to_pool) != job.coinbase_value {
-        return Err(RejectReason::BadCoinbase);
+    pub(super) fn check_outputs(
+        &self,
+        job: &JobSection,
+        tx: &CoinbaseTx,
+        s: &PowSubmit,
+    ) -> Result<Payments, RejectReason> {
+        let payout_script = &self.policy.config.payout_script;
+        let recorded = if s.subsidy_only { None } else { self.splits.get(job.coinbaser_id) };
+        let dictated: &[DictatedOutput] = recorded.map_or(&[], |d| &d.outputs);
+
+        let mut next = 0usize;
+        let mut paid = vec![false; dictated.len()];
+        let mut paid_to_split = 0u64;
+        let mut paid_to_pool = 0u64;
+        for out in &tx.outputs {
+            if out.value == 0 {
+                continue;
+            }
+            let matches = |d: &DictatedOutput| {
+                d.payout.sats == out.value && d.script_pubkey == out.script_pubkey
+            };
+            if let Some(pos) = dictated[next..].iter().position(matches) {
+                paid_to_split = paid_to_split.saturating_add(out.value);
+                paid[next + pos] = true;
+                next += pos + 1;
+                continue;
+            }
+            if out.script_pubkey == *payout_script {
+                paid_to_pool = paid_to_pool.saturating_add(out.value);
+                continue;
+            }
+            return Err(RejectReason::BadCoinbaseOutputs);
+        }
+
+        if !s.subsidy_only && paid_to_split.saturating_add(paid_to_pool) != job.coinbase_value {
+            return Err(RejectReason::BadCoinbase);
+        }
+
+        let unpaid_outputs = dictated
+            .iter()
+            .zip(paid)
+            .filter(|(d, paid)| !paid && d.script_pubkey != *payout_script)
+            .map(|(d, _)| d.payout.clone())
+            .collect();
+
+        Ok(Payments { paid_to_split, paid_to_pool, unpaid_outputs })
     }
-
-    let unpaid_output_indexes = dictated
-        .iter()
-        .enumerate()
-        .filter(|(i, d)| !paid[*i] && d.output.script_pubkey != policy.payout_script)
-        .map(|(i, _)| i)
-        .collect();
-
-    Ok(Payments { paid_to_split, paid_to_pool, unpaid_output_indexes })
 }

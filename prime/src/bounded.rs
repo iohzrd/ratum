@@ -1,3 +1,5 @@
+//! A map and a set that forget their oldest entry once they are past a capacity.
+
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
 
@@ -13,9 +15,12 @@ impl<K: Clone + Eq + Hash, V> BoundedMap<K, V> {
         Self { entries: HashMap::new(), order: VecDeque::new(), capacity: capacity.max(1) }
     }
 
-    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 
     #[cfg(test)]
@@ -23,11 +28,7 @@ impl<K: Clone + Eq + Hash, V> BoundedMap<K, V> {
         &self.order
     }
 
-    pub fn get<Q>(&self, key: &Q) -> Option<&V>
-    where
-        K: std::borrow::Borrow<Q>,
-        Q: Eq + Hash + ?Sized,
-    {
+    pub fn get(&self, key: &K) -> Option<&V> {
         self.entries.get(key)
     }
 
@@ -71,9 +72,12 @@ impl<T: Clone + Eq + Hash> BoundedSet<T> {
         Self(BoundedMap::new(capacity))
     }
 
-    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 
     pub fn insert(&mut self, value: T) -> bool {
@@ -86,5 +90,39 @@ impl<T: Clone + Eq + Hash> BoundedSet<T> {
 
     pub fn remove(&mut self, value: &T) -> bool {
         self.0.remove(value).is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_set_reports_what_it_holds_and_forgets_its_oldest_past_the_capacity() {
+        let mut s: BoundedSet<u8> = BoundedSet::new(2);
+        assert!(s.is_empty());
+        assert_eq!(s.len(), 0);
+
+        assert!(s.insert(1));
+        assert!(!s.is_empty());
+        assert!(!s.insert(1), "a value already held is not inserted again");
+        assert_eq!(s.len(), 1);
+
+        assert!(s.insert(2));
+        assert!(s.insert(3));
+        assert_eq!(s.len(), 2, "the capacity");
+        assert!(s.insert(1), "1 was the oldest and was forgotten");
+
+        assert!(s.remove(&1));
+        assert!(!s.remove(&1), "removed once");
+        assert_eq!(s.len(), 1);
+    }
+
+    #[test]
+    fn a_capacity_below_one_still_holds_one_value() {
+        let mut s: BoundedSet<u8> = BoundedSet::new(0);
+        assert!(s.insert(1));
+        assert_eq!(s.len(), 1);
+        assert!(!s.insert(1));
     }
 }

@@ -4,7 +4,7 @@
 # Enable with: git config core.hooksPath .githooks
 #
 # The one version line is `[workspace.package] version` in the root Cargo.toml; every crate
-# inherits it and `ratum::VERSION` reports it. Cargo.lock holds the same number for each
+# inherits it and each binary's `VERSION` reports it. Cargo.lock holds the same number for each
 # workspace member, so it is updated as well (offline, workspace members only) and both are
 # staged into the commit being made.
 #
