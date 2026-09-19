@@ -183,7 +183,8 @@ ignored. `RUST_LOG` overrides `logger.log_level_console`.
 - A share whose hash is a block and that a miner submits again is refused as a duplicate and
   is not submitted to the node, or sent to the pool, a second time (the newest 64 blocks
   found are held).
-- A username is cut at its first NUL character, as the C gateway's copy of it stops there.
+- A username (`mining.authorize` and `mining.submit`) is cut at its first NUL character, as the
+  C gateway's copy of it stops there.
 
 Not served: the PROXY protocol (`stratum.trust_proxy`), daily rotation
 and SIGHUP (`logger.log_rotate_daily`; the file is held open, so rotate it with logrotate's
@@ -316,7 +317,8 @@ configuration, runs that session under version 1.
 A version 3 session's anti-block-withholding slots rotate on a new tip (once the active
 slot is a quarter of `--abw-reveal-after` old), after 16384 accepted shares, and after 10
 minutes; a rotation onto a slot whose previous key is not yet revealed waits for that reveal
-rather than revealing it early. A retired slot's key is revealed `--abw-reveal-after` seconds
+rather than revealing it early. A slot on which the pool relays a block is treated as revealed
+(the block's header carries its key), and rotated off at once if active. A retired slot's key is revealed `--abw-reveal-after` seconds
 (1 to 600, default 300) after its retirement, not at the next rotation: the gateway audits every proof it retained on the slot
 the moment it processes the reveal, so the reveal must come after the last share the gateway
 can still submit on the slot's jobs (its stale-share rule allows `share_stale_seconds +
@@ -340,7 +342,8 @@ the saved session in place: the hello carries no challenge from the pool, so a c
 earlier hello sent again cannot discard the session its gateway is about to resume. A pool
 restart declines every resume. Every share that is a
 block by the node's target or by its job's own `nbits` (the measure of the gateway's reveal
-audit) gets a receipt, relayed or not.
+audit) gets a receipt, relayed or not; a refused share answered with a receipt or reference keeps
+its hash claimed, so a resend of it is not credited.
 
 ### Job validation
 
@@ -370,11 +373,11 @@ per job and coinbase on the pool's node, and the share responses of a job's firs
 delayed by that round trip. A transaction is held once however many jobs and connections
 name it. A connection holds at most 8 transaction requests and 4096 waiting shares; a share
 past either is refused. It holds the transactions of its 4 newest jobs that have sent them; a
-share on an older job requests them again. A block the node refuses is not recorded as found;
+share on an older job requests them again, and the node validates the job's block again. A block the node refuses is not recorded as found;
 one `submitblock` answers "duplicate" (the node already held it, as when the gateway's own
 submission reached it first) or "inconclusive" (stored without being connected) is recorded,
 and the confirmation pass reads whether it stays on the best chain. A block is submitted once
-however many times its share is sent, on any connection, unless the node did not answer. A
+however many times its share is sent, on any connection, unless the node did not answer, in which case a resend submits it again. A
 refused share that is a block by its job's own bits is submitted only when those bits are the
 template's for a job on the template's parent, or name a target at most four times the
 template's for a job on another parent (any bits on testnet and testnet4).

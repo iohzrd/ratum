@@ -3,7 +3,7 @@ resolver = "3"
 members = ["core", "prime", "gateway", "miner"]
 
 [workspace.package]
-version = "0.1.44"
+version = "0.1.45"
 edition = "2024"
 publish = false
 license = "AGPL-3.0-or-later"
@@ -34,5 +34,6 @@ serde = { version = "1", features = ["derive"] }
 # pays a different address for the same share.
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.11"
+socket2 = "0.6"
 thiserror = "2.0.20"
 toml = "1.1.6"

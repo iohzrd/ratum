@@ -469,10 +469,7 @@ impl<'a> Verifier<'a> {
             }
             refusal
         })?;
-        let meets_share_target = target::meets_target(
-            &rebuilt.raw_pow_hash,
-            &target::target_for_exponent(s.target_byte),
-        );
+        let meets_share_target = meets_share_target(s, &rebuilt);
         let checked = self.check_rebuilt(s, &rebuilt, now, meets_share_target);
         let rebuilt = RebuiltShare { job_generation: self.installed_generation(s), ..rebuilt };
         match checked {
@@ -516,6 +513,11 @@ fn check_username_and_time(s: &PowSubmit, now: u64) -> Result<(), RejectReason> 
         return Err(RejectReason::BadNtime);
     }
     Ok(())
+}
+
+/// Whether the share's hash meets the target its target byte names.
+pub fn meets_share_target(s: &PowSubmit, rebuilt: &RebuiltShare) -> bool {
+    target::meets_target(&rebuilt.raw_pow_hash, &target::target_for_exponent(s.target_byte))
 }
 
 fn meets_own_bits(rebuilt: &RebuiltShare) -> bool {

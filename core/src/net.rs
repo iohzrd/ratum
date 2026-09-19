@@ -2,7 +2,42 @@
 //! configured a listener binds the IPv6 wildcard first and the IPv4 wildcard second, so a host
 //! with either stack serves.
 
-use std::net::{IpAddr, Ipv6Addr};
+use socket2::{Domain, Protocol, Socket, Type};
+use std::io;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr, TcpListener, ToSocketAddrs};
+
+/// The accept backlog `TcpListener::bind` sets.
+const LISTEN_BACKLOG: i32 = 128;
+
+/// `TcpListener::bind`, with IPV6_V6ONLY cleared on the IPv6 wildcard so it also accepts IPv4
+/// (the option is set by default on Windows).
+pub fn listen(addr: impl ToSocketAddrs) -> io::Result<TcpListener> {
+    let mut last = None;
+    for addr in addr.to_socket_addrs()? {
+        match listen_on(addr) {
+            Ok(listener) => return Ok(listener),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "the address resolves to no address")
+    }))
+}
+
+fn listen_on(addr: SocketAddr) -> io::Result<TcpListener> {
+    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
+    if let SocketAddr::V6(v6) = addr
+        && v6.ip().is_unspecified()
+    {
+        socket.set_only_v6(false)?;
+    }
+    // As `TcpListener::bind`: on Windows the option lets another socket take the port.
+    #[cfg(unix)]
+    socket.set_reuse_address(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(LISTEN_BACKLOG)?;
+    Ok(socket.into())
+}
 
 /// The address a per-address limit counts a peer under: an IPv4 address, or an IPv4-mapped
 /// IPv6 one read as IPv4, as it is; any other IPv6 address by its /64 prefix, the smallest
@@ -57,6 +92,14 @@ mod tests {
         assert_eq!(limit_key(a), "2001:db8:1:2::".parse::<IpAddr>().unwrap());
         assert_eq!(limit_key(a), limit_key(b));
         assert_ne!(limit_key(a), limit_key(other));
+    }
+
+    #[test]
+    fn a_listener_on_the_ipv6_wildcard_accepts_ipv4_clients() {
+        // No IPv6 stack: nothing to check.
+        let Ok(listener) = listen("[::]:0") else { return };
+        let port = listener.local_addr().unwrap().port();
+        std::net::TcpStream::connect(("127.0.0.1", port)).expect("an IPv4 client connects");
     }
 
     #[test]

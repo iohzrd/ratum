@@ -14,7 +14,10 @@ use crate::accounting;
 use crate::payout;
 use crate::relay::{self, Relayed};
 use crate::txns;
-use crate::verify::{BlockCheck, JobTxns, RebuiltShare, Refusal, VERSION_ROLLING_MASK, Verifier};
+use crate::verify::{
+    self, BlockCheck, JobTxns, NTIME_WINDOW_SECS, RebuiltShare, Refusal, VERSION_ROLLING_MASK,
+    Verifier,
+};
 use log::{debug, error, warn};
 use ratum::datum::messages;
 use ratum::datum::messages::abw::CandidateRef;
@@ -224,6 +227,15 @@ impl Connection<'_> {
         verified: Result<RebuiltShare, Refusal>,
         received_at: u64,
     ) -> io::Result<()> {
+        // A resend of a held share gets no reference, which would precede the held answer.
+        let verified = match verified {
+            Err(Refusal { reason: RejectReason::DuplicateWork, rebuilt: Some(r) })
+                if self.holds(&r.block_hash) =>
+            {
+                Err(Refusal { reason: RejectReason::DuplicateWork, rebuilt: None })
+            }
+            verified => verified,
+        };
         let verdict = match self.job_verdict(&s, &verified, received_at) {
             Ok(verdict) => verdict,
             Err(e) => {
@@ -259,10 +271,14 @@ impl Connection<'_> {
         verified: &Result<RebuiltShare, Refusal>,
         now: u64,
     ) -> io::Result<JobVerdict> {
+        // A resend of a block is relayed only if the node never answered its submission.
         let (rebuilt, credited) = match verified {
             Ok(rebuilt) => (rebuilt, true),
             Err(Refusal { reason, rebuilt: Some(rebuilt) })
-                if *reason != RejectReason::DuplicateWork && self.verifier.relayable(rebuilt) =>
+                if self.verifier.relayable(rebuilt)
+                    && (*reason != RejectReason::DuplicateWork
+                        || !ratum::lock(&self.server.relayed_blocks)
+                            .contains(&rebuilt.block_hash)) =>
             {
                 (rebuilt.as_ref(), false)
             }
@@ -398,15 +414,18 @@ impl Connection<'_> {
                     JobVerdict::Unchecked(reason, txns) => (reason, Some(txns)),
                     _ => (RejectReason::Other, None),
                 };
-                ratum::lock(&self.server.accepted_hashes).remove(&rebuilt.block_hash);
+                // Under an assignment the hash stays claimed (`may_reference`).
+                if self.abw_slot_of(s).is_none() {
+                    ratum::lock(&self.server.accepted_hashes).remove(&rebuilt.block_hash);
+                }
                 let relay = txns.as_deref().filter(|_| rebuilt.meets_own_bits());
                 let refusal = Refusal { reason, rebuilt: Some(Box::new(rebuilt)) };
-                self.on_refused(s, refusal, relay.map(|txns| (txns, received_at)))?
+                self.on_refused(s, refusal, relay, received_at)?
             }
             (Err(refusal), JobVerdict::RelayOnly(txns)) => {
-                self.on_refused(s, refusal, Some((&txns, received_at)))?
+                self.on_refused(s, refusal, Some(&txns), received_at)?
             }
-            (Err(refusal), _) => self.on_refused(s, refusal, None)?,
+            (Err(refusal), _) => self.on_refused(s, refusal, None, received_at)?,
         };
         let abw_ref = outcome
             .raw_pow_hash
@@ -533,21 +552,36 @@ impl Connection<'_> {
                 self.peer
             ),
             Relayed::Accepted => {
+                self.note_published_slot(s);
                 accounting::record_block(self.server, self.peer, &s.username, rebuilt, now);
             }
             Relayed::Unknown => {
-                // The node did not answer: the share sent again is submitted again.
+                // The node did not answer: a resend submits the block again (`job_verdict`).
+                self.note_published_slot(s);
                 ratum::lock(&self.server.relayed_blocks).remove(&rebuilt.block_hash);
                 accounting::record_block(self.server, self.peer, &s.username, rebuilt, now);
             }
         }
     }
 
+    /// The relayed block's header carries its slot's key (`AbwSlotState::note_published`).
+    fn note_published_slot(&mut self, s: &PowSubmit) {
+        let (Some(slot), Some(v3)) = (self.abw_slot_of(s), &mut self.v3) else { return };
+        let Some(active) = v3.abw.note_published(slot) else { return };
+        warn!(
+            "[{}]      the block carries the key of ABW slot {slot}, which is public from now on: \
+             shares on the slot are refused{}",
+            self.peer,
+            if active { ", and the assignment rotates to a new slot" } else { "" }
+        );
+    }
+
     fn on_refused(
         &mut self,
         s: &PowSubmit,
         refusal: Refusal,
-        relay: Option<(&[Arc<[u8]>], u64)>,
+        relay: Option<&[Arc<[u8]>]>,
+        received_at: u64,
     ) -> io::Result<ShareOutcome> {
         let peer = self.peer;
         let Refusal { reason, rebuilt } = refusal;
@@ -566,7 +600,7 @@ impl Connection<'_> {
                 hex::encode(&r.coinbase_tx)
             );
         }
-        if let (Some(r), Some((txns, received_at))) = (&rebuilt, relay) {
+        if let (Some(r), Some(txns)) = (&rebuilt, relay) {
             warn!(
                 "[{peer}]   ** BLOCK at height {} on a refused share ({reason:?}); relaying it, \
                  the share is not credited: {}",
@@ -575,7 +609,7 @@ impl Connection<'_> {
             );
             self.relay_and_record(s, r, txns, received_at);
         }
-        let rebuilt = rebuilt.filter(|_| self.abw_slot_of(s).is_some());
+        let rebuilt = rebuilt.filter(|r| self.may_reference(s, r, received_at));
         if let Some(r) = &rebuilt
             && r.is_block_candidate()
         {
@@ -589,6 +623,27 @@ impl Connection<'_> {
             verdict: ShareVerdict::Rejected(reason),
             raw_pow_hash: rebuilt.map(|r| r.raw_pow_hash),
         })
+    }
+
+    /// Whether a refused share's answer may reference it (and so tell the gateway whether it is
+    /// a block). Claims its hash so a resend cannot be credited; false past the ntime window.
+    fn may_reference(&self, s: &PowSubmit, rebuilt: &RebuiltShare, received_at: u64) -> bool {
+        if self.abw_slot_of(s).is_none() {
+            return false;
+        }
+        if !verify::meets_share_target(s, rebuilt) {
+            return true;
+        }
+        if u64::from(s.block_time()) > received_at.saturating_add(NTIME_WINDOW_SECS) {
+            return false;
+        }
+        ratum::lock(&self.server.accepted_hashes).insert(rebuilt.block_hash, received_at);
+        true
+    }
+
+    /// Whether a share held here for its job's transactions claimed `hash`.
+    fn holds(&self, hash: &[u8; 32]) -> bool {
+        self.held.iter().any(|h| h.claimed_hash().as_ref() == Some(hash))
     }
 
     /// A job's transactions (0x50 0x92): checked against the job's merkle branches and held,

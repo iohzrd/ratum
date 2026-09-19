@@ -351,11 +351,13 @@ fn a_job_whose_parent_the_node_never_reports_is_evicted() {
 fn a_connection_holds_the_transactions_of_its_newest_jobs_only() {
     let (mut v, s) = setup();
     let on_slot = |slot: u8| PowSubmit { job_id: slot, ..s.clone() };
+    let valid = BlockCheck::Valid { version: 0x2000_0000 };
     for slot in 0..6u8 {
         v.install_sections(&on_slot(slot), [slot; 32], NOW).unwrap();
         let generation = v.installed_generation(&on_slot(slot)).unwrap();
         let none: std::sync::Arc<[std::sync::Arc<[u8]>]> = std::sync::Arc::from(Vec::new());
         assert!(v.set_job_txns(slot, generation, crate::verify::JobTxns::Held(none)));
+        v.record_block_check(slot, generation, [slot; 32], valid);
     }
     let holding: Vec<u8> = (0..6u8)
         .filter(|&slot| {
@@ -364,4 +366,16 @@ fn a_connection_holds_the_transactions_of_its_newest_jobs_only() {
         })
         .collect();
     assert_eq!(holding, vec![2, 3, 4, 5], "the four newest jobs keep theirs");
+    let checked: Vec<u8> = (0..6u8)
+        .filter(|&slot| {
+            let generation = v.installed_generation(&on_slot(slot)).unwrap();
+            v.block_check(slot, generation, &[slot; 32]).is_some()
+        })
+        .collect();
+    assert_eq!(
+        checked,
+        vec![2, 3, 4, 5],
+        "a released job's verdicts go with its transactions, so the transactions sent again \
+         are validated again"
+    );
 }

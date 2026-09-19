@@ -185,8 +185,8 @@ impl Verifier<'_> {
     }
 
     /// Sets the job's transactions; false when the job is no longer installed. Past
-    /// `MAX_JOBS_HOLDING_TXNS` jobs holding transactions, the oldest are released, and a
-    /// further share on one requests them again.
+    /// `MAX_JOBS_HOLDING_TXNS` jobs holding transactions, the oldest are released with their
+    /// node verdicts (txids omit witnesses, so transactions sent again are proposed again).
     pub fn set_job_txns(&mut self, job_id: u8, generation: u64, txns: JobTxns) -> bool {
         let holds = matches!(txns, JobTxns::Held(_));
         let set = self.live_job_mut(job_id, generation).map(|st| st.txns = txns).is_some();
@@ -212,6 +212,7 @@ impl Verifier<'_> {
         for &(_, at) in &holding[..surplus] {
             if let Some(st) = self.jobs[at].as_mut() {
                 st.txns = JobTxns::Unrequested;
+                st.checks.clear();
             }
         }
     }

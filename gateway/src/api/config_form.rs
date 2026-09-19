@@ -8,7 +8,6 @@ use crate::config::{
     VARDIFF_MIN_RANGE, WORK_UPDATE_SECONDS_RANGE,
 };
 use serde_json::{Value, json};
-use std::net::TcpListener;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
@@ -390,7 +389,7 @@ fn check_startup(running: &Config, new: &Config) -> Result<(), String> {
     let (was, s) = (&running.stratum, &new.stratum);
     if (was.listen_addr.as_str(), was.listen_port) != (s.listen_addr.as_str(), s.listen_port) {
         // The listener is dropped as soon as it is bound.
-        ratum::net::bind_first(&s.listen_addr, s.listen_port, |a: &str| TcpListener::bind(a))
+        ratum::net::bind_first(&s.listen_addr, s.listen_port, |a: &str| ratum::net::listen(a))
             .map_err(|e| format!("Stratum port {} cannot be opened: {e}", s.listen_port))?;
     }
     Ok(())
@@ -457,6 +456,7 @@ pub fn write_file(path: &str, text: &str) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use std::net::TcpListener;
 
     /// The `name` and the attribute `attr` of every `<input>` and `<select>` on the page.
     fn form_controls<'a>(html: &'a str, attr: &str) -> Vec<(&'a str, Option<&'a str>)> {

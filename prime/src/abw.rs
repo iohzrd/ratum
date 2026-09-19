@@ -86,6 +86,8 @@ pub struct AbwSlotState {
     held_until: Instant,
     /// A new tip asked for a rotation that the hold has not yet let through.
     tip_rotation_pending: bool,
+    /// The slots whose key a relayed block's header published.
+    published: [bool; SLOTS],
 }
 
 impl AbwSlotState {
@@ -98,6 +100,7 @@ impl AbwSlotState {
             reveal_after,
             held_until: now,
             tip_rotation_pending: false,
+            published: [false; SLOTS],
         };
         abw.seed(0);
         abw
@@ -119,17 +122,39 @@ impl AbwSlotState {
     }
 
     /// The key a share on `slot` is verified with, and whether it is still secret; none
-    /// for a slot that was never seeded or that is out of range.
+    /// for a slot that was never seeded or that is out of range. A published key is revealed.
     pub fn key_for(&self, slot: u8) -> Option<(XorKey, SlotKeyStatus)> {
-        match self.slots.get(usize::from(slot))? {
-            Slot::Seeded { key } | Slot::Retired { key, .. } => Some((*key, SlotKeyStatus::Secret)),
-            Slot::Revealed { key, .. } => Some((*key, SlotKeyStatus::Revealed)),
+        let entry = self.slots.get(usize::from(slot))?;
+        let published = self.published[usize::from(slot)];
+        match entry {
+            Slot::Seeded { key } | Slot::Retired { key, .. } if !published => {
+                Some((*key, SlotKeyStatus::Secret))
+            }
+            Slot::Seeded { key } | Slot::Retired { key, .. } | Slot::Revealed { key, .. } => {
+                Some((*key, SlotKeyStatus::Revealed))
+            }
             Slot::Empty => None,
         }
     }
 
+    /// Marks `slot`'s key public (a relayed block's header carries it); an active slot rotates at
+    /// once. Returns whether it was active; none if its key was not secret.
+    pub fn note_published(&mut self, slot: u8) -> Option<bool> {
+        let at = usize::from(slot);
+        self.slots.get(at)?.secret_key()?;
+        if std::mem::replace(&mut self.published[at], true) {
+            return None;
+        }
+        Some(slot == self.active)
+    }
+
+    fn active_published(&self) -> bool {
+        self.published[usize::from(self.active)]
+    }
+
     fn seed(&mut self, slot: u8) {
         self.slots[usize::from(slot)] = Slot::Seeded { key: ratum::rand::bytes() };
+        self.published[usize::from(slot)] = false;
         self.active = slot;
     }
 
@@ -207,7 +232,7 @@ impl AbwSlotState {
 
     /// The earliest instant a rotation or a reveal can be due, never before the hold ends.
     pub fn next_due(&self) -> Instant {
-        let rotation = if self.tip_rotation_pending {
+        let rotation = if self.tip_rotation_pending || self.active_published() {
             self.held_until
         } else {
             self.activated_at + ROTATE_AFTER
@@ -262,6 +287,8 @@ impl AbwSlotState {
     pub fn rotation_due(&self, now: Instant) -> Option<&'static str> {
         if self.held(now) || self.next_slot_reveal_at().is_some() {
             None
+        } else if self.active_published() {
+            Some("a relayed block published its key")
         } else if self.tip_rotation_pending {
             Some("new tip")
         } else if self.shares_since_activation >= ROTATE_AFTER_SHARES {
@@ -517,6 +544,39 @@ mod tests {
         assert!(!abw.note_tip(now + AFTER / 4), "a rotation resets the age");
         assert!(abw.note_tip(now + AFTER / 2));
     }
+
+    #[test]
+    fn a_relayed_block_publishes_its_slots_key_and_rotates_off_the_active_slot_at_once() {
+        let now = Instant::now();
+        let mut abw = AbwSlotState::start(now, AFTER);
+        abw.rotate(now);
+        let key0 = secret_key(&abw, 0).unwrap();
+        assert_eq!(abw.note_published(0), Some(false), "slot 0 is retired, not active");
+        assert_eq!(revealed_key(&abw, 0), Some(key0), "its shares are refused as revealed");
+        assert_eq!(retired_slots(&abw), [0], "its reveal still waits for its time");
+        assert!(abw.reveals_due(now).is_empty());
+        assert_eq!(abw.rotation_due(now), None, "the active slot's key is still secret");
+
+        let key1 = secret_key(&abw, 1).unwrap();
+        assert_eq!(abw.note_published(1), Some(true));
+        assert_eq!(abw.note_published(1), None, "published once");
+        assert_eq!(revealed_key(&abw, 1), Some(key1));
+        assert_eq!(abw.next_due(), now, "the rotation is due now, whatever the slot's age");
+        assert_eq!(abw.rotation_due(now), Some("a relayed block published its key"));
+        abw.rotate(now);
+        assert_eq!(abw.active, 2);
+        assert!(secret_key(&abw, 2).is_some(), "the new slot's key is secret");
+        assert_eq!(abw.rotation_due(now), None);
+        assert_eq!(abw.note_published(OUT_OF_RANGE_SLOT), None);
+
+        for _ in 0..15 {
+            abw.rotate(now);
+        }
+        assert_eq!(abw.active, 1);
+        assert!(secret_key(&abw, 1).is_some(), "a slot seeded again has a new, secret key");
+    }
+
+    const OUT_OF_RANGE_SLOT: u8 = abw::ASSIGNMENT_SLOTS;
 
     #[test]
     fn a_connection_holds_rotations_and_reveals_and_a_tip_during_the_hold_waits_for_it() {

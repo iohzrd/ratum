@@ -14,7 +14,6 @@ use mio::Waker;
 use ratum::lock;
 use std::collections::HashMap;
 use std::io;
-use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -214,7 +213,7 @@ pub fn spawn_listener(gateway: Arc<Gateway>) {
 fn listen(gateway: Arc<Gateway>) -> io::Result<()> {
     let s = &gateway.config.stratum;
     let listener =
-        ratum::net::bind_first(&s.listen_addr, s.listen_port, |a: &str| TcpListener::bind(a))
+        ratum::net::bind_first(&s.listen_addr, s.listen_port, |a: &str| ratum::net::listen(a))
             .map_err(io::Error::other)?;
     info!("Stratum V1 Server Init complete: listening on {}", listener.local_addr()?);
     gateway.stratum.listening.store(true, Ordering::Relaxed);

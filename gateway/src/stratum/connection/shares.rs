@@ -105,7 +105,7 @@ impl Connection {
             params.get(3).and_then(Value::as_str).and_then(parse_sia_field).ok_or(job_diff)?;
         let sia_nonce =
             params.get(4).and_then(Value::as_str).and_then(parse_sia_field).ok_or(job_diff)?;
-        let miner_username = params.get(0).and_then(Value::as_str).unwrap_or("NULL").to_string();
+        let miner_username = super::username_param(params).to_string();
         Ok(SubmitRequest {
             job,
             job_diff,

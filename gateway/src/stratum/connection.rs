@@ -329,11 +329,7 @@ impl Connection {
     }
 
     fn on_authorize(&mut self, id: &str, params: &Value) -> io::Result<()> {
-        let username = params.get(0).and_then(Value::as_str).unwrap_or("NULL");
-        // Cut at a NUL, as the C gateway's copy of the username stops at one: the share
-        // message ends the username at its first NUL, so a username carrying one would make
-        // every share on it undecodable by the pool.
-        let username = username.split('\0').next().unwrap_or_default();
+        let username = username_param(params);
         let name: String = username.chars().take(MAX_USERNAME_CHARS).collect();
         let refused: Option<String> =
             self.gateway.config.stratum.refuses_username(username).then(|| {
@@ -419,6 +415,12 @@ impl Connection {
         self.notified_prev_hash = Some(prev_hash);
         self.send_line(line)
     }
+}
+
+/// `params[0]` cut at its first NUL, as in C: the pool reads the share's username up to a NUL.
+fn username_param(params: &Value) -> &str {
+    let username = params.get(0).and_then(Value::as_str).unwrap_or("NULL");
+    username.split('\0').next().unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -686,5 +688,14 @@ mod tests {
             matches!(&ended, Disconnect::Protocol(why) if why.contains("read buffer overrun")),
             "{ended:?}"
         );
+    }
+
+    #[test]
+    fn a_username_is_cut_at_its_first_nul_on_authorize_and_submit_alike() {
+        let submit = serde_json::json!(["bc1qaddr.w\0\0\0\0x", "id", "00", "0", "0"]);
+        assert_eq!(username_param(&submit), "bc1qaddr.w");
+        assert_eq!(username_param(&serde_json::json!(["\0rest"])), "");
+        assert_eq!(username_param(&serde_json::json!(["plain"])), "plain");
+        assert_eq!(username_param(&serde_json::json!([])), "NULL", "no username named");
     }
 }

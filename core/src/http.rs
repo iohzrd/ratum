@@ -258,7 +258,7 @@ pub struct Server {
 
 impl Server {
     pub fn http(addr: impl ToSocketAddrs) -> io::Result<Self> {
-        Ok(Self { listener: TcpListener::bind(addr)? })
+        Ok(Self { listener: crate::net::listen(addr)? })
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {

@@ -236,7 +236,7 @@ fn main() -> io::Result<()> {
         }
     }
 
-    let listener = TcpListener::bind(&s.listen)?;
+    let listener = ratum::net::listen(&s.listen)?;
     let bound = listener.local_addr().map_or_else(|_| s.listen.clone(), |a| a.to_string());
     info!(
         "listening on {bound} (at most {} connections, {} from one address)",
