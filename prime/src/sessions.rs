@@ -130,7 +130,7 @@ mod tests {
             split.value,
             [0x5a; 32],
             vec![DictatedOutput {
-                payout: Payout { identity: "carol".to_string(), sats: split.value },
+                payout: Payout { identity: "carol".into(), sats: split.value },
                 script_pubkey: split.script_pubkey.clone(),
             }],
             0,

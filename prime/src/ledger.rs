@@ -173,8 +173,8 @@ impl Identities {
         }
     }
 
-    fn iter(&self) -> impl Iterator<Item = (&str, &IdentityState)> {
-        self.entries.iter().flatten().map(|e| (&*e.name, &e.state))
+    fn iter(&self) -> impl Iterator<Item = (&Arc<str>, &IdentityState)> {
+        self.entries.iter().flatten().map(|e| (&e.name, &e.state))
     }
 
     fn len(&self) -> usize {

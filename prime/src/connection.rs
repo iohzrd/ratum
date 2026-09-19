@@ -29,7 +29,9 @@ use std::time::{Duration, Instant};
 
 const LOG_PAYLOAD_BYTES: usize = 16;
 const LOG_HEX_CHARS: usize = 16;
-const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(15);
+/// How long a connection has from its acceptance to send its hello. It holds one of the
+/// `--max-connections` slots meanwhile, so the deadline bounds what an idle connection costs.
+const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(5);
 const FRAME_BODY_TIMEOUT: Duration = Duration::from_secs(30);
 const FRAME_BODY_DEADLINE: Duration = Duration::from_secs(120);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);

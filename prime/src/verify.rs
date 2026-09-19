@@ -35,6 +35,11 @@ const SPLIT_GRACE_SECS: u64 = 10;
 /// split.
 const MAX_SPLITS: usize = 64;
 
+/// The splits a saved session keeps. A resumed gateway replays the shares queued at its
+/// disconnect, on the jobs live then, one split each, so a few cover them; more would hold
+/// memory for the hour the session is kept, which any client can fill by requesting splits.
+pub const SAVED_SPLITS: usize = 8;
+
 /// The version bits a miner may roll (BIP 320). A share whose version differs from the version
 /// its job's block was validated with outside these bits is refused, since the node checks the
 /// rest of the version (the minimum version and any signalling a deployment requires).
@@ -159,7 +164,12 @@ impl DictatedSplits {
         self.by_id.insert(id, DictatedSplit { outputs, value, prev_hash, sent_at });
         self.order.push_back(id);
         self.last_id = id;
-        while self.order.len() > MAX_SPLITS {
+        self.keep_newest(MAX_SPLITS);
+    }
+
+    /// Drops the oldest splits until at most `n` remain.
+    fn keep_newest(&mut self, n: usize) {
+        while self.order.len() > n {
             if let Some(oldest) = self.order.pop_front() {
                 self.by_id.remove(&oldest);
             }
@@ -325,13 +335,14 @@ impl<'a> Verifier<'a> {
         self.splits.record(coinbaser_id, value, prev_hash, outputs, now);
     }
 
-    /// The splits to save with a session: those dictated on the tip or on a tip replaced
-    /// recently enough that a share on it can still be credited.
+    /// The splits to save with a session: the newest `SAVED_SPLITS` of those dictated on the
+    /// tip or on a tip replaced recently enough that a share on it can still be credited.
     pub fn take_splits(&mut self) -> DictatedSplits {
         let mut splits = std::mem::take(&mut self.splits);
         if self.tip.is_some() {
             splits.retain_prev(|prev| self.tip == Some(*prev) || self.recent_tip(*prev));
         }
+        splits.keep_newest(SAVED_SPLITS);
         splits
     }
 

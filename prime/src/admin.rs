@@ -98,7 +98,7 @@ fn owed_entries(entries: &[String]) -> Vec<Payout> {
         let split = entry.split_once('=').map(|(id, sats)| (id.trim(), sats.trim().parse::<u64>()));
         match split {
             Some((id, Ok(sats))) if !id.is_empty() && sats > 0 => {
-                let identity = ratum::bitcoin::address::canonical(id).into_owned();
+                let identity = ratum::bitcoin::address::canonical(id).into_owned().into();
                 parsed.push(Payout { identity, sats });
             }
             _ => fatal!(
@@ -262,8 +262,8 @@ mod tests {
             "BC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4=5".to_string(),
             "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2 = 7".to_string(),
         ]);
-        assert_eq!(entries[0].identity, "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4");
-        assert_eq!(entries[1].identity, "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2");
+        assert_eq!(&*entries[0].identity, "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4");
+        assert_eq!(&*entries[1].identity, "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2");
         assert_eq!((entries[0].sats, entries[1].sats), (5, 7));
     }
 

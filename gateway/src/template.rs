@@ -19,6 +19,7 @@ pub struct Txn {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TxnTotals {
+    /// At most the template's coinbase value: `decode` refuses a template claiming more.
     pub fee: u64,
     pub weight: u32,
     pub size: u32,
@@ -150,6 +151,12 @@ fn decode(v: &serde_json::Value) -> Result<Template, TemplateError> {
         size += raw.len() as u64;
         txns.push(Txn { raw, txid, witness_hash });
     }
+    if fee > coinbase_value {
+        return Err(TemplateError::Refused(format!(
+            "the transactions' fees total {fee} sats, more than the coinbase value of \
+             {coinbase_value} for block {height}; serving no work for it"
+        )));
+    }
 
     Ok(Template {
         height,
@@ -221,6 +228,13 @@ mod tests {
         assert_eq!(t.totals.size, 2);
         v["transactions"][0]["fee"] = serde_json::json!(-1);
         assert!(matches!(decode(&v), Err(TemplateError::Refused(_))));
+        v["transactions"][0]["fee"] = serde_json::json!(5_000_000_001u64);
+        assert!(
+            matches!(decode(&v), Err(TemplateError::Refused(_))),
+            "fees over the coinbase value would underflow the subsidy-only coinbase"
+        );
+        v["transactions"][0]["fee"] = serde_json::json!(5_000_000_000u64);
+        assert!(decode(&v).is_ok(), "fees equal to the coinbase value");
     }
 
     #[test]

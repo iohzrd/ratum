@@ -117,7 +117,7 @@ fn a_value_under_the_minimum_pays_nobody() {
 fn output_count_is_capped_largest_first() {
     let l = ledger_with(1_000_000, &[("a", 4), ("b", 3), ("c", 2), ("d", 1)]);
     let split = l.split_value(1_000_000, 0, 2);
-    assert_eq!(split.iter().map(|p| p.identity.as_str()).collect::<Vec<_>>(), vec!["a", "b"]);
+    assert_eq!(split.iter().map(|p| &*p.identity).collect::<Vec<_>>(), vec!["a", "b"]);
 }
 
 #[test]
@@ -384,8 +384,9 @@ fn weights_total_the_window() {
         for subsidy_bps in [0u16, 1, 3_333, FEE_BPS, FULL_SUBSIDY_BPS] {
             for gateway in [None, Some(public(fee_bps, subsidy_bps))] {
                 let l = tagged_ledger(gateway, SHARES);
-                let (weights, retained) = l.weights();
-                let total: u128 = weights.iter().map(|(_, w)| w).sum::<u128>() + retained;
+                let w = l.weights();
+                let total: u128 =
+                    w.entries.iter().map(|(_, w)| w).sum::<u128>() + w.retained_by_pool;
                 assert_eq!(
                     total,
                     l.total_work(),

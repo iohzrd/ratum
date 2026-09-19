@@ -114,7 +114,7 @@ pub fn share(
 }
 
 pub fn payout(identity: &str, sats: u64) -> Payout {
-    Payout { identity: identity.to_string(), sats }
+    Payout { identity: identity.into(), sats }
 }
 
 pub fn owed(n: u64, settled: Option<u64>) -> OwedBlock {

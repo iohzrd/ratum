@@ -14,11 +14,37 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 const HASHRATE_SPAN_SECS: u64 = 10 * ratum::SECS_PER_MINUTE;
 
+/// How long a snapshot answers requests before the next is computed, so a client polling at
+/// full rate costs the pool one computation a second under the ledger lock, not one a request.
+const SNAPSHOT_LIFETIME: Duration = Duration::from_secs(1);
+
+/// The last snapshot serialized, and when it was taken.
+#[derive(Default)]
+struct SnapshotCache(Mutex<Option<(Instant, String)>>);
+
+impl SnapshotCache {
+    /// The text held if it is younger than `lifetime`, else `compute`'s, held from now. The
+    /// lock is held across `compute`, so requests arriving together wait for one computation
+    /// rather than each making their own.
+    fn text(&self, lifetime: Duration, compute: impl FnOnce() -> String) -> String {
+        let mut held = lock(&self.0);
+        if let Some((taken_at, text)) = &*held
+            && taken_at.elapsed() < lifetime
+        {
+            return text.clone();
+        }
+        let text = compute();
+        *held = Some((Instant::now(), text.clone()));
+        text
+    }
+}
+
 fn hashes_per_second(work: u128, secs: u64) -> f64 {
-    ratum::hashrate::from_work(work, std::time::Duration::from_secs(secs))
+    ratum::hashrate::from_work(work, Duration::from_secs(secs))
 }
 
 const TARGET_BLOCK_SECS: f64 = 10.0 * ratum::SECS_PER_MINUTE as f64;
@@ -70,18 +96,27 @@ pub fn spawn(server: Arc<Server>, listen: &str) -> Result<SocketAddr, String> {
     hashrate::sample_every("stats-sampler", Arc::clone(&history), move || {
         pool_hashes_per_second(&sampled)
     });
+    let cache = Arc::new(SnapshotCache::default());
     // The interface serves GET only, so a request carrying a body is refused.
-    http::serve("stats", http, 0, move |request| handle(&server, &history, &request));
+    http::serve("stats", http, 0, move |request| handle(&server, &history, &cache, &request));
     Ok(addr)
 }
 
-fn handle(server: &Server, history: &Mutex<HashrateHistory>, request: &Request) -> Reply {
+fn handle(
+    server: &Server,
+    history: &Mutex<HashrateHistory>,
+    cache: &SnapshotCache,
+    request: &Request,
+) -> Reply {
     if request.method != Method::Get {
         return http::method_not_allowed();
     }
     let (path, _) = http::path_and_query(request);
     match path.as_str() {
-        "/stats.json" => http::noindex(http::json(snapshot(server, history))),
+        "/stats.json" => http::noindex(http::body(
+            cache.text(SNAPSHOT_LIFETIME, || snapshot(server, history).to_string()),
+            "application/json",
+        )),
         _ => http::not_found(),
     }
 }
@@ -148,14 +183,14 @@ fn owed_json(
     tip_height: Option<u32>,
 ) -> OwedJson {
     let mut unsettled_sats: u64 = 0;
-    let mut unsettled_per_identity: HashMap<String, u64> = HashMap::new();
+    let mut unsettled_per_identity: HashMap<Arc<str>, u64> = HashMap::new();
     let blocks: Vec<Value> = owed
         .iter()
         .map(|o| {
             if o.settled_at.is_none() {
                 unsettled_sats += o.total();
                 for p in &o.entries {
-                    *unsettled_per_identity.entry(p.identity.clone()).or_insert(0) += p.sats;
+                    *unsettled_per_identity.entry(Arc::clone(&p.identity)).or_insert(0) += p.sats;
                 }
             }
             json!({
@@ -166,7 +201,7 @@ fn owed_json(
                 "settled_at": o.settled_at,
                 "confirmations": confirmations_json(confirmations.get(&o.block_hash), o.height, tip_height),
                 "miners": o.entries.iter().map(|p| {
-                    json!({ "identity": p.identity, "sats": p.sats })
+                    json!({ "identity": &*p.identity, "sats": p.sats })
                 }).collect::<Vec<_>>(),
             })
         })
@@ -177,7 +212,7 @@ fn owed_json(
         .collect();
     ranked.sort_by(|a, b| b.sats.cmp(&a.sats).then_with(|| a.identity.cmp(&b.identity)));
     let by_identity =
-        ranked.into_iter().map(|p| json!({ "identity": p.identity, "sats": p.sats })).collect();
+        ranked.into_iter().map(|p| json!({ "identity": &*p.identity, "sats": p.sats })).collect();
     OwedJson { unsettled_sats, by_identity, blocks }
 }
 
@@ -281,29 +316,15 @@ impl LedgerView {
         };
         let l = lock(&server.ledger);
         let mut recent = l.work_since_by_identity(hashrate_cutoff());
-        let recent_work = recent.values().sum();
-        let mut payout_sats: HashMap<String, u64> = l
-            .split(coinbase_value.unwrap_or(0))
-            .into_iter()
-            .map(|p| (p.identity, p.sats))
-            .collect();
-        let miners = l
-            .identities()
-            .into_iter()
-            .map(|(identity, state)| MinerRow {
-                payout_sats: payout_sats.remove(&identity).unwrap_or(0),
-                recent_work: recent.remove(&identity).unwrap_or(0),
-                identity,
-                state,
-            })
-            .collect();
-        Self {
+        let (weights, miners_value) = l.weights_for(coinbase_value.unwrap_or(0));
+        let identities = l.identities();
+        let mut view = Self {
             total_work: l.total_work(),
             target_work: l.window(),
             shares: l.len(),
             max_shares: l.max_shares(),
             count_capped: l.count_capped(),
-            miners,
+            miners: Vec::with_capacity(identities.len()),
             window_multiple: l.window_rule().multiple,
             split_policy: l.split_policy().clone(),
             public_gateway_fee_work: l.public_gateway_fee_work(),
@@ -312,8 +333,22 @@ impl LedgerView {
             blocks_found,
             luck,
             confirmations,
-            recent_work,
-        }
+            recent_work: recent.values().sum(),
+        };
+        drop(l);
+        // The split's sort and amounts run off the ledger lock.
+        let mut payout_sats: HashMap<Arc<str>, u64> =
+            weights.split(miners_value).into_iter().map(|p| (p.identity, p.sats)).collect();
+        view.miners = identities
+            .into_iter()
+            .map(|(identity, state)| MinerRow {
+                payout_sats: payout_sats.remove(identity.as_str()).unwrap_or(0),
+                recent_work: recent.remove(&identity).unwrap_or(0),
+                identity,
+                state,
+            })
+            .collect();
+        view
     }
 }
 
@@ -443,6 +478,14 @@ mod tests {
             json!((CAP as u128 * 16).to_string()),
             "which is less work than the target, and no further share adds to it"
         );
+    }
+
+    #[test]
+    fn a_snapshot_answers_requests_for_its_lifetime_and_is_then_computed_again() {
+        let cache = SnapshotCache::default();
+        assert_eq!(cache.text(Duration::MAX, || "first".into()), "first");
+        assert_eq!(cache.text(Duration::MAX, || "second".into()), "first", "within the lifetime");
+        assert_eq!(cache.text(Duration::ZERO, || "second".into()), "second", "past it");
     }
 
     fn block(n: u8, cumulative_work: u128, network_difficulty: f64) -> FoundBlock {

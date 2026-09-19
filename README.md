@@ -311,9 +311,10 @@ described under "Owed blocks".
 
 `--max-connections` (default 1024) bounds the gateway connections served at once and
 `--max-connections-per-ip` (default 32) those from one address (an IPv4 address, or an IPv6
-/64 prefix, as the stats interface counts them). A connection is closed after
-10 minutes without a frame from its gateway, which sends a coinbaser request for every job it
-builds. The pool raises its soft open file limit to the hard limit at startup and warns when
+/64 prefix, as the stats interface counts them). A connection is closed when it sends no hello
+within 5 seconds of its acceptance, and after 10 minutes without a frame from its gateway, which
+sends a coinbaser request for every job it builds. The pool raises its soft open file limit to
+the hard limit at startup and warns when
 the limit does not cover three descriptors per connection.
 
 A share the ledger cannot record (a write error) is answered as refused (`Other`) and its
@@ -490,7 +491,7 @@ coinbase value, is refused (`BadCoinbaserId`): for more, its outputs would pay t
 the coinbase keeps more than their part; for less, the difference would reach the pool's
 script with no owed record. A gateway uses a split only on the value it requested it for. A connection may request 16 splits at once and one a second after that;
 a request past that is not answered. A session keeps its 64 newest splits, and saves with it
-for resume only those on the tip or a tip replaced within the last second.
+for resume at most the 8 newest of those on the tip or a tip replaced within the last second.
 
 ### Public gateway fee
 
@@ -570,7 +571,9 @@ that.
 ### Stats interface
 
 `--stats-listen <address>` serves one endpoint, the read-only snapshot at `/stats.json`;
-every other path is a 404. A request carrying a body is refused (413), and the interface
+every other path is a 404. The snapshot is computed at most once a second (`generated_at` is
+when), and requests within that second receive the same one, so a client polling at full
+rate costs the pool one computation a second. A request carrying a body is refused (413), and the interface
 serves at most 32 connections at once, 8 of them from one address (an IPv4 address, or an IPv6
 /64 prefix; loopback clients count only against the 32), one request each. It carries the tip, the coinbase value, the fee, the connected gateways, the build (`--version` prints the
 same string), an approximate hashrate (accepted-share difficulty over the last 10 minutes,

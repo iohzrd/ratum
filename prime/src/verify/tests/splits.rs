@@ -276,3 +276,19 @@ fn a_session_keeps_its_newest_splits_and_shares_outputs_that_repeat() {
     assert_eq!(splits.len(), 1);
     assert!(splits.get(101).is_some());
 }
+
+#[test]
+fn a_saved_session_keeps_the_newest_few_splits_on_the_tip() {
+    let (mut v, _) = setup();
+    v.set_tip(Some([0x5a; 32]), NOW);
+    for id in 2..=20u8 {
+        v.record_dictated(id, COINBASE_VALUE, [0x5a; 32], Vec::new(), NOW);
+    }
+    v.record_dictated(21, COINBASE_VALUE, [0x11; 32], Vec::new(), NOW);
+    let saved = v.take_splits();
+    assert_eq!(saved.len(), SAVED_SPLITS);
+    assert!(saved.get(21).is_none(), "another parent");
+    assert!(saved.get(12).is_none(), "older than the newest eight on the tip");
+    assert!(saved.get(13).is_some() && saved.get(20).is_some());
+    assert_eq!(saved.next_id(), 22, "the ids continue from the newest recorded, kept or not");
+}

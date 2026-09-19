@@ -4,10 +4,12 @@
 
 use super::{IdentityState, Ledger, most_work_first};
 use ratum::datum::messages::coinbaser::MAX_COINBASER_OUTPUTS;
+use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Payout {
-    pub identity: String,
+    /// Shared with the window's entry for the identity, so a split allocates no name.
+    pub identity: Arc<str>,
     pub sats: u64,
 }
 
@@ -70,6 +72,68 @@ fn reassigned_work(gateway: &PublicGateway, fee_work: u128, own_gateway_work: u1
     if own_gateway_work == 0 { 0 } else { basis_points_of(fee_work, gateway.subsidy_bps) }
 }
 
+/// Each identity's weight in the split and the fee work the pool retains, copied out of the
+/// window under the ledger lock so that the split (a sort and the amounts) runs without it.
+///
+/// The weights and the retained fee work total the window's work, because every identity is
+/// charged by `charged_work` in `Ledger::weights` and by the same function in
+/// `public_gateway_fee_work`, and `given` sums the reassignments handed out. `split` divides
+/// by that total, so the two must not drift apart; `weights_total_the_window` pins it.
+#[derive(Clone, Debug, Default)]
+pub struct Weights {
+    /// Each identity with work in the window and its weight, in the window's order.
+    pub(super) entries: Vec<(Arc<str>, u128)>,
+    /// What the public gateway fee charged less what it reassigned; the denominator includes
+    /// it, so it reaches the pool's script as the remainder.
+    pub(super) retained_by_pool: u128,
+}
+
+impl Weights {
+    /// The split of `value`, already less the operator fee, among at most
+    /// `MAX_COINBASER_OUTPUTS` identities of at least `MIN_PAYOUT`, most work first.
+    pub fn split(self, value: u64) -> Vec<Payout> {
+        self.split_with(value, MIN_PAYOUT, MAX_COINBASER_OUTPUTS)
+    }
+
+    fn split_with(self, value: u64, min_payout: u64, max_outputs: usize) -> Vec<Payout> {
+        let Self { mut entries, retained_by_pool } = self;
+        let total: u128 = entries.iter().map(|(_, w)| w).sum::<u128>() + retained_by_pool;
+        if total == 0 || value == 0 || max_outputs == 0 {
+            return Vec::new();
+        }
+        entries.sort_by(|(a, x), (b, y)| most_work_first((a, *x), (b, *y)));
+        entries.truncate(max_outputs);
+        let mut work: u128 = entries.iter().map(|(_, w)| w).sum::<u128>() + retained_by_pool;
+
+        while let Some(w) = entries.last().map(|(_, w)| *w) {
+            if work == 0 {
+                entries.clear();
+                break;
+            }
+            if u128::from(value).saturating_mul(w) / work >= u128::from(min_payout) {
+                break;
+            }
+            work -= w;
+            entries.pop();
+        }
+
+        let mut left = value;
+        let mut out = Vec::with_capacity(entries.len());
+        for (identity, w) in entries {
+            if work == 0 {
+                break;
+            }
+            let amount = (u128::from(left).saturating_mul(w) / work) as u64;
+            left -= amount;
+            work -= w;
+            if amount != 0 {
+                out.push(Payout { identity, sats: amount });
+            }
+        }
+        out
+    }
+}
+
 impl Ledger {
     /// The work the public gateway fee charges and reassigns; none without a public gateway.
     pub fn public_gateway_fee_work(&self) -> Option<PublicGatewayFeeWork> {
@@ -91,78 +155,46 @@ impl Ledger {
         })
     }
 
-    /// Each identity's weight in the split, most work first, and the fee work the pool
-    /// retains: what the public gateway fee charged less what it reassigned. The identities
-    /// are borrowed from the window: `split_value` keeps at most `MAX_COINBASER_OUTPUTS` of
-    /// them and copies only those.
-    ///
-    /// The weights and the retained fee work total `total_work`, because every identity is
-    /// charged by `charged_work` here and by the same function in `public_gateway_fee_work`,
-    /// and `given` sums the reassignments this loop hands out. `split_value` divides by that
-    /// total, so the two must not drift apart; `weights_total_the_window` pins it.
-    pub(super) fn weights(&self) -> (Vec<(&str, u128)>, u128) {
+    /// Each identity's weight in the split and the fee work the pool retains: what the
+    /// public gateway fee charged less what it reassigned. One pass over the window, taken
+    /// under the ledger lock; `Weights::split` then runs without it.
+    pub fn weights(&self) -> Weights {
         let fee_bps = self.split_policy.public_gateway.as_ref().map_or(0, |g| g.fee_bps);
         let PublicGatewayFeeWork { fee_work, reassigned_work, own_gateway_work, .. } =
             self.public_gateway_fee_work().unwrap_or_default();
         let mut given = 0u128;
-        let mut weights = Vec::with_capacity(self.identities.len());
+        let mut entries = Vec::with_capacity(self.identities.len());
         for (identity, state) in self.identities.iter() {
             let own = state.own_gateway_work;
             let extra =
                 reassigned_work.saturating_mul(own).checked_div(own_gateway_work).unwrap_or(0);
             given += extra;
-            weights.push((identity, state.work - charged_work(state, fee_bps) + extra));
+            entries.push((Arc::clone(identity), state.work - charged_work(state, fee_bps) + extra));
         }
-        weights.sort_by(|(a, x), (b, y)| most_work_first((a, *x), (b, *y)));
-        (weights, fee_work.saturating_sub(given))
+        Weights { entries, retained_by_pool: fee_work.saturating_sub(given) }
     }
 
-    /// The split of `value`: the operator fee taken off, and the rest divided over the
-    /// window's weights among at most `MAX_COINBASER_OUTPUTS` identities of at least the
-    /// minimum payout.
+    /// What the split of `value` is computed from: the weights, and `value` less the
+    /// operator fee. A caller holding the ledger lock takes these and releases it before
+    /// `Weights::split`.
+    pub fn weights_for(&self, value: u64) -> (Weights, u64) {
+        (self.weights(), self.split_policy.miners_share(value))
+    }
+
+    /// The split of `value`: `weights_for` and `Weights::split` in one call.
+    #[cfg(test)]
     pub fn split(&self, value: u64) -> Vec<Payout> {
-        let p = &self.split_policy;
-        self.split_value(p.miners_share(value), MIN_PAYOUT, MAX_COINBASER_OUTPUTS)
+        let (weights, value) = self.weights_for(value);
+        weights.split(value)
     }
 
+    #[cfg(test)]
     pub(super) fn split_value(
         &self,
         value: u64,
         min_payout: u64,
         max_outputs: usize,
     ) -> Vec<Payout> {
-        if self.total_work == 0 || value == 0 || max_outputs == 0 {
-            return Vec::new();
-        }
-        let (mut kept, retained_by_pool) = self.weights();
-        kept.truncate(max_outputs);
-        let mut work: u128 = kept.iter().map(|(_, w)| w).sum::<u128>() + retained_by_pool;
-
-        while let Some(w) = kept.last().map(|(_, w)| *w) {
-            if work == 0 {
-                kept.clear();
-                break;
-            }
-            if u128::from(value).saturating_mul(w) / work >= u128::from(min_payout) {
-                break;
-            }
-            work -= w;
-            kept.pop();
-        }
-
-        let mut left = value;
-        let mut out = Vec::with_capacity(kept.len());
-        for (identity, w) in kept {
-            if work == 0 {
-                break;
-            }
-            let amount = (u128::from(left).saturating_mul(w) / work) as u64;
-            left -= amount;
-            work -= w;
-            if amount != 0 {
-                out.push(Payout { identity: identity.to_string(), sats: amount });
-            }
-        }
-        out
+        self.weights().split_with(value, min_payout, max_outputs)
     }
 }

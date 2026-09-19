@@ -33,7 +33,7 @@ fn record(v: &mut Verifier, r: &CoinbaserResponse, identities: &[&str], now: u64
         .enumerate()
         .map(|(i, output)| DictatedOutput {
             payout: Payout {
-                identity: identities.get(i).map_or_else(String::new, |id| id.to_string()),
+                identity: identities.get(i).copied().unwrap_or("").into(),
                 sats: output.value,
             },
             script_pubkey: output.script_pubkey.clone(),

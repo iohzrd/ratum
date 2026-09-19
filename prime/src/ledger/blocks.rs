@@ -276,7 +276,7 @@ fn unpack_owed(hash: &[u8], bytes: &[u8]) -> Option<OwedBlock> {
     let mut entries = Vec::with_capacity(count as usize);
     for _ in 0..count {
         let len = c.u16("identity length").ok()? as usize;
-        let identity = String::from_utf8_lossy(c.take(len, "identity").ok()?).into_owned();
+        let identity = Arc::from(String::from_utf8_lossy(c.take(len, "identity").ok()?).as_ref());
         entries.push(Payout { identity, sats: c.u64("sats").ok()? });
     }
     Some(OwedBlock {

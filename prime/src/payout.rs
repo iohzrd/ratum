@@ -1,7 +1,6 @@
 //! The split as outputs: each identity's address decoded to the script that pays it, the ones no
 //! address decodes left with the pool, and the coinbaser response carrying the rest.
 
-use crate::ledger::Ledger;
 use crate::ledger::split::Payout;
 use crate::server::Server;
 use log::{info, warn};
@@ -59,15 +58,17 @@ pub fn unpayable_reason(chain: Option<rpc::Chain>) -> String {
     }
 }
 
-/// The split of `value` (`Ledger::split`), as outputs to the identities `address_script`
-/// gives a script for; the others are logged and left to the pool's script as the remainder.
+/// The split of `value` (`Weights::split`) as outputs. The ledger lock is held only to copy
+/// the window's weights (`Ledger::weights_for`): the sort, the amounts and the address
+/// decoding run without it.
 pub fn dictated_outputs(server: &Server, value: u64) -> Vec<DictatedOutput> {
-    split_outputs(&lock(&server.ledger), server.share_policy.chain, value)
+    let (weights, value) = lock(&server.ledger).weights_for(value);
+    outputs_for(weights.split(value), server.share_policy.chain)
 }
 
-/// `dictated_outputs` against a ledger the caller already holds.
-fn split_outputs(ledger: &Ledger, chain: Option<rpc::Chain>, value: u64) -> Vec<DictatedOutput> {
-    let split = ledger.split(value);
+/// The split as outputs to the identities `address_script` gives a script for; the others are
+/// logged and left to the pool's script as the remainder.
+fn outputs_for(split: Vec<Payout>, chain: Option<rpc::Chain>) -> Vec<DictatedOutput> {
     let mut kept = Vec::with_capacity(split.len());
     for payout in split {
         match address_script(&payout.identity, chain) {
@@ -107,10 +108,12 @@ pub fn dictate(
     value: u64,
     coinbaser_id: u8,
 ) -> (Vec<DictatedOutput>, Vec<u8>) {
-    let (dictated, window_shares, window_work) = {
+    let (weights, miners_value, window_shares, window_work) = {
         let l = lock(&server.ledger);
-        (split_outputs(&l, server.share_policy.chain, value), l.len(), l.total_work())
+        let (weights, miners_value) = l.weights_for(value);
+        (weights, miners_value, l.len(), l.total_work())
     };
+    let dictated = outputs_for(weights.split(miners_value), server.share_policy.chain);
     let paid: u64 = dictated.iter().map(|d| d.payout.sats).sum();
     info!(
         "[{peer}]      paying {} miners {paid} of {value} sats from a window of {window_shares} \

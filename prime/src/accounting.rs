@@ -267,7 +267,7 @@ fn owed_block(rebuilt: &RebuiltShare, found_at: u64, entries: Vec<Payout>) -> Op
 }
 
 /// A coinbase that paid the window nothing owes the split a coinbaser response would dictate
-/// for what the pool's payout script received (`Ledger::split` deducts the operator fee).
+/// for what the pool's payout script received (`Ledger::weights_for` deducts the operator fee).
 fn record_owed_block(server: &Server, peer: SocketAddr, rebuilt: &RebuiltShare, now: u64) {
     let value = rebuilt.paid_to_pool;
     let entries = dictated_outputs(server, value).into_iter().map(|d| d.payout).collect();
