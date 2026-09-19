@@ -31,12 +31,11 @@ impl SavedSession {
 pub struct SessionStore {
     saved: BoundedMap<[u8; 32], SavedSession>,
     prime_id: u64,
-    reveal_after: Duration,
 }
 
 impl SessionStore {
-    pub fn new(prime_id: u64, reveal_after: Duration) -> Self {
-        Self { saved: BoundedMap::new(MAX_SAVED_SESSIONS), prime_id, reveal_after }
+    pub fn new(prime_id: u64) -> Self {
+        Self { saved: BoundedMap::new(MAX_SAVED_SESSIONS), prime_id }
     }
 
     pub fn save(&mut self, key: [u8; 32], session: SavedSession) {
@@ -81,10 +80,8 @@ impl SessionStore {
             let v3 = V3Session { token: new_resume_token(self.prime_id), abw };
             return (v3, saved.splits.clone(), true);
         }
-        let v3 = V3Session {
-            token: new_resume_token(self.prime_id),
-            abw: AbwSlotState::start(now, self.reveal_after),
-        };
+        let v3 =
+            V3Session { token: new_resume_token(self.prime_id), abw: AbwSlotState::start(now) };
         (v3, DictatedSplits::default(), false)
     }
 
@@ -110,13 +107,12 @@ pub struct V3Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::abw::DEFAULT_REVEAL_AFTER;
     use crate::ledger::split::Payout;
     use crate::payout::DictatedOutput;
     use ratum::bitcoin::transaction::TxOut;
 
     fn store() -> SessionStore {
-        SessionStore::new(1, DEFAULT_REVEAL_AFTER)
+        SessionStore::new(1)
     }
 
     #[test]
@@ -125,7 +121,7 @@ mod tests {
         let key = [7u8; 32];
         let now = Instant::now();
         let token = new_resume_token(1);
-        let abw = AbwSlotState::start(now, DEFAULT_REVEAL_AFTER);
+        let abw = AbwSlotState::start(now);
         let hash0 = ratum::header::xor_key_hash(&abw.key_for(0).unwrap().0);
         let split = TxOut { value: 5, script_pubkey: vec![0x51] };
         let mut splits = DictatedSplits::default();
@@ -178,7 +174,7 @@ mod tests {
         let now = Instant::now();
         let token = new_resume_token(1);
         let save = |store: &mut SessionStore, saved_at: Instant| {
-            let abw = AbwSlotState::start(now, DEFAULT_REVEAL_AFTER);
+            let abw = AbwSlotState::start(now);
             store.save(key, saved(token, abw, saved_at, now));
         };
 
@@ -219,7 +215,7 @@ mod tests {
         for i in 0..=MAX_SAVED_SESSIONS {
             let mut key = [0u8; 32];
             key[..8].copy_from_slice(&(i as u64).to_le_bytes());
-            let abw = AbwSlotState::start(now, DEFAULT_REVEAL_AFTER);
+            let abw = AbwSlotState::start(now);
             store.save(key, saved(token, abw, now, now));
         }
         assert_eq!(store.saved.len(), MAX_SAVED_SESSIONS);
@@ -230,7 +226,7 @@ mod tests {
         assert_eq!(store.saved.len(), MAX_SAVED_SESSIONS - 1);
         let mut second = [0u8; 32];
         second[..8].copy_from_slice(&1u64.to_le_bytes());
-        let abw = AbwSlotState::start(now, DEFAULT_REVEAL_AFTER);
+        let abw = AbwSlotState::start(now);
         store.save(second, saved(token, abw, now, now));
         assert_eq!(store.saved.len(), MAX_SAVED_SESSIONS - 1);
         assert_eq!(store.saved.order().back(), Some(&second));
@@ -241,10 +237,10 @@ mod tests {
         let mut store = store();
         let t0 = Instant::now();
         let token = new_resume_token(1);
-        let abw = AbwSlotState::start(t0, DEFAULT_REVEAL_AFTER);
+        let abw = AbwSlotState::start(t0);
         store.save([1u8; 32], saved(token, abw, t0, t0));
         let later = t0 + SESSION_KEEP + Duration::from_secs(1);
-        let abw = AbwSlotState::start(later, DEFAULT_REVEAL_AFTER);
+        let abw = AbwSlotState::start(later);
         store.save([2u8; 32], saved(token, abw, later, later));
         assert_eq!(store.saved.len(), 1, "the expired entry is gone");
         assert!(store.take(&[1u8; 32]).is_none());
@@ -261,7 +257,7 @@ mod tests {
         let later = new_resume_token(1);
         let earlier = new_resume_token(1);
         let session = |token, connection_opened_at| {
-            let abw = AbwSlotState::start(t0, DEFAULT_REVEAL_AFTER);
+            let abw = AbwSlotState::start(t0);
             saved(token, abw, t1 + Duration::from_secs(1), connection_opened_at)
         };
         store.save(key, session(later, t1));

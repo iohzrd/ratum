@@ -60,8 +60,7 @@ impl Server {
                 format!("cannot build the client config: {e}"),
             )
         })?;
-        let sessions =
-            Mutex::new(SessionStore::new(share_policy.config.prime_id, settings.abw_reveal_after));
+        let sessions = Mutex::new(SessionStore::new(share_policy.config.prime_id));
         Ok(Self {
             settings,
             pool_keys,

@@ -232,7 +232,7 @@ pub fn watch_node(server: &Server, expected_chain: Option<rpc::Chain>) {
                     error!(
                         "the node refused the pool's RPC credential ({e}). A cookie is \
                          generated each time the node starts; with --rpc-cookie the file is \
-                         re-read on the next request, with --rpc-user/--rpc-pass the \
+                         re-read on the next request, with a user and password in --rpc the \
                          credential must match the node's configuration. Until a request \
                          is accepted no block this pool verifies can be submitted."
                     );

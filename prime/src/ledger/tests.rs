@@ -212,27 +212,24 @@ fn a_window_within_the_count_bound_is_not_capped() {
 }
 
 #[test]
-fn window_tracks_network_difficulty_with_a_floor() {
-    let rule = |floor| WindowRule { multiple: 8.0, floor };
-    assert_eq!(rule(1).window_for(1_000.0), 8_000);
-    assert_eq!(rule(1).window_for(4.6e-10), 1);
-    assert_eq!(rule(5_000).window_for(4.6e-10), 5_000);
-    assert_eq!(rule(1).window_for(f64::NAN), 1);
-    assert_eq!(rule(1).window_for(0.0), 1);
-    assert_eq!(rule(100).window_for(1_000.0), 8_000);
-    assert_eq!(rule(100_000).window_for(1_000.0), 100_000);
-    assert_eq!(WindowRule::fixed(64).window_for(1e30), 64, "a fixed window ignores difficulty");
+fn window_tracks_network_difficulty() {
+    let rule = WindowRule { multiple: 8.0 };
+    assert_eq!(rule.window_for(1_000.0), 8_000);
+    assert_eq!(rule.window_for(4.6e-10), 1);
+    assert_eq!(rule.window_for(f64::NAN), 1);
+    assert_eq!(rule.window_for(0.0), 1);
+    assert_eq!(WindowRule::fixed(64).window_for(1.0), 64);
 }
 
 #[test]
-fn the_network_difficulty_sizes_the_window_from_the_floor() {
-    let mut l = Ledger::new(WindowRule { multiple: 8.0, floor: 16 }, SplitPolicy::default());
-    assert_eq!(l.window(), 16, "the floor until a difficulty is set");
+fn the_network_difficulty_sizes_the_window() {
+    let mut l = Ledger::new(WindowRule { multiple: 16.0 }, SplitPolicy::default());
+    assert_eq!(l.window(), 16, "sized to a difficulty of 1 until one is set");
     for i in 0..4 {
         l.record(share(i, "a", 16, hash(i), "")).unwrap();
     }
     assert_eq!(l.total_work(), 16);
-    assert_eq!(l.set_network_difficulty(4.0), 0, "no store to re-read");
+    assert_eq!(l.set_network_difficulty(2.0), 0, "no store to re-read");
     assert_eq!(l.window(), 32);
     l.record(share(4, "a", 16, hash(4), "")).unwrap();
     assert_eq!(l.total_work(), 32, "the wider window keeps two shares");
@@ -240,16 +237,16 @@ fn the_network_difficulty_sizes_the_window_from_the_floor() {
 
 #[test]
 fn the_split_takes_the_operator_fee_and_the_minimum_from_the_policy() {
-    let policy = SplitPolicy { fee_bps: 100, min_payout: 10_000, public_gateway: None };
+    let policy = SplitPolicy { fee_bps: 100, public_gateway: None };
     let mut l = Ledger::new(WindowRule::fixed(u128::MAX), policy);
     for (i, (identity, difficulty)) in [("a", 99u64), ("b", 1)].into_iter().enumerate() {
         l.record(share(i as u64, identity, difficulty, hash(i as u64), "")).unwrap();
     }
-    assert_eq!(l.split_policy().fee_on(1_000_000), 10_000);
+    assert_eq!(l.split_policy().fee_on(50_000), 500);
     assert_eq!(
-        l.split(1_000_000),
-        vec![payout("a", 990_000)],
-        "the 990_000 after the fee is split, and b's 9_900 of it is under the minimum"
+        l.split(50_000),
+        vec![payout("a", 49_500)],
+        "the 49_500 after the fee is split, and b's 495 of it is under the minimum"
     );
 }
 
@@ -1118,7 +1115,7 @@ fn hide_share_table(l: &Ledger, hidden: bool) {
 #[test]
 fn a_widening_whose_read_failed_is_read_again_at_the_same_difficulty() {
     let scratch = Scratch::new("widen-retry");
-    let mut l = Ledger::new(WindowRule { multiple: 1.0, floor: 1 }, SplitPolicy::default());
+    let mut l = Ledger::new(WindowRule { multiple: 1.0 }, SplitPolicy::default());
     l.attach(Store::open(&scratch.join("regtest.redb"), None, Some("regtest")).unwrap()).unwrap();
     assert_eq!(l.set_network_difficulty(56.0), 0, "nothing stored to re-read");
     l.record(share(1, "alice", 16, hash(1), "")).unwrap();
@@ -1158,11 +1155,11 @@ fn a_read_back_of_no_shares_empties_the_window_and_clears_count_capped() {
 
 #[test]
 fn the_network_difficulty_is_the_one_last_set() {
-    let mut l = Ledger::new(WindowRule { multiple: 8.0, floor: 16 }, SplitPolicy::default());
+    let mut l = Ledger::new(WindowRule { multiple: 8.0 }, SplitPolicy::default());
     assert_eq!(l.network_difficulty(), None, "none before the node is read");
     l.set_network_difficulty(4.0);
     assert_eq!(l.network_difficulty(), Some(4.0));
-    l.set_network_difficulty(1.0);
-    assert_eq!(l.network_difficulty(), Some(1.0), "recorded when the window keeps its size");
-    assert_eq!(l.window(), 16);
+    l.set_network_difficulty(4.0625);
+    assert_eq!(l.network_difficulty(), Some(4.0625), "recorded when the window keeps its size");
+    assert_eq!(l.window(), 32);
 }

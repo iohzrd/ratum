@@ -5,12 +5,10 @@ use super::*;
 
 #[test]
 fn a_coinbase_without_the_split_is_refused_after_the_grace() {
-    let required = policy();
-    let not_required = SharePolicy { require_split: false, ..policy() };
-    let build = |coinbaser_id: u8, require_split: bool| {
-        let p = if require_split { &required } else { &not_required };
-        let (cb, target_byte_index) = coinbase_sections(p, &[]);
-        let mut v = Verifier::new(p);
+    let p = policy();
+    let build = |coinbaser_id: u8| {
+        let (cb, target_byte_index) = coinbase_sections(&p, &[]);
+        let mut v = Verifier::new(&p);
         record(&mut v, &split(), &[], NOW);
         v.set_next_bits(Some(u32::from_le_bytes(HARD_NBITS)));
         let mut job = job_section(target_byte_index);
@@ -20,19 +18,16 @@ fn a_coinbase_without_the_split_is_refused_after_the_grace() {
     let late = NOW + SPLIT_GRACE_SECS + 1;
     let no_split = Err(RejectReason::NoSplit);
 
-    let (mut v, s) = build(1, true);
+    let (mut v, s) = build(1);
     assert!(v.rebuild_checked_ignoring_target(&s, None, NOW).is_ok(), "inside the grace");
     assert_eq!(v.rebuild_checked_ignoring_target(&s, None, late), no_split, "past the grace");
     assert_eq!(v.checked(&s, None, late), no_split, "past the grace, through rebuild");
 
-    let (mut v, s) = build(0, true);
+    let (mut v, s) = build(0);
     assert!(v.rebuild_checked_ignoring_target(&s, None, late).is_ok(), "id 0 names no coinbaser");
 
-    let (mut v, s) = build(5, true);
+    let (mut v, s) = build(5);
     assert!(v.rebuild_checked_ignoring_target(&s, None, late).is_ok(), "id 5 was never recorded");
-
-    let (mut v, s) = build(1, false);
-    assert!(v.rebuild_checked_ignoring_target(&s, None, late).is_ok(), "require_split off");
 }
 
 #[test]
@@ -99,11 +94,6 @@ fn check_split_refuses_no_split_past_the_grace_and_passes_each_exemption() {
     assert_eq!(v.check_split(&s, &rebuilt, late), no_split, "past the grace");
     assert_eq!(v.check_split(&s, &rebuilt, NOW + SPLIT_GRACE_SECS), Ok(()), "at the grace");
     assert_eq!(v.check_split(&s, &rebuilt, NOW), Ok(()), "inside the grace");
-
-    let off_policy = SharePolicy { require_split: false, ..policy() };
-    let mut off = Verifier::new(&off_policy);
-    record(&mut off, &split(), &[], NOW);
-    assert_eq!(off.check_split(&s, &rebuilt, late), Ok(()), "require_split off");
 
     let subsidy_only = PowSubmit { subsidy_only: true, ..s.clone() };
     assert_eq!(v.check_split(&subsidy_only, &rebuilt, late), Ok(()), "subsidy-only work");

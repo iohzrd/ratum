@@ -31,26 +31,14 @@ pub struct Options {
     #[arg(long)]
     pub stats_listen: Option<String>,
     #[arg(long)]
-    pub advertise_address: Option<String>,
-    #[arg(long)]
-    pub public_gateway: Option<String>,
-    #[arg(long)]
     pub data_dir: Option<String>,
     #[arg(long)]
     #[serde(skip)]
     pub config: Option<String>,
     #[arg(long)]
-    pub key: Option<String>,
-    #[arg(long)]
     pub motd: Option<String>,
-    #[arg(long)]
-    pub allow_agent: Option<String>,
-    #[arg(long)]
-    pub require_split: Option<bool>,
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     pub require_v3: Option<bool>,
-    #[arg(long)]
-    pub abw_reveal_after: Option<u64>,
     #[arg(long)]
     pub min_diff: Option<u64>,
     #[arg(long)]
@@ -60,21 +48,11 @@ pub struct Options {
     #[arg(long)]
     pub payout_address: Option<String>,
     #[arg(long)]
-    pub payout_script: Option<String>,
-    #[arg(long)]
     pub coinbase_tag: Option<String>,
-    #[arg(long)]
-    pub prime_id: Option<u32>,
-    #[arg(long)]
-    pub ledger: Option<String>,
     #[arg(long)]
     pub ledger_keep_shares: Option<u64>,
     #[arg(long)]
     pub window: Option<f64>,
-    #[arg(long)]
-    pub window_floor: Option<u128>,
-    #[arg(long)]
-    pub min_payout: Option<u64>,
     #[arg(long)]
     pub fee_bps: Option<u16>,
     #[arg(long)]
@@ -85,10 +63,6 @@ pub struct Options {
     pub public_gateway_tag: Option<String>,
     #[arg(long)]
     pub rpc: Option<String>,
-    #[arg(long)]
-    pub rpc_user: Option<String>,
-    #[arg(long)]
-    pub rpc_pass: Option<String>,
     #[arg(long)]
     pub rpc_cookie: Option<String>,
     #[arg(long)]
@@ -110,59 +84,32 @@ pub struct Options {
     pub owed: Vec<String>,
 }
 
-impl Options {
-    /// The file's settings with every flag given on the command line applied over them.
-    /// `self` is the parsed command line and `argv` the arguments it was parsed from. A
-    /// payout choice on the command line replaces the file's as a pair, so an address from
-    /// one source is never combined with a script from the other.
-    pub fn over<I, T>(self, mut file: Self, argv: I) -> Self
-    where
-        I: IntoIterator<Item = T>,
-        T: Into<std::ffi::OsString> + Clone,
-    {
-        if self.payout_address.is_some() || self.payout_script.is_some() {
-            file.payout_address = None;
-            file.payout_script = None;
-        }
-        file.update_from(argv);
-        file
-    }
-}
-
-/// The options on the command line merged over those of the settings file: the file
+/// The options on the command line applied over those of the settings file: the file
 /// `--config` names, or `ratum.toml` in `--data-dir`.
 pub fn load() -> Options {
     let command_line = Options::parse();
-    let rpc_pass_on_argv = command_line.rpc_pass.is_some();
     let path = match (&command_line.config, &command_line.data_dir) {
         (Some(p), _) => Some(PathBuf::from(p)),
         (None, Some(dir)) => Some(PathBuf::from(dir).join("ratum.toml")),
         (None, None) => None,
     };
-    let file = match path {
+    let mut options = match path {
         Some(path) => load_file(&path, command_line.config.is_some()),
         None => Options::default(),
     };
-    let options = command_line.over(file, std::env::args_os());
-    if rpc_pass_on_argv {
+    options.update_from(std::env::args_os());
+    if command_line.rpc.as_deref().is_some_and(has_password) {
         warn!(
-            "--rpc-pass puts the node's password in this process's command line, where any \
-             local user can read it; a configuration file and --rpc-cookie do not"
+            "--rpc carries the node's password in this process's command line, where any local \
+             user can read it; a configuration file and --rpc-cookie do not"
         );
-        let user_set = options.rpc_user.as_deref().is_some_and(|user| !user.is_empty());
-        match (&options.rpc_cookie, user_set) {
-            (Some(_), true) => warn!(
-                "--rpc-cookie was given as well, but --rpc-user is set, so the user and \
-                 password are the credential being used; drop --rpc-user to read the cookie"
-            ),
-            (Some(_), false) => warn!(
-                "--rpc-cookie was given as well, and no --rpc-user is set, so the cookie is the \
-                 credential being used and --rpc-pass is ignored"
-            ),
-            (None, _) => {}
-        }
     }
     options
+}
+
+/// Whether `url` carries a `user:password@` before its host.
+fn has_password(url: &str) -> bool {
+    ratum::rpc::redact_url(url) != url
 }
 
 fn load_file(path: &Path, required: bool) -> Options {
@@ -185,7 +132,7 @@ fn load_file(path: &Path, required: bool) -> Options {
 #[cfg(unix)]
 fn warn_if_readable(path: &Path, settings: &Options) {
     use std::os::unix::fs::PermissionsExt as _;
-    if settings.rpc_pass.is_none() {
+    if !settings.rpc.as_deref().is_some_and(has_password) {
         return;
     }
     let Ok(mode) = std::fs::metadata(path).map(|m| m.permissions().mode()) else { return };
@@ -213,14 +160,14 @@ mod tests {
     #[test]
     fn settings_parse_into_their_typed_fields() {
         let c = parse_toml(
-            "rpc-user = \"ratum\"\nmin-diff = 16384\nwindow = 8.5\n\
+            "rpc = \"http://ratum:pw@127.0.0.1:8332\"\nmin-diff = 16384\nwindow = 8.5\n\
              public-gateway-fee-bps = 200\npublic-gateway-fee-subsidy-bps = 7500\n\
              public-gateway-tag = \"public\"\n",
         )
         .unwrap();
         assert_eq!(c.min_diff, Some(16384));
         assert_eq!(c.window, Some(8.5));
-        assert_eq!(c.rpc_user, Some("ratum".to_string()));
+        assert_eq!(c.rpc, Some("http://ratum:pw@127.0.0.1:8332".to_string()));
         assert_eq!(c.public_gateway_fee_bps, Some(200));
         assert_eq!(c.public_gateway_fee_subsidy_bps, Some(7500));
         assert_eq!(c.public_gateway_tag, Some("public".to_string()));
@@ -285,27 +232,19 @@ mod tests {
     }
 
     #[test]
-    fn a_flag_given_as_well_overrides_the_file_and_the_payout_pair_moves_together() {
-        let argv = ["ratum-prime", "--min-diff", "1024", "--payout-address", "cli", "--require-v3"];
-        let file = Options {
+    fn a_flag_given_as_well_overrides_the_file() {
+        let argv = ["ratum-prime", "--min-diff", "1024", "--require-v3"];
+        let mut merged = Options {
             min_diff: Some(16384),
             motd: Some("file".into()),
-            payout_script: Some("51".into()),
             require_v3: Some(false),
             ..Options::default()
         };
-        let merged = Options::parse_from(argv).over(file, argv);
+        merged.update_from(argv);
         assert_eq!(merged.min_diff, Some(1024));
         assert_eq!(merged.motd.as_deref(), Some("file"), "a flag not given keeps the file's value");
         assert_eq!(merged.require_v3, Some(true), "a bare flag overrides the file's false");
-        assert_eq!(merged.payout_address.as_deref(), Some("cli"));
-        assert_eq!(merged.payout_script, None, "the file's payout choice is replaced as a pair");
         assert!(!merged.dump_ledger);
-
-        let argv = ["ratum-prime"];
-        let file = Options { payout_script: Some("51".into()), ..Options::default() };
-        let merged = Options::parse_from(argv).over(file, argv);
-        assert_eq!(merged.payout_script.as_deref(), Some("51"));
     }
 
     #[test]
@@ -318,5 +257,12 @@ mod tests {
             Options { dump_ledger: false, ..c },
             "the same setting reads the same from either source"
         );
+    }
+
+    #[test]
+    fn a_password_is_recognized_in_the_url() {
+        assert!(has_password("http://ratum:pw@127.0.0.1:8332"));
+        assert!(!has_password("http://ratum@127.0.0.1:8332"));
+        assert!(!has_password("http://127.0.0.1:8332"));
     }
 }

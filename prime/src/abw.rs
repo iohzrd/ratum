@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 
 pub const ROTATE_AFTER_SHARES: u64 = 16384;
 pub const ROTATE_AFTER: Duration = Duration::from_secs(600);
-pub const DEFAULT_REVEAL_AFTER: Duration = Duration::from_secs(300);
-pub const REVEAL_AFTER_SECS_RANGE: std::ops::RangeInclusive<u64> = 1..=600;
+/// How long after a slot's retirement its key is revealed.
+pub const REVEAL_AFTER: Duration = Duration::from_secs(300);
 const MAX_TIP_ROTATIONS_PER_REVEAL: u32 = 4;
 /// How long after a connection opens its rotations and reveals wait, so the shares a resumed
 /// gateway replays are answered first.
@@ -82,7 +82,6 @@ pub struct AbwSlotState {
     active: u8,
     shares_since_activation: u64,
     activated_at: Instant,
-    reveal_after: Duration,
     /// Rotations and reveals are not due before this instant (see `connect`).
     held_until: Instant,
     /// A new tip asked for a rotation that the hold has not yet let through.
@@ -92,13 +91,12 @@ pub struct AbwSlotState {
 }
 
 impl AbwSlotState {
-    pub fn start(now: Instant, reveal_after: Duration) -> Self {
+    pub fn start(now: Instant) -> Self {
         let mut abw = Self {
             slots: [Slot::Empty; SLOTS],
             active: 0,
             shares_since_activation: 0,
             activated_at: now,
-            reveal_after,
             held_until: now,
             tip_rotation_pending: false,
             published: [false; SLOTS],
@@ -111,7 +109,7 @@ impl AbwSlotState {
     /// disclosed, slot 0 active.
     #[cfg(test)]
     pub fn with_keys(seeded: [Option<XorKey>; SLOTS], revealed: [Option<XorKey>; SLOTS]) -> Self {
-        let mut abw = Self::start(Instant::now(), DEFAULT_REVEAL_AFTER);
+        let mut abw = Self::start(Instant::now());
         for (slot, (seeded, revealed)) in abw.slots.iter_mut().zip(seeded.iter().zip(&revealed)) {
             *slot = match (seeded, revealed) {
                 (Some(key), _) => Slot::Seeded { key: *key },
@@ -187,7 +185,7 @@ impl AbwSlotState {
         for slot in &mut self.slots {
             match slot {
                 Slot::Retired { reveal_at, retired_on_open_connection: on_open @ true, .. } => {
-                    *reveal_at = closed_at + self.reveal_after;
+                    *reveal_at = closed_at + REVEAL_AFTER;
                     *on_open = false;
                 }
                 Slot::Revealed { resend_at: resend_at @ None, .. } => *resend_at = Some(closed_at),
@@ -267,7 +265,7 @@ impl AbwSlotState {
         if let Slot::Seeded { key } = self.slots[usize::from(old)] {
             self.slots[usize::from(old)] = Slot::Retired {
                 key,
-                reveal_at: now + self.reveal_after,
+                reveal_at: now + REVEAL_AFTER,
                 retired_on_open_connection: true,
             };
         }
@@ -304,8 +302,8 @@ impl AbwSlotState {
     /// Records a new tip: a rotation becomes due, once the hold ends, when the active slot is
     /// at least a quarter of the reveal delay old. Returns whether it was.
     pub fn note_tip(&mut self, now: Instant) -> bool {
-        let old_enough = now.duration_since(self.activated_at)
-            >= self.reveal_after / MAX_TIP_ROTATIONS_PER_REVEAL;
+        let old_enough =
+            now.duration_since(self.activated_at) >= REVEAL_AFTER / MAX_TIP_ROTATIONS_PER_REVEAL;
         self.tip_rotation_pending |= old_enough;
         old_enough
     }
@@ -316,7 +314,7 @@ mod tests {
     use super::*;
     use ratum::datum::messages::abw::AssignmentNotice as Notice;
 
-    const AFTER: Duration = Duration::from_secs(180);
+    const AFTER: Duration = REVEAL_AFTER;
 
     fn decoded_notices(abw: &AbwSlotState) -> Vec<(u8, bool)> {
         abw.notices()
@@ -361,7 +359,7 @@ mod tests {
 
     #[test]
     fn start_seeds_an_active_slot_zero() {
-        let abw = AbwSlotState::start(Instant::now(), AFTER);
+        let abw = AbwSlotState::start(Instant::now());
         assert_eq!(decoded_notices(&abw), [(0, true)]);
         assert_eq!(abw.active, 0);
         let key = secret_key(&abw, 0).expect("slot 0 seeded");
@@ -374,7 +372,7 @@ mod tests {
     #[test]
     fn a_rotation_retires_the_active_slot_and_its_reveal_follows_after_the_delay() {
         let now = Instant::now();
-        let mut abw = AbwSlotState::start(now, AFTER);
+        let mut abw = AbwSlotState::start(now);
         let key0 = secret_key(&abw, 0).unwrap();
 
         let Rotation { reveals, notice } = abw.rotate(now);
@@ -402,7 +400,7 @@ mod tests {
     #[test]
     fn two_rotations_within_the_delay_leave_two_slots_retired_until_each_is_due() {
         let now = Instant::now();
-        let mut abw = AbwSlotState::start(now, AFTER);
+        let mut abw = AbwSlotState::start(now);
         abw.rotate(now);
         let later = now + Duration::from_secs(100);
         abw.rotate(later);
@@ -421,7 +419,7 @@ mod tests {
     #[test]
     fn a_slot_seeded_again_before_its_reveal_is_revealed_first() {
         let now = Instant::now();
-        let mut abw = AbwSlotState::start(now, AFTER);
+        let mut abw = AbwSlotState::start(now);
         let key0 = secret_key(&abw, 0).unwrap();
         for _ in 0..15 {
             abw.rotate(now);
@@ -441,7 +439,7 @@ mod tests {
     #[test]
     fn a_rotation_onto_a_slot_awaiting_its_reveal_waits_for_the_reveal() {
         let now = Instant::now();
-        let mut abw = AbwSlotState::start(now, AFTER);
+        let mut abw = AbwSlotState::start(now);
         for _ in 0..15 {
             abw.rotate(now);
         }
@@ -461,7 +459,7 @@ mod tests {
     #[test]
     fn a_resume_keeps_each_reveal_time_and_resends_what_the_gateway_may_have_missed() {
         let now = Instant::now();
-        let mut abw = AbwSlotState::start(now, AFTER);
+        let mut abw = AbwSlotState::start(now);
         let key0 = secret_key(&abw, 0).unwrap();
         abw.rotate(now);
         let key1 = secret_key(&abw, 1).unwrap();
@@ -499,7 +497,7 @@ mod tests {
     #[test]
     fn resuming_again_and_again_does_not_postpone_a_reveal() {
         let now = Instant::now();
-        let mut abw = AbwSlotState::start(now, AFTER);
+        let mut abw = AbwSlotState::start(now);
         abw.rotate(now);
         let first_close = now + Duration::from_secs(30);
         let mut closed_at = first_close;
@@ -516,7 +514,7 @@ mod tests {
     #[test]
     fn a_rotation_is_due_by_share_count_or_slot_age() {
         let now = Instant::now();
-        let mut abw = AbwSlotState::start(now, AFTER);
+        let mut abw = AbwSlotState::start(now);
         assert_eq!(abw.rotation_due(now), None);
         for _ in 0..ROTATE_AFTER_SHARES - 1 {
             abw.note_share();
@@ -534,7 +532,7 @@ mod tests {
     #[test]
     fn a_tip_rotates_the_assignment_only_once_the_active_slot_is_old_enough() {
         let now = Instant::now();
-        let mut abw = AbwSlotState::start(now, AFTER);
+        let mut abw = AbwSlotState::start(now);
         assert!(!abw.note_tip(now));
         assert!(!abw.note_tip(now + AFTER / 4 - Duration::from_secs(1)));
         assert_eq!(abw.rotation_due(now + AFTER / 4), None, "a tip too early asks for nothing");
@@ -549,7 +547,7 @@ mod tests {
     #[test]
     fn a_relayed_block_publishes_its_slots_key_and_rotates_off_the_active_slot_at_once() {
         let now = Instant::now();
-        let mut abw = AbwSlotState::start(now, AFTER);
+        let mut abw = AbwSlotState::start(now);
         abw.rotate(now);
         let key0 = secret_key(&abw, 0).unwrap();
         assert_eq!(abw.note_published(0), Some(false), "slot 0 is retired, not active");
@@ -582,7 +580,7 @@ mod tests {
     #[test]
     fn a_connection_holds_rotations_and_reveals_and_a_tip_during_the_hold_waits_for_it() {
         let now = Instant::now();
-        let mut abw = AbwSlotState::start(now, AFTER);
+        let mut abw = AbwSlotState::start(now);
         abw.rotate(now);
         let opened_at = now + AFTER;
         abw.connect(opened_at);

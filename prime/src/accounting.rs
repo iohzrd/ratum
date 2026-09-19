@@ -207,7 +207,7 @@ fn log_and_record_owed(server: &Server, peer: SocketAddr, owed: OwedBlock) {
     let hash = hex::encode(owed.block_hash);
     warn!(
         "[{peer}]   ** recorded as owed by block hash {hash}; after paying it from the \
-         pool's wallet, run: ratum-prime --settle-block {hash} (with --ledger or \
+         pool's wallet, run: ratum-prime --settle-block {hash} (with \
          --data-dir, pool stopped)"
     );
     let recorded = lock(&server.records).record_owed(owed);
@@ -354,7 +354,7 @@ mod tests {
     }
 
     fn server() -> Server {
-        server_with(&[(ALICE, 3), (BOB, 1)], 0)
+        server_with(&[(ALICE, 3), (BOB, 1)])
     }
 
     fn owed_entries(server: &Server) -> Vec<Vec<Payout>> {
@@ -380,7 +380,7 @@ mod tests {
         let recorded = lock(&server.records).blocks()[0].network_difficulty;
         assert_eq!(recorded, 123.5, "the block being mined, from the template's bits");
 
-        let never_sized = server_with(&[(ALICE, 1)], 0);
+        let never_sized = server_with(&[(ALICE, 1)]);
         record_block(&never_sized, PEER, "alice", &block(900, 100, Vec::new()), 42);
         assert_eq!(
             lock(&never_sized.records).blocks()[0].network_difficulty,
@@ -391,7 +391,7 @@ mod tests {
 
     #[test]
     fn an_uppercase_bech32_username_is_credited_to_the_lowercase_identity() {
-        let server = server_with(&[], 0);
+        let server = server_with(&[]);
         let upper = ALICE.to_ascii_uppercase();
         let rebuilt = |n: u8| RebuiltShare { block_hash: [n; 32], ..block(900, 100, Vec::new()) };
         credit_share(&server, PEER, &format!("{upper}.rig1"), &rebuilt(1), 42).unwrap();
@@ -422,7 +422,7 @@ mod tests {
     }
 
     fn server_charging_a_fee() -> Server {
-        server_with_fee(&[(ALICE, 3), (BOB, 1)], 0, 100)
+        server_with_fee(&[(ALICE, 3), (BOB, 1)], 100)
     }
 
     #[test]
@@ -467,7 +467,7 @@ mod tests {
 
     #[test]
     fn a_block_paying_an_empty_window_nothing_owes_nothing() {
-        let server = server_with(&[], 0);
+        let server = server_with(&[]);
         record_block(&server, PEER, "alice", &block(0, 1_000_000, Vec::new()), 42);
         assert_eq!(lock(&server.records).blocks().len(), 1);
         assert!(owed_entries(&server).is_empty());
@@ -476,8 +476,8 @@ mod tests {
     #[test]
     fn the_owed_split_charges_the_public_gateway_fee_and_reassigns_it() {
         let server = server_with_public_gateway_fee(5_000, 10_000);
-        record_block(&server, PEER, "alice", &block(0, 200, Vec::new()), 42);
-        assert_eq!(owed_entries(&server), [vec![payout(BOB, 150), payout(ALICE, 50)]]);
+        record_block(&server, PEER, "alice", &block(0, 200_000, Vec::new()), 42);
+        assert_eq!(owed_entries(&server), [vec![payout(BOB, 150_000), payout(ALICE, 50_000)]]);
     }
 
     #[test]

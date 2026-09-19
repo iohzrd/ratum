@@ -55,10 +55,12 @@ BOB = "bcrt1qk2et9v4jk2et9v4jk2et9v4jk2et9v4jldyv0a"
 CAROL = "bcrt1qc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rpz2hyw"
 GATEWAY_ADDRESS = "bcrt1q6n2df4x56n2df4x56n2df4x56n2df4x5jumwup"
 
-# The share window is set far above the work a run produces, so no share is trimmed and the
-# split for every block is computable from a prefix of the ledger.
-WINDOW_FLOOR = 1 << 20
-MIN_PAYOUT = 1
+# The window multiple is set so that at regtest's difficulty the window holds far more work
+# than a run produces, so no share is trimmed and the split for every block is computable
+# from a prefix of the ledger.
+WINDOW_MULTIPLE = "1e24"
+# The pool's constant minimum output, the P2PKH dust threshold.
+MIN_PAYOUT = 546
 
 SATS_PER_BTC = 100_000_000
 MAX_OUTPUTS = 512
@@ -357,11 +359,10 @@ class Stack:
             str(ROOT / "target/release/ratum-prime"),
             "--listen", f"127.0.0.1:{self.pool_port}",
             "--data-dir", str(self.work / "pool"),
-            "--rpc", f"http://127.0.0.1:{self.rpc_port}", "--rpc-user", "ratum",
-            "--rpc-pass", "ratumtest",
+            "--rpc", f"http://ratum:ratumtest@127.0.0.1:{self.rpc_port}",
             "--payout-address", POOL_ADDRESS,
             "--coinbase-tag", "RATUM",
-            "--min-diff", "1", "--min-payout", str(MIN_PAYOUT), "--poll", "1",
+            "--min-diff", "1", "--poll", "1",
             *extra_args,
         ]
         env = dict(os.environ, RUST_LOG=os.environ.get("RUST_LOG", "debug"))
@@ -457,7 +458,7 @@ class Stack:
         self.pool.wait(timeout=10)
         argv = [
             str(ROOT / "target/release/ratum-prime"),
-            "--dump-ledger", "--ledger", str(self.work / "pool" / "regtest.redb"),
+            "--dump-ledger", "--data-dir", str(self.work / "pool"),
         ]
         r = subprocess.run(argv, capture_output=True, text=True)
         if r.returncode != 0:
@@ -622,8 +623,8 @@ def multi_miner(stack: Stack, a: argparse.Namespace) -> None:
             fail(f"{address} is not an address this node accepts")
     stack.mine_through_activation()
 
-    step(f"starting ratum-prime on port {stack.pool_port}, window floor {WINDOW_FLOOR}")
-    stack.start_pool("--window-floor", str(WINDOW_FLOOR))
+    step(f"starting ratum-prime on port {stack.pool_port}, window {WINDOW_MULTIPLE}x difficulty")
+    stack.start_pool("--window", WINDOW_MULTIPLE)
 
     ports = {"A": free_port(23300, 90), "B": free_port(23400, 90)}
     for name, api_base in (("A", 7100), ("B", 7200)):
@@ -738,7 +739,7 @@ def public_gateway_fee(stack: Stack, a: argparse.Namespace) -> None:
 
     step(f"starting ratum-prime on port {stack.pool_port}, fee {fee_bps} bps on shares tagged {public_tag}, subsidy {subsidy_bps} bps")
     stack.start_pool(
-        "--window-floor", str(WINDOW_FLOOR),
+        "--window", WINDOW_MULTIPLE,
         "--public-gateway-fee-bps", str(fee_bps),
         "--public-gateway-fee-subsidy-bps", str(subsidy_bps),
         "--public-gateway-tag", public_tag,
@@ -860,9 +861,7 @@ def main() -> int:
     fs.add_argument("--gateway-pool-address", default=MINER_ADDRESS,
                     help="the gateway's mining.pool_address; the C gateway decodes bc1/tb1 only")
     fs.add_argument("--prime-args", default="",
-                    help='extra ratum-prime flags, split on whitespace ("--abw-reveal-after 20" '
-                    "reveals each retired ABW slot 20 s after the rotation, so a short run "
-                    "exercises the gateway's reveal audit)")
+                    help="extra ratum-prime flags, split on whitespace")
     fs.set_defaults(scenario=full_stack)
 
     mm = runs.add_parser("multi-miner", help="three miners behind two gateways: credit and payout split")

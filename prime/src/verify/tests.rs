@@ -76,7 +76,6 @@ fn policy() -> SharePolicy {
             min_difficulty: 1,
             v3: None,
         },
-        require_split: true,
         chain: Some(rpc::Chain::Regtest),
     }
 }

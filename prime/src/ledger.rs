@@ -58,25 +58,22 @@ pub struct IdentityState {
     pub tag_secondary: String,
 }
 
-/// The work the share window spans: `multiple` times the network difficulty, never under
-/// `floor`.
+/// The work the share window spans: `multiple` times the network difficulty, at least 1.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct WindowRule {
     pub multiple: f64,
-    pub floor: u128,
 }
 
 impl WindowRule {
-    /// A window of `window` work at every network difficulty.
+    /// A window of `window` work at a network difficulty of 1, which a test leaves set.
     #[cfg(test)]
     pub fn fixed(window: u128) -> Self {
-        Self { multiple: 0.0, floor: window }
+        Self { multiple: window as f64 }
     }
 
     pub fn window_for(&self, network_difficulty: f64) -> u128 {
         let w = network_difficulty * self.multiple;
-        let scaled = if w.is_finite() && w >= 1.0 { w as u128 } else { 1 };
-        scaled.max(self.floor.max(1))
+        if w.is_finite() && w >= 1.0 { w as u128 } else { 1 }
     }
 }
 
@@ -207,14 +204,14 @@ pub struct Ledger {
 }
 
 impl Ledger {
-    /// An empty file-less ledger, its window at the rule's floor. A share whose secondary tag
-    /// is not the public gateway's counts as own-gateway work; with no public gateway, no share
-    /// does.
+    /// An empty file-less ledger, its window sized to a network difficulty of 1 until one is
+    /// set. A share whose secondary tag is not the public gateway's counts as own-gateway work;
+    /// with no public gateway, no share does.
     pub fn new(window_rule: WindowRule, split_policy: SplitPolicy) -> Self {
         Self {
             shares: VecDeque::new(),
             identities: Identities::default(),
-            window: window_rule.floor.max(1),
+            window: window_rule.window_for(1.0),
             window_rule,
             split_policy,
             total_work: 0,
@@ -521,28 +518,22 @@ fn most_work_first((a, a_work): (&str, u128), (b, b_work): (&str, u128)) -> std:
 }
 
 pub enum LedgerLocation {
-    File(PathBuf),
     InDir(PathBuf),
     MemoryOnly,
 }
 
 impl LedgerLocation {
-    pub fn new(ledger_path: Option<String>, data_dir: Option<&Path>) -> Self {
-        match (ledger_path, data_dir) {
-            (Some(p), _) => Self::File(PathBuf::from(p)),
-            (None, Some(dir)) => Self::InDir(dir.to_path_buf()),
-            (None, None) => Self::MemoryOnly,
-        }
+    pub fn new(data_dir: Option<&Path>) -> Self {
+        data_dir.map_or(Self::MemoryOnly, |dir| Self::InDir(dir.to_path_buf()))
     }
 
     /// The ledger file for the chain, or none for a memory-only ledger.
     pub fn file_for(&self, chain: Option<rpc::Chain>) -> io::Result<Option<PathBuf>> {
         Ok(match (self, chain) {
-            (Self::File(p), _) => Some(p.clone()),
             (Self::InDir(dir), Some(rpc::Chain::Other)) => {
                 return Err(invalid_input(format!(
                     "the node reports a chain this pool has no name for, so it cannot name the \
-                     ledger in {}; give --ledger a file for it",
+                     ledger in {}",
                     dir.display()
                 )));
             }
@@ -558,35 +549,30 @@ impl LedgerLocation {
     /// never creates one.
     pub fn existing_file(&self, flag: &str) -> io::Result<PathBuf> {
         Ok(match self {
-            Self::File(p) if p.is_file() => p.clone(),
-            Self::File(p) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!(
-                        "no ledger file at {}; {flag} reads the ledger a pool wrote and does not \
-                         create one",
-                        p.display()
-                    ),
-                ));
-            }
             Self::InDir(dir) => match ledger_files_in(dir)?.as_slice() {
                 [one] => one.clone(),
                 [] => {
-                    return Err(invalid_input(format!("no ledger (*.redb) in {}", dir.display())));
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!(
+                            "no ledger (*.redb) in {}; {flag} reads the ledger a pool wrote and \
+                             does not create one",
+                            dir.display()
+                        ),
+                    ));
                 }
                 many => {
                     let names: Vec<String> = many.iter().map(|p| p.display().to_string()).collect();
                     return Err(invalid_input(format!(
-                        "{} holds more than one ledger; give --ledger to choose one of: {}",
+                        "{} holds more than one ledger; a data directory serves one chain, so \
+                         move the others out: {}",
                         dir.display(),
                         names.join(", ")
                     )));
                 }
             },
             Self::MemoryOnly => {
-                return Err(invalid_input(format!(
-                    "{flag} needs a ledger: give --ledger or --data-dir"
-                )));
+                return Err(invalid_input(format!("{flag} needs a ledger: give --data-dir")));
             }
         })
     }
@@ -621,10 +607,7 @@ pub fn open_share_ledger(
     mut ledger: Ledger,
 ) -> io::Result<(Ledger, BlockRecords)> {
     let Some(path) = path else {
-        warn!(
-            "no --ledger file or --data-dir; the share window and the block records are lost on \
-             restart"
-        );
+        warn!("no --data-dir; the share window and the block records are lost on restart");
         return Ok((ledger, BlockRecords::default()));
     };
     let store = Store::open(path, keep, chain_name)?;

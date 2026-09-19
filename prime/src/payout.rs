@@ -160,7 +160,7 @@ mod tests {
 
     #[test]
     fn a_split_names_every_miner_and_never_the_pool() {
-        let server = server_with(&[(ALICE, 3), (BOB, 1)], 0);
+        let server = server_with(&[(ALICE, 3), (BOB, 1)]);
         let outputs = coinbaser_outputs(&server, 1_000_000);
         assert_eq!(
             outputs.iter().map(|o| (o.value, o.script_pubkey.clone())).collect::<Vec<_>>(),
@@ -172,7 +172,7 @@ mod tests {
 
     #[test]
     fn a_fee_is_deducted_before_the_split_and_left_to_the_pool() {
-        let server = server_with_fee(&[(ALICE, 3), (BOB, 1)], 0, 100);
+        let server = server_with_fee(&[(ALICE, 3), (BOB, 1)], 100);
         let outputs = coinbaser_outputs(&server, 1_000_000);
         assert_eq!(
             outputs.iter().map(|o| (o.value, o.script_pubkey.clone())).collect::<Vec<_>>(),
@@ -198,14 +198,14 @@ mod tests {
 
     #[test]
     fn an_empty_window_names_nobody() {
-        let server = server_with(&[], 0);
+        let server = server_with(&[]);
         assert!(coinbaser_outputs(&server, 1_000_000).is_empty());
     }
 
     #[test]
     fn an_identity_that_is_not_an_address_of_the_chain_leaves_its_amount_to_the_pool() {
         for unpayable in ["nonsense", MAIN_ADDRESS] {
-            let server = server_with(&[(ALICE, 3), (unpayable, 1)], 0);
+            let server = server_with(&[(ALICE, 3), (unpayable, 1)]);
             let outputs = coinbaser_outputs(&server, 1_000_000);
             assert_eq!(outputs.len(), 1, "{unpayable}");
             assert_eq!(outputs[0].script_pubkey, p2wpkh(0xa1));
@@ -217,22 +217,22 @@ mod tests {
     #[test]
     fn the_dictated_split_charges_the_public_gateway_fee_and_reassigns_it() {
         let server = server_with_public_gateway_fee(5_000, 10_000);
-        let outputs = coinbaser_outputs(&server, 200);
+        let outputs = coinbaser_outputs(&server, 200_000);
         assert_eq!(
             outputs.iter().map(|o| (o.value, o.script_pubkey.clone())).collect::<Vec<_>>(),
-            vec![(150, p2wpkh(0xb2)), (50, p2wpkh(0xa1))]
+            vec![(150_000, p2wpkh(0xb2)), (50_000, p2wpkh(0xa1))]
         );
 
         let off = server_with_public_gateway_fee(0, 0);
-        let outputs = coinbaser_outputs(&off, 200);
-        assert_eq!(outputs.iter().map(|o| o.value).collect::<Vec<_>>(), vec![100, 100]);
+        let outputs = coinbaser_outputs(&off, 200_000);
+        assert_eq!(outputs.iter().map(|o| o.value).collect::<Vec<_>>(), vec![100_000, 100_000]);
     }
 
     #[test]
     fn the_minimum_is_applied_before_the_identities_are_decoded() {
-        let server = server_with(&[(ALICE, 999), (BOB, 1)], 10_000);
-        let outputs = coinbaser_outputs(&server, 1_000_000);
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].value, 1_000_000);
+        let server = server_with(&[(ALICE, 999), (BOB, 1)]);
+        let outputs = coinbaser_outputs(&server, 500_000);
+        assert_eq!(outputs.len(), 1, "bob's 500 is under the minimum");
+        assert_eq!(outputs[0].value, 500_000);
     }
 }

@@ -62,8 +62,8 @@ fn luck(blocks: &[FoundBlock]) -> Luck {
 pub fn spawn(server: Arc<Server>, listen: &str) -> Result<SocketAddr, String> {
     let http = http::Server::http(listen).map_err(|e| e.to_string())?;
     let addr = http.local_addr().map_err(|e| e.to_string())?;
-    let history = Arc::new(Mutex::new(match &server.settings.hashrate_path {
-        Some(path) => HashrateHistory::in_file(path.clone()),
+    let history = Arc::new(Mutex::new(match server.settings.hashrate_path() {
+        Some(path) => HashrateHistory::in_file(path),
         None => HashrateHistory::default(),
     }));
     let sampled = Arc::clone(&server);
@@ -365,13 +365,11 @@ fn snapshot(server: &Server, history: &Mutex<HashrateHistory>) -> Value {
             "fee_bps": l.split_policy.fee_bps,
             "public_gateway_fee_bps": public_gateway_fee.map_or(0, |f| f.fee_bps),
             "public_gateway_fee_subsidy_bps": public_gateway_fee.map_or(0, |f| f.subsidy_bps),
-            "min_payout": l.split_policy.min_payout,
+            "min_payout": crate::ledger::split::MIN_PAYOUT,
             "window_multiple": l.window_multiple,
             "min_difficulty": server.share_policy.config.min_difficulty,
             "datum_port": server.settings.datum_port(),
             "pubkey": server.pool_keys.public().to_hex(),
-            "advertise": server.settings.advertise_address,
-            "public_gateway": server.settings.public_gateway_url,
         },
         "network": network,
         "connections": {
@@ -422,7 +420,7 @@ mod tests {
     #[test]
     fn the_window_reports_its_share_count_against_the_bound_it_stops_at() {
         const CAP: usize = 8;
-        let server = server_with(&[], 0);
+        let server = server_with(&[]);
         let history = Mutex::new(HashrateHistory::default());
 
         lock(&server.ledger).set_max_shares(CAP);

@@ -21,13 +21,15 @@ pub struct PublicGateway {
     pub subsidy_bps: u16,
 }
 
+/// The smallest output written, the P2PKH dust threshold: an identity whose amount would fall
+/// under it leaves the split.
+pub const MIN_PAYOUT: u64 = 546;
+
 /// What a block's value is split by: the operator fee paid to the pool's script before the
-/// split, the smallest amount written as an output, and the public gateway fee charged on the
-/// window's weights.
+/// split, and the public gateway fee charged on the window's weights.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SplitPolicy {
     pub fee_bps: u16,
-    pub min_payout: u64,
     pub public_gateway: Option<PublicGateway>,
 }
 
@@ -120,7 +122,7 @@ impl Ledger {
     /// minimum payout.
     pub fn split(&self, value: u64) -> Vec<Payout> {
         let p = &self.split_policy;
-        self.split_value(p.miners_share(value), p.min_payout, MAX_COINBASER_OUTPUTS)
+        self.split_value(p.miners_share(value), MIN_PAYOUT, MAX_COINBASER_OUTPUTS)
     }
 
     pub(super) fn split_value(

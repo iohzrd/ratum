@@ -270,15 +270,42 @@ that already changes the version line, and `NO_BUMP=1` are left alone.
 ### Configuration
 
 Every setting is a flag; `--config`, or `ratum.toml` in `--data-dir`, may hold them under the
-flags' names without the dashes, and a flag given as well overrides the file.
+flags' names without the dashes, and a flag given as well overrides the file. The file keeps
+the node's password out of the process command line; the pool warns when it holds one and is
+readable by more than its owner.
 
 ```toml
-rpc = "http://127.0.0.1:8332"   # the node, on this host or a private link
-rpc-user = "ratum"              # or --rpc-cookie <file>, or "user:pass@" in the url above
-rpc-pass = "..."                # the credential is taken in that order of precedence
-min-diff = 16384                # smallest share difficulty credited, a power of two
-min-payout = 546                # smallest output written; a miner under it leaves the split
+rpc = "http://ratum:...@127.0.0.1:8332"   # the node, on this host or a private link
+min-diff = 16384                          # smallest share difficulty credited, a power of two
 ```
+
+| Flag | Default | Effect |
+| --- | --- | --- |
+| `--rpc <url>` | required | the node; a `user:password@` in the URL is the credential |
+| `--rpc-cookie <file>` | none | the node's cookie file, used instead of the URL's credential and re-read when a request is refused |
+| `--payout-address <address>` | required | the pool's script: the coinbase output every job reserves, and every fallback payment |
+| `--data-dir <dir>` | none | holds `<chain>.redb`, `ratum-prime.key`, `hashrate.json` and `ratum.toml`; without it the window is in memory only |
+| `--config <file>` | `ratum.toml` in `--data-dir` | the settings file |
+| `--listen <address>` | `0.0.0.0:28915` | the DATUM listener |
+| `--stats-listen <address>` | none | the `/stats.json` listener (see "Stats interface") |
+| `--coinbase-tag <text>` | empty | pushed into every pooled coinbase ahead of the gateway's secondary tag |
+| `--motd <text>` | `RATUM Prime` | sent to every gateway at hello |
+| `--min-diff <n>` | 16384 | the smallest share difficulty credited, a power of two |
+| `--window <multiple>` | 8 | the window's work as a multiple of the network difficulty |
+| `--ledger-keep-shares <n>` | keep all | the shares retained on disk (see "Ledger and window") |
+| `--fee-bps <n>` | 0 | the operator fee, at most 100 |
+| `--public-gateway-tag <text>` | none | the public gateway's secondary coinbase tag |
+| `--public-gateway-fee-bps <n>` | 0 | the fee on public-gateway work, at most 10000 |
+| `--public-gateway-fee-subsidy-bps <n>` | 0 | the portion of that fee reassigned to own-gateway miners |
+| `--require-v3` | off | refuse version 1 gateways at hello |
+| `--max-connections <n>` | 1024 | the gateway connections served at once |
+| `--max-connections-per-ip <n>` | 32 | those from one address |
+| `--poll <seconds>` | 0.5 | the bound on each wait for the next block before the tip is re-read |
+
+The ledger commands run instead of the pool, with `--data-dir` and the pool stopped:
+`--dump-ledger` prints every stored share, one per line (time, difficulty, identity, hash,
+secondary tag); `--settle-block`, `--void-block` and `--record-owed` with `--owed` are
+described under "Owed blocks".
 
 `RUST_LOG` selects the level (`info` default; `debug` adds every frame and share).
 
@@ -292,25 +319,6 @@ the limit does not cover three descriptors per connection.
 A share the ledger cannot record (a write error) is answered as refused (`Other`) and its
 hash released, so the gateway's count of accepted shares matches the credit.
 
-`--allow-agent` (comma-separated prefixes, e.g. `ratum-gateway/`) refuses at hello any
-gateway whose user agent matches none of them; empty (the default) accepts every agent.
-The agent is self-reported: this refuses builds known to mishandle the coinbaser (their
-blocks pay no split), it does not authenticate anyone.
-
-`--require-split` (`true`, the default, or `false`) refuses with reject code 43 (`NoSplit`)
-a share whose job names a coinbaser response this pool sent while its coinbase pays none of
-that response's outputs, once 10 seconds have passed since the response: the C gateway
-serves its outputs-free coinbase 0 to a miner it notifies while the job's coinbaser is
-awaited (a connect, a quick difficulty change, its 5 second timeout), and that miner holds
-it until its next notify. A job naming no coinbaser (id 0: the job needed none, or the
-request was refused or timed out), a response with no outputs, and subsidy-only work are
-exempt, so the check covers builds that fetch the split and then mine coinbase 0; a share
-paying any part of the split passes, and so does a block, whose value reached the pool's
-script and is recorded as owed. Like `--allow-agent`, it is a check on misbuilt gateways,
-not authentication: a build that never requests a coinbaser, or that names no coinbaser (id
-0) on the jobs it builds after the response, is not refused, and its blocks are recorded as
-owed.
-
 `--require-v3` refuses at hello any gateway that does not use the version 3 protocol (its
 hello carries no DRS extension). Off, the default, serves version 1 and version 3 gateways;
 a version 1 client computes true block hashes and so can withhold blocks selectively. On,
@@ -321,11 +329,11 @@ hello by default (`datum.protocol_v3`) and, when the pool responds with a versio
 configuration, runs that session under version 1.
 
 A version 3 session's anti-block-withholding slots rotate on a new tip (once the active
-slot is a quarter of `--abw-reveal-after` old), after 16384 accepted shares, and after 10
+slot is 75 seconds old), after 16384 accepted shares, and after 10
 minutes; a rotation onto a slot whose previous key is not yet revealed waits for that reveal
 rather than revealing it early. A slot on which the pool relays a block is treated as revealed
-(the block's header carries its key), and rotated off at once if active. A retired slot's key is revealed `--abw-reveal-after` seconds
-(1 to 600, default 300) after its retirement, not at the next rotation: the gateway audits every proof it retained on the slot
+(the block's header carries its key), and rotated off at once if active. A retired slot's key is revealed 300 seconds
+after its retirement, not at the next rotation: the gateway audits every proof it retained on the slot
 the moment it processes the reveal, so the reveal must come after the last share the gateway
 can still submit on the slot's jobs (its stale-share rule allows `share_stale_seconds +
 work_update_seconds`, 160 s by default and 270 s at most; the default covers the most), and
@@ -400,8 +408,8 @@ template's for a job on another parent (any bits on testnet and testnet4).
 ### Ledger and window
 
 Every accepted share is written to a [redb](https://github.com/cberner/redb) database before
-it is credited: `--ledger` names the file, `--data-dir` puts `<chain>.redb` inside, with
-neither the window is in memory only. `--ledger-keep-shares <n>` keeps the newest `n` shares
+it is credited: `--data-dir` holds it as `<chain>.redb`; without one the window is in
+memory only. `--ledger-keep-shares <n>` keeps the newest `n` shares
 on disk and removes the rest as each share is recorded, at most 4096 rows per share, so a
 surplus left by setting or lowering it on a large ledger is removed over the shares that
 follow; unset keeps every one, which is what
@@ -414,10 +422,10 @@ A ledger is stamped with the node's chain and refused on another chain.
 
 A payout is measured over the most recent shares whose difficulties sum to `--window` times the
 difficulty of the block being mined, read from the node's template (the tip's while no template
-has been read), as OCEAN's TIDES rule specifies (8 by default), never below `--window-floor`. At
-the BLAKE2b activation height Knots resets the target to the previous target shifted left by
-`Blake2bTargetShift` bits (22 on mainnet, 20 elsewhere), so set `--window-floor` to hold the
-intended span of work and keep the whole ledger across the fork.
+has been read), as OCEAN's TIDES rule specifies (8 by default), and at least 1. At the BLAKE2b
+activation height Knots resets the target to the previous target shifted left by
+`Blake2bTargetShift` bits (22 on mainnet, 20 elsewhere), so the window narrows by that factor
+at the fork and the shares before it leave it.
 
 The window holds at most `2^22` shares whatever their difficulties sum to. The window is a work
 target and how many shares that is depends on their difficulty, so a count bound is the only
@@ -467,7 +475,7 @@ for `stratum.require_address_username`, so a witness version above 1, the pay-to
 address and an address of another chain are refused. A pool that started without an answer
 from the node, which only a memory-only ledger does, accepts the prefixes of every chain, for
 identities and for `--payout-address`. An identity past the 512 outputs a gateway accepts, or
-one whose amount would fall under `--min-payout`, is dropped before the split's denominator is
+one whose amount would fall under 546 sats (the P2PKH dust threshold), is dropped before the split's denominator is
 summed, so the miners that remain divide the whole value between them. An identity in the
 window that is not such an address when the split is built (a share an earlier version of the
 pool credited) is dropped after the amounts are computed, so its amount stays in the coinbase
@@ -501,7 +509,7 @@ work. The rest stays in the coinbase value that reaches the pool's payout script
 remainder, so with no own-gateway work in the window the whole fee stays with the pool. The
 fee requires the tag, and the subsidy requires the fee. The fee is charged on the work the
 pool credits, so a share it rejects is not charged and a block share is charged like any
-other. The reassignment is applied before the 512-output limit and `--min-payout`, and the
+other. The reassignment is applied before the 512-output limit and the 546 sat minimum, and the
 owed-block records and `/stats.json` payouts follow it, since all of them are one split. No
 sats are held or paid by hand: the fee and the subsidy are share work, settled in the
 coinbase of the next block found and ageing out of the window with the shares that produced
@@ -528,8 +536,8 @@ interval between a tip change and the next coinbaser split); the record is the s
 coinbaser at that moment would have dictated, minus the operator fee. The amounts are logged, shown in the stats page's block table ("in
 coinbase; X owed to N", or "owed by pool") and summed in its banner, and included in
 `/stats.json` under `owed`. Settlement is an ordinary transaction from the operator's
-wallet; afterwards `ratum-prime --settle-block <block-hash>` (with `--ledger` or
-`--data-dir`, pool stopped) marks the record settled, and `--settle-block list` prints every
+wallet; afterwards `ratum-prime --settle-block <block-hash>` (with `--data-dir`, pool
+stopped) marks the record settled, and `--settle-block list` prints every
 record. A recorded block that was rejected or orphaned (the pool's payout script never
 received its value) is removed with `--void-block <block-hash>`, which deletes its block
 record, its owed record if it has one, and its confirmation reading, so it is no longer
@@ -582,11 +590,9 @@ a cumulative work counter it derives a luck figure (blocks found over blocks
 expected, each block's expected count being the work since the previous block over that
 block's own difficulty, the one the window was sized to), and from the observed block spacing an expected time to the pool's next block and
 the next difficulty adjustment (height, countdown, estimated factor). It also carries the
-DATUM address, the public key and the values a `datum_gateway` config block needs to point a
-gateway at the pool; `--advertise-address host[:port]` sets the address when the public one
-differs. `--public-gateway <url>` names a gateway that accepts miners who do not run their
-own (a value without a scheme is read as `https://`); unset, the field is null. It is
-unauthenticated: bind it to `127.0.0.1` unless it is behind a reverse proxy.
+DATUM port, the public key and the values a `datum_gateway` config block needs to point a
+gateway at the pool. It is unauthenticated: bind it to `127.0.0.1` unless it is behind a
+reverse proxy.
 
 The node is read for `getmininginfo` once a minute alongside the tip: `hashrate.network_hs`
 is its estimate of the network's hashes per second and `hashrate.pool_share` is

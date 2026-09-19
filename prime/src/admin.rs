@@ -270,22 +270,22 @@ mod tests {
     #[test]
     fn a_ledger_command_on_a_missing_file_is_refused_naming_the_path_and_creates_nothing() {
         let scratch = crate::fixtures::Scratch::new("admin-missing");
-        let path = scratch.join("typo.redb");
-        let location = LedgerLocation::File(path.clone());
+        let dir = scratch.dir().to_path_buf();
+        let location = LedgerLocation::InDir(dir.clone());
         for (flag, run) in [
             ("--settle-block", settle_block as fn(&LedgerLocation, &str) -> io::Result<()>),
             ("--void-block", void_block),
         ] {
             let e = run(&location, "list").expect_err(flag);
             assert_eq!(e.kind(), io::ErrorKind::NotFound, "{flag}");
-            assert!(e.to_string().contains(&path.display().to_string()), "{flag}: {e}");
+            assert!(e.to_string().contains(&dir.display().to_string()), "{flag}: {e}");
             assert!(e.to_string().contains(flag), "{flag}: {e}");
         }
         let e = record_owed(&location, "list", &[]).expect_err("--record-owed");
         assert!(e.to_string().contains("--record-owed"), "{e}");
         let e = dump_ledger(&location).expect_err("--dump-ledger");
         assert!(e.to_string().contains("--dump-ledger"), "{e}");
-        assert!(!path.exists(), "no command created the file");
+        assert!(std::fs::read_dir(&dir).unwrap().next().is_none(), "no command created a file");
     }
 
     #[test]
@@ -304,7 +304,7 @@ mod tests {
             let reading = ConfirmationReading { checked_at: 5, confirmations: -1 };
             records.record_confirmations(orphan.block_hash, reading).unwrap();
         }
-        let location = LedgerLocation::File(path.clone());
+        let location = LedgerLocation::InDir(scratch.dir().to_path_buf());
         void_block(&location, &hex::encode(orphan.block_hash)).unwrap();
         let records = BlockRecords::open_file(&path).unwrap();
         assert_eq!(records.blocks(), &[found(2, 32)], "only the orphan was removed");

@@ -45,7 +45,6 @@ pub const VERSION_ROLLING_MASK: u32 = 0x1fff_e000;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SharePolicy {
     pub config: ClientConfig,
-    pub require_split: bool,
     /// The chain the node reported at startup, none when it did not answer, whose address
     /// prefixes a miner's identity carries (`payout::address_script`).
     pub chain: Option<rpc::Chain>,
@@ -426,8 +425,7 @@ impl<'a> Verifier<'a> {
         rebuilt: &RebuiltShare,
         now: u64,
     ) -> Result<(), RejectReason> {
-        if !self.policy.require_split
-            || s.subsidy_only
+        if s.subsidy_only
             || rebuilt.paid_to_split != 0
             || rebuilt.coinbaser_id == 0
             || rebuilt.is_block

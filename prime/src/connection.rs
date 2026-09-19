@@ -99,13 +99,6 @@ pub fn handle(stream: TcpStream, server: &Server) -> io::Result<()> {
     let Some(hello) = read_hello(&mut socket, server, peer, handshake_started_at)? else {
         return Ok(());
     };
-    if !agent_allowed(&server.settings.allowed_agents, &hello.user_agent) {
-        warn!(
-            "[{peer}] hello refused: agent {:?} matches none of the allowed prefixes {:?}",
-            hello.user_agent, server.settings.allowed_agents
-        );
-        return Ok(());
-    }
     let protocol_version = hello.protocol_version;
     let client_sign_pk = hello.client.sign_pk;
     if server.settings.require_v3 && protocol_version == ProtocolVersion::V1 {
@@ -503,10 +496,6 @@ impl RequestBudget {
     }
 }
 
-fn agent_allowed(allowed: &[String], user_agent: &str) -> bool {
-    allowed.is_empty() || allowed.iter().any(|p| user_agent.starts_with(p))
-}
-
 #[cfg(test)]
 mod tests {
     #[test]
@@ -520,17 +509,5 @@ mod tests {
         assert!(!budget.take(start + Duration::from_millis(500), 3.0, 1.0));
         assert!(budget.take(start + Duration::from_millis(1000), 3.0, 1.0), "one a second");
         assert!(!budget.take(start + Duration::from_millis(1000), 3.0, 1.0));
-    }
-
-    #[test]
-    fn agents_are_allowed_by_prefix_and_an_empty_list_allows_all() {
-        use super::agent_allowed;
-        let none: Vec<String> = Vec::new();
-        assert!(agent_allowed(&none, "v0.4.1-beta/deadbeef"));
-        let list = vec!["ratum-gateway/".to_string(), "v0.4.1-beta/fa61d81".to_string()];
-        assert!(agent_allowed(&list, "ratum-gateway/0.1.7/1eb08f1"));
-        assert!(agent_allowed(&list, "v0.4.1-beta/fa61d81"));
-        assert!(!agent_allowed(&list, "v0.4.1-beta/a1fbb293"));
-        assert!(!agent_allowed(&list, ""));
     }
 }

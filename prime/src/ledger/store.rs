@@ -106,8 +106,8 @@ impl Store {
                             io::ErrorKind::InvalidData,
                             format!(
                                 "{} holds shares for chain {stored}, but the node is on chain \
-                                 {chain}; a ledger serves one chain, so give --ledger a file \
-                                 of {chain} shares",
+                                 {chain}; a ledger serves one chain, so move it out of the \
+                                 data directory",
                                 path.display()
                             ),
                         ));

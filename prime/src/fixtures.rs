@@ -18,12 +18,12 @@ pub const ALICE: &str = "bcrt1q5xs6rgdp5xs6rgdp5xs6rgdp5xs6rgdpa854mc";
 pub const BOB: &str = "bcrt1qk2et9v4jk2et9v4jk2et9v4jk2et9v4jldyv0a";
 
 /// A server on regtest whose window holds `shares`, each an identity and its difficulty.
-pub fn server_with(shares: &[(&str, u64)], min_payout: u64) -> Server {
-    server_with_fee(shares, min_payout, 0)
+pub fn server_with(shares: &[(&str, u64)]) -> Server {
+    server_with_fee(shares, 0)
 }
 
-pub fn server_with_fee(shares: &[(&str, u64)], min_payout: u64, fee_bps: u16) -> Server {
-    let policy = SplitPolicy { fee_bps, min_payout, public_gateway: None };
+pub fn server_with_fee(shares: &[(&str, u64)], fee_bps: u16) -> Server {
+    let policy = SplitPolicy { fee_bps, public_gateway: None };
     let mut ledger = Ledger::new(WindowRule::fixed(u128::MAX), policy);
     for (i, (identity, difficulty)) in shares.iter().enumerate() {
         let mut hash = [0u8; 32];
@@ -47,7 +47,6 @@ pub fn server_on(ledger: Ledger, records: BlockRecords) -> Server {
             min_difficulty: 1,
             v3: None,
         },
-        require_split: true,
         chain: Some(rpc::Chain::Regtest),
     };
     let node = rpc::Client::new("http://127.0.0.1:1", "u", "p", None).unwrap();
@@ -57,7 +56,7 @@ pub fn server_on(ledger: Ledger, records: BlockRecords) -> Server {
 /// A server whose window holds 100 work from `ALICE` on the public gateway (tag "public") and
 /// 100 from `BOB` on an own gateway.
 pub fn server_with_public_gateway_fee(fee_bps: u16, subsidy_bps: u16) -> Server {
-    let server = server_with(&[], 0);
+    let server = server_with(&[]);
     let gateway = PublicGateway { tag: "public".into(), fee_bps, subsidy_bps };
     let policy = SplitPolicy { public_gateway: Some(gateway), ..SplitPolicy::default() };
     let mut l = ratum::lock(&server.ledger);
@@ -85,6 +84,10 @@ impl Scratch {
 
     pub fn join(&self, name: &str) -> std::path::PathBuf {
         self.0.join(name)
+    }
+
+    pub fn dir(&self) -> &std::path::Path {
+        &self.0
     }
 }
 

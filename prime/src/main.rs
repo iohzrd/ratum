@@ -35,7 +35,6 @@ use std::io;
 use std::net::TcpListener;
 use std::sync::Arc;
 use std::time::Duration;
-use verify::SharePolicy;
 
 const VERSION: &str = ratum::version!();
 
@@ -47,20 +46,14 @@ fn init_logging() {
 /// address prefixes the payout address and every miner's identity must carry, and its
 /// difficulty sizes the window read back. A memory-only ledger starts without it when the node
 /// does not answer.
-fn startup_tip(
-    node: &rpc::Client,
-    location: &LedgerLocation,
-    s: &Settings,
-    window_floor: u128,
-) -> Option<rpc::Tip> {
+fn startup_tip(node: &rpc::Client, location: &LedgerLocation, s: &Settings) -> Option<rpc::Tip> {
     loop {
         match node.tip() {
             Ok(t) => return Some(t),
             Err(e) if matches!(location, LedgerLocation::MemoryOnly) => {
                 warn!(
-                    "could not read the node difficulty to size the share window ({e}); \
-                     starting from the floor of {window_floor}, so shares recorded before this \
-                     restart are credited only as far back as that floor reaches, and an \
+                    "could not read the node difficulty to size the share window ({e}); the \
+                     window is sized to a difficulty of 1 until the node answers, and an \
                      address with the prefixes of any chain is accepted"
                 );
                 return None;
@@ -162,15 +155,12 @@ fn raise_open_file_limit(max_connections: usize) {
     }
 }
 
-fn report_settings(s: &Settings, share: &SharePolicy, ledger: &Ledger) {
+fn report_settings(s: &Settings, ledger: &Ledger) {
     let (window, split) = (ledger.window_rule(), ledger.split_policy());
     info!(
-        "payouts: window {}x network difficulty (floor {}, {} at startup), minimum {} sats, \
-         operator fee {} bps",
+        "payouts: window {}x network difficulty ({} at startup), operator fee {} bps",
         window.multiple,
-        window.floor,
         ledger.window(),
-        split.min_payout,
         split.fee_bps
     );
     if let Some(gateway) = split.public_gateway.as_ref().filter(|g| g.fee_bps > 0) {
@@ -179,17 +169,6 @@ fn report_settings(s: &Settings, share: &SharePolicy, ledger: &Ledger) {
              tag {:?}, of which {} bps is reassigned at each split to miners whose shares do \
              not carry it",
             gateway.fee_bps, gateway.tag, gateway.subsidy_bps
-        );
-    }
-    if !share.require_split {
-        info!(
-            "--require-split=false: a coinbase paying only the pool script is accepted from any job"
-        );
-    }
-    if !s.allowed_agents.is_empty() {
-        info!(
-            "gateway user agents restricted to the prefixes {:?}; others are refused at hello",
-            s.allowed_agents
         );
     }
     if s.require_v3 {
@@ -210,16 +189,16 @@ fn main() -> io::Result<()> {
     if let Some(dir) = &s.data_dir {
         std::fs::create_dir_all(dir)?;
     }
-    let ledger_location = LedgerLocation::new(s.ledger_path.clone(), s.data_dir.as_deref());
+    let ledger_location = LedgerLocation::new(s.data_dir.as_deref());
     if let Some(done) = admin::run_command(&options, &ledger_location) {
         return done;
     }
 
-    let pool_keys = keys::load_or_create_keys(&s.key_path)?;
+    let pool_keys = keys::load_or_create_keys(&s.key_path())?;
     info!("pool_pubkey: {}", pool_keys.public().to_hex());
 
     let node = settings::connect_node(&options).unwrap_or_else(|e| cli::fatal!("{e}"));
-    let tip = startup_tip(&node, &ledger_location, &s, window.floor);
+    let tip = startup_tip(&node, &ledger_location, &s);
     let chain = tip.map(|t| t.chain);
     let share = settings::share_policy(&options, chain).unwrap_or_else(|e| cli::fatal!("{e}"));
     info!("pool payout script: {}", hex::encode(&share.config.payout_script));
@@ -234,7 +213,7 @@ fn main() -> io::Result<()> {
         chain.map(rpc::Chain::name),
         ledger,
     )?;
-    report_settings(&s, &share, &ledger);
+    report_settings(&s, &ledger);
 
     let server = Arc::new(Server::new(s, share, pool_keys, node, (ledger, records))?);
     let s = &server.settings;
