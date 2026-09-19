@@ -4,15 +4,19 @@
 
 pub mod blocks;
 mod db;
+mod snapshot;
 pub mod split;
 mod store;
 #[cfg(test)]
 mod tests;
 
+pub use snapshot::{snapshot_refusal, write_snapshot};
+
 use crate::accounting::{ACCEPTED_HASH_RETENTION_SECS, MAX_ACCEPTED_HASHES};
 use blocks::BlockRecords;
 use log::{info, warn};
 use ratum::rpc;
+use redb::Database;
 use split::SplitPolicy;
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -412,6 +416,12 @@ impl Ledger {
         self.cumulative_work
     }
 
+    /// The ledger file's database and path; none for a file-less ledger. A caller reads the
+    /// file through its own read transaction, off the ledger lock.
+    pub fn file(&self) -> Option<(Arc<Database>, PathBuf)> {
+        self.store.as_ref().map(|s| (s.database(), s.path().to_path_buf()))
+    }
+
     /// The shares accepted at or after `cutoff`, newest first.
     fn shares_since(&self, cutoff: u64) -> impl Iterator<Item = &WindowShare> {
         self.shares.iter().rev().take_while(move |s| u64::from(s.accepted_at) >= cutoff)
@@ -591,11 +601,24 @@ fn ledger_files_in(dir: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(found)
 }
 
-/// Passes `f` every share the existing ledger file stores, oldest first and one at a time, so
-/// a ledger larger than memory can be read; one read transaction, without reading back the
-/// share window or opening the block records. Stops at the first error `f` returns.
+/// Passes `f` every share `db` stores, oldest first and one at a time, so a ledger larger
+/// than memory can be read; one read transaction, without reading back the share window or
+/// opening the block records, so the shares a running pool records meanwhile are not in its
+/// view and its writes are not held up. Stops at the first error `f` returns.
+pub fn dump(db: &Database, f: impl FnMut(Share) -> io::Result<()>) -> io::Result<()> {
+    store::dump(db, f)
+}
+
+/// `dump` on the existing ledger file at `path`.
+#[cfg(test)]
 pub fn dump_file(path: &Path, f: impl FnMut(Share) -> io::Result<()>) -> io::Result<()> {
-    store::dump_file(path, f)
+    dump(&open_existing(path)?, f)
+}
+
+/// The existing ledger file at `path`, opened writable as the pool opens it (a file a pool
+/// stopped by a signal did not close is repaired only by a writable open); never created.
+pub fn open_existing(path: &Path) -> io::Result<Database> {
+    db::open_database(path)
 }
 
 /// `ledger` with the store at `path` attached, and the block records stored beside it; with

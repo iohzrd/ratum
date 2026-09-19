@@ -48,6 +48,11 @@ pub(super) fn open_database(path: &Path) -> io::Result<Database> {
     builder().open(path).db()
 }
 
+/// A new database in `file`, which must be empty.
+pub(super) fn create_in_file(file: std::fs::File) -> io::Result<Database> {
+    builder().create_file(file).db()
+}
+
 /// Runs `f` in a write transaction committed at `Durability::Immediate`, so a row is on disk
 /// before the caller is told it was written.
 pub(super) fn write<T>(

@@ -207,8 +207,8 @@ fn log_and_record_owed(server: &Server, peer: SocketAddr, owed: OwedBlock) {
     let hash = hex::encode(owed.block_hash);
     warn!(
         "[{peer}]   ** recorded as owed by block hash {hash}; after paying it from the \
-         pool's wallet, run: ratum-prime --settle-block {hash} (with \
-         --data-dir, pool stopped)"
+         pool's wallet, run: ratum-prime --settle-block {hash} (with --data-dir; the \
+         running pool executes it)"
     );
     let recorded = lock(&server.records).record_owed(owed);
     if let Err(e) = recorded {

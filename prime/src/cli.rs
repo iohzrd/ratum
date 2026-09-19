@@ -82,6 +82,12 @@ pub struct Options {
     #[arg(long, value_name = "IDENTITY=SATS")]
     #[serde(skip)]
     pub owed: Vec<String>,
+    #[arg(long, value_name = "PATH")]
+    #[serde(skip)]
+    pub snapshot: Option<String>,
+    #[arg(long)]
+    #[serde(skip)]
+    pub offline: bool,
 }
 
 /// The options on the command line applied over those of the settings file: the file
@@ -217,6 +223,8 @@ mod tests {
             "void-block = \"00\"\n",
             "record-owed = \"00\"\n",
             "owed = [\"alice=1\"]\n",
+            "snapshot = \"/backups/main.redb\"\n",
+            "offline = true\n",
         ] {
             let e = parse_toml(text).expect_err("a command is not a setting").to_string();
             assert!(e.contains("unknown field"), "{text:?}: {e}");

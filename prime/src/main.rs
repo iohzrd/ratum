@@ -10,6 +10,7 @@ mod bounded;
 mod cli;
 mod confirmations;
 mod connection;
+mod control;
 #[cfg(test)]
 mod fixtures;
 mod keys;
@@ -203,6 +204,23 @@ fn main() -> io::Result<()> {
     let share = settings::share_policy(&options, chain).unwrap_or_else(|e| cli::fatal!("{e}"));
     info!("pool payout script: {}", hex::encode(&share.config.payout_script));
 
+    // Bound before the ledger opens, so a second pool on the data directory is refused here,
+    // naming this one; dropped when main returns, which removes the socket file. A socket
+    // that cannot be bound (a path past the socket path limit, a filesystem that holds no
+    // sockets) leaves the pool running without one, as before the socket existed.
+    let mut control = match s.data_dir.as_deref().map(control::ControlSocket::bind) {
+        Some(Ok(control)) => Some(control),
+        Some(Err(e)) if e.kind() == io::ErrorKind::AddrInUse => return Err(e),
+        Some(Err(e)) => {
+            warn!(
+                "no control socket: {e}; the ledger commands run on the ledger file with the \
+                 pool stopped"
+            );
+            None
+        }
+        None => None,
+    };
+
     let mut ledger = Ledger::new(window, split);
     if let Some(t) = tip {
         ledger.set_network_difficulty(t.difficulty);
@@ -221,6 +239,9 @@ fn main() -> io::Result<()> {
 
     watch_node_in_background(&server, chain);
     confirmations::watch(Arc::clone(&server));
+    if let Some(control) = &mut control {
+        control.serve(Arc::clone(&server));
+    }
 
     if let Some(addr) = &s.stats_listen {
         match stats::spawn(Arc::clone(&server), addr) {

@@ -55,7 +55,8 @@ fn check_once(server: &Server) {
 
 /// Reads each due block from the node and records the answer as read at `now`: the
 /// confirmation count, or `ConfirmationReading::NOT_STORED` when the node stores no block
-/// under the hash. A read that fails records nothing, so the block stays first in line.
+/// under the hash. A read that fails records nothing, so the block stays first in line, and
+/// a block voided while it was read gets no reading.
 fn check_blocks<E: std::fmt::Display>(
     records: &Mutex<BlockRecords>,
     now: u64,
@@ -74,6 +75,10 @@ fn check_blocks<E: std::fmt::Display>(
         };
         let state = ConfirmationReading { checked_at: now, confirmations };
         let mut r = lock(records);
+        // Voided (--void-block through the control socket) while the node was read.
+        if !r.blocks().iter().any(|b| b.block_hash == hash) {
+            continue;
+        }
         let previous = match r.record_confirmations(hash, state) {
             Ok(previous) => previous,
             Err(e) => {
@@ -297,5 +302,19 @@ mod tests {
         let l = lock(&records);
         assert_eq!(l.confirmations(&hash(1)).map(|s| s.confirmations), Some(7));
         assert_eq!(l.confirmations(&hash(2)).map(|s| s.confirmations), Some(7));
+    }
+
+    #[test]
+    fn a_block_voided_while_the_node_is_read_gets_no_reading() {
+        let records = Mutex::new(with_blocks(&[(1, None), (2, None)]));
+        check_blocks(&records, 1_000, |display| {
+            if display == hex::encode(hash(1)) {
+                lock(&records).void_block(&hash(1)).unwrap();
+            }
+            Ok::<_, String>(Some(3))
+        });
+        let l = lock(&records);
+        assert_eq!(l.confirmations(&hash(1)), None, "the voided block has no reading");
+        assert_eq!(l.confirmations(&hash(2)).map(|s| s.confirmations), Some(3));
     }
 }

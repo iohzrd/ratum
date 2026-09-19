@@ -376,7 +376,7 @@ fn recent_blocks_json(
         .collect()
 }
 
-fn snapshot(server: &Server, history: &Mutex<HashrateHistory>) -> Value {
+pub(crate) fn snapshot(server: &Server, history: &Mutex<HashrateHistory>) -> Value {
     let (tip, template) = server.node_state.tip_and_template();
     let tip_height = tip.as_ref().map(|t| t.height);
     let coinbase_value = template.map(|t| t.coinbase_value);

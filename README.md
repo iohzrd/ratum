@@ -302,10 +302,9 @@ min-diff = 16384                          # smallest share difficulty credited, 
 | `--max-connections-per-ip <n>` | 32 | those from one address |
 | `--poll <seconds>` | 0.5 | the bound on each wait for the next block before the tip is re-read |
 
-The ledger commands run instead of the pool, with `--data-dir` and the pool stopped:
-`--dump-ledger` prints every stored share, one per line (time, difficulty, identity, hash,
-secondary tag); `--settle-block`, `--void-block` and `--record-owed` with `--owed` are
-described under "Owed blocks".
+The ledger commands (`--settle-block`, `--void-block`, `--record-owed` with `--owed`,
+`--dump-ledger`, `--snapshot`) run instead of the pool, with `--data-dir`, and are executed
+by the pool running on that directory when there is one; see "Ledger commands".
 
 `RUST_LOG` selects the level (`info` default; `debug` adds every frame and share).
 
@@ -537,9 +536,9 @@ interval between a tip change and the next coinbaser split); the record is the s
 coinbaser at that moment would have dictated, minus the operator fee. The amounts are logged, shown in the stats page's block table ("in
 coinbase; X owed to N", or "owed by pool") and summed in its banner, and included in
 `/stats.json` under `owed`. Settlement is an ordinary transaction from the operator's
-wallet; afterwards `ratum-prime --settle-block <block-hash>` (with `--data-dir`, pool
-stopped) marks the record settled, and `--settle-block list` prints every
-record. A recorded block that was rejected or orphaned (the pool's payout script never
+wallet; afterwards `ratum-prime --settle-block <block-hash>` (with `--data-dir`; the
+running pool executes it, see "Ledger commands") marks the record settled, and
+`--settle-block list` prints every record. A recorded block that was rejected or orphaned (the pool's payout script never
 received its value) is removed with `--void-block <block-hash>`, which deletes its block
 record, its owed record if it has one, and its confirmation reading, so it is no longer
 counted in luck or read from the node; `--record-owed <block-hash> --owed <identity>=<sats>
@@ -567,6 +566,70 @@ nobody; it also refuses a block the pool has not yet read from the node, which i
 five minutes while running, so run the pool until the block's confirmations are read. `submitblock` answering null means the node
 accepted the block, not that it stayed in the chain, and nothing else in the pool re-read
 that.
+
+### Ledger commands
+
+The ledger commands run instead of the pool and take the same `--data-dir` (or `--config`
+naming a file that sets it):
+
+| Command | Effect |
+| --- | --- |
+| `--settle-block <block-hash>` | marks the block's owed record settled (see "Owed blocks") |
+| `--settle-block list` | prints every owed record with its confirmations |
+| `--void-block <block-hash>` | removes the block's record, its owed record and its confirmation reading |
+| `--record-owed <block-hash> --owed <identity>=<sats> ...` | adds an owed record for a block in the history that has none |
+| `--dump-ledger` | prints every stored share, one per line: time, difficulty, identity, hash, secondary tag |
+| `--snapshot <path>` | writes a copy of the ledger file to `<path>` |
+| `--offline` | with any of the above: opens the ledger file directly instead of asking the pool |
+
+A pool started with `--data-dir` listens on a Unix domain socket at `<data-dir>/control.sock`
+(mode 0600; never a TCP port, and not the stats interface). A command first connects to that
+socket: when a pool answers, the pool executes the command against its open ledger and its
+in-memory records, so a settlement or a voided block shows in `/stats.json` at once and no
+restart is needed; the pool logs each command at `info` and its result at `info` (done) or
+`warn` (refused or failed). When there is no socket file, or nobody listens on the one there
+(a pool stopped by a signal leaves it, and the next start replaces it), the command opens the
+ledger file itself, as it did before the socket existed; the file's lock still refuses that
+while a pool holds the file open. `--offline` skips the socket. Either way the command says
+on stderr which of the two ran, prints the same text on stdout and exits with the same code
+(2 for a refused argument, 1 for an error reading or writing the ledger). In Docker, with
+the pool as container `ratum-pool` on `--data-dir=/data`:
+
+```
+docker exec ratum-pool ratum-prime --data-dir=/data --settle-block list
+docker exec ratum-pool ratum-prime --data-dir=/data --settle-block <block-hash>
+docker exec ratum-pool ratum-prime --data-dir=/data --snapshot /data/backups/main-$(date +%F)
+docker exec ratum-pool ratum-prime --data-dir=/data --dump-ledger > shares.txt
+```
+
+`--snapshot <path>` is how the ledger is backed up while the pool runs: a copy of the file
+taken while the pool writes does not open, and the pool holds the file's lock, so a plain
+copy needed the pool stopped. The snapshot is written from one read transaction of the
+ledger's database (the pool's writes proceed meanwhile and are not in it), first to
+`<path>.tmp`, which is opened again and its row counts checked before it is renamed to
+`<path>`, so `<path>` is either the previous file or a copy that opens. It is refused for
+any path directly in the data directory, which holds the pool's own files (a second `.redb`
+there would be read as a second ledger); a subdirectory such as `/data/backups` is allowed.
+The path is written by the pool, so in Docker it is a path inside the container; a relative
+path is resolved by the command before it is sent. A snapshot holds every share, block, owed
+record and confirmation reading as of the transaction. The ledger commands read it as they
+read a ledger, named `<anything>.redb` and the only `.redb` in the directory `--data-dir`
+names, so a dated snapshot as in the example is renamed into a directory of its own to be
+read. A snapshot of 2 million shares takes about 1.2 seconds with the file in the
+operating system's page cache, and `--dump-ledger` of the same about 0.7 seconds (both
+measured, release build).
+
+The socket takes one request and answers with newline-delimited JSON (protocol version 1; a
+request of another version is answered with a refusal naming the version the pool serves).
+A request is at most 1 MiB and must arrive within 10 seconds, each write to the client must
+be taken within 30 seconds, and at most 4 control connections are served at once, so a stuck
+client holds a thread and never the pool: no ledger or records lock is held while the socket
+is read or written, and `--dump-ledger` and `--snapshot` read the file through their own
+transaction. A second pool started on the same data directory finds the socket answering and
+refuses to start, naming the first; a pool that returns from an error at startup removes the
+socket. When the socket cannot be bound for any other reason (a path of more than 107 bytes
+on Linux, or a filesystem that holds no sockets), the pool warns at startup and runs without
+it, and its commands run on the file with the pool stopped, as before the socket existed.
 
 ### Stats interface
 

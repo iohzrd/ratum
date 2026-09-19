@@ -1,47 +1,300 @@
-//! The ledger commands, which run against the ledger file of a stopped pool and then exit: printing
-//! the shares, listing and settling what a block owes, voiding a block's records, and recording
-//! amounts owed by hand. Each opens an existing ledger and none creates one.
+//! The ledger commands: listing and settling what a block owes, voiding a block's records,
+//! recording amounts owed by hand, printing the shares, and writing a snapshot of the ledger
+//! file. Each runs in the pool that owns the data directory, over its control socket
+//! (`control`), or against the ledger file directly when no pool answers or `--offline` is given.
+//! None creates a ledger.
 
-use crate::cli::{Options, fatal};
+use crate::cli::{Options, USAGE_EXIT};
+use crate::control;
 use crate::ledger::blocks::{BlockRecords, ConfirmationReading, OwedBlock, Voided};
 use crate::ledger::split::Payout;
-use crate::ledger::{self, LedgerLocation};
-use std::io;
+use crate::ledger::{self, LedgerLocation, Share};
+use redb::Database;
+use serde::{Deserialize, Serialize};
+use std::fmt::{self, Write as _};
+use std::io::{self, Write};
+use std::path::PathBuf;
+use std::sync::Arc;
 
-fn open_records(location: &LedgerLocation, flag: &str) -> io::Result<BlockRecords> {
-    BlockRecords::open_file(&location.existing_file(flag)?)
+/// A ledger command as its flags give it. Serialized as the control socket's request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "command", rename_all = "kebab-case")]
+pub enum Command {
+    /// `--settle-block <hash>`, or `--settle-block list`.
+    SettleBlock {
+        arg: String,
+    },
+    VoidBlock {
+        arg: String,
+    },
+    /// `--record-owed <hash>` with each `--owed identity=sats`.
+    RecordOwed {
+        arg: String,
+        owed: Vec<String>,
+    },
+    DumpLedger,
+    /// `--snapshot <path>`, made absolute by the client since the pool writes it.
+    Snapshot {
+        path: PathBuf,
+    },
 }
 
-pub fn run_command(options: &Options, location: &LedgerLocation) -> Option<io::Result<()>> {
-    if options.dump_ledger {
-        return Some(dump_ledger(location));
+impl Command {
+    /// The command the options name, or none when they name no ledger command.
+    pub fn from_options(o: &Options) -> Option<Self> {
+        if o.dump_ledger {
+            return Some(Self::DumpLedger);
+        }
+        if let Some(arg) = &o.settle_block {
+            return Some(Self::SettleBlock { arg: arg.clone() });
+        }
+        if let Some(arg) = &o.void_block {
+            return Some(Self::VoidBlock { arg: arg.clone() });
+        }
+        if let Some(arg) = &o.record_owed {
+            return Some(Self::RecordOwed { arg: arg.clone(), owed: o.owed.clone() });
+        }
+        let path = o.snapshot.as_ref()?;
+        let path = std::path::absolute(path).unwrap_or_else(|_| PathBuf::from(path));
+        Some(Self::Snapshot { path })
     }
-    if let Some(arg) = &options.settle_block {
-        return Some(settle_block(location, arg));
-    }
-    if let Some(arg) = &options.void_block {
-        return Some(void_block(location, arg));
-    }
-    if let Some(arg) = &options.record_owed {
-        return Some(record_owed(location, arg, &options.owed));
-    }
-    None
-}
 
-fn block_hash_arg(flag: &str, arg: &str, also: &str) -> [u8; 32] {
-    match hex::decode(arg).ok().and_then(|v| v.try_into().ok()) {
-        Some(hash) => hash,
-        None => {
-            fatal!("{flag} takes the block hash the pool logged (64 hex digits){also}, got {arg:?}")
+    pub fn flag(&self) -> &'static str {
+        match self {
+            Self::SettleBlock { .. } => "--settle-block",
+            Self::VoidBlock { .. } => "--void-block",
+            Self::RecordOwed { .. } => "--record-owed",
+            Self::DumpLedger => "--dump-ledger",
+            Self::Snapshot { .. } => "--snapshot",
         }
     }
 }
 
-fn print_or_refuse(arg: &str, record: Option<OwedBlock>, state: Option<ConfirmationReading>) {
-    let Some(owed) = record else {
-        fatal!("no owed block under {arg}; --settle-block list prints them")
+impl fmt::Display for Command {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.flag())?;
+        match self {
+            Self::SettleBlock { arg } | Self::VoidBlock { arg } => write!(f, " {arg}"),
+            Self::RecordOwed { arg, owed } => {
+                write!(f, " {arg}")?;
+                owed.iter().try_for_each(|entry| write!(f, " --owed {entry}"))
+            }
+            Self::DumpLedger => Ok(()),
+            Self::Snapshot { path } => write!(f, " {}", path.display()),
+        }
+    }
+}
+
+/// Why a command did not complete.
+#[derive(Debug)]
+pub enum Failure {
+    /// Refused as given; the process exits `USAGE_EXIT` after the text is written to stderr.
+    Usage(String),
+    /// The ledger could not be read or written; the process exits 1.
+    Io(io::Error),
+}
+
+impl From<io::Error> for Failure {
+    fn from(e: io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
+impl Failure {
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            Self::Usage(_) => USAGE_EXIT,
+            Self::Io(_) => 1,
+        }
+    }
+
+    pub fn message(&self) -> String {
+        match self {
+            Self::Usage(text) => text.clone(),
+            Self::Io(e) => e.to_string(),
+        }
+    }
+}
+
+/// What a command reads and writes: the block records under whatever lock guards them, and
+/// the ledger file for the commands that read it through their own transaction.
+pub trait LedgerAccess {
+    /// Runs `f` on the records, which no socket or file I/O happens under.
+    fn with_records<T>(&mut self, f: impl FnOnce(&mut BlockRecords) -> T) -> io::Result<T>;
+
+    /// The ledger file's database and path.
+    fn database(&mut self) -> io::Result<(Arc<Database>, PathBuf)>;
+}
+
+/// The ledger file of a stopped pool: opened by each command, never created.
+struct FileLedger<'a> {
+    location: &'a LedgerLocation,
+    flag: &'static str,
+}
+
+impl LedgerAccess for FileLedger<'_> {
+    fn with_records<T>(&mut self, f: impl FnOnce(&mut BlockRecords) -> T) -> io::Result<T> {
+        let mut records = BlockRecords::open_file(&self.location.existing_file(self.flag)?)?;
+        Ok(f(&mut records))
+    }
+
+    fn database(&mut self) -> io::Result<(Arc<Database>, PathBuf)> {
+        let path = self.location.existing_file(self.flag)?;
+        Ok((Arc::new(ledger::open_existing(&path)?), path))
+    }
+}
+
+/// Runs `command` at `now`, writing what it prints to `out`. The records are read and
+/// written inside `access.with_records`; the text goes to `out` after that returns, so a
+/// slow `out` never holds the records.
+pub fn execute(
+    command: &Command,
+    access: &mut impl LedgerAccess,
+    now: u64,
+    out: &mut dyn Write,
+) -> Result<(), Failure> {
+    match command {
+        Command::DumpLedger => {
+            let (db, _) = access.database()?;
+            ledger::dump(&db, |share| write_share(out, &share))?;
+            Ok(())
+        }
+        Command::Snapshot { path } => {
+            let (db, live) = access.database()?;
+            if let Some(why) = ledger::snapshot_refusal(path, &live) {
+                return Err(Failure::Usage(format!("--snapshot: {why}")));
+            }
+            let counts = ledger::write_snapshot(&db, &live, path)?;
+            writeln!(
+                out,
+                "snapshot of {} written to {}: {counts}",
+                live.display(),
+                path.display()
+            )?;
+            Ok(())
+        }
+        _ => {
+            let mut text = String::new();
+            let result = access.with_records(|records| match command {
+                Command::SettleBlock { arg } => settle_block(records, arg, now, &mut text),
+                Command::VoidBlock { arg } => void_block(records, arg, &mut text),
+                Command::RecordOwed { arg, owed } => record_owed(records, arg, owed, &mut text),
+                Command::DumpLedger | Command::Snapshot { .. } => unreachable!("matched above"),
+            })?;
+            out.write_all(text.as_bytes())?;
+            result
+        }
+    }
+}
+
+/// One share as `--dump-ledger` prints it: time, difficulty, identity, hash, secondary tag.
+pub fn write_share(out: &mut dyn Write, s: &Share) -> io::Result<()> {
+    writeln!(
+        out,
+        "{} {} {} {} {}",
+        s.accepted_at,
+        s.difficulty,
+        s.identity,
+        hex::encode(s.block_hash),
+        s.tag_secondary
+    )
+}
+
+/// Runs the command the options name, if any: through the pool at the data directory's
+/// control socket, or on the ledger file when no pool answers or `--offline` is given.
+pub fn run_command(options: &Options, location: &LedgerLocation) -> Option<io::Result<()>> {
+    let Some(command) = Command::from_options(options) else {
+        if options.offline {
+            crate::cli::fatal!(
+                "--offline applies to a ledger command (--settle-block, --void-block, \
+                 --record-owed, --dump-ledger, --snapshot); none was given"
+            );
+        }
+        return None;
     };
-    print_owed(&owed, state);
+    Some(run(&command, options.offline, location))
+}
+
+/// An error reaching the pool or the ledger file is one line on stderr and exit code 1, as a
+/// failure the pool answers is.
+fn run(command: &Command, offline: bool, location: &LedgerLocation) -> io::Result<()> {
+    let stdout = io::stdout();
+    let mut out = io::BufWriter::new(stdout.lock());
+    let mut err = io::stderr().lock();
+    let code = match run_to(command, offline, location, &mut out, &mut err) {
+        Ok(code) => code,
+        Err(e) => {
+            writeln!(err, "{e}")?;
+            1
+        }
+    };
+    out.flush()?;
+    if code != 0 {
+        std::process::exit(code);
+    }
+    Ok(())
+}
+
+/// Sends `command` to the pool at the data directory's control socket, or runs it on the
+/// ledger file when there is no pool to answer (no socket, or one no pool listens on) or
+/// `offline` is set, and says on `err` which. What the command prints goes to `out`; the
+/// result is the exit code, after the text of a refusal went to `err`.
+pub fn run_to(
+    command: &Command,
+    offline: bool,
+    location: &LedgerLocation,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> io::Result<i32> {
+    if let LedgerLocation::InDir(dir) = location {
+        let socket = dir.join(control::SOCKET_NAME);
+        if offline {
+            writeln!(err, "--offline: opening the ledger in {} directly", dir.display())?;
+        } else {
+            match control::connect(&socket) {
+                Ok(stream) => {
+                    writeln!(err, "executed by the pool at {}", socket.display())?;
+                    return control::send(stream, command, out, err);
+                }
+                Err(control::ConnectError::NoPool(why)) => writeln!(
+                    err,
+                    "no pool at {} ({why}); opening the ledger in {} directly",
+                    socket.display(),
+                    dir.display()
+                )?,
+                Err(control::ConnectError::Failed(e)) => return Err(e),
+            }
+        }
+    }
+    run_offline(command, location, ratum::unix_now(), out, err)
+}
+
+/// Runs `command` on the ledger file at `now`: what it prints goes to `out`, and the result
+/// is the exit code, after the text of a refusal went to `err`.
+pub fn run_offline(
+    command: &Command,
+    location: &LedgerLocation,
+    now: u64,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> io::Result<i32> {
+    let mut access = FileLedger { location, flag: command.flag() };
+    match execute(command, &mut access, now, out) {
+        Ok(()) => Ok(0),
+        Err(Failure::Usage(message)) => {
+            writeln!(err, "{message}")?;
+            Ok(USAGE_EXIT)
+        }
+        Err(Failure::Io(e)) => Err(e),
+    }
+}
+
+fn block_hash_arg(flag: &str, arg: &str, also: &str) -> Result<[u8; 32], Failure> {
+    hex::decode(arg).ok().and_then(|v| v.try_into().ok()).ok_or_else(|| {
+        Failure::Usage(format!(
+            "{flag} takes the block hash the pool logged (64 hex digits){also}, got {arg:?}"
+        ))
+    })
 }
 
 fn confirmations_text(state: Option<ConfirmationReading>) -> String {
@@ -55,12 +308,13 @@ fn confirmations_text(state: Option<ConfirmationReading>) -> String {
     }
 }
 
-fn print_owed(o: &OwedBlock, state: Option<ConfirmationReading>) {
+fn write_owed(out: &mut String, o: &OwedBlock, state: Option<ConfirmationReading>) {
     let status = match o.settled_at {
         Some(at) => format!("settled at {at}"),
         None => "unsettled".to_string(),
     };
-    println!(
+    let _ = writeln!(
+        out,
         "height {} block {} found {} total {} sats {status}{}",
         o.height,
         hex::encode(o.block_hash),
@@ -69,30 +323,11 @@ fn print_owed(o: &OwedBlock, state: Option<ConfirmationReading>) {
         confirmations_text(state)
     );
     for Payout { identity, sats } in &o.entries {
-        println!("  {identity} {sats}");
+        let _ = writeln!(out, "  {identity} {sats}");
     }
 }
 
-/// Writes each share as it is read, so the ledger is never held in memory whole.
-fn dump_ledger(location: &LedgerLocation) -> io::Result<()> {
-    use std::io::Write as _;
-    let path = location.existing_file("--dump-ledger")?;
-    let mut out = io::BufWriter::new(io::stdout().lock());
-    ledger::dump_file(&path, |share| {
-        writeln!(
-            out,
-            "{} {} {} {} {}",
-            share.accepted_at,
-            share.difficulty,
-            share.identity,
-            hex::encode(share.block_hash),
-            share.tag_secondary
-        )
-    })?;
-    out.flush()
-}
-
-fn owed_entries(entries: &[String]) -> Vec<Payout> {
+fn owed_entries(entries: &[String]) -> Result<Vec<Payout>, Failure> {
     let mut parsed: Vec<Payout> = Vec::with_capacity(entries.len());
     for entry in entries {
         let split = entry.split_once('=').map(|(id, sats)| (id.trim(), sats.trim().parse::<u64>()));
@@ -101,73 +336,93 @@ fn owed_entries(entries: &[String]) -> Vec<Payout> {
                 let identity = ratum::bitcoin::address::canonical(id).into_owned().into();
                 parsed.push(Payout { identity, sats });
             }
-            _ => fatal!(
-                "--owed takes identity=sats with a positive whole number of sats, got {entry:?}"
-            ),
+            _ => {
+                return Err(Failure::Usage(format!(
+                    "--owed takes identity=sats with a positive whole number of sats, got {entry:?}"
+                )));
+            }
         }
     }
     if parsed.is_empty() {
-        fatal!("--record-owed needs at least one --owed identity=sats");
+        return Err(Failure::Usage(
+            "--record-owed needs at least one --owed identity=sats".to_string(),
+        ));
     }
-    parsed
+    Ok(parsed)
 }
 
-fn record_owed(location: &LedgerLocation, arg: &str, entries: &[String]) -> io::Result<()> {
-    let mut records = open_records(location, "--record-owed")?;
-    let hash = block_hash_arg("--record-owed", arg, "");
+fn record_owed(
+    records: &mut BlockRecords,
+    arg: &str,
+    entries: &[String],
+    out: &mut String,
+) -> Result<(), Failure> {
+    let hash = block_hash_arg("--record-owed", arg, "")?;
     let Some(block) = records.blocks().iter().find(|b| b.block_hash == hash).cloned() else {
-        fatal!(
+        return Err(Failure::Usage(format!(
             "no block under {arg} in the ledger's block history; the pool records every block \
              it accepted there"
-        )
+        )));
     };
     if let Some(existing) = records.owed().iter().find(|o| o.block_hash == hash) {
-        eprintln!("block {arg} already has an owed record; --void-block removes it first:");
-        print_owed(existing, records.confirmations(&hash));
-        std::process::exit(crate::cli::USAGE_EXIT);
+        write_owed(out, existing, records.confirmations(&hash));
+        return Err(Failure::Usage(format!(
+            "block {arg} already has an owed record; --void-block removes it first:"
+        )));
     }
     let owed = OwedBlock {
         found_at: block.found_at,
         height: block.height,
         block_hash: hash,
         settled_at: None,
-        entries: owed_entries(entries),
+        entries: owed_entries(entries)?,
     };
     let total = owed.total();
     if total > block.paid_to_pool {
-        fatal!(
+        return Err(Failure::Usage(format!(
             "the entries total {total} sats, more than the {} sats the block's coinbase paid to \
              the pool's payout script (a figure that includes the operator fee, which is not \
              owed)",
             block.paid_to_pool
-        );
+        )));
     }
     records.record_owed(owed.clone())?;
-    print_owed(&owed, records.confirmations(&hash));
+    write_owed(out, &owed, records.confirmations(&hash));
     Ok(())
 }
 
-fn settle_block(location: &LedgerLocation, arg: &str) -> io::Result<()> {
-    let mut records = open_records(location, "--settle-block")?;
+fn settle_block(
+    records: &mut BlockRecords,
+    arg: &str,
+    now: u64,
+    out: &mut String,
+) -> Result<(), Failure> {
     if arg == "list" {
         if records.owed().is_empty() {
-            println!("no owed blocks");
+            out.push_str("no owed blocks\n");
         }
         for o in records.owed() {
-            print_owed(o, records.confirmations(&o.block_hash));
+            write_owed(out, o, records.confirmations(&o.block_hash));
         }
         return Ok(());
     }
-    let hash = block_hash_arg("--settle-block", arg, " or 'list'");
+    let hash = block_hash_arg("--settle-block", arg, " or 'list'")?;
     let state = records.confirmations(&hash);
     if let Some(owed) = records.owed().iter().find(|o| o.block_hash == hash)
         && let Some(refusal) = settle_refusal(arg, state)
     {
-        print_owed(owed, state);
-        fatal!("{refusal}");
+        write_owed(out, owed, state);
+        return Err(Failure::Usage(refusal));
     }
-    print_or_refuse(arg, records.settle_owed(&hash, ratum::unix_now())?, state);
-    Ok(())
+    match records.settle_owed(&hash, now)? {
+        Some(owed) => {
+            write_owed(out, &owed, state);
+            Ok(())
+        }
+        None => Err(Failure::Usage(format!(
+            "no owed block under {arg}; --settle-block list prints them"
+        ))),
+    }
 }
 
 /// Why the owed record of block `arg` may not be settled at its last reading `state`, or none
@@ -201,19 +456,19 @@ fn settle_refusal(arg: &str, state: Option<ConfirmationReading>) -> Option<Strin
 
 /// Removes the block's record, its owed record and its confirmation reading, whichever exist,
 /// and prints what was removed; refuses a hash under which there is neither record.
-fn void_block(location: &LedgerLocation, arg: &str) -> io::Result<()> {
-    let mut records = open_records(location, "--void-block")?;
-    let hash = block_hash_arg("--void-block", arg, "");
+fn void_block(records: &mut BlockRecords, arg: &str, out: &mut String) -> Result<(), Failure> {
+    let hash = block_hash_arg("--void-block", arg, "")?;
     let state = records.confirmations(&hash);
     let Voided { block, owed } = records.void_block(&hash)?;
     if block.is_none() && owed.is_none() {
-        fatal!(
+        return Err(Failure::Usage(format!(
             "no block and no owed record under {arg} in the ledger; --settle-block list prints \
              the owed records"
-        );
+        )));
     }
     if let Some(b) = &block {
-        println!(
+        let _ = writeln!(
+            out,
             "removed block {arg} at height {} found {} from the block history{}",
             b.height,
             b.found_at,
@@ -221,8 +476,8 @@ fn void_block(location: &LedgerLocation, arg: &str) -> io::Result<()> {
         );
     }
     if let Some(o) = &owed {
-        println!("removed its owed record:");
-        print_owed(o, state);
+        out.push_str("removed its owed record:\n");
+        write_owed(out, o, state);
     }
     Ok(())
 }
@@ -233,6 +488,17 @@ mod tests {
 
     fn read(confirmations: i64) -> Option<ConfirmationReading> {
         Some(ConfirmationReading { checked_at: 1_750_000_000, confirmations })
+    }
+
+    /// `run_offline` at a fixed time, with what it wrote to stdout and stderr.
+    pub(crate) fn offline(
+        command: &Command,
+        location: &LedgerLocation,
+        now: u64,
+    ) -> io::Result<(i32, String, String)> {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = run_offline(command, location, now, &mut out, &mut err)?;
+        Ok((code, String::from_utf8(out).unwrap(), String::from_utf8(err).unwrap()))
     }
 
     #[test]
@@ -261,10 +527,38 @@ mod tests {
         let entries = owed_entries(&[
             "BC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4=5".to_string(),
             "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2 = 7".to_string(),
-        ]);
+        ])
+        .unwrap();
         assert_eq!(&*entries[0].identity, "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4");
         assert_eq!(&*entries[1].identity, "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2");
         assert_eq!((entries[0].sats, entries[1].sats), (5, 7));
+        let e = owed_entries(&["alice=0".to_string()]).unwrap_err();
+        assert!(matches!(e, Failure::Usage(ref m) if m.contains("positive")), "{e:?}");
+        assert!(matches!(owed_entries(&[]).unwrap_err(), Failure::Usage(_)));
+    }
+
+    #[test]
+    fn the_options_name_one_command_and_a_relative_snapshot_path_is_made_absolute() {
+        assert_eq!(Command::from_options(&Options::default()), None);
+        let o = Options {
+            settle_block: Some("list".into()),
+            offline: true,
+            snapshot: Some("backup".into()),
+            ..Options::default()
+        };
+        assert_eq!(Command::from_options(&o), Some(Command::SettleBlock { arg: "list".into() }));
+        let o = Options { snapshot: Some("backups/main".into()), ..Options::default() };
+        let Some(Command::Snapshot { path }) = Command::from_options(&o) else { panic!() };
+        assert!(path.is_absolute(), "{}", path.display());
+        assert!(path.ends_with("backups/main"), "{}", path.display());
+        let o = Options {
+            record_owed: Some("ab".into()),
+            owed: vec!["alice=1".into(), "bob=2".into()],
+            ..Options::default()
+        };
+        let command = Command::from_options(&o).unwrap();
+        assert_eq!(command.to_string(), "--record-owed ab --owed alice=1 --owed bob=2");
+        assert_eq!(Command::DumpLedger.to_string(), "--dump-ledger");
     }
 
     #[test]
@@ -272,19 +566,21 @@ mod tests {
         let scratch = crate::fixtures::Scratch::new("admin-missing");
         let dir = scratch.dir().to_path_buf();
         let location = LedgerLocation::InDir(dir.clone());
-        for (flag, run) in [
-            ("--settle-block", settle_block as fn(&LedgerLocation, &str) -> io::Result<()>),
-            ("--void-block", void_block),
+        for command in [
+            Command::SettleBlock { arg: "list".into() },
+            Command::VoidBlock { arg: "list".into() },
+            Command::RecordOwed { arg: "list".into(), owed: vec![] },
+            Command::DumpLedger,
+            Command::Snapshot { path: dir.join("copy") },
         ] {
-            let e = run(&location, "list").expect_err(flag);
+            let flag = command.flag();
+            let e = offline(&command, &location, 1).expect_err(flag);
             assert_eq!(e.kind(), io::ErrorKind::NotFound, "{flag}");
             assert!(e.to_string().contains(&dir.display().to_string()), "{flag}: {e}");
             assert!(e.to_string().contains(flag), "{flag}: {e}");
         }
-        let e = record_owed(&location, "list", &[]).expect_err("--record-owed");
-        assert!(e.to_string().contains("--record-owed"), "{e}");
-        let e = dump_ledger(&location).expect_err("--dump-ledger");
-        assert!(e.to_string().contains("--dump-ledger"), "{e}");
+        let e = offline(&Command::DumpLedger, &LedgerLocation::MemoryOnly, 1).unwrap_err();
+        assert!(e.to_string().contains("give --data-dir"), "{e}");
         assert!(std::fs::read_dir(&dir).unwrap().next().is_none(), "no command created a file");
     }
 
@@ -305,9 +601,17 @@ mod tests {
             records.record_confirmations(orphan.block_hash, reading).unwrap();
         }
         let location = LedgerLocation::InDir(scratch.dir().to_path_buf());
-        void_block(&location, &hex::encode(orphan.block_hash)).unwrap();
+        let void = Command::VoidBlock { arg: hex::encode(orphan.block_hash) };
+        let (code, out, err) = offline(&void, &location, 1).unwrap();
+        assert_eq!((code, err.as_str()), (0, ""));
+        assert!(out.starts_with("removed block "), "{out}");
+        assert!(out.contains("NOT ON THE BEST CHAIN as of 5"), "{out}");
         let records = BlockRecords::open_file(&path).unwrap();
         assert_eq!(records.blocks(), &[found(2, 32)], "only the orphan was removed");
         assert_eq!(records.confirmations(&orphan.block_hash), None);
+        drop(records);
+        let (code, out, err) = offline(&void, &location, 1).unwrap();
+        assert_eq!((code, out.as_str()), (USAGE_EXIT, ""));
+        assert!(err.starts_with("no block and no owed record under "), "{err}");
     }
 }

@@ -13,9 +13,9 @@ use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
-const BLOCKS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("blocks");
-const OWED: TableDefinition<&[u8], &[u8]> = TableDefinition::new("owed");
-const CHAIN_STATE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("chain_state");
+pub(super) const BLOCKS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("blocks");
+pub(super) const OWED: TableDefinition<&[u8], &[u8]> = TableDefinition::new("owed");
+pub(super) const CHAIN_STATE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("chain_state");
 
 const OWED_PREFIX_LEN: usize =
     size_of::<u64>() + size_of::<u32>() + 2 * size_of::<u64>() + size_of::<u16>();

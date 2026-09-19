@@ -1,24 +1,22 @@
 //! The share rows on disk, each under a sequence number, and the metadata beside them: the chain
 //! the ledger serves and the running total of credited work.
 
-use super::db::{
-    DbResult as _, NAME_SEPARATOR, create_database, open_database, split_at_separator, write,
-};
+use super::db::{DbResult as _, NAME_SEPARATOR, create_database, split_at_separator, write};
 use super::{ReadBack, Share};
 use bytes::BufMut as _;
 use ratum::bitcoin::HASH_SIZE;
 use ratum::reader::ByteReader;
 use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-const SHARES: TableDefinition<u64, &[u8]> = TableDefinition::new("shares");
+pub(super) const SHARES: TableDefinition<u64, &[u8]> = TableDefinition::new("shares");
 /// A hash index earlier versions kept beside `SHARES`; deleted when a ledger is opened, since
 /// `accounting::claim` refuses a duplicate share before it reaches the store.
-const RETIRED_BY_HASH: TableDefinition<&[u8], u64> = TableDefinition::new("by_hash");
+pub(super) const RETIRED_BY_HASH: TableDefinition<&[u8], u64> = TableDefinition::new("by_hash");
 
-const META: TableDefinition<&str, &str> = TableDefinition::new("meta");
+pub(super) const META: TableDefinition<&str, &str> = TableDefinition::new("meta");
 const META_CHAIN: &str = "chain";
 const META_CUMULATIVE_WORK: &str = "cumulative_work";
 
@@ -80,6 +78,7 @@ pub(super) enum WindowRow {
 
 pub(super) struct Store {
     db: Arc<Database>,
+    path: PathBuf,
     next_seq: u64,
     retain_bound: Option<u64>,
     /// The counter as the store held it when it was opened; the ledger carries it on.
@@ -131,11 +130,16 @@ impl Store {
             let shares = r.open_table(SHARES).db()?;
             shares.last().db()?.map_or(0, |(k, _)| k.value() + 1)
         };
-        Ok(Self { db, next_seq, retain_bound: keep, cumulative_work, stamped })
+        let path = path.to_path_buf();
+        Ok(Self { db, path, next_seq, retain_bound: keep, cumulative_work, stamped })
     }
 
     pub(super) fn database(&self) -> Arc<Database> {
         Arc::clone(&self.db)
+    }
+
+    pub(super) fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Stores the share under the next sequence number with `cumulative_work`, the
@@ -275,14 +279,12 @@ impl Store {
     }
 }
 
-/// Opened writable (`open_database`) rather than read-only: a pool stopped by a signal leaves
-/// the file not closed cleanly, which only a writable open repairs.
-pub(super) fn dump_file(path: &Path, f: impl FnMut(Share) -> io::Result<()>) -> io::Result<()> {
-    dump(&open_database(path)?, f)
-}
-
-/// Passes `f` each stored share, oldest first, and stops at the first error it returns.
-fn dump(db: &impl ReadableDatabase, mut f: impl FnMut(Share) -> io::Result<()>) -> io::Result<()> {
+/// Passes `f` each stored share, oldest first, and stops at the first error it returns. One
+/// read transaction: the shares recorded while it runs are not in its view.
+pub(super) fn dump(
+    db: &impl ReadableDatabase,
+    mut f: impl FnMut(Share) -> io::Result<()>,
+) -> io::Result<()> {
     let r = db.begin_read().db()?;
     let shares = r.open_table(SHARES).db()?;
     for entry in shares.iter().db()? {
