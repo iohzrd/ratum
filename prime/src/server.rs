@@ -37,7 +37,8 @@ pub struct Server {
     pub share_policy: SharePolicy,
     pub config_payload: Vec<u8>,
     pub open_connections: AtomicUsize,
-    /// The open connections from each address, which `--max-connections-per-ip` bounds.
+    /// The open connections from each address (`net::limit_key`: an IPv4 address, or an IPv6
+    /// /64 prefix), which `--max-connections-per-ip` bounds.
     pub open_per_ip: Mutex<HashMap<IpAddr, usize>>,
     pub txn_cache: Mutex<TxnCache>,
     /// The hashes of the blocks most recently submitted to the node, so a share sent again,
@@ -79,10 +80,10 @@ impl Server {
         })
     }
 
-    /// Counts one more open connection from `ip` and returns the guard that counts it back
-    /// down when it is dropped, or why it is refused: `--max-connections` are already open, or
-    /// `--max-connections-per-ip` from that address. Every change to the counts is here and in
-    /// that guard's `Drop`.
+    /// Counts one more open connection from `ip` (the peer's `net::limit_key`) and returns the
+    /// guard that counts it back down when it is dropped, or why it is refused:
+    /// `--max-connections` are already open, or `--max-connections-per-ip` from that address.
+    /// Every change to the counts is here and in that guard's `Drop`.
     pub fn open_connection(
         server: &Arc<Self>,
         ip: IpAddr,

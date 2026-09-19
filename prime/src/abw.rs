@@ -76,6 +76,7 @@ pub struct Rotation {
     pub notice: Vec<u8>,
 }
 
+#[derive(Clone)]
 pub struct AbwSlotState {
     slots: [Slot; SLOTS],
     active: u8,

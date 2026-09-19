@@ -52,35 +52,51 @@ impl SessionStore {
         self.saved.insert(key, session);
     }
 
+    #[cfg(test)]
     pub fn take(&mut self, key: &[u8; 32]) -> Option<SavedSession> {
         self.saved.remove(key)
     }
 
-    /// The session and splits for a hello, and whether they resumed a saved session. A hello
-    /// that presents no token, or another token, leaves the saved session in place: the hello
-    /// carries no challenge from the pool, so a copy of an earlier hello can be sent again by
-    /// anyone who observed it, and must not discard the session its gateway is about to resume.
+    /// The session and splits for a hello, and whether they resumed a saved session. The
+    /// hello carries no challenge from the pool, so a copy of an earlier hello can be sent
+    /// again by anyone who observed it. A hello that presents no token, or another token,
+    /// leaves the saved session in place. One that presents its token receives a copy of the
+    /// session under a new token, and the saved session stays until `claim` removes it, once
+    /// the connection has sent a frame the session key decrypts, which a copy of a hello
+    /// cannot: the gateway that sent the hello can still resume the session after it.
     pub fn resume_or_start(
         &mut self,
         client_sign_pk: [u8; 32],
         presented: Option<&ResumeToken>,
         now: Instant,
     ) -> (V3Session, DictatedSplits, bool) {
-        let resumable = presented.is_some_and(|presented| {
+        let saved = presented.and_then(|presented| {
             self.saved
                 .get(&client_sign_pk)
-                .is_some_and(|saved| !saved.expired(now) && saved.v3.token == *presented)
+                .filter(|saved| !saved.expired(now) && saved.v3.token == *presented)
         });
-        if resumable && let Some(saved) = self.take(&client_sign_pk) {
-            let SavedSession { mut v3, splits, saved_at, .. } = saved;
-            v3.abw.resume(saved_at);
-            return (v3, splits, true);
+        if let Some(saved) = saved {
+            let mut abw = saved.v3.abw.clone();
+            abw.resume(saved.saved_at);
+            let v3 = V3Session { token: new_resume_token(self.prime_id), abw };
+            return (v3, saved.splits.clone(), true);
         }
         let v3 = V3Session {
             token: new_resume_token(self.prime_id),
             abw: AbwSlotState::start(now, self.reveal_after),
         };
         (v3, DictatedSplits::default(), false)
+    }
+
+    /// Removes the saved session `presented` resumed, now that the connection holding its
+    /// copy has proved it holds the session keys; false when no saved session carries the
+    /// token, as when another connection claimed it first or its gateway saved a newer one.
+    pub fn claim(&mut self, client_sign_pk: [u8; 32], presented: &ResumeToken) -> bool {
+        let claimed = self.saved.get(&client_sign_pk).is_some_and(|s| s.v3.token == *presented);
+        if claimed {
+            self.saved.remove(&client_sign_pk);
+        }
+        claimed
     }
 }
 
@@ -104,7 +120,7 @@ mod tests {
     }
 
     #[test]
-    fn a_saved_session_is_resumed_once_by_its_token() {
+    fn a_saved_session_is_copied_by_its_token_and_removed_once_claimed() {
         let mut store = store();
         let key = [7u8; 32];
         let now = Instant::now();
@@ -128,7 +144,8 @@ mod tests {
 
         let (v3, splits, resumed) = store.resume_or_start(key, Some(&token), now);
         assert!(resumed);
-        assert_eq!(v3.token, token);
+        assert_ne!(v3.token, token, "the copy carries a new token");
+        assert_eq!(v3.token[..8], 1u64.to_le_bytes());
         assert_eq!(ratum::header::xor_key_hash(&v3.abw.key_for(0).unwrap().0), hash0);
         assert_eq!(
             splits.get(7).map(|d| d.outputs[0].output()).as_ref(),
@@ -136,12 +153,20 @@ mod tests {
             "the session's splits continue"
         );
         assert_eq!(splits.next_id(), 8, "the next split takes id 8");
-        assert_eq!(store.saved.len(), 0, "the entry is consumed");
+        assert_eq!(store.saved.len(), 1, "the entry stays until the connection is proved");
+
+        let (again, _, resumed) = store.resume_or_start(key, Some(&token), now);
+        assert!(resumed, "a copy of the hello sent again receives another copy");
+        assert_ne!(again.token, v3.token, "under a token of its own");
+
+        assert!(!store.claim(key, &v3.token), "the new token names no saved session");
+        assert!(store.claim(key, &token));
+        assert_eq!(store.saved.len(), 0, "the entry is removed once");
+        assert!(!store.claim(key, &token));
 
         let (v3, splits, resumed) = store.resume_or_start(key, Some(&token), now);
-        assert!(!resumed, "a consumed session is not resumed again");
+        assert!(!resumed, "a claimed session is not resumed again");
         assert_ne!(v3.token, token);
-        assert_eq!(v3.token[..8], 1u64.to_le_bytes());
         assert_eq!(splits, DictatedSplits::default());
         assert_eq!(splits.next_id(), 1);
     }
@@ -169,10 +194,11 @@ mod tests {
 
         assert!(!store.resume_or_start(key, None, now).2, "no token presented");
         assert_eq!(store.saved.len(), 1, "and neither does a hello without one");
-        assert!(store.resume_or_start(key, Some(&token), now).2, "the right token resumes it");
-        assert_eq!(store.saved.len(), 0);
-
         assert!(!store.resume_or_start([9u8; 32], Some(&token), now).2, "another gateway's key");
+        assert!(store.resume_or_start(key, Some(&token), now).2, "the right token resumes it");
+        assert_eq!(store.saved.len(), 1, "and leaves the entry until it is claimed");
+        assert!(store.claim(key, &token));
+        assert_eq!(store.saved.len(), 0);
     }
 
     fn saved(

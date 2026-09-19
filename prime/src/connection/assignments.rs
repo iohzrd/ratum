@@ -29,6 +29,9 @@ impl Connection<'_> {
             let tip_replaced = self.verifier.tip().is_some();
             self.verifier.set_tip(current, ratum::unix_now());
             self.verifier.set_template(template);
+            // The shares held for a parent the node had not reported: verified again now
+            // that it reports this tip, and held on while their parent is another block.
+            self.release_held(super::shares::HeldShare::awaits_parent)?;
             if current.is_some() {
                 if tip_replaced {
                     self.rotate_on_tip()?;

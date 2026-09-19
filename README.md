@@ -39,7 +39,10 @@ ignored. `RUST_LOG` overrides `logger.log_level_console`.
 ### Differences from the C gateway
 
 - SIGUSR1 is a block notification, as in C (`blocknotify=kill -USR1 <pid>`); `/NOTIFY` on
-  the API port does the same over HTTP. Unix only.
+  the API port does the same over HTTP. Unix only. A notification is followed by
+  `getbestblockhash` reads, every 250 ms for up to 4 s, and one template request once the
+  best block moves; a notification the node does not bear out requests no template, and one
+  naming no block within 2.5 s of a block change is ignored.
 
 - `api.miner_listen_port` defaults to `8000` and serves one endpoint, the miner lookup
   `GET /?addr=<address>` (the C gateway leaves the lookup off). It answers JSON and is
@@ -192,8 +195,8 @@ and SIGHUP (`logger.log_rotate_daily`; the file is held open, so rotate it with 
 testnet fast-forward, hasher time rolling (`mining.allow_hasher_time_rolling`), the
 retention and audit of anti-block-withholding proofs
 (`mining.abw_verify_all_shares_on_disclosure`), migration (`datum.migration_max_seconds`),
-`--help`, `--example-conf`, `--test` and `/assets`. Set values among these are reported at
-startup.
+`--example-conf`, `--test` and `/assets` (`--help` lists this gateway's own options). Set
+values among these are reported at startup.
 
 ### Coinbase size
 
@@ -280,7 +283,8 @@ min-payout = 546                # smallest output written; a miner under it leav
 `RUST_LOG` selects the level (`info` default; `debug` adds every frame and share).
 
 `--max-connections` (default 1024) bounds the gateway connections served at once and
-`--max-connections-per-ip` (default 32) those from one address. A connection is closed after
+`--max-connections-per-ip` (default 32) those from one address (an IPv4 address, or an IPv6
+/64 prefix, as the stats interface counts them). A connection is closed after
 10 minutes without a frame from its gateway, which sends a coinbaser request for every job it
 builds. The pool raises its soft open file limit to the hard limit at startup and warns when
 the limit does not cover three descriptors per connection.
@@ -303,7 +307,9 @@ request was refused or timed out), a response with no outputs, and subsidy-only 
 exempt, so the check covers builds that fetch the split and then mine coinbase 0; a share
 paying any part of the split passes, and so does a block, whose value reached the pool's
 script and is recorded as owed. Like `--allow-agent`, it is a check on misbuilt gateways,
-not authentication: a build that never requests a coinbaser is not refused.
+not authentication: a build that never requests a coinbaser, or that names no coinbaser (id
+0) on the jobs it builds after the response, is not refused, and its blocks are recorded as
+owed.
 
 `--require-v3` refuses at hello any gateway that does not use the version 3 protocol (its
 hello carries no DRS extension). Off, the default, serves version 1 and version 3 gateways;
@@ -337,10 +343,13 @@ connection ends. The reveals it may not have received are sent again on the next
 Every reveal, and every rotation, waits for the first 10 seconds of a connection to pass, for
 its socket to hold no unread data and for no share to be waiting on its job's transactions,
 so every share the gateway sent before it, the ones it replays when it is configured
-included, is answered first. A hello that presents no resume token, or another one, leaves
-the saved session in place: the hello carries no challenge from the pool, so a copy of an
-earlier hello sent again cannot discard the session its gateway is about to resume. A pool
-restart declines every resume. Every share that is a
+included, is answered first. The hello carries no challenge from the pool, so a copy of an
+earlier hello can be sent again by anyone who observed it. A hello that presents no resume
+token, or another one, leaves the saved session in place; one that presents its token
+receives a copy of the session under a new token, and the saved session is removed only once
+the connection sends a frame the session key decrypts, which a copy of a hello cannot. A
+connection that never does saves nothing when it closes. A pool restart declines every
+resume. Every share that is a
 block by the node's target or by its job's own `nbits` (the measure of the gateway's reveal
 audit) gets a receipt, relayed or not; a refused share answered with a receipt or reference keeps
 its hash claimed, so a resend of it is not credited.
@@ -360,7 +369,11 @@ each share's header version may differ from the validated one only in the bits B
 miner roll. A job whose transactions do not arrive, are not the job's, or whose block the
 node refuses has none of its shares credited, and a block found on a validated job is relayed
 from the transactions the pool already holds. A job with no transactions, and subsidy-only
-work, is checked by the node at its first share without a request.
+work, is checked by the node at its first share without a request. A share on a block the
+pool's node has not reported (the gateway's node received it first) is held up to 10 seconds
+for the node to report it, then verified on that tip; one whose block the node does not
+report in time is refused as stale. A share held for its job's transactions when the tip
+moves is refused: the node validates a block on its tip alone.
 
 Before that, a share on a job built on the node's template's parent is refused when the job's
 `nbits` differ from the template's (except on testnet and testnet4, whose blocks may carry the
@@ -371,8 +384,10 @@ The cost is one transfer of each job's transactions from its gateway (a job's bl
 800,000 weight units while RDTS is active, about every 40 seconds per gateway), one proposal
 per job and coinbase on the pool's node, and the share responses of a job's first shares
 delayed by that round trip. A transaction is held once however many jobs and connections
-name it. A connection holds at most 8 transaction requests and 4096 waiting shares; a share
-past either is refused. It holds the transactions of its 4 newest jobs that have sent them; a
+name it. A connection holds at most 8 transaction requests and 4096 waiting shares (for
+their transactions or their parent); a share past either is refused. A frame from a gateway
+is at most 64 KiB, or the protocol's 4 MiB while the pool has asked it for a job's
+transactions. It holds the transactions of its 4 newest jobs that have sent them; a
 share on an older job requests them again, and the node validates the job's block again. A block the node refuses is not recorded as found;
 one `submitblock` answers "duplicate" (the node already held it, as when the gateway's own
 submission reached it first) or "inconclusive" (stored without being connected) is recorded,

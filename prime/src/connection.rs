@@ -34,6 +34,12 @@ const FRAME_BODY_TIMEOUT: Duration = Duration::from_secs(30);
 const FRAME_BODY_DEADLINE: Duration = Duration::from_secs(120);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
 const MAX_HELLO_FRAME_LEN: usize = 4 * 1024;
+/// The largest frame a gateway may send while the pool has asked it for no job's
+/// transactions: only a transaction list reply (0x50 0x92) reaches the protocol's 4 MiB, and
+/// the pool sends the request it answers. The largest other message is a share carrying a
+/// job section of 24 branches and a coinbase section at `MAX_COINBASE_SECTION_LEN`, about 35
+/// KiB with its pad and MAC; a bulk fragment is 16 KiB.
+const MAX_UNSOLICITED_FRAME_LEN: usize = 64 * 1024;
 /// How long a connection is kept without a frame from the gateway. A gateway sends a coinbaser
 /// request for every job it builds, about every 40 seconds with or without miners, so only a
 /// connection that stopped serving goes this long without one.
@@ -153,6 +159,8 @@ pub fn handle(stream: TcpStream, server: &Server) -> io::Result<()> {
         last_send_at: Instant::now(),
         client_sign_pk,
         v3: None,
+        resumed_from: None,
+        proven: false,
         bulk: Reassembler::new(),
     };
 
@@ -190,6 +198,13 @@ struct Connection<'a> {
     last_send_at: Instant,
     client_sign_pk: [u8; 32],
     v3: Option<V3Session>,
+    /// The token of the saved session this connection holds a copy of, until `proven`
+    /// removes that session from the store.
+    resumed_from: Option<ResumeToken>,
+    /// Whether a frame from the gateway has decrypted under the session keys, which a copy
+    /// of its hello sent by another party cannot produce. The session is saved for resume
+    /// only then.
+    proven: bool,
     bulk: Reassembler,
 }
 
@@ -197,20 +212,29 @@ impl Drop for Connection<'_> {
     fn drop(&mut self) {
         self.server.node_state.remove_waker(&self.waker);
         if let Some(v3) = self.v3.take() {
-            let session = SavedSession {
-                v3,
-                splits: self.verifier.take_splits(),
-                saved_at: Instant::now(),
-                connection_opened_at: self.opened_at,
-            };
-            lock(&self.server.sessions).save(self.client_sign_pk, session);
-            debug!("[{}] session saved for resume", self.peer);
+            if self.proven {
+                let session = SavedSession {
+                    v3,
+                    splits: self.verifier.take_splits(),
+                    saved_at: Instant::now(),
+                    connection_opened_at: self.opened_at,
+                };
+                lock(&self.server.sessions).save(self.client_sign_pk, session);
+                debug!("[{}] session saved for resume", self.peer);
+            } else {
+                debug!(
+                    "[{}] session not saved: no frame from the gateway decrypted on this \
+                     connection",
+                    self.peer
+                );
+            }
         }
         if !self.held.is_empty() {
             warn!(
-                "[{}]      {} share(s) waiting for their jobs' transactions were not answered \
-                 before the connection closed, and are not credited; their hashes are released \
-                 so a gateway replaying them on its next connection can be credited",
+                "[{}]      {} share(s) waiting for their jobs' transactions or parent were not \
+                 answered before the connection closed, and are not credited; the hashes of \
+                 those that verified are released so a gateway replaying them on its next \
+                 connection can be credited",
                 self.peer,
                 self.held.len()
             );
@@ -234,13 +258,17 @@ impl Connection<'_> {
     }
 
     /// How long the loop may wait for a frame before something else is due: a keepalive, the
-    /// idle limit, a transaction request's deadline, or, while no share is held, a rotation or
-    /// a reveal (which wait for the held shares to be answered).
+    /// idle limit, a transaction request's deadline, a held share's parent hold, or, while no
+    /// share is held, a rotation or a reveal (which wait for the held shares to be answered).
     fn until_next_action(&self) -> Duration {
         let mut due =
             (self.last_send_at + KEEPALIVE_INTERVAL).min(self.last_frame_at + IDLE_TIMEOUT);
         if let Some(deadline) = self.txn_requests.iter().map(shares::TxnRequest::deadline).min() {
             due = due.min(deadline);
+        }
+        if let Some(until) = self.held.iter().filter_map(shares::HeldShare::parent_hold_until).min()
+        {
+            due = due.min(until);
         }
         if self.held.is_empty()
             && let Some(next) = self.abw().map(AbwSlotState::next_due)
@@ -266,12 +294,14 @@ impl Connection<'_> {
         let payload = self.server.config_payload_v3(&v3.token);
         let notices = v3.abw.notices();
         self.v3 = Some(v3);
+        self.resumed_from = resume.filter(|_| resumed).copied();
         self.send_mining(&payload, true)?;
         debug!("[{peer}] sent v3 0x99 config ({} bytes, signed)", payload.len());
         match (resume.is_some(), resumed) {
             (true, true) => info!(
                 "[{peer}] resume accepted: the session's ABW assignments continue and its \
-                 replayed shares verify"
+                 replayed shares verify; the saved session is released by the first frame \
+                 that decrypts"
             ),
             (true, false) => info!(
                 "[{peer}] resume declined: no saved session under this gateway's key with \
@@ -292,11 +322,27 @@ impl Connection<'_> {
         Ok(())
     }
 
+    /// Records that a frame decrypted under the session keys: the connection is the
+    /// gateway's own, so the saved session it resumed is removed from the store and the
+    /// session is saved again when this connection closes.
+    fn note_proven(&mut self) {
+        if self.proven {
+            return;
+        }
+        self.proven = true;
+        if let Some(token) = self.resumed_from.take()
+            && lock(&self.server.sessions).claim(self.client_sign_pk, &token)
+        {
+            debug!("[{}] the resumed session is released to this connection", self.peer);
+        }
+    }
+
     fn run(&mut self) -> io::Result<()> {
         let peer = self.peer;
         loop {
             self.notify_tip_change()?;
             self.expire_txn_requests()?;
+            self.expire_parent_holds()?;
             self.answer_orphaned_held()?;
             if let Some(why) = self.abw().and_then(|abw| abw.rotation_due(Instant::now()))
                 && self.may_rotate_or_reveal()?
@@ -317,10 +363,16 @@ impl Connection<'_> {
                 self.socket.wait(Some(timeout))?;
                 continue;
             }
+            let max_len = if self.txn_requests.is_empty() {
+                MAX_UNSOLICITED_FRAME_LEN
+            } else {
+                framing::MAX_CMD_LEN
+            };
             let unmask = |bytes| self.channel.unmask_header(bytes);
             let read = framing::read_next_frame(
                 &mut self.socket,
                 unmask,
+                max_len,
                 FRAME_BODY_TIMEOUT,
                 FRAME_BODY_DEADLINE,
             )?;
@@ -340,6 +392,7 @@ impl Connection<'_> {
                 }
             };
             self.last_frame_at = Instant::now();
+            self.note_proven();
             debug!("[{peer}] {}", describe(header, &plain));
 
             let mining = match header.proto_cmd {

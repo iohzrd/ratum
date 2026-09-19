@@ -44,9 +44,14 @@ pub(super) const TXNS_TIMEOUT: Duration = Duration::from_secs(20);
 /// about one round trip; a share on a further job is refused rather than requested.
 const MAX_TXN_REQUESTS: usize = 8;
 
-/// The shares one connection may have held for their job's transactions: 200 a second over
-/// `TXNS_TIMEOUT`. A share past it is refused.
+/// The shares one connection may have held for their job's transactions or parent: 200 a
+/// second over `TXNS_TIMEOUT`. A share past it is refused.
 const MAX_HELD_SHARES: usize = 4096;
+
+/// How long a share on a block the node has not reported is held for the node to report it,
+/// before it is refused as stale: the gateway's node received the block first, and the pool's
+/// node reports it once it propagates, within a few seconds.
+pub(super) const UNSEEN_PARENT_HOLD: Duration = Duration::from_secs(10);
 
 /// How long a node that did not answer a proposal is not asked again for that job's block
 /// with that coinbase; its shares are refused meanwhile.
@@ -56,19 +61,49 @@ const PROPOSAL_RETRY_SECS: u64 = 10;
 /// written at debug, so a gateway sending such shares without limit cannot fill the log.
 const MAX_WARNED: u32 = 16;
 
-/// A share held until its job's transactions arrive: the share as verified and claimed on
-/// arrival, the generation of the job it was verified on, and when it arrived.
+/// What a held share waits for.
+enum Awaiting {
+    /// Its job's transactions.
+    Txns,
+    /// The node to report its job's parent, until the instant.
+    Parent { until: Instant },
+}
+
+/// A share held until its job's transactions arrive, as verified and claimed on arrival, or
+/// until the node reports its job's parent, as refused on arrival and verified again on
+/// release; the generation of the job it was verified on, and when it arrived.
 pub(super) struct HeldShare {
     s: PowSubmit,
     verified: Result<RebuiltShare, Refusal>,
     generation: u64,
     received_at: u64,
+    awaiting: Awaiting,
 }
 
 impl HeldShare {
     /// The block hash the share claimed on arrival, when it verified.
     pub(super) fn claimed_hash(&self) -> Option<[u8; 32]> {
         self.verified.as_ref().ok().map(|rebuilt| rebuilt.block_hash)
+    }
+
+    /// The block hash the share rebuilt to, claimed or not.
+    fn hash(&self) -> Option<[u8; 32]> {
+        match &self.verified {
+            Ok(rebuilt) => Some(rebuilt.block_hash),
+            Err(refusal) => refusal.rebuilt.as_ref().map(|rebuilt| rebuilt.block_hash),
+        }
+    }
+
+    pub(super) fn awaits_parent(&self) -> bool {
+        matches!(self.awaiting, Awaiting::Parent { .. })
+    }
+
+    /// When the share's wait for its parent ends; none for a share held for its transactions.
+    pub(super) fn parent_hold_until(&self) -> Option<Instant> {
+        match self.awaiting {
+            Awaiting::Parent { until } => Some(until),
+            Awaiting::Txns => None,
+        }
     }
 }
 
@@ -182,13 +217,18 @@ impl Connection<'_> {
         };
         debug!("[{}]   -> share {}", self.peer, describe_share(&s));
         let now = ratum::unix_now();
+        let verified = self.verify_and_claim(&s, now);
+        self.settle(s, verified, now, Some(Instant::now() + UNSEEN_PARENT_HOLD))
+    }
+
+    /// Verifies the share against this connection's jobs, splits and tip, and claims its
+    /// hash across every connection.
+    fn verify_and_claim(&mut self, s: &PowSubmit, now: u64) -> Result<RebuiltShare, Refusal> {
         // Not `self.abw()`: the borrow must stay on `v3` alone, beside `verifier` under &mut.
         let abw = self.v3.as_ref().map(|v| &v.abw);
-        let verified = self
-            .verifier
-            .verify(&s, abw, now)
-            .and_then(|rebuilt| accounting::claim(&self.server.accepted_hashes, rebuilt, now));
-        self.settle(s, verified, now)
+        self.verifier
+            .verify(s, abw, now)
+            .and_then(|rebuilt| accounting::claim(&self.server.accepted_hashes, rebuilt, now))
     }
 
     fn on_undecodable_share(&mut self, plain: &[u8], e: &messages::Error) -> io::Result<()> {
@@ -220,19 +260,55 @@ impl Connection<'_> {
         self.send_mining(&response.encode(), false)
     }
 
-    /// Answers the share, or holds it while its job's transactions are awaited.
+    /// Answers the share, or holds it while its job's transactions are awaited, or, until
+    /// `parent_hold`, while the node has not reported its job's parent.
     fn settle(
         &mut self,
         s: PowSubmit,
         verified: Result<RebuiltShare, Refusal>,
         received_at: u64,
+        parent_hold: Option<Instant>,
     ) -> io::Result<()> {
-        // A resend of a held share gets no reference, which would precede the held answer.
         let verified = match verified {
-            Err(Refusal { reason: RejectReason::DuplicateWork, rebuilt: Some(r) })
-                if self.holds(&r.block_hash) =>
-            {
+            // A resend of a held share gets no reference, which would precede the held answer.
+            Err(Refusal {
+                reason: RejectReason::DuplicateWork | RejectReason::StaleBlock,
+                rebuilt: Some(r),
+            }) if self.holds(&r.block_hash) => {
                 Err(Refusal { reason: RejectReason::DuplicateWork, rebuilt: None })
+            }
+            Err(Refusal { reason: RejectReason::StaleBlock, rebuilt: Some(r) })
+                if parent_hold.is_some_and(|until| Instant::now() < until)
+                    && r.job_generation.is_some()
+                    && self.verifier.parent_unseen(&s, r.prev_hash) =>
+            {
+                let generation = r.job_generation.expect("checked in the guard");
+                let prev_hash = r.prev_hash;
+                let refusal = Refusal { reason: RejectReason::StaleBlock, rebuilt: Some(r) };
+                if self.held.len() >= MAX_HELD_SHARES {
+                    warn!(
+                        "[{}]   !! {MAX_HELD_SHARES} shares already wait for their jobs' \
+                         transactions or parent; refusing another",
+                        self.peer
+                    );
+                    Err(refusal)
+                } else {
+                    debug!(
+                        "[{}]      holding a share on block {}, which the node has not reported",
+                        self.peer,
+                        ratum::bitcoin::hash_to_display_hex(&prev_hash)
+                    );
+                    let until = parent_hold.expect("checked in the guard");
+                    let awaiting = Awaiting::Parent { until };
+                    self.held.push(HeldShare {
+                        s,
+                        verified: Err(refusal),
+                        generation,
+                        received_at,
+                        awaiting,
+                    });
+                    return Ok(());
+                }
             }
             verified => verified,
         };
@@ -250,13 +326,14 @@ impl Connection<'_> {
         };
         match verdict {
             JobVerdict::Pending(generation) if self.held.len() < MAX_HELD_SHARES => {
-                self.held.push(HeldShare { s, verified, generation, received_at });
+                let awaiting = Awaiting::Txns;
+                self.held.push(HeldShare { s, verified, generation, received_at, awaiting });
                 Ok(())
             }
             JobVerdict::Pending(_) => {
                 warn!(
                     "[{}]   !! {MAX_HELD_SHARES} shares already wait for their jobs' \
-                     transactions; refusing another",
+                     transactions or parent; refusing another",
                     self.peer
                 );
                 self.answer(&s, verified, JobVerdict::Invalid(RejectReason::Other), received_at)
@@ -641,9 +718,9 @@ impl Connection<'_> {
         true
     }
 
-    /// Whether a share held here for its job's transactions claimed `hash`.
+    /// Whether a share held here for its job's transactions or parent rebuilt to `hash`.
     fn holds(&self, hash: &[u8; 32]) -> bool {
-        self.held.iter().any(|h| h.claimed_hash().as_ref() == Some(hash))
+        self.held.iter().any(|h| h.hash().as_ref() == Some(hash))
     }
 
     /// A job's transactions (0x50 0x92): checked against the job's merkle branches and held,
@@ -744,13 +821,33 @@ impl Connection<'_> {
         Ok(())
     }
 
-    /// Settles again, in the order they arrived, the held shares `matches` selects.
-    fn release_held(&mut self, matches: impl Fn(&HeldShare) -> bool) -> io::Result<()> {
+    /// Refuses the shares whose parent the node has not reported within `UNSEEN_PARENT_HOLD`
+    /// of their arrival, by settling them again past their hold.
+    pub(super) fn expire_parent_holds(&mut self) -> io::Result<()> {
+        let now = Instant::now();
+        let due = |h: &HeldShare| h.parent_hold_until().is_some_and(|until| now >= until);
+        if !self.held.iter().any(due) {
+            return Ok(());
+        }
+        self.release_held(due)
+    }
+
+    /// Settles again, in the order they arrived, the held shares `matches` selects: a share
+    /// held for its job's transactions as it was verified on arrival, and a share held for
+    /// its job's parent verified anew against the tip now held, its hold kept while the
+    /// parent is still unreported and the hold has not passed.
+    pub(super) fn release_held(&mut self, matches: impl Fn(&HeldShare) -> bool) -> io::Result<()> {
         let (released, kept): (Vec<HeldShare>, Vec<HeldShare>) =
             std::mem::take(&mut self.held).into_iter().partition(|h| matches(h));
         self.held = kept;
-        for HeldShare { s, verified, received_at, .. } in released {
-            self.settle(s, verified, received_at)?;
+        for HeldShare { s, verified, received_at, awaiting, .. } in released {
+            match awaiting {
+                Awaiting::Txns => self.settle(s, verified, received_at, None)?,
+                Awaiting::Parent { until } => {
+                    let verified = self.verify_and_claim(&s, ratum::unix_now());
+                    self.settle(s, verified, received_at, Some(until))?;
+                }
+            }
         }
         Ok(())
     }

@@ -177,10 +177,12 @@ pub enum FrameRead {
 /// header's first byte has arrived the read waits for the rest, up to
 /// `PARTIAL_HEADER_TIMEOUT`: a header or body that does not complete in time is an
 /// `io::ErrorKind::TimedOut` error, and a peer that closes before it completes is an
-/// `io::ErrorKind::UnexpectedEof` error.
+/// `io::ErrorKind::UnexpectedEof` error. A header announcing more than `max_len` bytes is an
+/// `io::ErrorKind::InvalidData` error, returned before the body is read or allocated.
 pub fn read_next_frame(
     socket: &mut PolledSocket,
     unmask: impl FnOnce([u8; HEADER_LEN]) -> FrameHeader,
+    max_len: usize,
     body_idle: Duration,
     body_total: Duration,
 ) -> io::Result<FrameRead> {
@@ -192,7 +194,14 @@ pub fn read_next_frame(
     };
     socket.read_exact(&mut head[got..], PARTIAL_HEADER_TIMEOUT, PARTIAL_HEADER_TIMEOUT)?;
     let header = unmask(head);
-    let body = socket.read_vec(header.cmd_len as usize, body_idle, body_total)?;
+    let len = header.cmd_len as usize;
+    if len > max_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("frame of {len} bytes, over the {max_len} allowed"),
+        ));
+    }
+    let body = socket.read_vec(len, body_idle, body_total)?;
     Ok(FrameRead::Complete(header, body))
 }
 
@@ -349,7 +358,7 @@ mod tests {
         let mut socket = PolledSocket::new(listener.accept().unwrap().0).unwrap();
         let limit = Duration::from_secs(5);
         let read = |socket: &mut PolledSocket| {
-            read_next_frame(socket, FrameHeader::from_bytes, limit, limit).unwrap()
+            read_next_frame(socket, FrameHeader::from_bytes, MAX_CMD_LEN, limit, limit).unwrap()
         };
         assert_eq!(read(&mut socket), FrameRead::Empty, "nothing sent yet");
 

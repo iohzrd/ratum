@@ -235,7 +235,11 @@ fn the_network_target_check_needs_a_tip_match_and_a_template() {
 
     v.set_next_bits(Some(0x1d00_ffff));
     v.set_tip(Some([0x11; 32]), NOW);
-    assert!(v.checked(&s, None, NOW).is_ok(), "a job off the tip is not target-checked");
+    assert_eq!(
+        v.checked(&s, None, NOW),
+        Err(RejectReason::StaleBlock),
+        "a job off the tip is not target-checked: it waits for its parent"
+    );
 
     v.set_tip(Some([0x5a; 32]), NOW);
     v.set_next_bits(None);

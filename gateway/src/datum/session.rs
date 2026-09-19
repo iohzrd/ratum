@@ -195,14 +195,20 @@ impl<'a> Session<'a> {
                 continue;
             }
             let unmask = |bytes| self.channel.unmask_header(bytes);
-            let (header, body) =
-                match framing::read_next_frame(&mut self.socket, unmask, left, left)? {
-                    FrameRead::Closed => {
-                        return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
-                    }
-                    FrameRead::Empty => continue,
-                    FrameRead::Complete(header, body) => (header, body),
-                };
+            let read = framing::read_next_frame(
+                &mut self.socket,
+                unmask,
+                framing::MAX_CMD_LEN,
+                left,
+                left,
+            )?;
+            let (header, body) = match read {
+                FrameRead::Closed => {
+                    return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
+                }
+                FrameRead::Empty => continue,
+                FrameRead::Complete(header, body) => (header, body),
+            };
             let plain = self.channel.decrypt(header, &body)?;
             self.last_server_message_at = Instant::now();
             match header.proto_cmd {

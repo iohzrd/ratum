@@ -398,16 +398,21 @@ impl<'a> Verifier<'a> {
         Ok(())
     }
 
+    /// A share on a previous block other than the tip is stale, unless the tip was replaced
+    /// within the grace, or the share is a block on a parent the node has reported (relayed,
+    /// so the node decides it). A share on a parent the node has not reported is stale here
+    /// whether or not it is a block, and the connection holds it for the node to report the
+    /// parent (`parent_unseen`).
     fn check_share(
         &self,
         s: &PowSubmit,
         rebuilt: &RebuiltShare,
         now: u64,
     ) -> Result<(), RejectReason> {
-        if !rebuilt.is_block
-            && let Some(tip) = self.tip
+        if let Some(tip) = self.tip
             && rebuilt.prev_hash != tip
             && !self.within_tip_grace(rebuilt.prev_hash, now)
+            && (!rebuilt.is_block || self.parent_unseen(s, rebuilt.prev_hash))
         {
             return Err(RejectReason::StaleBlock);
         }

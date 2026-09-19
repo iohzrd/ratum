@@ -164,20 +164,41 @@ fn a_block_on_a_replaced_tip_is_credited_after_the_grace() {
     assert!(v.checked(&s, None, NOW + 3_600).is_ok(), "the job's tip is still kept");
 }
 
+/// A share on a block the node has not reported is stale until the node reports it, block or
+/// not, and `parent_unseen` says so, which is what makes the connection hold it rather than
+/// answer; the job is kept until its parent is replaced without having been the tip.
 #[test]
 fn a_job_on_a_tip_the_pool_has_not_seen_is_kept_until_that_tip_is_replaced() {
-    let (mut v, s) = setup();
-    v.set_tip(Some([0x11; 32]), NOW);
-    assert!(v.checked(&s, None, NOW).is_ok(), "0x5a is not a tip yet");
-    v.set_tip(Some([0x22; 32]), NOW);
-    v.set_tip(Some([0x33; 32]), NOW + TIP_GRACE_SECS + 1);
-    assert!(v.checked(&s, None, NOW + TIP_GRACE_SECS + 1).is_ok(), "0x5a has never been a tip");
-    v.set_tip(Some([0x5a; 32]), NOW + TIP_GRACE_SECS + 1);
-    assert!(v.checked(&s, None, NOW + TIP_GRACE_SECS + 1).is_ok(), "0x5a is the tip");
-    v.set_tip(Some([0x44; 32]), NOW + TIP_GRACE_SECS + 1);
-    v.set_tip(Some([0x55; 32]), NOW + 2 * TIP_GRACE_SECS + 2);
-    assert_eq!(v.checked(&s, None, NOW + 2 * TIP_GRACE_SECS + 2), Err(RejectReason::StaleBlock));
-    assert!(v.jobs[0].as_ref().is_some_and(|j| j.evicted));
+    for (v, s) in [setup(), setup_hard()] {
+        let mut v = v;
+        v.set_tip(Some([0x11; 32]), NOW);
+        assert_eq!(
+            v.checked(&s, None, NOW),
+            Err(RejectReason::StaleBlock),
+            "0x5a is not a tip yet"
+        );
+        assert!(v.parent_unseen(&s, [0x5a; 32]), "so the share waits for it");
+        assert!(!v.parent_unseen(&s, [0x11; 32]), "the parent named must be the job's");
+        v.set_tip(Some([0x22; 32]), NOW);
+        v.set_tip(Some([0x33; 32]), NOW + TIP_GRACE_SECS + 1);
+        assert_eq!(
+            v.checked(&s, None, NOW + TIP_GRACE_SECS + 1),
+            Err(RejectReason::StaleBlock),
+            "0x5a has never been a tip"
+        );
+        assert!(v.parent_unseen(&s, [0x5a; 32]), "and the share still waits for it");
+        v.set_tip(Some([0x5a; 32]), NOW + TIP_GRACE_SECS + 1);
+        assert!(!v.parent_unseen(&s, [0x5a; 32]));
+        assert!(v.checked(&s, None, NOW + TIP_GRACE_SECS + 1).is_ok(), "0x5a is the tip");
+        v.set_tip(Some([0x44; 32]), NOW + TIP_GRACE_SECS + 1);
+        v.set_tip(Some([0x55; 32]), NOW + 2 * TIP_GRACE_SECS + 2);
+        assert_eq!(
+            v.checked(&s, None, NOW + 2 * TIP_GRACE_SECS + 2),
+            Err(RejectReason::StaleBlock)
+        );
+        assert!(v.jobs[0].as_ref().is_some_and(|j| j.evicted));
+        assert!(!v.parent_unseen(&s, [0x5a; 32]), "a replaced parent is not waited for");
+    }
 }
 
 #[test]
@@ -338,7 +359,7 @@ fn one_share_installs_sections_once() {
 fn a_job_whose_parent_the_node_never_reports_is_evicted() {
     let (mut v, s) = setup();
     v.set_tip(Some([0x11; 32]), NOW);
-    v.checked(&s, None, NOW).unwrap();
+    assert_eq!(v.checked(&s, None, NOW), Err(RejectReason::StaleBlock), "held for its parent");
     let generation = v.installed_generation(&s).expect("installed");
     assert!(v.job(s.job_id, generation).is_some());
     v.set_tip(Some([0x11; 32]), NOW + jobs::UNSEEN_PARENT_SECS);

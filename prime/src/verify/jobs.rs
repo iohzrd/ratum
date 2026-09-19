@@ -264,6 +264,17 @@ impl Verifier<'_> {
         if valid { Ok(()) } else { Err(RejectReason::BadCoinbaseId) }
     }
 
+    /// Whether the share's job builds on a block the node has not reported: the job installed
+    /// in the share's slot is not evicted, builds on `prev_hash`, and its parent has never
+    /// been the tip or a replaced tip. The connection holds such a share for the node to
+    /// report the block (`connection::shares::UNSEEN_PARENT_HOLD`), since a gateway whose
+    /// node received the block first builds on it before the pool's node reports it.
+    pub fn parent_unseen(&self, s: &PowSubmit, prev_hash: [u8; 32]) -> bool {
+        self.jobs[usize::from(s.job_id)]
+            .as_ref()
+            .is_some_and(|st| !st.evicted && !st.parent_seen && st.job.prev_hash == prev_hash)
+    }
+
     /// Whether the share names an evicted job, rather than bringing a new job on another tip
     /// into the evicted slot.
     pub(super) fn names_evicted_job(&self, s: &PowSubmit) -> bool {

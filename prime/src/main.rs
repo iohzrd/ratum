@@ -34,6 +34,7 @@ use settings::{Resolved, Settings};
 use std::io;
 use std::net::TcpListener;
 use std::sync::Arc;
+use std::time::Duration;
 use verify::SharePolicy;
 
 const VERSION: &str = ratum::version!();
@@ -87,12 +88,25 @@ fn watch_node_in_background(server: &Arc<Server>, chain: Option<rpc::Chain>) {
     );
 }
 
+/// The pause after an accept error other than a connection the peer aborted. Without it a
+/// descriptor limit (EMFILE, ENFILE) would make the listener call accept() without pause.
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
+
 fn accept_connections(listener: TcpListener, server: &Arc<Server>) {
     for stream in listener.incoming() {
         let stream = match stream {
             Ok(s) => s,
             Err(e) => {
-                error!("could not accept a connection: {e}");
+                let aborted = matches!(
+                    e.kind(),
+                    io::ErrorKind::Interrupted
+                        | io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::ConnectionReset
+                );
+                if !aborted {
+                    error!("could not accept a connection: {e}");
+                    std::thread::sleep(ACCEPT_RETRY_DELAY);
+                }
                 continue;
             }
         };
@@ -103,7 +117,7 @@ fn accept_connections(listener: TcpListener, server: &Arc<Server>) {
                 continue;
             }
         };
-        let open = match Server::open_connection(server, peer.ip()) {
+        let open = match Server::open_connection(server, ratum::net::limit_key(peer.ip())) {
             Ok(open) => open,
             Err(limit) => {
                 warn!("[{peer}] refused: at {limit}");

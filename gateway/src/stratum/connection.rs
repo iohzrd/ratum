@@ -285,9 +285,22 @@ impl Connection {
         Ok(())
     }
 
+    /// The mining.subscribe result: the subscription ids, the extranonce1 (the header's
+    /// leading zeros and the session id) and the extranonce2 size.
+    fn subscription(&self) -> Value {
+        let sid = format!("{:08x}", self.sid);
+        let pad = "0".repeat(2 * HEADER_EXTRANONCE_PAD);
+        json!([
+            [["mining.notify", format!("{sid}1")], ["mining.set_difficulty", format!("{sid}2")]],
+            format!("{pad}{sid}"),
+            EXTRANONCE2_SIZE
+        ])
+    }
+
     fn on_subscribe(&mut self, id: &str, params: &Value) -> io::Result<()> {
         if self.stats().subscribed() {
-            return Ok(());
+            // The same subscription again: the ids and extranonce are the connection's.
+            return self.reply_result(id, self.subscription());
         }
         let s = &self.gateway.config.stratum;
         let user_agent: String =
@@ -300,19 +313,7 @@ impl Connection {
         if s.fingerprint_miners && user_agent.starts_with("NiceHash/") {
             self.vardiff.raise_floor(NICEHASH_MIN_DIFFICULTY);
         }
-        let sid = format!("{:08x}", self.sid);
-        let pad = "0".repeat(2 * HEADER_EXTRANONCE_PAD);
-        self.reply_result(
-            id,
-            json!([
-                [
-                    ["mining.notify", format!("{sid}1")],
-                    ["mining.set_difficulty", format!("{sid}2")]
-                ],
-                format!("{pad}{sid}"),
-                EXTRANONCE2_SIZE
-            ]),
-        )?;
+        self.reply_result(id, self.subscription())?;
         let d = self.vardiff.mark_sent();
         self.send_difficulty(d)?;
         let mut st = self.stats();
@@ -547,6 +548,19 @@ mod tests {
             Some(job.serial),
             "both publications are the one job, in the one slot"
         );
+    }
+
+    #[test]
+    fn a_second_subscription_is_answered_with_the_same_ids_and_extranonce() {
+        let mut c = Client::connect();
+        c.send(r#"{"id":1,"method":"mining.subscribe","params":["tester/1"]}"#);
+        let first = c.line("subscribe reply");
+        assert_eq!(c.line("difficulty")["method"], "mining.set_difficulty");
+        c.send(r#"{"id":2,"method":"mining.subscribe","params":["tester/1"]}"#);
+        let second = c.line("the second subscribe reply");
+        assert_eq!(second["id"], 2);
+        assert_eq!(second["result"], first["result"]);
+        assert_eq!(second["error"], Value::Null);
     }
 
     #[test]
