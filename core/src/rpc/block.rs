@@ -1,7 +1,10 @@
 //! One block as the node prints it: `getblock` at verbosity 1, and its coinbase from verbose
 //! `getrawtransaction`, which needs no txindex when the block hash is given.
 
-use super::{Client, Error, f64_field, i64_field, missing, string_field, u32_field, u64_field};
+use super::{
+    Client, Error, f64_field, i64_field, missing, node_difficulty, string_field, u32_field,
+    u64_field,
+};
 use crate::bitcoin::{HASH_SIZE, display_hex_bytes};
 
 /// A block as `getblock` at verbosity 1 prints it: the header fields the node reports and
@@ -45,7 +48,7 @@ impl Block {
             confirmations: i64_field(v, "confirmations")?,
             version: i64_field(v, "version")?,
             bits: string_field(v, "bits")?,
-            difficulty: f64_field(v, "difficulty")?,
+            difficulty: node_difficulty(v)?,
             nonce: u64_field(v, "nonce")?,
             merkle_root: string_field(v, "merkleroot")?,
             previous_hash: v["previousblockhash"].as_str().map(str::to_string),
@@ -140,7 +143,9 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixtures::{FakeNode, HASH, PREVIOUS, TXID, node_block, node_coinbase};
+    use crate::fixtures::{
+        FakeNode, HASH, PREVIOUS, TXID, node_block, node_block_header_v2, node_coinbase,
+    };
 
     fn client(url: &str) -> Client {
         Client::new(url, "u", "p", None).unwrap()
@@ -208,6 +213,18 @@ mod tests {
         let tip = Block::decode(&tip).unwrap();
         assert_eq!(tip.next_hash, None);
         assert_eq!(tip.confirmations, -1, "the node's count, sign included");
+        assert_eq!(Block::decode(&node_block()).unwrap().difficulty, 1234.5, "the field verbatim");
+        let v2 = Block::decode(&node_block_header_v2()).unwrap();
+        let from_bits = crate::target::node_difficulty_from_bits(0x1702c4e4).unwrap();
+        assert_eq!(v2.difficulty, from_bits, "29.4.2 omits difficulty on a header-v2 block");
+        assert_eq!(v2.bits, "1702c4e4");
+        let mut no_difficulty = node_block_header_v2();
+        no_difficulty["bits"] = serde_json::json!("1d80ffff");
+        no_difficulty.as_object_mut().unwrap().remove("difficulty_blake2b");
+        assert_eq!(
+            Block::decode(&no_difficulty).unwrap_err().to_string(),
+            "malformed rpc response: no difficulty, bits or difficulty_blake2b"
+        );
         let mut short = node_block();
         short.as_object_mut().unwrap().remove("merkleroot");
         assert_eq!(

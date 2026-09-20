@@ -253,6 +253,12 @@ the tagged SHA-256 chain, the BLAKE2b work root, the ASIC input of each of the f
 and the XOR mask. `core/tests/decoders.rs` feeds every decoder random and damaged input and
 requires that none panics and that whatever decodes re-encodes to a fixed point.
 
+The pool and the gateway read the node over JSON-RPC. Knots 29.4.2 (`v29.4.2.knots20260508rc2`
+and later) prints a header-v2 block's difficulty as `difficulty_blake2b` (the expected hash
+count) and omits `difficulty` in `getblockchaininfo`, `getblock` and `getblockheader`; 29.4.1
+prints `difficulty`. The pool reads either: `difficulty` when present, else the difficulty
+of the answer's `bits` in the same unit, else `difficulty_blake2b` divided by `2^32`.
+
 The e2e runs need a Knots build with the BLAKE2b change (`BITCOIND`, `BITCOIN_CLI`);
 `DATUM_GATEWAY` or `--gateway` runs another gateway build instead of this workspace's, and
 `e2e/e2e.py <run> --help` lists each run's own options (share counts, timeouts, `--keep`).

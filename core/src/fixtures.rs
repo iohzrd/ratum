@@ -115,6 +115,48 @@ pub fn node_block() -> Value {
     })
 }
 
+/// `node_block` as Knots 29.4.2 prints a header-v2 block: no `difficulty`, and
+/// `difficulty_blake2b` holding `GetBlockProof`, `2^256 / (target + 1)` for bits 1702c4e4.
+pub fn node_block_header_v2() -> Value {
+    let mut block = node_block();
+    let fields = block.as_object_mut().unwrap();
+    fields.remove("difficulty");
+    fields.insert("difficulty_blake2b".into(), json!(4.3657653085953146e23));
+    block
+}
+
+/// `getblockchaininfo` as a node before 29.4.2 prints it: `HASH` at height 973054 on mainnet
+/// at bits 190141c0.
+pub fn node_chain_info() -> Value {
+    json!({
+        "chain": "main",
+        "blocks": 973_054,
+        "headers": 973_054,
+        "bestblockhash": HASH,
+        "bits": "190141c0",
+        "target": "0".repeat(64),
+        "difficulty": 3_417_233_412.773893,
+        "time": 1_789_848_656,
+        "mediantime": 1_789_848_000,
+        "verificationprogress": 1.0,
+        "initialblockdownload": false,
+        "chainwork": "0".repeat(64),
+        "size_on_disk": 700_000_000_000u64,
+        "pruned": false,
+        "warnings": [],
+    })
+}
+
+/// `node_chain_info` as Knots 29.4.2 prints it at a header-v2 tip: no `difficulty`, and
+/// `difficulty_blake2b` holding `GetBlockProof` for bits 190141c0.
+pub fn node_chain_info_header_v2() -> Value {
+    let mut info = node_chain_info();
+    let fields = info.as_object_mut().unwrap();
+    fields.remove("difficulty");
+    fields.insert("difficulty_blake2b".into(), json!(1.4677129705888563e19));
+    info
+}
+
 /// `TXID` as verbose `getrawtransaction` prints it: a coinbase paying `pays` 3 BTC and
 /// 0.125 BTC, then a witness commitment.
 pub fn node_coinbase(pays: [&str; 2]) -> Value {

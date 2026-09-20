@@ -165,19 +165,14 @@ fn read_template_summary(node: &rpc::Client) -> Option<rpc::TemplateSummary> {
     }
 }
 
-/// `difficulty_from_bits` measures a target against share difficulty 1, `2^224`; the node's
-/// `getblockchaininfo` against the target of bits `0x1d00ffff`, `0xffff × 2^208`. Multiplying
-/// by this turns the first into the second.
-const NODE_DIFFICULTY_PER_SHARE_DIFFICULTY: f64 = 65_535.0 / 65_536.0;
-
 /// The difficulty the share window is sized to: that of the block being mined, as TIDES
 /// specifies, read from the template's bits in the node's unit; the tip's when no template was
 /// read. The two differ for the first block after a retarget and for the BLAKE2b activation
 /// block.
 fn window_difficulty(tip: &rpc::Tip, template: Option<rpc::TemplateSummary>) -> f64 {
     template
-        .and_then(|t| ratum::target::difficulty_from_bits(t.bits))
-        .map_or(tip.difficulty, |d| d * NODE_DIFFICULTY_PER_SHARE_DIFFICULTY)
+        .and_then(|t| ratum::target::node_difficulty_from_bits(t.bits))
+        .unwrap_or(tip.difficulty)
 }
 
 /// Reads the node's tip, template and mining info into the server's node state, waking
@@ -286,5 +281,18 @@ mod tests {
         assert!((next - 1.0).abs() < 1e-12, "the next block's, in the node's unit: {next}");
         assert_eq!(window_difficulty(&tip, None), 5.0, "no template read");
         assert_eq!(window_difficulty(&tip, template(0x1d80ffff)), 5.0, "bits with no difficulty");
+    }
+
+    #[test]
+    fn the_tip_of_either_node_version_sizes_the_window_alike() {
+        use crate::ledger::WindowRule;
+        use ratum::fixtures::{FakeNode, node_chain_info, node_chain_info_header_v2};
+        let window = WindowRule { multiple: 8.0 };
+        for info in [node_chain_info(), node_chain_info_header_v2()] {
+            let node = FakeNode::start(move |_, _| Ok(info.clone()));
+            let client = rpc::Client::new(&node.url(), "u", "p", None).unwrap();
+            let tip = client.tip().unwrap();
+            assert_eq!(window.window_for(window_difficulty(&tip, None)), 27_337_867_302);
+        }
     }
 }

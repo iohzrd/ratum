@@ -100,6 +100,17 @@ pub fn difficulty_from_bits(bits: u32) -> Option<f64> {
     Some(be_to_f64(&DIFF1_TARGET) / t)
 }
 
+/// `difficulty_from_bits` measures a target against share difficulty 1, `2^224`; the node's
+/// `getblockchaininfo` against the target of bits `0x1d00ffff`, `0xffff × 2^208`. Multiplying
+/// by this turns the first into the second.
+pub const NODE_DIFFICULTY_PER_SHARE_DIFFICULTY: f64 = 65_535.0 / 65_536.0;
+
+/// The difficulty of the target `bits` encodes in the node's unit, or none where
+/// `bits_to_target` refuses it.
+pub fn node_difficulty_from_bits(bits: u32) -> Option<f64> {
+    difficulty_from_bits(bits).map(|d| d * NODE_DIFFICULTY_PER_SHARE_DIFFICULTY)
+}
+
 fn be_to_f64(v: &Target) -> f64 {
     v.iter().fold(0.0f64, |out, b| out.mul_add(256.0, f64::from(*b)))
 }
@@ -307,6 +318,15 @@ mod tests {
         let d = difficulty_from_bits(0x207fffff).unwrap();
         assert!(d > 0.0 && d < 1e-8, "got {d}");
         assert_eq!(difficulty_from_bits(0x1d80ffff), None);
+    }
+
+    #[test]
+    fn the_node_unit_is_measured_against_the_target_of_bits_1d00ffff() {
+        let one = node_difficulty_from_bits(0x1d00ffff).unwrap();
+        assert!((one - 1.0).abs() < 1e-12, "got {one}");
+        let d = node_difficulty_from_bits(0x190141c0).unwrap();
+        assert!((d - 3_417_233_412.773893).abs() < 1e-3, "29.4.1 reports 3417233412.773893: {d}");
+        assert_eq!(node_difficulty_from_bits(0x1d80ffff), None);
     }
 
     #[test]

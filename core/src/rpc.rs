@@ -180,6 +180,27 @@ fn missing(key: &str) -> Error {
     Error::BadResponse(format!("no {key}"))
 }
 
+/// The difficulty `v` reports in the node's unit. Knots 29.4.2 omits `difficulty` on a
+/// header-v2 block and prints `difficulty_blake2b`, `GetBlockProof`: the expected hash count,
+/// `2^32` per unit. Read in order: `difficulty` verbatim, else derived from `bits`, else
+/// `difficulty_blake2b` over `2^32` (in the share unit, `2^224` against the target).
+pub(crate) fn node_difficulty(v: &serde_json::Value) -> Result<f64, Error> {
+    if let Some(d) = v["difficulty"].as_f64() {
+        return Ok(d);
+    }
+    let from_bits = v["bits"]
+        .as_str()
+        .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+        .and_then(crate::target::node_difficulty_from_bits);
+    if let Some(d) = from_bits {
+        return Ok(d);
+    }
+    if let Some(work) = v["difficulty_blake2b"].as_f64() {
+        return Ok(work / 2f64.powi(32) * crate::target::NODE_DIFFICULTY_PER_SHARE_DIFFICULTY);
+    }
+    Err(Error::BadResponse("no difficulty, bits or difficulty_blake2b".into()))
+}
+
 fn warnings_of(v: &serde_json::Value) -> Vec<String> {
     match v {
         serde_json::Value::Array(a) => a
@@ -435,7 +456,7 @@ impl Client {
         let info = self.call("getblockchaininfo", serde_json::json!([]))?;
         let display = str_field(&info, "bestblockhash")?;
         let height = u32_field(&info, "blocks")?;
-        let difficulty = f64_field(&info, "difficulty")?;
+        let difficulty = node_difficulty(&info)?;
         let chain = Chain::parse(str_field(&info, "chain")?);
         let hash = crate::bitcoin::hash_from_display_hex(display)
             .ok_or_else(|| Error::BadResponse(format!("bestblockhash {display:?}")))?;
@@ -603,6 +624,58 @@ mod tests {
         ] {
             assert!(!other.is_not_found(), "{other} is not a missing block: the code decides");
         }
+    }
+
+    #[test]
+    fn the_tip_difficulty_is_read_from_either_node_version() {
+        use crate::fixtures::{FakeNode, node_chain_info, node_chain_info_header_v2};
+        let node = FakeNode::start(|_, _| Ok(node_chain_info()));
+        let t = client(&node.url(), "u", "p").unwrap().tip().unwrap();
+        assert_eq!(t.difficulty, 3_417_233_412.773893, "the field verbatim");
+        assert_eq!(t.height, 973_054);
+        assert_eq!(t.chain, Chain::Main);
+
+        let node = FakeNode::start(|_, _| Ok(node_chain_info_header_v2()));
+        let t = client(&node.url(), "u", "p").unwrap().tip().unwrap();
+        let relative = (t.difficulty - 3_417_233_412.77).abs() / 3_417_233_412.77;
+        assert!(relative < 1e-4, "within 0.01% of what 29.4.1 reports: {}", t.difficulty);
+
+        let mut none = node_chain_info_header_v2();
+        let fields = none.as_object_mut().unwrap();
+        fields.remove("bits");
+        fields.remove("difficulty_blake2b");
+        let node = FakeNode::start(move |_, _| Ok(none.clone()));
+        assert_eq!(
+            client(&node.url(), "u", "p").unwrap().tip().unwrap_err().to_string(),
+            "malformed rpc response: no difficulty, bits or difficulty_blake2b"
+        );
+    }
+
+    #[test]
+    fn deriving_from_bits_and_dividing_the_work_by_2_pow_32_agree_within_a_hundredth_of_a_percent()
+    {
+        for (bits, work) in
+            [("190141c0", 1.4677129705888563e19), ("1702c4e4", 4.3657653085953146e23)]
+        {
+            let v = serde_json::json!({ "bits": bits });
+            let from_bits = node_difficulty(&v).unwrap();
+            let v = serde_json::json!({ "difficulty_blake2b": work });
+            let from_work = node_difficulty(&v).unwrap();
+            let relative = (from_bits - from_work).abs() / from_bits;
+            assert!(relative < 1e-4, "bits {bits}: {from_bits} against {from_work}");
+            let v =
+                serde_json::json!({ "bits": bits, "difficulty_blake2b": work, "difficulty": 7.0 });
+            assert_eq!(node_difficulty(&v).unwrap(), 7.0, "the field first");
+            let v = serde_json::json!({ "bits": bits, "difficulty_blake2b": work });
+            assert_eq!(node_difficulty(&v).unwrap(), from_bits, "then bits");
+            let v = serde_json::json!({ "bits": "zz", "difficulty_blake2b": work });
+            assert_eq!(node_difficulty(&v).unwrap(), from_work, "then the work");
+        }
+        let v = serde_json::json!({ "bits": "1d80ffff", "difficulty_blake2b": "1e19" });
+        assert_eq!(
+            node_difficulty(&v).unwrap_err().to_string(),
+            "malformed rpc response: no difficulty, bits or difficulty_blake2b"
+        );
     }
 
     #[test]
