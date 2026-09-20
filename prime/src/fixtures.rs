@@ -19,10 +19,16 @@ pub const BOB: &str = "bcrt1qk2et9v4jk2et9v4jk2et9v4jk2et9v4jldyv0a";
 
 /// A server on regtest whose window holds `shares`, each an identity and its difficulty.
 pub fn server_with(shares: &[(&str, u64)]) -> Server {
-    server_with_fee(shares, 0)
+    server_on(ledger_with(shares, 0), BlockRecords::default())
 }
 
+/// `server_with` under an operator fee of `fee_bps`.
 pub fn server_with_fee(shares: &[(&str, u64)], fee_bps: u16) -> Server {
+    server_on(ledger_with(shares, fee_bps), BlockRecords::default())
+}
+
+/// An unbounded window holding `shares`, each an identity and its difficulty.
+pub fn ledger_with(shares: &[(&str, u64)], fee_bps: u16) -> Ledger {
     let policy = SplitPolicy { fee_bps, public_gateway: None };
     let mut ledger = Ledger::new(WindowRule::fixed(u128::MAX), policy);
     for (i, (identity, difficulty)) in shares.iter().enumerate() {
@@ -30,11 +36,20 @@ pub fn server_with_fee(shares: &[(&str, u64)], fee_bps: u16) -> Server {
         hash[0] = i as u8;
         ledger.record(share(1_000 + i as u64, identity, *difficulty, hash, "")).unwrap();
     }
-    server_on(ledger, BlockRecords::default())
+    ledger
 }
 
-/// A server on regtest over `ledger` and `records`, as `Server::new` builds it at startup.
+/// A port nothing listens on: the node of a server whose test reads none.
+pub const UNREACHABLE_NODE: &str = "http://127.0.0.1:1";
+
+/// `server` over `ledger` and `records` with the node at `UNREACHABLE_NODE`.
 pub fn server_on(ledger: Ledger, records: BlockRecords) -> Server {
+    server(ledger, records, UNREACHABLE_NODE)
+}
+
+/// A server on regtest over `ledger` and `records` with the node at `node_url` (a
+/// `FakeNode`'s), as `Server::new` builds it at startup.
+pub fn server(ledger: Ledger, records: BlockRecords, node_url: &str) -> Server {
     let Resolved { mut settings, .. } = crate::settings::resolve(&Options::default()).unwrap();
     settings.motd = String::new();
     settings.listen = "0.0.0.0:28915".into();
@@ -49,7 +64,7 @@ pub fn server_on(ledger: Ledger, records: BlockRecords) -> Server {
         },
         chain: Some(rpc::Chain::Regtest),
     };
-    let node = rpc::Client::new("http://127.0.0.1:1", "u", "p", None).unwrap();
+    let node = rpc::Client::new(node_url, "u", "p", None).unwrap();
     Server::new(settings, share_policy, KeyPairs::generate(), node, (ledger, records)).unwrap()
 }
 

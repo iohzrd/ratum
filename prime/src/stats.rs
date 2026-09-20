@@ -1,5 +1,7 @@
 //! The stats interface: one JSON snapshot of the pool, the window, the miners in it, the blocks
-//! found and what they owe.
+//! found and what they owe, and one block at a time read from the node (`block`).
+
+mod block;
 
 use crate::ledger::IdentityState;
 use crate::ledger::blocks::{ConfirmationReading, FoundBlock, OwedBlock};
@@ -22,24 +24,39 @@ const HASHRATE_SPAN_SECS: u64 = 10 * ratum::SECS_PER_MINUTE;
 /// full rate costs the pool one computation a second under the ledger lock, not one a request.
 const SNAPSHOT_LIFETIME: Duration = Duration::from_secs(1);
 
-/// The last snapshot serialized, and when it was taken.
-#[derive(Default)]
-struct SnapshotCache(Mutex<Option<(Instant, String)>>);
+/// The last value computed, and when it was taken.
+struct Cached<T>(Mutex<Option<(Instant, T)>>);
 
-impl SnapshotCache {
-    /// The text held if it is younger than `lifetime`, else `compute`'s, held from now. The
+impl<T> Default for Cached<T> {
+    fn default() -> Self {
+        Self(Mutex::new(None))
+    }
+}
+
+impl<T: Clone> Cached<T> {
+    /// The value held if it is younger than `lifetime`, else `compute`'s, held from now. The
     /// lock is held across `compute`, so requests arriving together wait for one computation
     /// rather than each making their own.
-    fn text(&self, lifetime: Duration, compute: impl FnOnce() -> String) -> String {
+    fn value(&self, lifetime: Duration, compute: impl FnOnce() -> T) -> T {
+        let Ok(value) = self.try_value(lifetime, || Ok::<_, std::convert::Infallible>(compute()));
+        value
+    }
+
+    /// As `value`, holding `compute`'s value only when it is `Ok`.
+    fn try_value<E>(
+        &self,
+        lifetime: Duration,
+        compute: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
         let mut held = lock(&self.0);
-        if let Some((taken_at, text)) = &*held
+        if let Some((taken_at, value)) = &*held
             && taken_at.elapsed() < lifetime
         {
-            return text.clone();
+            return Ok(value.clone());
         }
-        let text = compute();
-        *held = Some((Instant::now(), text.clone()));
-        text
+        let value = compute()?;
+        *held = Some((Instant::now(), value.clone()));
+        Ok(value)
     }
 }
 
@@ -85,6 +102,15 @@ fn luck(blocks: &[FoundBlock]) -> Luck {
     Luck { percent: Some(f64::from(counted) / expected * 100.0), blocks: counted }
 }
 
+/// What the handler shares across requests: the server, the hashrate history the sampler
+/// writes, and the caches.
+struct Stats {
+    server: Arc<Server>,
+    history: Arc<Mutex<HashrateHistory>>,
+    snapshot: Cached<String>,
+    blocks: block::Cache,
+}
+
 pub fn spawn(server: Arc<Server>, listen: &str) -> Result<SocketAddr, String> {
     let http = http::Server::http(listen).map_err(|e| e.to_string())?;
     let addr = http.local_addr().map_err(|e| e.to_string())?;
@@ -96,29 +122,37 @@ pub fn spawn(server: Arc<Server>, listen: &str) -> Result<SocketAddr, String> {
     hashrate::sample_every("stats-sampler", Arc::clone(&history), move || {
         pool_hashes_per_second(&sampled)
     });
-    let cache = Arc::new(SnapshotCache::default());
+    let stats = Stats::new(server, history);
     // The interface serves GET only, so a request carrying a body is refused.
-    http::serve("stats", http, 0, move |request| handle(&server, &history, &cache, &request));
+    http::serve("stats", http, 0, move |request| stats.handle(&request));
     Ok(addr)
 }
 
-fn handle(
-    server: &Server,
-    history: &Mutex<HashrateHistory>,
-    cache: &SnapshotCache,
-    request: &Request,
-) -> Reply {
-    if request.method != Method::Get {
-        return http::method_not_allowed();
+impl Stats {
+    fn new(server: Arc<Server>, history: Arc<Mutex<HashrateHistory>>) -> Self {
+        Self { server, history, snapshot: Cached::default(), blocks: block::Cache::default() }
     }
-    let (path, _) = http::path_and_query(request);
-    match path.as_str() {
-        "/stats.json" => http::noindex(http::body(
-            cache.text(SNAPSHOT_LIFETIME, || snapshot(server, history).to_string()),
-            "application/json",
-        )),
-        _ => http::not_found(),
+
+    fn handle(&self, request: &Request) -> Reply {
+        if request.method != Method::Get {
+            return error_reply(405, "method not allowed");
+        }
+        let (path, query) = http::path_and_query(request);
+        match path.as_str() {
+            "/stats.json" => http::noindex(http::body(
+                self.snapshot
+                    .value(SNAPSHOT_LIFETIME, || snapshot(&self.server, &self.history).to_string()),
+                "application/json",
+            )),
+            "/block.json" => block::reply(&self.server, &self.blocks, &query),
+            _ => error_reply(404, "not found"),
+        }
     }
+}
+
+/// `http::json_error` marked noindex, as every reply on this listener is.
+fn error_reply(status: u16, message: &str) -> Reply {
+    http::noindex(http::json_error(status, message))
 }
 
 fn network_json(
@@ -352,6 +386,20 @@ impl LedgerView {
     }
 }
 
+/// The pool's record of a block, as `/stats.json` lists it under `blocks.recent` (with
+/// `confirmations` added) and `/block.json` under `pool`.
+fn found_block_json(b: &FoundBlock) -> Value {
+    json!({
+        "height": b.height,
+        "block_hash": hex::encode(b.block_hash),
+        "found_at": b.found_at,
+        "paid_to_split": b.paid_to_split,
+        "paid_to_pool": b.paid_to_pool,
+        "finder": b.finder,
+        "tag": b.tag_secondary,
+    })
+}
+
 /// `blocks` newest first. The caller passes the newest `RECENT_BLOCKS` alone.
 fn recent_blocks_json(
     blocks: &[FoundBlock],
@@ -362,16 +410,10 @@ fn recent_blocks_json(
         .iter()
         .rev()
         .map(|b| {
-            json!({
-                "height": b.height,
-                "block_hash": hex::encode(b.block_hash),
-                "found_at": b.found_at,
-                "paid_to_split": b.paid_to_split,
-                "paid_to_pool": b.paid_to_pool,
-                "finder": b.finder,
-                "tag": b.tag_secondary,
-                "confirmations": confirmations_json(confirmations.get(&b.block_hash), b.height, tip_height),
-            })
+            let mut row = found_block_json(b);
+            row["confirmations"] =
+                confirmations_json(confirmations.get(&b.block_hash), b.height, tip_height);
+            row
         })
         .collect()
 }
@@ -482,10 +524,13 @@ mod tests {
 
     #[test]
     fn a_snapshot_answers_requests_for_its_lifetime_and_is_then_computed_again() {
-        let cache = SnapshotCache::default();
-        assert_eq!(cache.text(Duration::MAX, || "first".into()), "first");
-        assert_eq!(cache.text(Duration::MAX, || "second".into()), "first", "within the lifetime");
-        assert_eq!(cache.text(Duration::ZERO, || "second".into()), "second", "past it");
+        let cache = Cached::<String>::default();
+        assert_eq!(cache.value(Duration::MAX, || "first".into()), "first");
+        assert_eq!(cache.value(Duration::MAX, || "second".into()), "first", "within the lifetime");
+        assert_eq!(cache.value(Duration::ZERO, || "second".into()), "second", "past it");
+        assert_eq!(cache.try_value(Duration::MAX, || Err("failed")), Ok("second".into()));
+        assert_eq!(cache.try_value(Duration::ZERO, || Err("failed")), Err("failed"));
+        assert_eq!(cache.try_value(Duration::MAX, || Err("failed")), Ok("second".into()), "kept");
     }
 
     fn block(n: u8, cumulative_work: u128, network_difficulty: f64) -> FoundBlock {

@@ -71,7 +71,7 @@ fn job_json(j: &Job) -> Value {
         "slot": j.slot,
         "created_seconds_ago": j.created_at.elapsed().as_secs_f64(),
         "height": j.template.height,
-        "value_btc": j.template.coinbase_value as f64 / ratum::SATS_PER_BTC,
+        "value_btc": ratum::sats_to_btc(j.template.coinbase_value),
         "previous_block": ratum::bitcoin::hash_to_display_hex(&j.template.prev_hash),
         "target": hex::encode(j.block_target),
         "witness_commitment": hex::encode(&j.template.witness_commitment),
@@ -96,7 +96,7 @@ fn job_json(j: &Job) -> Value {
 fn coinbaser_json(j: &Job) -> Vec<Value> {
     let row = |value: u64, script: &[u8], remainder: bool| {
         json!({
-            "value_btc": value as f64 / ratum::SATS_PER_BTC,
+            "value_btc": ratum::sats_to_btc(value),
             "address": address::output_script_to_display(script),
             "remainder": remainder,
         })

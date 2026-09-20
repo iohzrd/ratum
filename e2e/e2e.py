@@ -33,6 +33,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -228,6 +230,7 @@ class Stack:
         self.miners: list[subprocess.Popen] = []
         self.rpc_port = free_port(18400, 150)
         self.pool_port = free_port(28900, 90)
+        self.stats_port = free_port(29000, 90)
         self.pool: subprocess.Popen | None = None
         self.pubkey = ""
         self.ledger_path = self.work / "pool" / "shares.txt"
@@ -363,6 +366,7 @@ class Stack:
             "--payout-address", POOL_ADDRESS,
             "--coinbase-tag", "RATUM",
             "--min-diff", "1", "--poll", "1",
+            "--stats-listen", f"127.0.0.1:{self.stats_port}",
             *extra_args,
         ]
         env = dict(os.environ, RUST_LOG=os.environ.get("RUST_LOG", "debug"))
@@ -470,6 +474,17 @@ class Stack:
         block_hash = self.cli("getblockhash", str(height))
         return block_hash, self.cli_json("getblock", block_hash, "2")
 
+    def block_json(self, query: str) -> tuple[int, dict]:
+        """The pool's /block.json for `query` (hash=... or height=...): status and JSON body."""
+        url = f"http://127.0.0.1:{self.stats_port}/block.json?{query}"
+        try:
+            with urllib.request.urlopen(url, timeout=30) as r:
+                return r.status, json.load(r)
+        except urllib.error.HTTPError as e:
+            return e.code, json.load(e)
+        except (urllib.error.URLError, OSError) as e:
+            fail(f"{url}: {e}")
+
     @staticmethod
     def coinbase_outputs(block: dict, addresses) -> dict[str, int]:
         """The coinbase outputs paying the given addresses, in sats by address."""
@@ -500,6 +515,52 @@ class Stack:
     def print_ledger(self, ledger: list[Share]) -> None:
         print("ledger:")
         print(self.ledger_path.read_text(), end="")
+
+
+def check_block_endpoint(stack: Stack, height: int) -> None:
+    """/block.json by hash and by height for the pooled block at `height`: 200, the same
+    block, the finder and amounts the pool logged, the coinbase the node holds."""
+    block_hash, block = stack.block(height)
+    recorded = stack.acceptance_of(block_hash)
+    by_hash = stack.block_json(f"hash={block_hash}")
+    by_height = stack.block_json(f"height={height}")
+    for label, (status, body) in (("hash", by_hash), ("height", by_height)):
+        if status != 200:
+            fail(f"/block.json by {label} for height {height}: {status} {body}")
+        if body["hash"] != block_hash or body["height"] != height:
+            fail(f"/block.json by {label} answered {body['hash']} at {body['height']}, not {block_hash} at {height}")
+        if body["pool"] is None or body["pool"]["finder"] != recorded.identity:
+            fail(f"/block.json by {label}: pool {body['pool']}, the finder the pool logged is {recorded.identity}")
+    if by_hash[1] != by_height[1]:
+        fail(f"/block.json by hash and by height differ for height {height}")
+    body = by_hash[1]
+    on_chain = [
+        (out["scriptPubKey"].get("address"), sats(out["value"])) for out in block["tx"][0]["vout"]
+    ]
+    reported = [(out["address"], out["value"]) for out in body["coinbase"]["outputs"]]
+    if reported != on_chain:
+        fail(f"/block.json coinbase outputs {reported} are not the node's {on_chain}")
+    if body["coinbase"]["value"] != stack.coinbase_value(block):
+        fail(f"/block.json coinbase value {body['coinbase']['value']} is not {stack.coinbase_value(block)}")
+    if body["pool"]["paid_to_split"] != recorded.split or body["pool"]["paid_to_pool"] != recorded.pool:
+        fail(f"/block.json pool amounts {body['pool']} are not the logged split={recorded.split} pool={recorded.pool}")
+    if body["coinbase"]["txid"] != block["tx"][0]["txid"]:
+        fail(f"/block.json coinbase txid {body['coinbase']['txid']} is not {block['tx'][0]['txid']}")
+
+
+def check_block_endpoint_for_pooled_blocks(stack: Stack, first_pooled: int) -> None:
+    """Every block from `first_pooled` up is the pool's; /block.json reports each."""
+    step("the block endpoint reports each pooled block by hash and by height")
+    tip = stack.height()
+    heights = range(first_pooled, tip + 1)
+    for height in heights:
+        check_block_endpoint(stack, height)
+    # Far above the tip: the miners may still be running, and a block arriving between the
+    # tip read and the request would put a block at tip + 1.
+    status, body = stack.block_json(f"height={tip + 1000}")
+    if status != 404:
+        fail(f"/block.json past the tip answered {status} {body}, not 404")
+    print(f"  {len(heights)} block(s) reported, each with its finder and coinbase; past the tip: 404")
 
 
 def cpu_spans(parts: int) -> list[str]:
@@ -595,6 +656,8 @@ def full_stack(stack: Stack, a: argparse.Namespace) -> None:
             fail("the pool never requested a job's transactions")
         print(f"transactions in the pooled blocks besides their coinbases: {carried}")
 
+    check_block_endpoint_for_pooled_blocks(stack, first_pooled)
+
     step(
         f"passed: height {target} is {block_hash}: a 164-byte header mined through the stack "
         f"({a.blocks} pooled block(s))"
@@ -659,6 +722,7 @@ def multi_miner(stack: Stack, a: argparse.Namespace) -> None:
     ):
         fail(f"fewer than {a.shares} shares from every miner in {a.timeout}s; see {stack.pool_log_path}")
 
+    check_block_endpoint_for_pooled_blocks(stack, ACTIVATION_HEIGHT + 1)
     ledger = stack.stop_and_dump_ledger()
 
     step("shares recorded per miner")
@@ -787,6 +851,7 @@ def public_gateway_fee(stack: Stack, a: argparse.Namespace) -> None:
     if not reached:
         fail(f"alice {counts['alice']} and bob {counts['bob']} shares in {a.timeout}s, wanted {a.alice_shares} and {a.bob_shares}")
 
+    check_block_endpoint_for_pooled_blocks(stack, ACTIVATION_HEIGHT + 1)
     ledger = stack.stop_and_dump_ledger()
 
     step("work credited per identity and tag")

@@ -121,7 +121,7 @@ impl Reply {
 
     /// The status line, headers and body as written to the socket; the body is left out of
     /// the reply to a HEAD request, whose Content-Length still gives its length.
-    fn encode(&self, head_request: bool) -> Vec<u8> {
+    pub(crate) fn encode(&self, head_request: bool) -> Vec<u8> {
         let mut out = format!("HTTP/1.1 {} {}\r\n", self.status, reason(self.status));
         for h in &self.headers {
             out.push_str(&format!("{}: {}\r\n", h.name, h.value));
@@ -192,6 +192,11 @@ pub fn not_found() -> Reply {
 
 pub fn method_not_allowed() -> Reply {
     text(405, "method not allowed")
+}
+
+/// `status` with the body `{"error": message}`, for a listener whose every reply is JSON.
+pub fn json_error(status: u16, message: &str) -> Reply {
+    json(serde_json::json!({ "error": message })).with_status_code(status)
 }
 
 pub fn header_value(req: &Request, name: &str) -> Option<String> {
@@ -450,7 +455,7 @@ fn serve_connection(
 /// Why no request was read: the connection closed or failed, which is answered with nothing,
 /// or the request broke a rule, which is answered with the status.
 #[derive(Debug, PartialEq, Eq)]
-enum Refusal {
+pub(crate) enum Refusal {
     Closed,
     Status(u16, &'static str),
 }
@@ -488,7 +493,7 @@ fn find(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     haystack.get(from..)?.windows(needle.len()).position(|w| w == needle).map(|at| from + at)
 }
 
-fn read_request(
+pub(crate) fn read_request(
     stream: &mut TcpStream,
     peer: SocketAddr,
     max_body: usize,

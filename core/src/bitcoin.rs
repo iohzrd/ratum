@@ -24,9 +24,14 @@ pub(crate) fn reversed(hash: &[u8; 32]) -> [u8; 32] {
     out
 }
 
+/// `s` as 32 bytes in display order, the order the node prints a hash in, if it is exactly
+/// 64 hex digits of either case. `hash_from_display_hex` reverses to internal order.
+pub fn display_hex_bytes(s: &str) -> Option<[u8; 32]> {
+    hex::decode(s).ok()?.try_into().ok()
+}
+
 pub fn hash_from_display_hex(s: &str) -> Option<[u8; 32]> {
-    let v: [u8; 32] = hex::decode(s).ok()?.try_into().ok()?;
-    Some(reversed(&v))
+    display_hex_bytes(s).map(|v| reversed(&v))
 }
 
 pub fn hash_to_display_hex(v: &[u8; 32]) -> String {

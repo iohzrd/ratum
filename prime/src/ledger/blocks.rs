@@ -122,7 +122,7 @@ impl BlockRecords {
     }
 
     pub fn record_block(&mut self, block: FoundBlock) -> io::Result<()> {
-        if self.blocks.iter().any(|b| b.block_hash == block.block_hash) {
+        if self.block(&block.block_hash).is_some() {
             return Ok(());
         }
         self.put(BLOCKS, &block.block_hash, &pack_block(&block))?;
@@ -146,6 +146,11 @@ impl BlockRecords {
 
     pub fn blocks(&self) -> &[FoundBlock] {
         &self.blocks
+    }
+
+    /// The pool's record of the block at `hash`, if it found it.
+    pub fn block(&self, hash: &[u8; HASH_SIZE]) -> Option<&FoundBlock> {
+        self.blocks.iter().find(|b| b.block_hash == *hash)
     }
 
     pub fn confirmations(&self, hash: &[u8; HASH_SIZE]) -> Option<ConfirmationReading> {

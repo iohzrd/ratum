@@ -265,7 +265,7 @@ pub fn run(gateway: &Arc<Gateway>) {
                     "Updating {} stratum job for block {}: {:.8} BTC, {} txns, {} bytes",
                     if new_block { "priority" } else { "standard" },
                     t.height,
-                    t.coinbase_value as f64 / ratum::SATS_PER_BTC,
+                    ratum::sats_to_btc(t.coinbase_value),
                     t.txns.len(),
                     t.totals.size
                 );

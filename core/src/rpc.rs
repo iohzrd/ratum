@@ -2,6 +2,10 @@
 //! and the cookie file re-read once when the node refuses the credential, which is what a node
 //! restart needs.
 
+mod block;
+
+pub use block::{Block, Coinbase, Output};
+
 use crate::bitcoin::address;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -35,6 +39,7 @@ pub enum Error {
 }
 
 const RPC_METHOD_NOT_FOUND: i64 = -32601;
+const RPC_INVALID_PARAMETER: i64 = -8;
 const RPC_INVALID_ADDRESS_OR_KEY: i64 = -5;
 
 impl Error {
@@ -46,8 +51,15 @@ impl Error {
         matches!(self, Self::Rpc { code: RPC_METHOD_NOT_FOUND, .. })
     }
 
+    /// Whether the node answered that it stores no block or transaction under the argument.
     pub(crate) fn is_not_found(&self) -> bool {
         matches!(self, Self::Rpc { code: RPC_INVALID_ADDRESS_OR_KEY, .. })
+    }
+
+    /// Whether the node refused a parameter's value, as `getblockhash` does a height above
+    /// its tip.
+    pub(crate) fn is_invalid_parameter(&self) -> bool {
+        matches!(self, Self::Rpc { code: RPC_INVALID_PARAMETER, .. })
     }
 
     fn from_rpc_object(error: &serde_json::Value) -> Self {
@@ -148,6 +160,20 @@ fn f64_field(v: &serde_json::Value, key: &str) -> Result<f64, Error> {
 
 fn str_field<'a>(v: &'a serde_json::Value, key: &str) -> Result<&'a str, Error> {
     v[key].as_str().ok_or_else(|| missing(key))
+}
+
+fn i64_field(v: &serde_json::Value, key: &str) -> Result<i64, Error> {
+    v[key].as_i64().ok_or_else(|| missing(key))
+}
+
+/// A field that must fit a u32, as a height does.
+fn u32_field(v: &serde_json::Value, key: &str) -> Result<u32, Error> {
+    u32::try_from(u64_field(v, key)?)
+        .map_err(|_| Error::BadResponse(format!("{key} {} above u32", v[key])))
+}
+
+fn string_field(v: &serde_json::Value, key: &str) -> Result<String, Error> {
+    str_field(v, key).map(str::to_string)
 }
 
 fn missing(key: &str) -> Error {
@@ -408,7 +434,7 @@ impl Client {
     pub fn tip(&self) -> Result<Tip, Error> {
         let info = self.call("getblockchaininfo", serde_json::json!([]))?;
         let display = str_field(&info, "bestblockhash")?;
-        let height = u64_field(&info, "blocks")? as u32;
+        let height = u32_field(&info, "blocks")?;
         let difficulty = f64_field(&info, "difficulty")?;
         let chain = Chain::parse(str_field(&info, "chain")?);
         let hash = crate::bitcoin::hash_from_display_hex(display)
@@ -440,8 +466,7 @@ impl Client {
         let prev_display = str_field(&result, "previousblockhash")?;
         let prev_hash = crate::bitcoin::hash_from_display_hex(prev_display)
             .ok_or_else(|| Error::BadResponse(format!("previousblockhash {prev_display:?}")))?;
-        let height = u32::try_from(u64_field(&result, "height")?)
-            .map_err(|_| Error::BadResponse("height out of range".into()))?;
+        let height = u32_field(&result, "height")?;
         let mintime = u64_field(&result, "mintime")?;
         Ok(TemplateSummary { prev_hash, height, coinbase_value, bits, mintime })
     }
@@ -567,6 +592,8 @@ mod tests {
     #[test]
     fn recognizes_a_hash_the_node_stores_no_block_under() {
         assert!(rpc_error(-5, "Block not found").is_not_found());
+        assert!(rpc_error(-8, "Block height out of range").is_invalid_parameter());
+        assert!(!rpc_error(-5, "Block not found").is_invalid_parameter());
         for other in [
             rpc_error(-8, "Block height out of range"),
             rpc_error(-32601, "Method not found"),
@@ -576,6 +603,23 @@ mod tests {
         ] {
             assert!(!other.is_not_found(), "{other} is not a missing block: the code decides");
         }
+    }
+
+    #[test]
+    fn a_call_decodes_the_result_or_the_error_object() {
+        let node = crate::fixtures::FakeNode::start(|method, _| match method {
+            "getblockcount" => Ok(serde_json::json!(7)),
+            "getblockhash" => Err((-8, "Block height out of range")),
+            _ => Err((-32601, "Method not found")),
+        });
+        let c = client(&node.url(), "u", "p").unwrap();
+        assert_eq!(c.call("getblockcount", serde_json::json!([])).unwrap(), 7);
+        let e = c.call("getblockhash", serde_json::json!([1])).unwrap_err();
+        assert!(
+            matches!(&e, Error::Rpc { code: -8, message } if message == "Block height out of range")
+        );
+        assert!(c.call("nothing", serde_json::json!([])).unwrap_err().is_method_not_found());
+        assert_eq!(node.calls(), ["getblockcount", "getblockhash", "nothing"]);
     }
 
     #[test]

@@ -287,7 +287,7 @@ min-diff = 16384                          # smallest share difficulty credited, 
 | `--data-dir <dir>` | none | holds `<chain>.redb`, `ratum-prime.key`, `hashrate.json` and `ratum.toml`; without it the window is in memory only |
 | `--config <file>` | `ratum.toml` in `--data-dir` | the settings file |
 | `--listen <address>` | `0.0.0.0:28915` | the DATUM listener |
-| `--stats-listen <address>` | none | the `/stats.json` listener (see "Stats interface") |
+| `--stats-listen <address>` | none | the `/stats.json` and `/block.json` listener (see "Stats interface") |
 | `--coinbase-tag <text>` | empty | pushed into every pooled coinbase ahead of the gateway's secondary tag |
 | `--motd <text>` | `RATUM Prime` | sent to every gateway at hello |
 | `--min-diff <n>` | 16384 | the smallest share difficulty credited, a power of two |
@@ -633,8 +633,9 @@ it, and its commands run on the file with the pool stopped, as before the socket
 
 ### Stats interface
 
-`--stats-listen <address>` serves one endpoint, the read-only snapshot at `/stats.json`;
-every other path is a 404. The snapshot is computed at most once a second (`generated_at` is
+`--stats-listen <address>` serves two read-only endpoints, the snapshot at `/stats.json` and
+one block at a time at `/block.json` (below); every other path is a 404 and every method but
+GET a 405, each with the JSON body `{"error": "<reason>"}`. The snapshot is computed at most once a second (`generated_at` is
 when), and requests within that second receive the same one, so a client polling at full
 rate costs the pool one computation a second. A request carrying a body is refused (413), and the interface
 serves at most 32 connections at once, 8 of them from one address (an IPv4 address, or an IPv6
@@ -679,6 +680,69 @@ history is in memory only.
 The response carries `X-Robots-Tag: noindex`, so the snapshot is not a search result of its
 own. Rendering it is the job of a separate frontend project, which serves the snapshot from
 its own origin so the browser makes no cross-origin request.
+
+#### `/block.json`
+
+`GET /block.json?hash=<64 hex digits>` or `GET /block.json?height=<decimal>` answers one
+block the node holds, its header fields and its coinbase decoded, with the pool's own record
+of it when the block is one the pool found. The node runs without `txindex`; the coinbase is
+read with its block hash, which needs none. The parameters are checked before the node is
+read: `hash` must be exactly 64 hex digits (either case; the reply prints it lowercase) and
+`height` a decimal integer below 2^32. The statuses, each with a JSON body:
+
+| Status | Condition | Body |
+| ------ | --------- | ---- |
+| 200 | the node holds the block | the object below |
+| 400 | neither or both parameters, or one that does not parse | `{"error": "<reason>"}` |
+| 404 | the node stores no block under the hash (`no block under the hash`), or the height is above its tip (`no block at the height`) | `{"error": "<reason>", "pool": <the pool's record of the hash, as in the object below, or null>}` |
+| 405 | a method other than GET | `{"error": "method not allowed"}` |
+| 502 | a node error other than those, or an answer missing a field | `{"error": "<the node error, or the field missing>"}` |
+
+The node's answer for a hash (the block and its coinbase) is held for 60 seconds per hash,
+and a height's hash for 60 seconds per height, each at most 128 entries (the least recently
+requested is dropped for a new one, so a run of 128 new hashes, held by the node or not,
+evicts every held answer; a run of height lookups evicts none), since `confirmations` and
+`next_hash` change as blocks arrive and a height's hash on a reorg; requests for one hash or
+one height arriving together wait for one node read. The `pool` object is read from the
+pool's records on every request, so it reflects a `--void-block` at once, and a 404 by hash
+carries it too: a block the pool found that the node does not hold is off the node's chain,
+which `/stats.json` reports as `confirmations` -1, and the record is what identifies it. A 404 is held for the same 60 seconds, so a height above the tip answers 404 for up to
+60 seconds after the block arrives, as `next_hash` on the block before it stays null for up
+to 60 seconds. A 400 costs no node read and a 502 is not held (its key's entry stays, empty,
+until evicted), so the node is read again on the next request. An uncached request makes two node calls, `getblock <hash> 1` and
+`getrawtransaction <coinbase txid> true <hash>`; an uncached `height` makes one more,
+`getblockhash`, before them. A key not held always costs a node read, and the connection
+limit above (32 at once, 8 per address) bounds the reads in progress. The interface is
+unauthenticated and read-only, and this endpoint lets a client make the pool read the node,
+so the same advice applies: bind it to `127.0.0.1` unless it is behind a reverse proxy.
+
+The fields, in order:
+
+- `hash`, `height`, `time`, `mediantime`: the node's.
+- `confirmations`: the node's count, negative when the block is off its best chain, as
+  `/stats.json` reports it.
+- `version` (the header's version integer), `bits` (hex, as the node prints it),
+  `difficulty`, `nonce`, `merkle_root`.
+- `previous_hash`: null on the genesis block. `next_hash`: null at the tip.
+- `size`, `weight`, `tx_count`.
+- `coinbase`: `txid`; `script_sig`, the coinbase input's script hex (the height push and the
+  tags are in it); `value`, the sum of the outputs in sats; `outputs`, each with `value` in
+  sats, `address` (the node's `scriptPubKey.address`, null for an OP_RETURN or a
+  non-standard script) and `script`, the scriptPubKey hex.
+- `pool`: null unless the block is in the pool's `blocks` table; else the row `/stats.json`
+  lists the block as under `blocks.recent`, without `confirmations`: `height`, `block_hash`,
+  `found_at`, `paid_to_split`, `paid_to_pool`, `finder` and `tag` (the secondary coinbase
+  tag, empty when the coinbase carried none).
+
+Nothing else the node answers is passed through: not `versionHex`, `target`, `chainwork`
+or `strippedsize`, and not the transactions past the coinbase (the node lists their txids
+at verbosity 1; verbosity 2, which decodes every transaction, is not used). The 164-byte
+version 2 header carries fields past the first nonce (`nonce2`, `nonce3`, the time offset
+and the merge-mining commitment) that the node's `getblock` does not print, so this endpoint
+cannot carry them; `nonce` is the first nonce field, `version` is the header's version
+integer without the version 2 flag, and `time` is the block time with the header's time
+offset applied, as the node reports it. Transactions, addresses and the mempool have no
+endpoint: the node keeps no index for them.
 
 ## References
 

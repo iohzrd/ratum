@@ -30,6 +30,15 @@ pub const SECS_PER_DAY: u64 = 24 * SECS_PER_HOUR;
 
 pub const SATS_PER_BTC: f64 = 100_000_000.0;
 
+/// An amount the node prints in BTC, in sats.
+pub fn btc_to_sats(btc: f64) -> u64 {
+    (btc * SATS_PER_BTC).round() as u64
+}
+
+pub fn sats_to_btc(sats: u64) -> f64 {
+    sats as f64 / SATS_PER_BTC
+}
+
 pub(crate) const HASHES_PER_DIFFICULTY: f64 = (1u64 << 32) as f64;
 pub const HASHES_PER_TERAHASH: f64 = 1e12;
 

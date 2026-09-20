@@ -32,6 +32,15 @@ impl<K: Clone + Eq + Hash, V> BoundedMap<K, V> {
         self.entries.get(key)
     }
 
+    /// `get`, with the entry moved to the newest position, so it is the last forgotten.
+    pub fn get_renewed(&mut self, key: &K) -> Option<&V> {
+        if self.entries.contains_key(key) {
+            self.forget_order(key);
+            self.order.push_back(key.clone());
+        }
+        self.entries.get(key)
+    }
+
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
         let replaced = self.entries.insert(key.clone(), value);
         if replaced.is_some() {
@@ -120,6 +129,19 @@ mod tests {
         assert!(s.remove(&1));
         assert!(!s.remove(&1), "removed once");
         assert_eq!(s.len(), 1);
+    }
+
+    #[test]
+    fn a_renewed_entry_is_the_last_forgotten() {
+        let mut m: BoundedMap<u8, &str> = BoundedMap::new(2);
+        m.insert(1, "one");
+        m.insert(2, "two");
+        assert_eq!(m.get_renewed(&1), Some(&"one"));
+        assert_eq!(m.get_renewed(&3), None, "a key not held is not inserted");
+        assert_eq!(m.order().iter().copied().collect::<Vec<_>>(), [2, 1]);
+        m.insert(3, "three");
+        assert_eq!(m.get(&2), None, "2 was the oldest once 1 was renewed");
+        assert_eq!(m.get(&1), Some(&"one"));
     }
 
     #[test]

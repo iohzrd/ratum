@@ -76,7 +76,7 @@ fn check_blocks<E: std::fmt::Display>(
         let state = ConfirmationReading { checked_at: now, confirmations };
         let mut r = lock(records);
         // Voided (--void-block through the control socket) while the node was read.
-        if !r.blocks().iter().any(|b| b.block_hash == hash) {
+        if r.block(&hash).is_none() {
             continue;
         }
         let previous = match r.record_confirmations(hash, state) {
