@@ -676,7 +676,12 @@ hardforked this is where a node that does not know the new rules says so, which 
 whether the blocks the pool relays are accepted.
 
 `hashrate.history` is the pool's hashrate over the last 24 hours as `[unix time, hashes per
-second]` pairs, oldest first, one taken every `hashrate.interval_seconds` (60). With
+second]` pairs, oldest first, one taken every `hashrate.interval_seconds` (60). A sample
+taken while the node has answered `getnetworkhashps` carries that estimate as a third
+element, `[unix time, pool hashes per second, network hashes per second]`, so the two can be
+charted over the same span; a sample taken before the node answered is a pair, as is every
+sample a gateway takes, and a reader that takes the first two elements reads either shape.
+With
 `--data-dir` the samples are written to `hashrate.json` in it whenever one is taken and read
 back at startup, so a restart keeps the history rather than starting from an empty chart; a
 sample more than 24 hours old is discarded as the file is read, and a file that cannot be

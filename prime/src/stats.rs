@@ -120,7 +120,7 @@ pub fn spawn(server: Arc<Server>, listen: &str) -> Result<SocketAddr, String> {
     }));
     let sampled = Arc::clone(&server);
     hashrate::sample_every("stats-sampler", Arc::clone(&history), move || {
-        pool_hashes_per_second(&sampled)
+        (pool_hashes_per_second(&sampled), sampled.node_state.mining.network_hashps())
     });
     let stats = Stats::new(server, history);
     // The interface serves GET only, so a request carrying a body is refused.

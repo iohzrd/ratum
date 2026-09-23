@@ -1,6 +1,10 @@
 //! Hashrate as a rate in hashes per second, and the one-day history the status pages chart,
 //! sampled once a minute on its own thread. A history given a file is read back from it at
 //! startup and rewritten at every sample, so a restart keeps the samples it already took.
+//!
+//! A sample carries the network's rate beside its own where the sampler knows it (the pool
+//! reads `getnetworkhashps` from its node; the gateway does not), so the chart can show both
+//! over the same span.
 
 use log::warn;
 use std::collections::VecDeque;
@@ -30,6 +34,15 @@ pub fn from_work(work: u128, span: std::time::Duration) -> f64 {
 pub struct HashrateSample {
     pub sampled_at: u64,
     pub hashes_per_second: f64,
+    /// The whole network's rate at that moment, where the sampler knows it.
+    pub network_hashes_per_second: Option<f64>,
+}
+
+impl HashrateSample {
+    /// A sample of this rate alone, taken now.
+    pub fn now(hashes_per_second: f64, network_hashes_per_second: Option<f64>) -> Self {
+        Self { sampled_at: crate::unix_now(), hashes_per_second, network_hashes_per_second }
+    }
 }
 
 /// The samples, newest last, and the file they are written to if there is one. The default is
@@ -81,13 +94,21 @@ impl HashrateHistory {
         }
     }
 
-    /// The samples as `[sampled_at, hashes_per_second]` pairs, oldest first, the rate
-    /// rounded to a whole number of hashes. This is both what the status interfaces serve and
-    /// what the file holds.
+    /// The samples as `[sampled_at, hashes_per_second]` oldest first, the rate rounded to a
+    /// whole number of hashes, with the network's rate as a third element on the samples that
+    /// carry one. This is both what the status interfaces serve and what the file holds, so a
+    /// reader that takes the first two elements reads either shape.
     pub fn json(&self) -> serde_json::Value {
         self.samples
             .iter()
-            .map(|s| serde_json::json!([s.sampled_at, s.hashes_per_second.round() as u64]))
+            .map(|s| {
+                let at = s.sampled_at;
+                let hs = s.hashes_per_second.round() as u64;
+                match s.network_hashes_per_second {
+                    Some(network) => serde_json::json!([at, hs, network.round() as u64]),
+                    None => serde_json::json!([at, hs]),
+                }
+            })
             .collect()
     }
 }
@@ -109,6 +130,7 @@ fn read(path: &Path) -> io::Result<VecDeque<HashrateSample>> {
             Some(HashrateSample {
                 sampled_at: pair.first()?.as_u64()?,
                 hashes_per_second: pair.get(1)?.as_f64()?,
+                network_hashes_per_second: pair.get(2).and_then(serde_json::Value::as_f64),
             })
         })
         .collect())
@@ -130,19 +152,16 @@ fn write_replacing(path: &Path, data: &[u8]) -> io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
-/// Pushes a sample of `hashes_per_second()` into `history` now and once per `INTERVAL`, on
-/// a thread named `name`.
+/// Pushes a sample of `rates()` into `history` now and once per `INTERVAL`, on a thread
+/// named `name`. `rates` returns this sampler's own rate and the network's where it knows it.
 pub fn sample_every(
     name: &str,
     history: Arc<Mutex<HashrateHistory>>,
-    hashes_per_second: impl Fn() -> f64 + Send + 'static,
+    rates: impl Fn() -> (f64, Option<f64>) + Send + 'static,
 ) {
     crate::thread::spawn_repeating(name, INTERVAL, move || {
-        let sample = HashrateSample {
-            sampled_at: crate::unix_now(),
-            hashes_per_second: hashes_per_second(),
-        };
-        crate::lock(&history).push(sample);
+        let (own, network) = rates();
+        crate::lock(&history).push(HashrateSample::now(own, network));
     });
 }
 
@@ -173,7 +192,15 @@ mod tests {
     }
 
     fn sample(sampled_at: u64, hashes_per_second: f64) -> HashrateSample {
-        HashrateSample { sampled_at, hashes_per_second }
+        HashrateSample { sampled_at, hashes_per_second, network_hashes_per_second: None }
+    }
+
+    fn with_network(sampled_at: u64, own: f64, network: f64) -> HashrateSample {
+        HashrateSample {
+            sampled_at,
+            hashes_per_second: own,
+            network_hashes_per_second: Some(network),
+        }
     }
 
     #[test]
@@ -242,6 +269,26 @@ mod tests {
         }
         let h = HashrateHistory::in_file(path);
         assert!(h.samples.is_empty(), "a history a day old does not come back");
+    }
+
+    #[test]
+    fn a_network_rate_is_a_third_element_and_a_sample_without_one_stays_a_pair() {
+        let scratch = Scratch::new("network-rate");
+        let path = scratch.join("hashrate.json");
+        let now = crate::unix_now();
+        let mut h = HashrateHistory::in_file(path.clone());
+        h.push(sample(now - 60, 4.0));
+        h.push(with_network(now, 5.0, 100.0));
+        assert_eq!(
+            h.json(),
+            serde_json::json!([[now - 60, 4], [now, 5, 100]]),
+            "the rate the sampler did not know is left out"
+        );
+        assert_eq!(
+            read(&path).unwrap().iter().copied().collect::<Vec<_>>(),
+            vec![sample(now - 60, 4.0), with_network(now, 5.0, 100.0)],
+            "both shapes read back"
+        );
     }
 
     #[test]

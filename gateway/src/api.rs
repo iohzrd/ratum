@@ -235,7 +235,8 @@ pub fn start(gateway: Arc<Gateway>, config_path: String) {
         ratum::hashrate::sample_every(
             "api-sampler",
             Arc::clone(&ctx.hashrate_history),
-            move || sampled.stratum.summary().hashrate_hs,
+            // The gateway reads no network estimate, so its samples carry its own rate alone.
+            move || (sampled.stratum.summary().hashrate_hs, None),
         );
         let admin = Arc::clone(&ctx);
         http::serve("api", server, MAX_BODY_LEN, move |req| serve_admin(&admin, &req));
