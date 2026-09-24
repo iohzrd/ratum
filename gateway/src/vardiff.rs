@@ -31,7 +31,6 @@ pub struct Vardiff {
     params: VardiffParams,
     current: u64,
     last_sent: u64,
-    forced_floor: u64,
     quickdiff_active: bool,
     quickdiff_value: u64,
     shares_since_snapshot: u64,
@@ -44,7 +43,6 @@ impl Vardiff {
             params,
             current: params.min,
             last_sent: 0,
-            forced_floor: 0,
             quickdiff_active: false,
             quickdiff_value: 0,
             shares_since_snapshot: 0,
@@ -59,11 +57,6 @@ impl Vardiff {
 
     pub fn last_sent(&self) -> u64 {
         self.last_sent
-    }
-
-    pub fn raise_floor(&mut self, floor: u64) {
-        self.forced_floor = self.forced_floor.max(floor);
-        self.current = self.current.max(floor);
     }
 
     /// The difficulty for a mining.notify: adjusts for the job sent (a quickdiff resend
@@ -107,10 +100,6 @@ impl Vardiff {
         self.current
     }
 
-    fn floor(&self) -> u64 {
-        self.forced_floor.max(self.params.min)
-    }
-
     /// The milliseconds a share should take at `vardiff_target_shares_min` shares a minute.
     fn target_ms(&self) -> u64 {
         MS_PER_MINUTE / self.params.target_shares_min.max(1)
@@ -138,7 +127,7 @@ impl Vardiff {
     }
 
     fn halve(&mut self, now: Instant) {
-        self.current = (self.current >> 1).max(self.floor());
+        self.current = (self.current >> 1).max(self.params.min);
         self.reset_snapshot(now);
     }
 
@@ -239,15 +228,6 @@ mod tests {
         assert_eq!(v.current, 16384);
         v.on_notify(0, false, now + Duration::from_secs(183));
         assert_eq!(v.current, 16384, "never under vardiff_min");
-    }
-
-    #[test]
-    fn a_forced_floor_holds_above_the_minimum() {
-        let (mut v, now) = started();
-        v.raise_floor(524_288);
-        v.mark_sent();
-        v.on_notify(0, false, now + Duration::from_secs(61));
-        assert_eq!(v.current, 524_288);
     }
 
     #[test]

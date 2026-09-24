@@ -209,22 +209,21 @@ block has room for. Under the version 2 header the mining machine never receives
 coinbase: the bytes it is sent (`CBlockHeader::GetHash`) are a fixed 35-byte `coinb1`
 (three zero bytes and H2, the commitment to the header's first stage, which carries the
 merkle root) and the 16-byte extranonce the header carries, so a coinbase of two
-outputs and one of two thousand give a miner the same job. The size classes the C gateway
-builds per miner (its Antminer-safe default holds about 17 outputs) exist because SHA256d
-miners reconstruct and hash the coinbase; this gateway builds one pooled coinbase and one
-subsidy-only coinbase per job, and serves the pooled one to every miner.
+outputs and one of two thousand give a miner the same job. The gateway therefore builds
+one pooled coinbase and one subsidy-only coinbase per job, and serves the pooled one to
+every miner.
 
 What bounds it is the block: the weight limit (4,000,000; 800,000 while RDTS is active,
 every block from the fork height until the parent's median-time-past reaches
 2027-09-01), the sigop limit (80,000; a legacy P2PKH output costs four, a segwit output
 none), and, while RDTS is active, output scripts of at most 34 bytes. The gateway sizes the
 coinbase to the template's `sizelimit`, `weightlimit` and `sigoplimit` less its
-transactions, and at 33,791 bytes in all, the largest coinbase section the pool accepts
-(sized to the 512-output, 32,767-byte split a coinbaser response carries). The room a template leaves is the node's
+transactions, and at 32,768 bytes in all, the largest coinbase section the pool accepts
+(it holds a 1024-output P2WPKH split; a coinbaser response carries up to 65,535 bytes). The room a template leaves is the node's
 `-blockreservedweight` (8,000 by default, about 40 taproot outputs or 55 P2WPKH) once transactions fill it, so a
 node serving a pool with many identities is run with more: about 172 weight units per
-output (a taproot output; 124 for P2WPKH) plus about 1,400 for the rest of the coinbase. The pool dictates at most 512
-outputs (the DATUM coinbaser cap), and records what a coinbase leaves out as owed (see
+output (a taproot output; 124 for P2WPKH) plus about 1,400 for the rest of the coinbase. The pool dictates at most 1024
+outputs (the coinbaser cap RATUM and the C gateway share), and records what a coinbase leaves out as owed (see
 "Owed blocks" under Prime).
 
 ## Prime
@@ -484,7 +483,7 @@ with `BadUsername`. The pool decodes the address itself, with the decoder `ratum
 for `stratum.require_address_username`, so a witness version above 1, the pay-to-anchor
 address and an address of another chain are refused. A pool that started without an answer
 from the node, which only a memory-only ledger does, accepts the prefixes of every chain, for
-identities and for `--payout-address`. An identity past the 512 outputs a gateway accepts, or
+identities and for `--payout-address`. An identity past the 1024 outputs a gateway accepts, or
 one whose amount would fall under 546 sats (the P2PKH dust threshold), is dropped before the split's denominator is
 summed, so the miners that remain divide the whole value between them. An identity in the
 window that is not such an address when the split is built (a share an earlier version of the
@@ -519,7 +518,7 @@ work. The rest stays in the coinbase value that reaches the pool's payout script
 remainder, so with no own-gateway work in the window the whole fee stays with the pool. The
 fee requires the tag, and the subsidy requires the fee. The fee is charged on the work the
 pool credits, so a share it rejects is not charged and a block share is charged like any
-other. The reassignment is applied before the 512-output limit and the 546 sat minimum, and the
+other. The reassignment is applied before the 1024-output limit and the 546 sat minimum, and the
 owed-block records and `/stats.json` payouts follow it, since all of them are one split. No
 sats are held or paid by hand: the fee and the subsidy are share work, settled in the
 coinbase of the next block found and ageing out of the window with the shares that produced

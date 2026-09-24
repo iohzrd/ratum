@@ -7,10 +7,17 @@ use crate::bitcoin::transaction::TxOut;
 use crate::reader::ByteReader;
 use bytes::BufMut as _;
 
-pub const MAX_COINBASER_BLOB_LEN: usize = 32767;
+/// The coinbaser blob's length field is a `u32`; this is one less than what the gateway
+/// buffers for it (`DATUM_PROTOCOL_COINBASER_BUFFER_SIZE`, 65536, against which it checks the
+/// length as `> SIZE - 1`), and it holds `MAX_COINBASER_OUTPUTS` outputs of any script an
+/// address decodes to.
+pub const MAX_COINBASER_BLOB_LEN: usize = 65535;
 pub(crate) const MIN_COINBASER_OUTPUT_SCRIPT_LEN: usize = 2;
 pub const MAX_COINBASER_OUTPUT_SCRIPT_LEN: usize = 64;
-pub const MAX_COINBASER_OUTPUTS: usize = 512;
+/// The outputs one split may dictate. A coinbase holds fewer than this when its scripts are
+/// long: `MAX_COINBASE_SECTION_LEN` fits about 1050 P2WPKH outputs but only about 750 taproot
+/// ones, and the block's remaining weight usually cuts it further.
+pub const MAX_COINBASER_OUTPUTS: usize = 1024;
 const COINBASER_OUTPUT_FIXED_LEN: usize = size_of::<u64>() + 1;
 const COINBASER_RESPONSE_HEADER_LEN: usize = 1 + size_of::<u64>() + size_of::<u32>();
 const COINBASER_REQUEST_LEN: usize = 1 + size_of::<u64>() + crate::bitcoin::HASH_SIZE + 1;

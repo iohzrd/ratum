@@ -39,7 +39,7 @@ const MAX_HELLO_FRAME_LEN: usize = 4 * 1024;
 /// The largest frame a gateway may send while the pool has asked it for no job's
 /// transactions: only a transaction list reply (0x50 0x92) reaches the protocol's 4 MiB, and
 /// the pool sends the request it answers. The largest other message is a share carrying a
-/// job section of 24 branches and a coinbase section at `MAX_COINBASE_SECTION_LEN`, about 35
+/// job section of 24 branches and a coinbase section at `MAX_COINBASE_SECTION_LEN`, about 34
 /// KiB with its pad and MAC; a bulk fragment is 16 KiB.
 const MAX_UNSOLICITED_FRAME_LEN: usize = 64 * 1024;
 /// How long a connection is kept without a frame from the gateway. A gateway sends a coinbaser

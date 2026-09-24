@@ -12,7 +12,9 @@ use crate::ledger::split::Payout;
 use crate::payout::DictatedOutput;
 use ratum::datum::messages;
 use ratum::datum::messages::config::ClientConfig;
-use ratum::datum::messages::share::{MAX_JOBS, MAX_USERNAME_LEN, PowSubmit};
+use ratum::datum::messages::share::{
+    MAX_COINBASE_SECTION_LEN, MAX_JOBS, MAX_USERNAME_LEN, PowSubmit,
+};
 use ratum::datum::messages::share_response::RejectReason;
 use ratum::header;
 use ratum::{rpc, target};
@@ -21,10 +23,13 @@ use std::sync::Arc;
 
 pub use jobs::{BlockCheck, JobTxns};
 
-/// The coinbase sections one connection's jobs may hold, about twice what a gateway serving
-/// every job slot with the widest split the coinbaser dictates (512 outputs) installs. It
-/// bounds one gateway, so the pool's total is this times `--max-connections`.
-const MAX_INSTALLED_COINBASE_BYTES: usize = 16 << 20;
+/// The coinbase sections one connection's jobs may hold: twice what a gateway installs when
+/// every job slot carries one coinbase at `MAX_COINBASE_SECTION_LEN`. A slot may hold more,
+/// since `check_coinbase_id` admits `MAX_COINBASE_TYPES` ids and the subsidy-only one, so this
+/// cap rather than that count is what bounds the bytes: past it a share carrying a further
+/// coinbase is rejected. It bounds one gateway, so the pool's total is this times
+/// `--max-connections`.
+const MAX_INSTALLED_COINBASE_BYTES: usize = 2 * MAX_JOBS * MAX_COINBASE_SECTION_LEN;
 
 pub const NTIME_WINDOW_SECS: u64 = 2 * ratum::SECS_PER_HOUR;
 
@@ -236,7 +241,7 @@ pub struct Verifier<'a> {
     installed_by: crate::bounded::BoundedSet<[u8; 32]>,
     installed_coinbase_bytes: usize,
     /// `MAX_INSTALLED_COINBASE_BYTES` for the life of every connection. It is a field rather
-    /// than the constant so a test can lower it and reach the cap without installing sixteen
+    /// than the constant so a test can lower it and reach the cap without installing tens of
     /// megabytes of sections; nothing in the pool varies it.
     installed_coinbase_bytes_cap: usize,
 }

@@ -24,7 +24,6 @@ const CLIENT_BUFFER: usize = 16384 * 3 + 1024;
 const MAX_REQUEST_ID_CHARS: usize = 64;
 const MAX_USER_AGENT_CHARS: usize = 127;
 const MAX_USERNAME_CHARS: usize = 191;
-const NICEHASH_MIN_DIFFICULTY: u64 = 524_288;
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_millis(11150);
 const FIRST_IDLE_CHECK_DELAY: Duration = Duration::from_secs(10);
 const READ_CHUNK: usize = 4096;
@@ -302,7 +301,6 @@ impl Connection {
             // The same subscription again: the ids and extranonce are the connection's.
             return self.reply_result(id, self.subscription());
         }
-        let s = &self.gateway.config.stratum;
         let user_agent: String =
             params.get(0).and_then(Value::as_str).map_or_else(String::new, |ua| {
                 ua.chars()
@@ -310,9 +308,6 @@ impl Connection {
                     .take(MAX_USER_AGENT_CHARS)
                     .collect()
             });
-        if s.fingerprint_miners && user_agent.starts_with("NiceHash/") {
-            self.vardiff.raise_floor(NICEHASH_MIN_DIFFICULTY);
-        }
         self.reply_result(id, self.subscription())?;
         let d = self.vardiff.mark_sent();
         self.send_difficulty(d)?;

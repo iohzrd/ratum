@@ -25,7 +25,11 @@ pub const HEADER_EXTRANONCE_PAD: usize = HEADER_EXTRANONCE_SIZE - EXTRANONCE_SIZ
 pub(crate) const RESERVED_SIZE: usize = 4;
 pub const COINBASE_ID_SUBSIDY_ONLY: u8 = 0xFF;
 pub const MAX_JOBS: usize = 256;
-pub const MAX_COINBASE_SECTION_LEN: usize = super::coinbaser::MAX_COINBASER_BLOB_LEN + 1024;
+/// The largest coinbase transaction a share carries, coinb1 and coinb2 together. The section
+/// writes each part as a `u16` length, which would allow 65535; this limit holds
+/// `MAX_COINBASER_OUTPUTS` P2WPKH outputs and the C gateway's `MAX_DICTATED_COINBASE_SIZE`
+/// (32000), and at four weight units a byte costs a sixth of an RDTS block.
+pub const MAX_COINBASE_SECTION_LEN: usize = 32768;
 pub const MAX_MERKLE_BRANCHES: usize = 24;
 pub const MAX_USERNAME_LEN: usize = 384;
 
@@ -228,6 +232,12 @@ fn decode_coinbase_section(r: &mut ByteReader<'_>) -> Result<CoinbaseSection, Er
 }
 
 fn encode_coinbase_section(out: &mut Vec<u8>, c: &CoinbaseSection) {
+    // What the pool enforces before installing a section, and stronger than each part
+    // fitting its own u16 length: a longer part is written as a truncated length.
+    debug_assert!(
+        c.coinb1.len() + c.coinb2.len() <= MAX_COINBASE_SECTION_LEN,
+        "coinbase over MAX_COINBASE_SECTION_LEN"
+    );
     out.put_u8(SECTION_COINBASE);
     out.put_u8(c.coinbase_id);
     out.put_u16_le(c.coinb1.len() as u16);

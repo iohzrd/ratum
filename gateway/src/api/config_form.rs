@@ -73,7 +73,6 @@ const FIELDS: &[Field] = &[
         "Network hashrate limit",
         int(&MAX_NETWORK_SHARE_BPS_RANGE)
     ),
-    field!(stratum.fingerprint_miners, "Fingerprint miners", FieldKind::Bool),
     field!(stratum.require_address_username, "Require an address as the username", FieldKind::Bool),
     field!(bitcoind.work_update_seconds, "Job update interval", int(&WORK_UPDATE_SECONDS_RANGE)),
     // Shown and compared in its redacted form, so the page never carries the password a
@@ -557,7 +556,6 @@ mod tests {
             ("bitcoind_rpcpassword", ""),
             ("reward_sharing", "never"),
             ("username_behaviour", "full_users"),
-            ("stratum_fingerprint_miners", "1"),
         ]);
         assert_eq!(apply(&c, FILE, &f).unwrap(), None);
     }

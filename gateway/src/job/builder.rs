@@ -267,6 +267,7 @@ mod tests {
 
     #[test]
     fn the_pooled_coinbase_stays_under_the_pools_section_limit() {
+        use ratum::datum::messages::coinbaser::MAX_COINBASER_OUTPUTS;
         use ratum::datum::messages::share::MAX_COINBASE_SECTION_LEN;
         let pool = ClientConfig {
             payout_script: p2wpkh(0xee),
@@ -300,7 +301,8 @@ mod tests {
             job.pooled_coinbase.section.coinb1.len() + job.pooled_coinbase.section.coinb2.len()
         };
 
-        let widest: Vec<TxOut> = (0..512u16)
+        // 64-byte scripts: the section limit stops the split before its output count does.
+        let widest: Vec<TxOut> = (0..MAX_COINBASER_OUTPUTS as u16)
             .map(|i| {
                 let mut s = vec![0x6a, 0x3e];
                 s.extend_from_slice(&i.to_le_bytes());
@@ -309,12 +311,13 @@ mod tests {
             })
             .collect();
         let job = build(widest);
-        assert!(job.coinbaser_outputs.len() < 512, "{} outputs", job.coinbaser_outputs.len());
-        assert!(job.coinbaser_outputs.len() > 400, "{} outputs", job.coinbaser_outputs.len());
+        let included = job.coinbaser_outputs.len();
+        assert!(included < MAX_COINBASER_OUTPUTS && included > 400, "{included} outputs");
         assert!(section(&job) <= MAX_COINBASE_SECTION_LEN, "{} bytes", section(&job));
         assert!(section(&job) > MAX_COINBASE_SECTION_LEN - 128, "{} bytes", section(&job));
 
-        let taproot: Vec<TxOut> = (0..512u16)
+        // Taproot outputs are 43 bytes each, so about 750 of them reach the same limit.
+        let taproot: Vec<TxOut> = (0..MAX_COINBASER_OUTPUTS as u16)
             .map(|i| {
                 let mut s = vec![0x51, 0x20];
                 s.extend_from_slice(&i.to_le_bytes());
@@ -323,7 +326,16 @@ mod tests {
             })
             .collect();
         let job = build(taproot);
-        assert_eq!(job.coinbaser_outputs.len(), 512);
+        let included = job.coinbaser_outputs.len();
+        assert!(included < MAX_COINBASER_OUTPUTS && included > 700, "{included} outputs");
+        assert!(section(&job) <= MAX_COINBASE_SECTION_LEN, "{} bytes", section(&job));
+
+        // P2WPKH outputs are 31 bytes each, so the whole split fits with room to spare.
+        let p2wpkh_split: Vec<TxOut> = (0..MAX_COINBASER_OUTPUTS)
+            .map(|i| TxOut { value: 1_000, script_pubkey: p2wpkh(i as u8) })
+            .collect();
+        let job = build(p2wpkh_split);
+        assert_eq!(job.coinbaser_outputs.len(), MAX_COINBASER_OUTPUTS);
         assert!(section(&job) <= MAX_COINBASE_SECTION_LEN, "{} bytes", section(&job));
     }
 
