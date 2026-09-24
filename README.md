@@ -148,7 +148,13 @@ ignored. `RUST_LOG` overrides `logger.log_level_console`.
   says whether it is still on the best chain and at what depth, or that another block won the
   height. `submitblock` answering null means the node accepted the block, not that it stayed
   in the chain. The C gateway does not check.
-- Log level 5 keeps errors; higher silences the sink. Timestamps are UTC.
+- Log level 5 keeps errors; higher silences the sink. Timestamps are UTC, and
+  `logger.log_rotate_daily` rotates at UTC midnight where the C gateway rotates at local
+  midnight: the first record of a new UTC day renames `logger.log_file` to
+  `<log_file>.YYYY-MM-DD` of the day it holds and opens the path again. SIGHUP opens the path
+  again before the next record, for a rotation performed outside the process (logrotate's
+  rename, then `kill -HUP`). Neither a rename nor an open that fails ends the process: the
+  failure goes to stderr and the records keep reaching the open file.
 - Every message to the pool is padded, the block-transactions response included.
 - After the handshake a frame from the pool that is neither channel-encrypted nor sealed ends
   the session, which then reconnects; the C gateway processes it, which lets anyone able to
@@ -189,11 +195,9 @@ ignored. `RUST_LOG` overrides `logger.log_level_console`.
 - A username (`mining.authorize` and `mining.submit`) is cut at its first NUL character, as the
   C gateway's copy of it stops there.
 
-Not served: the PROXY protocol (`stratum.trust_proxy`), daily rotation
-and SIGHUP (`logger.log_rotate_daily`; the file is held open, so rotate it with logrotate's
-`copytruncate`), `datum.always_pay_self`, the per-client pacing of job updates, the
-testnet fast-forward, hasher time rolling (`mining.allow_hasher_time_rolling`), the
-retention and audit of anti-block-withholding proofs
+Not served: the PROXY protocol (`stratum.trust_proxy`), `datum.always_pay_self`, the
+per-client pacing of job updates, the testnet fast-forward, hasher time rolling
+(`mining.allow_hasher_time_rolling`), the retention and audit of anti-block-withholding proofs
 (`mining.abw_verify_all_shares_on_disclosure`), migration (`datum.migration_max_seconds`),
 `--example-conf`, `--test` and `/assets` (`--help` lists this gateway's own options). Set
 values among these are reported at startup.

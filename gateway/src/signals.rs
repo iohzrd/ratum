@@ -1,6 +1,7 @@
-//! SIGUSR1 as a block notification, as the C gateway takes it (`blocknotify=kill -USR1 <pid>`). The
-//! handler writes one byte to a pipe and a thread reading that pipe raises the template waker, so
-//! the handler itself only writes.
+//! SIGUSR1 as a block notification, as the C gateway takes it (`blocknotify=kill -USR1 <pid>`), and
+//! SIGHUP as a request to open the log file again. The SIGUSR1 handler writes one byte to a pipe and
+//! a thread reading that pipe raises the template waker; the SIGHUP handler stores to an atomic the
+//! logger reads. Neither handler does more than that write.
 
 use crate::gateway::Gateway;
 use log::{info, warn};
@@ -16,7 +17,33 @@ extern "C" fn on_usr1(_: libc::c_int) {
     }
 }
 
+extern "C" fn on_hup(_: libc::c_int) {
+    crate::logger::request_reopen();
+}
+
+fn handler(signum: libc::c_int, handler: extern "C" fn(libc::c_int)) -> bool {
+    let installed = unsafe {
+        libc::signal(signum, handler as extern "C" fn(libc::c_int) as libc::sighandler_t)
+    };
+    installed != libc::SIG_ERR
+}
+
 pub fn install(gateway: Arc<Gateway>) {
+    install_hup();
+    install_usr1(gateway);
+}
+
+/// SIGHUP reopens the log file, for a rotation performed outside the process. Installing the
+/// handler also keeps the default action, which ends the process, from running.
+fn install_hup() {
+    if handler(libc::SIGHUP, on_hup) {
+        info!("SIGHUP reopens the log file");
+    } else {
+        warn!("could not install the SIGHUP handler; SIGHUP is not handled");
+    }
+}
+
+fn install_usr1(gateway: Arc<Gateway>) {
     let mut fds = [0i32; 2];
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
         warn!("could not create the SIGUSR1 pipe; SIGUSR1 is not handled");
@@ -29,10 +56,7 @@ pub fn install(gateway: Arc<Gateway>) {
         unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
     }
     PIPE_WRITE.store(write_fd, Ordering::Relaxed);
-    let installed = unsafe {
-        libc::signal(libc::SIGUSR1, on_usr1 as extern "C" fn(libc::c_int) as libc::sighandler_t)
-    };
-    if installed == libc::SIG_ERR {
+    if !handler(libc::SIGUSR1, on_usr1) {
         warn!("could not install the SIGUSR1 handler; SIGUSR1 is not handled");
         return;
     }

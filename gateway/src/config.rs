@@ -229,7 +229,7 @@ pub struct LoggerConfig {
     pub log_to_stderr: bool,
     pub log_to_file: bool,
     pub log_file: String,
-    pub log_rotate_daily: Option<bool>,
+    pub log_rotate_daily: bool,
     pub log_calling_function: bool,
     pub log_level_console: u8,
     pub log_level_file: u8,
@@ -242,7 +242,7 @@ impl Default for LoggerConfig {
             log_to_stderr: false,
             log_to_file: false,
             log_file: String::new(),
-            log_rotate_daily: None,
+            log_rotate_daily: true,
             log_calling_function: true,
             log_level_console: 2,
             log_level_file: 1,
@@ -349,7 +349,6 @@ impl Config {
         self.validate_stratum()?;
         self.validate_mining()?;
         self.validate_api();
-        self.validate_logger();
         self.validate_datum()?;
         self.validate_username_modifiers()
     }
@@ -484,12 +483,6 @@ impl Config {
         }
         if self.api.modify_conf && self.api.admin_password.is_empty() {
             self.note_warning("api.modify_conf is set but api.admin_password is empty, so the settings page cannot save");
-        }
-    }
-
-    fn validate_logger(&mut self) {
-        if self.logger.log_rotate_daily.is_some() {
-            self.note_warning("logger.log_rotate_daily has no effect: the file is held open, so rotate it with logrotate's copytruncate");
         }
     }
 
