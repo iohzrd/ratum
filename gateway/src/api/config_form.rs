@@ -3,8 +3,8 @@
 //! and the result is validated as at startup before it is written.
 
 use crate::config::{
-    COINBASE_UNIQUE_ID_RANGE, Config, DatumConfig, GLOBAL_TIMEOUT_MARGIN_SECS,
-    MAX_CONFIGURED_TAG_LEN, MAX_CONFIGURED_TAGS_TOTAL_LEN, MAX_NETWORK_SHARE_BPS_RANGE, PORT_RANGE,
+    COINBASE_UNIQUE_ID_RANGE, Config, GLOBAL_TIMEOUT_MARGIN_SECS, MAX_CONFIGURED_TAG_LEN,
+    MAX_CONFIGURED_TAGS_TOTAL_LEN, MAX_NETWORK_SHARE_BPS_RANGE, PORT_RANGE, Pool,
     VARDIFF_MIN_RANGE, WORK_UPDATE_SECONDS_RANGE,
 };
 use serde_json::{Value, json};
@@ -44,16 +44,23 @@ const fn int(range: &RangeInclusive<u64>) -> FieldKind {
 }
 
 /// A field named `<section>_<key>` for the key `section.key` of the file, whose current
-/// value is read from the same field of `Config`.
+/// value is read from the same field of `Config`, or from the struct `inner` flattened into
+/// the section.
 macro_rules! field {
     ($section:ident . $key:ident, $label:literal, $kind:expr) => {
+        field!(@ $section, $key, $label, $kind, |c| json!(c.$section.$key))
+    };
+    ($section:ident . $inner:ident . $key:ident, $label:literal, $kind:expr) => {
+        field!(@ $section, $key, $label, $kind, |c| json!(c.$section.$inner.$key))
+    };
+    (@ $section:ident, $key:ident, $label:literal, $kind:expr, $current:expr) => {
         Field {
             name: concat!(stringify!($section), "_", stringify!($key)),
             label: $label,
             section: stringify!($section),
             key: stringify!($key),
             kind: $kind,
-            current: |c| json!(c.$section.$key),
+            current: $current,
         }
     };
 }
@@ -62,9 +69,9 @@ const FIELDS: &[Field] = &[
     field!(mining.pool_address, "Bitcoin address", FieldKind::Text),
     field!(mining.coinbase_tag_secondary, "Coinbase tag", FieldKind::Text),
     field!(mining.coinbase_unique_id, "Unique gateway ID", int(&COINBASE_UNIQUE_ID_RANGE)),
-    field!(datum.pool_port, "Pool port", int(&PORT_RANGE)),
-    field!(datum.pool_pubkey, "Pool public key", FieldKind::Text),
-    field!(datum.pool_url, "Pool web page", FieldKind::Text),
+    field!(datum.pool.pool_port, "Pool port", int(&PORT_RANGE)),
+    field!(datum.pool.pool_pubkey, "Pool public key", FieldKind::Text),
+    field!(datum.pool.pool_url, "Pool web page", FieldKind::Text),
     field!(datum.protocol_v3, "Version 3 protocol", FieldKind::Bool),
     field!(stratum.listen_port, "Stratum port", int(&PORT_RANGE)),
     field!(stratum.vardiff_min, "Minimum difficulty", int(&VARDIFF_MIN_RANGE)),
@@ -93,14 +100,82 @@ const FIELDS: &[Field] = &[
 const OLD_POOL_HOST: &str = "pool_host(old)";
 
 fn shown_pool_host(cfg: &Config, doc: &Value) -> String {
-    if !cfg.datum.pool_host.is_empty() {
-        return cfg.datum.pool_host.clone();
+    if !cfg.datum.pool.pool_host.is_empty() {
+        return cfg.datum.pool.pool_host.clone();
     }
-    old_pool_host(doc).unwrap_or_else(|| DatumConfig::default().pool_host)
+    old_pool_host(doc).unwrap_or_else(|| Pool::default().pool_host)
 }
 
 fn old_pool_host(doc: &Value) -> Option<String> {
     doc.get("datum")?.get(OLD_POOL_HOST)?.as_str().map(str::to_string)
+}
+
+/// `datum.fallback_pools` as the page's text area shows it: one pool per line,
+/// `host:port pubkey`, then the web page when one is set.
+fn fallback_pools_text(pools: &[Pool]) -> String {
+    pools
+        .iter()
+        .map(|p| {
+            let mut line = format!("{}:{} {}", p.pool_host, p.pool_port, p.pool_pubkey);
+            if !p.pool_url.is_empty() {
+                line.push(' ');
+                line.push_str(&p.pool_url);
+            }
+            line
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn fallback_pool_json(p: &Pool) -> Value {
+    let mut o = json!({
+        "pool_host": p.pool_host,
+        "pool_port": p.pool_port,
+        "pool_pubkey": p.pool_pubkey,
+    });
+    if !p.pool_url.is_empty() {
+        o["pool_url"] = json!(p.pool_url);
+    }
+    o
+}
+
+/// The text area's lines as `datum.fallback_pools` entries; a blank line is skipped. The
+/// key, port range and web page scheme are checked by `Config::parse` of the edited file.
+fn parse_fallback_pools(text: &str) -> Result<Vec<Pool>, String> {
+    let mut pools = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        let mut words = line.split_whitespace();
+        let Some(address) = words.next() else { continue };
+        let bad = |what: &str| format!("Fallback pool line {}: {what}", n + 1);
+        let (host, port) =
+            address.rsplit_once(':').ok_or_else(|| bad("the first word must be host:port"))?;
+        let port = port.parse::<u16>().map_err(|_| bad("the port is not a number"))?;
+        let pubkey = words.next().ok_or_else(|| bad("the public key is missing"))?;
+        let url = words.next().unwrap_or_default();
+        if words.next().is_some() {
+            return Err(bad("more than host:port, the public key and the web page"));
+        }
+        pools.push(Pool {
+            pool_host: host.to_string(),
+            pool_port: port,
+            pool_pubkey: pubkey.to_string(),
+            pool_url: url.to_string(),
+        });
+    }
+    Ok(pools)
+}
+
+fn apply_fallback_pools(edit: &mut Edit<'_>, cfg: &Config, form: &[(String, String)]) {
+    let Some(text) = submitted(form, "datum_fallback_pools") else { return };
+    match parse_fallback_pools(text) {
+        Ok(pools) => {
+            let current: Vec<Value> =
+                cfg.datum.fallback_pools.iter().map(fallback_pool_json).collect();
+            let new: Vec<Value> = pools.iter().map(fallback_pool_json).collect();
+            edit.set_if_changed("datum", "fallback_pools", json!(new), json!(current));
+        }
+        Err(e) => edit.errors.push(e),
+    }
 }
 
 fn secondary_tag_max(cfg: &Config) -> usize {
@@ -120,7 +195,7 @@ fn username_behaviour(cfg: &Config) -> &'static str {
 }
 
 fn reward_sharing(cfg: &Config) -> &'static str {
-    if cfg.datum.pool_host.is_empty() {
+    if cfg.datum.pool.pool_host.is_empty() {
         "never"
     } else if cfg.datum.pooled_mining_only {
         "require"
@@ -139,6 +214,7 @@ pub fn form_values(cfg: &Config, doc: &Value) -> Value {
     v.insert("username_behaviour".into(), json!(username_behaviour(cfg)));
     v.insert("reward_sharing".into(), json!(reward_sharing(cfg)));
     v.insert("datum_pool_host".into(), json!(shown_pool_host(cfg, doc)));
+    v.insert("datum_fallback_pools".into(), json!(fallback_pools_text(&cfg.datum.fallback_pools)));
     v.insert("mining_coinbase_tag_secondary_max".into(), json!(secondary_tag_max(cfg)));
     Value::Object(v)
 }
@@ -214,8 +290,8 @@ fn submitted<'a>(form: &'a [(String, String)], name: &str) -> Option<&'a str> {
 }
 
 fn apply_reward_sharing(edit: &mut Edit<'_>, cfg: &Config, form: &[(String, String)]) {
-    let mut pool_host = cfg.datum.pool_host.clone();
-    let default_host = DatumConfig::default().pool_host;
+    let mut pool_host = cfg.datum.pool.pool_host.clone();
+    let default_host = Pool::default().pool_host;
     match submitted(form, "reward_sharing") {
         None => {}
         Some(choice @ ("require" | "prefer")) => {
@@ -312,6 +388,7 @@ pub fn apply(
 
     apply_reward_sharing(&mut edit, cfg, form);
     apply_username_behaviour(&mut edit, cfg, form);
+    apply_fallback_pools(&mut edit, cfg, form);
 
     for f in FIELDS {
         let Some(text) = submitted(form, f.name) else { continue };
@@ -471,7 +548,7 @@ mod tests {
             let Some(end) = rest.find('>') else { break };
             let (tag, after) = rest.split_at(end);
             rest = after;
-            if !tag.starts_with("input ") && !tag.starts_with("select ") {
+            if !["input ", "select ", "textarea "].iter().any(|t| tag.starts_with(t)) {
                 continue;
             }
             if let Some(name) = value(tag, "name") {
@@ -487,10 +564,10 @@ mod tests {
     /// entry with no element of that name, so the field renders as editable and never saves.
     #[test]
     fn every_control_on_the_settings_page_is_a_field_of_the_matching_type() {
-        /// The controls the page handles on its own, outside `FIELDS`: the two selects, and
-        /// the pool host that `apply_reward_sharing` parks and restores.
-        const HANDLED_ON_THE_PAGE: [&str; 3] =
-            ["datum_pool_host", "reward_sharing", "username_behaviour"];
+        /// The controls the page handles on its own, outside `FIELDS`: the two selects, the
+        /// pool host that `apply_reward_sharing` parks and restores, and the fallback pools.
+        const HANDLED_ON_THE_PAGE: [&str; 4] =
+            ["datum_pool_host", "reward_sharing", "username_behaviour", "datum_fallback_pools"];
 
         let controls = form_controls(include_str!("config.html"), "type");
         for f in FIELDS {
@@ -594,14 +671,13 @@ mod tests {
         assert_eq!(doc["datum"]["pool_host"], "");
         assert_eq!(doc["datum"]["pool_host(old)"], "pool.example");
         assert_eq!(form_values(&c, &doc)["datum_pool_host"], "pool.example");
-        let default = DatumConfig::default().pool_host;
+        let default = Pool::default().pool_host;
         assert_eq!(apply(&c, FILE, &form(&[("datum_pool_host", default.as_str())])).unwrap(), None);
 
-        let key = "f21f2f0ef0aa1970468f22bad9bb7f4535146f8e4a8f646bebc93da3d89b1406f40d032f09a417d94dc068055df654937922d2c89522e3e8f6f0e649de473003";
         let f = form(&[
             ("reward_sharing", "require"),
             ("datum_pool_host", "pool.example"),
-            ("datum_pool_pubkey", key),
+            ("datum_pool_pubkey", KEY),
         ]);
         let text = apply(&c, &text, &f).unwrap().unwrap();
         let doc: Value = serde_json::from_str(&text).unwrap();
@@ -615,6 +691,57 @@ mod tests {
         assert_eq!(doc["datum"]["pool_host"], "");
         assert_eq!(doc["datum"]["pool_host(old)"], "pool.example");
         assert_eq!(doc["datum"]["pooled_mining_only"], false);
+    }
+
+    const KEY: &str = "f21f2f0ef0aa1970468f22bad9bb7f4535146f8e4a8f646bebc93da3d89b1406f40d032f09a417d94dc068055df654937922d2c89522e3e8f6f0e649de473003";
+
+    #[test]
+    fn fallback_pools_round_trip_through_the_text_area() {
+        let c = cfg();
+        assert_eq!(form_values(&c, &Value::Null)["datum_fallback_pools"], "");
+        let lines =
+            format!("pool-b.example:28915 {KEY} https://pool-b.example\n\n[::1]:28916 {KEY}");
+        let text = apply(&c, FILE, &form(&[("datum_fallback_pools", &lines)])).unwrap().unwrap();
+        let doc: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            doc["datum"]["fallback_pools"],
+            json!([
+                {"pool_host": "pool-b.example", "pool_port": 28915, "pool_pubkey": KEY,
+                 "pool_url": "https://pool-b.example"},
+                {"pool_host": "[::1]", "pool_port": 28916, "pool_pubkey": KEY},
+            ])
+        );
+        let saved = Config::parse(&text).unwrap();
+        assert_eq!(
+            form_values(&saved, &doc)["datum_fallback_pools"],
+            format!("pool-b.example:28915 {KEY} https://pool-b.example\n[::1]:28916 {KEY}")
+        );
+        let same = form(&[("datum_fallback_pools", &lines)]);
+        assert_eq!(apply(&saved, &text, &same).unwrap(), None, "unchanged lines write nothing");
+        let cleared = apply(&saved, &text, &form(&[("datum_fallback_pools", "")])).unwrap();
+        let doc: Value = serde_json::from_str(&cleared.unwrap()).unwrap();
+        assert_eq!(doc["datum"]["fallback_pools"], json!([]));
+
+        for (bad, must) in [
+            ("pool-b.example", "host:port"),
+            ("pool-b.example:x k", "port is not a number"),
+            ("pool-b.example:28915", "public key is missing"),
+            (&format!("pool-b.example:28915 {KEY} https://x y"), "more than"),
+        ] {
+            let e = apply(&c, FILE, &form(&[("datum_fallback_pools", bad)])).unwrap_err();
+            assert!(e[0].contains(must), "{bad}: {e:?}");
+        }
+        // The key and the web page are checked by the startup validation, which reads the
+        // fallbacks only when a pool is configured.
+        let pooled = FILE.replace(r#""pool_host": """#, r#""pool_host": "pool.example""#);
+        let c = Config::parse(&pooled).unwrap();
+        for (bad, must) in [
+            ("pool-b.example:28915 abc", "datum.fallback_pools[0].pool_pubkey"),
+            (&format!("pool-b.example:28915 {KEY} ftp://x"), "datum.fallback_pools[0].pool_url"),
+        ] {
+            let e = apply(&c, &pooled, &form(&[("datum_fallback_pools", bad)])).unwrap_err();
+            assert!(e[0].contains(must), "{bad}: {e:?}");
+        }
     }
 
     #[test]

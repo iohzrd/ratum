@@ -2,7 +2,8 @@
 //! per request.
 
 use super::Context;
-use crate::config::Config;
+use crate::config::{Config, Pool};
+use crate::gateway::Gateway;
 use crate::job::Job;
 use crate::stratum::ClientStats;
 use crate::tally::ShareTallies;
@@ -25,12 +26,22 @@ fn or_null(text: &str) -> Value {
     if text.is_empty() { Value::Null } else { json!(text) }
 }
 
-fn pool_host_json(cfg: &Config) -> Value {
-    if cfg.datum.pool_host.is_empty() {
-        Value::Null
-    } else {
-        json!(format!("{}:{}", cfg.datum.pool_host, cfg.datum.pool_port))
-    }
+/// The pool the DATUM thread is on: the configured pool, or the fallback it moved to.
+fn current_pool(gateway: &Gateway) -> Option<&Pool> {
+    gateway.config.pools.get(gateway.pool.current_pool())
+}
+
+fn pool_host_json(gateway: &Gateway) -> Value {
+    current_pool(gateway).map_or(Value::Null, |p| json!(p.address()))
+}
+
+fn pool_url_json(gateway: &Gateway) -> Value {
+    current_pool(gateway).map_or(Value::Null, |p| or_null(&p.pool_url))
+}
+
+/// Every configured pool's address, the configured pool first.
+fn pools_json(cfg: &Config) -> Vec<String> {
+    cfg.pools.iter().map(Pool::address).collect()
 }
 
 fn client_json(c: &ClientStats) -> Value {
@@ -121,7 +132,7 @@ pub(super) fn status_json(ctx: &Context, with_clients: bool) -> Value {
     // so rewording the sentence does not change the page's colour or its banner.
     let (state, status) = if let Some(e) = &work_error {
         ("error", format!("ERROR: {e}"))
-    } else if cfg.datum.pool_host.is_empty() {
+    } else if cfg.pools.is_empty() {
         ("non_pooled", "Non-Pooled Mode".to_string())
     } else if current.is_none() {
         ("initialising", "Initialising...".to_string())
@@ -156,9 +167,10 @@ pub(super) fn status_json(ctx: &Context, with_clients: bool) -> Value {
         },
         "shares_accepted": pool_tallies.accepted.json(),
         "shares_rejected": pool_tallies.rejected.json(),
-        "pool_host": pool_host_json(cfg),
-        "pool_url": or_null(&cfg.datum.pool_url),
-        "pool_pubkey": cfg.datum.pool_pubkey,
+        "pool_host": pool_host_json(gateway),
+        "pool_url": pool_url_json(gateway),
+        "pool_pubkey": current_pool(gateway).map(|p| p.pool_pubkey.clone()),
+        "pools": pools_json(cfg),
         "pool_tag": pool.as_ref().map_or_else(|| cfg.mining.coinbase_tag_primary.clone(), |p| p.coinbase_tag.clone()),
         "secondary_tag": cfg.mining.coinbase_tag_secondary,
         "pool_min_diff": pool.as_ref().map(|p| p.min_difficulty),
@@ -224,7 +236,7 @@ pub(super) fn miner_lookup_json(ctx: &Context, addr: Option<&str>) -> Value {
         "require_address_username": cfg.stratum.require_address_username,
         "max_network_share_bps": cfg.stratum.max_network_share_bps,
         "network_share": ctx.gateway.network_share(),
-        "pool_host": pool_host_json(cfg),
-        "pool_url": or_null(&cfg.datum.pool_url),
+        "pool_host": pool_host_json(&ctx.gateway),
+        "pool_url": pool_url_json(&ctx.gateway),
     })
 }

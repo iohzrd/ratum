@@ -1,5 +1,6 @@
-//! The gateway's end of the DATUM protocol: what it holds about the pool across connections, and
-//! the loop that opens a connection again after every disconnect.
+//! The gateway's end of the DATUM protocol: what it holds about the pool across connections, the
+//! loop that opens a connection again after every disconnect, and the order the configured pools
+//! are tried in.
 
 pub mod abw;
 mod session;
@@ -12,16 +13,16 @@ use crate::tally::ShareTallies;
 use crate::template::Template;
 use log::{debug, error, info, warn};
 use mio::Waker;
-use ratum::datum::keys::{KeyPairs, PublicKeys};
+use ratum::datum::keys::KeyPairs;
 use ratum::datum::messages::config::ClientConfig;
 use ratum::header::BlockHeaderV2;
 use ratum::{lock, target};
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 const MIN_QUEUE_CAPACITY: usize = 64;
-const FAILURES_BEFORE_SHUTDOWN: u32 = 2;
 
 /// The least time between two log lines `RepeatedEvent` lets through for one event.
 const REPEATED_EVENT_LOG_INTERVAL: Duration = Duration::from_secs(10);
@@ -128,6 +129,8 @@ pub struct PoolState {
     queue_capacity: usize,
     /// Shares not queued because the queue was full.
     queue_full: Mutex<RepeatedEvent>,
+    /// The index in `Config::pools` of the pool the DATUM thread is connected to or connecting to.
+    current: AtomicUsize,
 }
 
 impl PoolState {
@@ -138,7 +141,12 @@ impl PoolState {
             queue: Mutex::new(VecDeque::new()),
             queue_capacity: queue_capacity.max(MIN_QUEUE_CAPACITY),
             queue_full: Mutex::new(RepeatedEvent::default()),
+            current: AtomicUsize::new(0),
         }
+    }
+
+    pub fn current_pool(&self) -> usize {
+        self.current.load(Ordering::Relaxed)
     }
 
     fn session(&self) -> MutexGuard<'_, SessionView> {
@@ -253,40 +261,150 @@ pub fn user_agent() -> String {
 
 const RECONNECT_DELAY_MIN: Duration = Duration::from_secs(5);
 const RECONNECT_DELAY_SPREAD: Duration = Duration::from_secs(15);
+/// How often, while a session is on a fallback pool, each pool before it is probed.
+const RETURN_PROBE_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Connects to the pool again after every disconnect. With `datum.pooled_mining_only` set,
-/// new stratum connections are refused from startup and from each disconnect until a
-/// session receives the pool's configuration, and every stratum client is disconnected on
-/// the second failed attempt in a row (a session that received a configuration counts as
-/// the first).
-pub fn run_forever(gateway: &Gateway, pool_pubkey: PublicKeys, identity: KeyPairs) {
-    let pool = &gateway.pool;
-    let d = &gateway.config.datum;
-    let mut failures = 0u32;
-    let mut resume_token = None;
-    loop {
-        info!("connecting to DATUM pool {}:{}", d.pool_host, d.pool_port);
-        let outcome = session::run(gateway, pool_pubkey, &identity, &mut resume_token);
-        let was_active = pool.clear_after_disconnect();
-        if let Err(e) = outcome {
-            error!("DATUM connection ended: {e}");
+/// What the probe thread reports to a session on a fallback pool: the index of the pool before
+/// it that answered a handshake. `stop` ends the thread once the session is over.
+#[derive(Default)]
+pub(crate) struct ReturnProbe {
+    found: Mutex<Option<usize>>,
+    stop: AtomicBool,
+}
+
+impl ReturnProbe {
+    pub(crate) fn found(&self) -> Option<usize> {
+        *lock(&self.found)
+    }
+
+    fn stopped(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
+    }
+}
+
+/// Which pool the next session opens on. A session that received a pool configuration is
+/// opened again on the same pool; one that did not moves to the next, and a probe that
+/// reached an earlier pool moves back to it. `failures` counts the sessions since the last
+/// active one, that one included, and `shutdown` is set once on the failure after every pool
+/// has been tried once (with one pool: the second failed attempt in a row).
+struct PoolRotation {
+    count: usize,
+    index: usize,
+    failures: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Next {
+    index: usize,
+    /// Whether the reconnect delay applies: the same pool again, or a new round from the first.
+    delay: bool,
+    shutdown: bool,
+}
+
+impl PoolRotation {
+    fn new(count: usize) -> Self {
+        Self { count, index: 0, failures: 0 }
+    }
+
+    fn next(&mut self, was_active: bool, return_to: Option<usize>) -> Next {
+        self.failures = if was_active { 1 } else { self.failures.saturating_add(1) };
+        let index = match return_to {
+            Some(i) => i,
+            None if was_active => self.index,
+            None => (self.index + 1) % self.count,
+        };
+        let next = Next {
+            index,
+            delay: return_to.is_none() && index <= self.index,
+            shutdown: self.failures == self.count + 1,
+        };
+        self.index = index;
+        next
+    }
+}
+
+/// Probes the pools before `index`, in order, every `RETURN_PROBE_INTERVAL`, until one answers
+/// a handshake or the session ends.
+fn spawn_return_probe(gateway: Arc<Gateway>, index: usize, probe: Arc<ReturnProbe>) {
+    ratum::thread::spawn_or_warn("datum-probe", move || {
+        let protocol_v3 = gateway.config.datum.protocol_v3;
+        loop {
+            std::thread::sleep(RETURN_PROBE_INTERVAL);
+            for (i, p) in gateway.config.pools[..index].iter().enumerate() {
+                if probe.stopped() {
+                    return;
+                }
+                match session::probe(p, protocol_v3) {
+                    Ok(()) => {
+                        *lock(&probe.found) = Some(i);
+                        gateway.pool.wake();
+                        return;
+                    }
+                    Err(e) => debug!("pool {} not reachable: {e}", p.address()),
+                }
+            }
         }
-        failures = if was_active { 1 } else { failures.saturating_add(1) };
-        if d.pooled_mining_only && failures == FAILURES_BEFORE_SHUTDOWN {
+    });
+}
+
+/// Connects to a pool again after every disconnect, in the order of `Config::pools`
+/// (`PoolRotation`). With `datum.pooled_mining_only` set, new stratum connections are refused
+/// from startup and from each disconnect until a session receives the pool's configuration,
+/// and every stratum client is disconnected on the failure after every pool was tried.
+pub fn run_forever(gateway: Arc<Gateway>, identity: KeyPairs) {
+    let pools = &gateway.config.pools;
+    let d = &gateway.config.datum;
+    let mut rotation = PoolRotation::new(pools.len());
+    let mut resume_tokens = vec![None; pools.len()];
+    let mut index = 0;
+    loop {
+        let p = &pools[index];
+        gateway.pool.current.store(index, Ordering::Relaxed);
+        if index == 0 {
+            info!("connecting to DATUM pool {}", p.address());
+        } else {
+            info!(
+                "connecting to DATUM pool {} (fallback {index} of {})",
+                p.address(),
+                pools.len() - 1
+            );
+        }
+        let probe = Arc::new(ReturnProbe::default());
+        if index > 0 {
+            spawn_return_probe(Arc::clone(&gateway), index, Arc::clone(&probe));
+        }
+        let outcome = session::run(&gateway, p, &identity, &mut resume_tokens[index], &probe);
+        probe.stop.store(true, Ordering::Relaxed);
+        let was_active = gateway.pool.clear_after_disconnect();
+        let return_to = match outcome {
+            Ok(i) => {
+                info!("DATUM pool {} answers again; leaving {}", pools[i].address(), p.address());
+                Some(i)
+            }
+            Err(e) => {
+                error!("DATUM connection ended: {e}");
+                None
+            }
+        };
+        let next = rotation.next(was_active, return_to);
+        if d.pooled_mining_only && next.shutdown {
             warn!(
-                "The DATUM pool is unreachable and datum.pooled_mining_only is set: disconnecting stratum clients until it is reached again"
+                "No DATUM pool is reachable and datum.pooled_mining_only is set: disconnecting stratum clients until one is reached again"
             );
             gateway.stratum.shutdown_all();
         }
         if was_active {
             gateway.template_waker.rebuild();
         }
-        let delay = RECONNECT_DELAY_MIN
-            + Duration::from_millis(u64::from(
-                ratum::rand::u32() % (RECONNECT_DELAY_SPREAD.as_millis() as u32 + 1),
-            ));
-        info!("reconnecting to the pool in {:.1}s", delay.as_secs_f64());
-        std::thread::sleep(delay);
+        if next.delay {
+            let delay = RECONNECT_DELAY_MIN
+                + Duration::from_millis(u64::from(
+                    ratum::rand::u32() % (RECONNECT_DELAY_SPREAD.as_millis() as u32 + 1),
+                ));
+            info!("reconnecting to the pool in {:.1}s", delay.as_secs_f64());
+            std::thread::sleep(delay);
+        }
+        index = next.index;
     }
 }
 
@@ -308,5 +426,44 @@ mod tests {
         let quiet = due + 3 * REPEATED_EVENT_LOG_INTERVAL;
         assert_eq!(e.occurred(quiet), Some(2), "the one held back is carried to the next line");
         assert_eq!(e.occurred(quiet + 2 * REPEATED_EVENT_LOG_INTERVAL), Some(1));
+    }
+
+    fn next(index: usize, delay: bool, shutdown: bool) -> Next {
+        Next { index, delay, shutdown }
+    }
+
+    #[test]
+    fn one_pool_is_retried_with_a_delay_and_shuts_down_on_the_second_failure_in_a_row() {
+        let mut r = PoolRotation::new(1);
+        assert_eq!(r.next(false, None), next(0, true, false));
+        assert_eq!(r.next(false, None), next(0, true, true));
+        assert_eq!(r.next(false, None), next(0, true, false), "reported once");
+        assert_eq!(r.next(true, None), next(0, true, false));
+        assert_eq!(r.next(false, None), next(0, true, true));
+    }
+
+    #[test]
+    fn a_failed_pool_is_followed_by_the_next_without_delay_and_a_round_of_failures_shuts_down() {
+        let mut r = PoolRotation::new(3);
+        assert_eq!(r.next(false, None), next(1, false, false));
+        assert_eq!(r.next(false, None), next(2, false, false));
+        assert_eq!(r.next(false, None), next(0, true, false), "a new round is delayed");
+        assert_eq!(r.next(false, None), next(1, false, true), "every pool tried once");
+        assert_eq!(r.next(true, None), next(1, true, false), "an active pool is retried");
+        assert_eq!(r.next(false, None), next(2, false, false));
+        assert_eq!(r.next(false, None), next(0, true, false));
+        assert_eq!(r.next(false, None), next(1, false, true));
+    }
+
+    #[test]
+    fn a_probe_that_reached_an_earlier_pool_returns_to_it_at_once() {
+        let mut r = PoolRotation::new(3);
+        r.next(false, None);
+        r.next(false, None);
+        assert_eq!(r.next(true, Some(0)), next(0, false, false));
+        assert_eq!(r.next(false, None), next(1, false, false), "the return failed: onward");
+        assert_eq!(r.next(true, Some(0)), next(0, false, false));
+        assert_eq!(r.next(false, None), next(1, false, false));
+        assert_eq!(r.next(true, None), next(1, true, false), "no shutdown across the returns");
     }
 }

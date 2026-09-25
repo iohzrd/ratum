@@ -51,6 +51,23 @@ ignored. `RUST_LOG` overrides `logger.log_level_console`.
 - `datum.pool_url` (not a C key; empty by default) names the pool's web page, and the status
   page links the pool host to it when it is set. It must begin with http:// or https://; any
   other scheme is refused at startup.
+- `datum.fallback_pools` (not a C key; empty by default) is an array of pools tried in order
+  while the one before them is unreachable, each an object of `pool_host`, `pool_port`,
+  `pool_pubkey` and `pool_url` with the `datum` section's defaults for the keys it leaves
+  out, checked at startup as the `datum` keys are, and refused when it names a pool already
+  listed. A session that received a pool configuration is opened again on the same
+  pool when it ends; one that did not moves on to the next pool without the 5 to 20 second
+  reconnect delay, which applies before a pool is retried and before a new round from the
+  first. On a fallback pool the pools before it are probed once a minute (a handshake under a
+  key pair of its own, then the connection is closed), and the session is ended and opened on
+  the first that answers. Each pool keeps its own version 3 resume token; a switch discards
+  the queued shares as any disconnect does and rebuilds the work. With
+  `datum.pooled_mining_only`, the stratum clients are disconnected once every pool has failed
+  in a row (with one pool: on the second failed attempt, as in C). `/stats.json` reports the
+  pool the gateway is on as `pool_host`, `pool_url` and `pool_pubkey`, and every configured
+  pool as `pools`; the status page notes a fallback in use. The settings page edits the
+  fallbacks as one line per pool, `host:port publickey [web page]`. The C gateway has one
+  pool.
 - `/clients` and `/coinbaser` are not served: the status page renders both tables from
   `/stats.json`, which carries the coinbaser outputs to anyone (the C gateway serves
   `/coinbaser` without authentication too) and the clients table only after `/login` has

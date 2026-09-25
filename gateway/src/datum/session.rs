@@ -5,10 +5,10 @@ mod assignments;
 mod shares;
 
 use super::{
-    COINBASER_WAIT, PendingCoinbaser, abw_disabled, user_agent, validation_replies,
+    COINBASER_WAIT, PendingCoinbaser, ReturnProbe, abw_disabled, user_agent, validation_replies,
     with_rounded_min_difficulty,
 };
-use crate::config::DatumConfig;
+use crate::config::Pool;
 use crate::gateway::Gateway;
 use crate::publish;
 use log::{debug, error, info, warn};
@@ -31,17 +31,55 @@ use std::time::{Duration, Instant};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const SHARE_ACK_TIMEOUT: Duration = Duration::from_secs(30);
+const PROBE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Runs one DATUM connection to its end. `resume_token` is the token the last version 3
-/// configuration carried, sent in the hello and replaced by the one this connection receives.
+/// Runs one DATUM connection to `pool` to its end. `resume_token` is the token the last
+/// version 3 configuration of that pool carried, sent in the hello and replaced by the one
+/// this connection receives. Ok carries the index of the earlier pool `probe` reached, on
+/// which the connection was ended.
 pub(super) fn run(
     gateway: &Gateway,
-    pool_pubkey: PublicKeys,
+    pool: &Pool,
     identity: &KeyPairs,
     resume_token: &mut Option<ResumeToken>,
+    probe: &ReturnProbe,
+) -> Result<usize, SessionError> {
+    Session::open(gateway, pool, identity, resume_token).and_then(|mut session| session.run(probe))
+}
+
+/// Opens a connection to `pool` under a key pair of its own, completes the handshake and
+/// closes it: whether the pool answers, without a session the pool would keep.
+pub(super) fn probe(pool: &Pool, protocol_v3: bool) -> Result<(), SessionError> {
+    let pubkey = pool.pubkey().map_err(SessionError::Key)?;
+    let mut socket = PolledSocket::new(connect(pool)?)?;
+    let mut channel = ClientChannel::with_key_pairs(
+        KeyPairs::generate(),
+        KeyPairs::generate(),
+        ratum::rand::u32(),
+    );
+    let protocol_version =
+        if protocol_v3 { ProtocolVersion::V3 { resume: None } } else { ProtocolVersion::V1 };
+    handshake(&mut socket, &mut channel, &pubkey, protocol_version, PROBE_HANDSHAKE_TIMEOUT)
+}
+
+/// Sends the hello and reads the pool's response, which must arrive within `timeout`.
+fn handshake(
+    socket: &mut PolledSocket,
+    channel: &mut ClientChannel,
+    pool_pubkey: &PublicKeys,
+    protocol_version: ProtocolVersion,
+    timeout: Duration,
 ) -> Result<(), SessionError> {
-    Session::open(gateway, pool_pubkey, identity, resume_token)
-        .and_then(|mut session| session.run())
+    let hello = channel.hello(&pool_pubkey.box_pk, &user_agent(), protocol_version);
+    socket.write_all(&hello, WRITE_TIMEOUT)?;
+    let (header, body) = framing::read_frame(
+        socket,
+        |bytes| channel.unmask_header(bytes),
+        framing::MAX_CMD_LEN,
+        Instant::now() + timeout,
+    )?;
+    channel.read_handshake_response(header, &body, &pool_pubkey.sign_pk)?;
+    Ok(())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -58,6 +96,8 @@ pub(super) enum SessionError {
     Resolve(String),
     #[error("malformed pool configuration: {0}")]
     BadConfig(String),
+    #[error("pool key {0}")]
+    Key(String),
 }
 
 struct Session<'a> {
@@ -78,8 +118,8 @@ struct Session<'a> {
     awaiting_coinbaser: Option<PendingCoinbaser>,
 }
 
-fn connect(d: &DatumConfig) -> Result<TcpStream, SessionError> {
-    let target = format!("{}:{}", d.pool_host, d.pool_port);
+fn connect(pool: &Pool) -> Result<TcpStream, SessionError> {
+    let target = pool.address();
     let addrs =
         target.to_socket_addrs().map_err(|e| SessionError::Resolve(format!("{target}: {e}")))?;
     let mut last = None;
@@ -101,14 +141,15 @@ fn connect(d: &DatumConfig) -> Result<TcpStream, SessionError> {
 impl<'a> Session<'a> {
     fn open(
         gateway: &'a Gateway,
-        pool_pubkey: PublicKeys,
+        endpoint: &Pool,
         identity: &'a KeyPairs,
         resume_token: &'a mut Option<ResumeToken>,
     ) -> Result<Self, SessionError> {
         let pool = &gateway.pool;
         let config = &gateway.config;
         let global_timeout = config.protocol_global_timeout();
-        let mut socket = PolledSocket::new(connect(&config.datum)?)?;
+        let pubkey = endpoint.pubkey().map_err(SessionError::Key)?;
+        let mut socket = PolledSocket::new(connect(endpoint)?)?;
         let mut channel = ClientChannel::with_key_pairs(
             identity.clone(),
             KeyPairs::generate(),
@@ -119,16 +160,7 @@ impl<'a> Session<'a> {
         } else {
             ProtocolVersion::V1
         };
-        let hello = channel.hello(&pool_pubkey.box_pk, &user_agent(), protocol_version);
-        socket.write_all(&hello, WRITE_TIMEOUT)?;
-
-        let (header, body) = framing::read_frame(
-            &mut socket,
-            |bytes| channel.unmask_header(bytes),
-            framing::MAX_CMD_LEN,
-            Instant::now() + global_timeout,
-        )?;
-        channel.read_handshake_response(header, &body, &pool_pubkey.sign_pk)?;
+        handshake(&mut socket, &mut channel, &pubkey, protocol_version, global_timeout)?;
         info!("DATUM Server MOTD: {}", channel.motd());
 
         pool.session().waker = Some(socket.waker()?);
@@ -138,7 +170,7 @@ impl<'a> Session<'a> {
             gateway,
             identity,
             resume_token,
-            pool_sign_pk: pool_pubkey.sign_pk,
+            pool_sign_pk: pubkey.sign_pk,
             global_timeout,
             socket,
             channel,
@@ -168,8 +200,11 @@ impl<'a> Session<'a> {
         Ok(())
     }
 
-    fn run(&mut self) -> Result<(), SessionError> {
+    fn run(&mut self, probe: &ReturnProbe) -> Result<usize, SessionError> {
         loop {
+            if let Some(preferred) = probe.found() {
+                return Ok(preferred);
+            }
             if self.last_server_message_at.elapsed() >= self.global_timeout {
                 return Err(SessionError::GlobalTimeout(self.global_timeout));
             }

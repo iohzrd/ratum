@@ -248,13 +248,67 @@ impl Default for LoggerConfig {
     }
 }
 
+/// A DATUM pool: the `datum` section's own `pool_*` keys, and each entry of
+/// `datum.fallback_pools`. The defaults are the Ocean pool.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct Pool {
+    pub pool_host: String,
+    pub pool_port: u16,
+    pub pool_pubkey: String,
+    pub pool_url: String,
+}
+
+impl Default for Pool {
+    fn default() -> Self {
+        Self {
+            pool_host: "datum-beta1.mine.ocean.xyz".into(),
+            pool_port: 28915,
+            pool_pubkey: "f21f2f0ef0aa1970468f22bad9bb7f4535146f8e4a8f646bebc93da3d89b1406f40d032f09a417d94dc068055df654937922d2c89522e3e8f6f0e649de473003".into(),
+            pool_url: String::new(),
+        }
+    }
+}
+
+impl Pool {
+    pub fn address(&self) -> String {
+        format!("{}:{}", self.pool_host, self.pool_port)
+    }
+
+    /// `pool_pubkey` parsed; the error reads as the predicate of a sentence naming the key.
+    pub fn pubkey(&self) -> Result<ratum::datum::keys::PublicKeys, String> {
+        ratum::datum::keys::PublicKeys::from_hex(&self.pool_pubkey)
+    }
+
+    /// The checks a pool the gateway connects to must pass, each error naming the key under
+    /// `name` (`datum`, or `datum.fallback_pools[i]`).
+    fn check(&self, name: &str) -> Result<(), String> {
+        if self.pool_host.is_empty() {
+            return Err(format!("{name}.pool_host is empty"));
+        }
+        in_range(&format!("{name}.pool_port"), u64::from(self.pool_port), &PORT_RANGE)?;
+        self.pubkey().map_err(|e| format!("{name}.pool_pubkey {e}"))?;
+        self.check_url(name)
+    }
+
+    /// The status page links the pool's name to `pool_url`, so a scheme a browser runs
+    /// (javascript:, data:) is refused.
+    fn check_url(&self, name: &str) -> Result<(), String> {
+        if !self.pool_url.is_empty() && !is_web_url(&self.pool_url) {
+            return Err(format!("{name}.pool_url must begin with http:// or https://"));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct DatumConfig {
-    pub pool_host: String,
-    pub pool_port: u16,
-    pub pool_url: String,
-    pub pool_pubkey: String,
+    /// `pool_host`, `pool_port`, `pool_pubkey` and `pool_url`, the keys of this section.
+    #[serde(flatten)]
+    pub pool: Pool,
+    /// Pools tried in order when the one before them is unreachable; not a C key.
+    pub fallback_pools: Vec<Pool>,
     pub pool_pass_workers: bool,
     pub protocol_job_slots: usize,
     pub pool_pass_full_users: bool,
@@ -269,10 +323,8 @@ pub struct DatumConfig {
 impl Default for DatumConfig {
     fn default() -> Self {
         Self {
-            pool_host: "datum-beta1.mine.ocean.xyz".into(),
-            pool_port: 28915,
-            pool_url: String::new(),
-            pool_pubkey: "f21f2f0ef0aa1970468f22bad9bb7f4535146f8e4a8f646bebc93da3d89b1406f40d032f09a417d94dc068055df654937922d2c89522e3e8f6f0e649de473003".into(),
+            pool: Pool::default(),
+            fallback_pools: Vec::new(),
             pool_pass_workers: true,
             protocol_job_slots: 256,
             pool_pass_full_users: true,
@@ -299,9 +351,10 @@ pub struct Config {
     pub startup_notes: Vec<StartupNote>,
     #[serde(skip)]
     pub pool_output_script: Vec<u8>,
-    /// `datum.pool_pubkey` parsed; none while `datum.pool_host` is empty (non-pooled mining).
+    /// The `datum` section's pool first, then `datum.fallback_pools`, each checked; empty
+    /// while `datum.pool_host` is empty (non-pooled mining).
     #[serde(skip)]
-    pub pool_pubkey: Option<ratum::datum::keys::PublicKeys>,
+    pub pools: Vec<Pool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -486,9 +539,6 @@ impl Config {
 
     fn validate_datum(&mut self) -> Result<(), String> {
         let d = &self.datum;
-        if !d.pool_host.is_empty() {
-            in_range("datum.pool_port", u64::from(d.pool_port), &PORT_RANGE)?;
-        }
         if !(1..=ratum::datum::messages::share::MAX_JOBS).contains(&d.protocol_job_slots) {
             return Err(format!(
                 "datum.protocol_job_slots must be 1..{}",
@@ -517,18 +567,26 @@ impl Config {
             d.protocol_global_timeout,
             MAX_PROTOCOL_GLOBAL_TIMEOUT_SECS,
         )?;
-        // The status page links the pool's name to this URL, so a scheme a browser runs
-        // (javascript:, data:) is refused.
-        if !d.pool_url.is_empty() && !is_web_url(&d.pool_url) {
-            return Err("datum.pool_url must begin with http:// or https://".into());
-        }
-        if d.pooled_mining_only && d.pool_host.is_empty() {
+        // Checked in non-pooled mode as well: the settings page shows the URL.
+        d.pool.check_url("datum")?;
+        if d.pooled_mining_only && d.pool.pool_host.is_empty() {
             return Err("datum.pooled_mining_only requires datum.pool_host".into());
         }
-        if !d.pool_host.is_empty() {
-            self.pool_pubkey = Some(
-                ratum::datum::keys::PublicKeys::from_hex(&d.pool_pubkey)
-                    .map_err(|e| format!("datum.pool_pubkey {e}"))?,
+        if !d.pool.pool_host.is_empty() {
+            d.pool.check("datum")?;
+            let mut pools = vec![d.pool.clone()];
+            for (i, f) in d.fallback_pools.iter().enumerate() {
+                let name = format!("datum.fallback_pools[{i}]");
+                f.check(&name)?;
+                if pools.iter().any(|p| p.address() == f.address()) {
+                    return Err(format!("{name} names {} again", f.address()));
+                }
+                pools.push(f.clone());
+            }
+            self.pools = pools;
+        } else if !d.fallback_pools.is_empty() {
+            self.note_warning(
+                "datum.fallback_pools is ignored: datum.pool_host is empty (non-pooled mining)",
             );
         }
         if self.stratum.require_address_username && !self.datum.pool_pass_full_users {
@@ -675,6 +733,92 @@ mod tests {
         assert!(Config::parse(&minimal()).is_ok(), "no pool host, so the port is not reached");
     }
 
+    const KEY: &str = "f21f2f0ef0aa1970468f22bad9bb7f4535146f8e4a8f646bebc93da3d89b1406f40d032f09a417d94dc068055df654937922d2c89522e3e8f6f0e649de473003";
+
+    /// `minimal()` pooled, with `fallbacks` as the `datum.fallback_pools` array.
+    fn with_fallbacks(fallbacks: &str) -> String {
+        minimal().replace(
+            r#""pool_host": """#,
+            &format!(r#""pool_host": "pool.example", "fallback_pools": {fallbacks}"#),
+        )
+    }
+
+    #[test]
+    fn the_pools_are_the_configured_pool_then_each_fallback_in_order() {
+        let c = Config::parse(&with_fallbacks(&format!(
+            r#"[{{"pool_host": "b.example", "pool_pubkey": "{KEY}", "pool_url": "https://b"}},
+                {{"pool_host": "c.example", "pool_port": 1, "pool_pubkey": "{KEY}"}}]"#
+        )))
+        .unwrap();
+        let addresses: Vec<String> = c.pools.iter().map(Pool::address).collect();
+        assert_eq!(addresses, ["pool.example:28915", "b.example:28915", "c.example:1"]);
+        assert_eq!(c.pools[1].pool_url, "https://b");
+        assert_eq!(c.pools[2].pool_url, "");
+        assert_eq!(c.pools[0].pool_pubkey, Pool::default().pool_pubkey);
+        assert!(c.startup_notes.is_empty(), "{:?}", c.startup_notes);
+
+        let c = Config::parse(&with_fallbacks("[]")).unwrap();
+        assert_eq!(c.pools.len(), 1);
+        assert!(Config::parse(&minimal()).unwrap().pools.is_empty(), "non-pooled");
+    }
+
+    #[test]
+    fn a_fallback_pool_is_checked_as_the_configured_pool_is() {
+        for (fallback, must) in [
+            (
+                format!(r#"{{"pool_host": "", "pool_pubkey": "{KEY}"}}"#),
+                "datum.fallback_pools[0].pool_host is empty",
+            ),
+            (
+                r#"{"pool_host": "b.example", "pool_pubkey": "abc"}"#.to_string(),
+                "datum.fallback_pools[0].pool_pubkey",
+            ),
+            (
+                format!(r#"{{"pool_host": "b.example", "pool_port": 0, "pool_pubkey": "{KEY}"}}"#),
+                "datum.fallback_pools[0].pool_port",
+            ),
+            (
+                format!(r#"{{"pool_host": "b.example", "pool_pubkey": "{KEY}", "pool_url": "b"}}"#),
+                "datum.fallback_pools[0].pool_url",
+            ),
+        ] {
+            let e = Config::parse(&with_fallbacks(&format!("[{fallback}]"))).unwrap_err();
+            assert!(e.contains(must), "{fallback}: {e}");
+            let ok = format!(r#"{{"pool_host": "a.example", "pool_pubkey": "{KEY}"}}"#);
+            let e = Config::parse(&with_fallbacks(&format!("[{ok}, {fallback}]"))).unwrap_err();
+            let second = must.replace("[0]", "[1]");
+            assert!(e.contains(&second), "{fallback}: {e}");
+        }
+        let twice = format!(r#"{{"pool_host": "pool.example", "pool_pubkey": "{KEY}"}}"#);
+        let e = Config::parse(&with_fallbacks(&format!("[{twice}]"))).unwrap_err();
+        assert!(e.contains("datum.fallback_pools[0] names pool.example:28915 again"), "{e}");
+        let defaulted = minimal().replace(r#""pool_host": "", "#, r#""fallback_pools": [{}], "#);
+        let e = Config::parse(&defaulted).unwrap_err();
+        assert!(e.contains("names datum-beta1.mine.ocean.xyz:28915 again"), "{e}");
+    }
+
+    #[test]
+    fn a_datum_section_without_pool_keys_names_the_ocean_pool() {
+        let text = minimal().replace(r#""pool_host": "", "#, "");
+        let c = Config::parse(&text).unwrap();
+        assert_eq!(c.pools.len(), 1);
+        assert_eq!(c.pools[0].address(), "datum-beta1.mine.ocean.xyz:28915");
+        assert_eq!(c.pools[0].pool_pubkey, Pool::default().pool_pubkey);
+        assert_eq!(c.datum.protocol_job_slots, 256, "the other keys keep their defaults");
+    }
+
+    #[test]
+    fn fallback_pools_without_a_pool_host_are_reported_and_ignored() {
+        let text = minimal().replace(
+            r#""pool_host": """#,
+            &format!(r#""pool_host": "", "fallback_pools": [{{"pool_host": "b.example", "pool_pubkey": "{KEY}"}}]"#),
+        );
+        let c = Config::parse(&text).unwrap();
+        assert!(c.pools.is_empty());
+        assert_eq!(c.startup_notes.len(), 1);
+        assert!(c.startup_notes[0].message.contains("datum.fallback_pools is ignored"));
+    }
+
     #[test]
     fn parses_the_minimal_file_with_defaults() {
         let c = Config::parse(&minimal()).unwrap();
@@ -718,12 +862,12 @@ mod tests {
 
     #[test]
     fn the_pool_url_is_empty_unless_set() {
-        assert_eq!(Config::parse(&minimal()).unwrap().datum.pool_url, "");
+        assert_eq!(Config::parse(&minimal()).unwrap().datum.pool.pool_url, "");
         let text = minimal().replace(
             "\"pooled_mining_only\": false",
             "\"pooled_mining_only\": false, \"pool_url\": \"https://pool.example\"",
         );
-        assert_eq!(Config::parse(&text).unwrap().datum.pool_url, "https://pool.example");
+        assert_eq!(Config::parse(&text).unwrap().datum.pool.pool_url, "https://pool.example");
     }
 
     #[test]

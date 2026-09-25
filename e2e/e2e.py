@@ -14,6 +14,8 @@ version 2 work.
   e2e/e2e.py multi-miner         three miners behind two gateways: credit and payout split
   e2e/e2e.py public-gateway-fee  a tagged gateway's shares charged, the fee paid to the
                                  other gateway's miner
+  e2e/e2e.py pool-fallback       the gateway moves to a fallback pool when the pool stops,
+                                 and returns when it is started again
 
 Every run needs a Bitcoin Knots build with the BLAKE2b change, named by BITCOIND and
 BITCOIN_CLI (default ~/src/bitcoin/build/bin/); the gateway is this workspace's
@@ -300,10 +302,13 @@ class Stack:
         except Failed:
             return 0
 
-    def wait_for_log(self, log: Path, pattern: str, timeout: float = STARTUP_WAIT) -> bool:
+    def wait_for_log(
+        self, log: Path, pattern: str, timeout: float = STARTUP_WAIT, after: int = 0
+    ) -> bool:
+        """Whether `pattern` appears in `log` past byte `after` within `timeout` seconds."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            if log.exists() and pattern in log.read_text(errors="replace"):
+            if log.exists() and pattern in log.read_text(errors="replace")[after:]:
                 return True
             time.sleep(0.5)
         return False
@@ -358,29 +363,39 @@ class Stack:
         """ratum-prime on the pool port against the node, paying POOL_ADDRESS, with the
         flags every run gives plus `extra_args`. "<- accepted" is logged at debug, which the
         default info level would not print, and the checks read those lines."""
-        (self.work / "pool").mkdir()
+        self.pool, self.pubkey = self.start_pool_at(
+            self.pool_port, self.stats_port, self.work / "pool", self.pool_log_path, *extra_args
+        )
+
+    def start_pool_at(
+        self, port: int, stats_port: int, data_dir: Path, log: Path, *extra_args: str
+    ) -> tuple[subprocess.Popen, str]:
+        """A pool on `port` with `data_dir`, started again with the same directory to keep
+        its key; returns the process and the public key it printed."""
+        data_dir.mkdir(exist_ok=True)
         argv = [
             str(ROOT / "target/release/ratum-prime"),
-            "--listen", f"127.0.0.1:{self.pool_port}",
-            "--data-dir", str(self.work / "pool"),
+            "--listen", f"127.0.0.1:{port}",
+            "--data-dir", str(data_dir),
             "--rpc", f"http://ratum:ratumtest@127.0.0.1:{self.rpc_port}",
             "--payout-address", POOL_ADDRESS,
             "--coinbase-tag", "RATUM",
             "--min-diff", "1", "--poll", "1",
-            "--stats-listen", f"127.0.0.1:{self.stats_port}",
+            "--stats-listen", f"127.0.0.1:{stats_port}",
             *extra_args,
         ]
         env = dict(os.environ, RUST_LOG=os.environ.get("RUST_LOG", "debug"))
-        self.pool = self.spawn(argv, self.pool_log_path, env=env)
+        started = log.stat().st_size if log.exists() else 0
+        pool = self.spawn(argv, log, env=env)
         # The public key is printed before the listener binds, so the key alone does not
         # mean the pool started. A port already in use ends the process right after it
         # prints the key.
-        if not self.wait_for_log(self.pool_log_path, "listening on"):
-            fail(f"the pool never listened on 127.0.0.1:{self.pool_port}; see {self.pool_log_path}")
-        m = re.search(r"pool_pubkey: ([0-9a-f]+)", self.pool_log())
+        if not self.wait_for_log(log, "listening on", after=started):
+            fail(f"the pool never listened on 127.0.0.1:{port}; see {log}")
+        m = re.search(r"pool_pubkey: ([0-9a-f]+)", log.read_text(errors="replace")[started:])
         if not m:
-            fail(f"the pool never printed its public key; see {self.pool_log_path}")
-        self.pubkey = m.group(1)
+            fail(f"the pool never printed its public key; see {log}")
+        return pool, m.group(1)
 
     @property
     def pool_log_path(self) -> Path:
@@ -407,10 +422,11 @@ class Stack:
         tag: str,
         protocol_v3: bool = True,
         vardiff_target: int = 4,
+        fallback_pools: list[dict] | None = None,
     ) -> None:
         """A gateway pointed at the pool, paying `pool_address` and tagging its coinbases
-        with `tag` (empty for none). Its configuration and log are gateway-<name>.json and
-        .log in the work directory."""
+        with `tag` (empty for none), with `fallback_pools` as its datum.fallback_pools. Its
+        configuration and log are gateway-<name>.json and .log in the work directory."""
         config = {
             "bitcoind": {
                 "rpcuser": "ratum",
@@ -438,6 +454,7 @@ class Stack:
                 "pool_pass_full_users": True,
                 "pooled_mining_only": True,
                 "protocol_v3": protocol_v3,
+                "fallback_pools": fallback_pools or [],
             },
         }
         path = self.work / f"gateway-{name}.json"
@@ -907,6 +924,70 @@ def public_gateway_fee(stack: Stack, a: argparse.Namespace) -> None:
     stack.print_ledger(ledger)
 
 
+def pool_fallback(stack: Stack, a: argparse.Namespace) -> None:
+    """Two pools; the gateway names the second as a fallback. Stopping the first moves the
+    gateway to the second within the reconnect delay; starting the first again (the same
+    data directory, so the same key) brings the gateway back once its probe, sent once a
+    minute from a fallback, is answered. No miner: the checks read the logs."""
+    stack.require_tools()
+    stack.build_release()
+    stack.start_node()
+    stack.mine_through_activation()
+
+    step(f"starting the pool on port {stack.pool_port} and the fallback pool")
+    stack.start_pool()
+    fallback_port = free_port(28800, 90)
+    fallback_log = stack.work / "pool-fallback.log"
+    _, fallback_key = stack.start_pool_at(
+        fallback_port, free_port(29100, 90), stack.work / "pool-fallback", fallback_log
+    )
+
+    stratum_port, api_port = free_port(23300, 90), free_port(7100, 90)
+    step(f"starting the gateway on stratum port {stratum_port}")
+    stack.start_gateway(
+        "A", stratum_port, api_port, MINER_ADDRESS, "e2e",
+        fallback_pools=[
+            {"pool_host": "127.0.0.1", "pool_port": fallback_port, "pool_pubkey": fallback_key},
+        ],
+    )
+    log = stack.work / "gateway-A.log"
+
+    def stats():
+        with urllib.request.urlopen(f"http://127.0.0.1:{api_port}/stats.json", timeout=5) as r:
+            return json.load(r)
+
+    s = stats()
+    if s["pool_host"] != f"127.0.0.1:{stack.pool_port}" or len(s["pools"]) != 2:
+        fail(f"/stats.json reports pool_host {s['pool_host']} and pools {s['pools']}")
+
+    step("stopping the pool")
+    stopped_at = log.stat().st_size
+    stack.pool.terminate()
+    stack.pool.wait(timeout=10)
+    moved = f"connecting to DATUM pool 127.0.0.1:{fallback_port} (fallback 1 of 1)"
+    if not stack.wait_for_log(log, moved, timeout=60, after=stopped_at):
+        fail(f"the gateway did not move to the fallback pool within 60 s; see {log}")
+    if not stack.wait_for_log(fallback_log, "hello ok", timeout=30):
+        fail(f"the fallback pool completed no handshake; see {fallback_log}")
+    if not stack.wait_until(lambda: stats()["pool_host"] == f"127.0.0.1:{fallback_port}", 30, lambda: stats()["status"]):
+        fail("/stats.json does not report the fallback pool as pool_host")
+    print(f"  on the fallback pool: {stats()['status']}")
+
+    step("starting the pool again")
+    returned_at = log.stat().st_size
+    stack.start_pool()
+    back = f"DATUM pool 127.0.0.1:{stack.pool_port} answers again"
+    if not stack.wait_for_log(log, back, timeout=150, after=returned_at):
+        fail(f"the gateway did not return to the pool within 150 s; see {log}")
+    if not stack.wait_for_log(log, "DATUM pool configuration", timeout=30, after=log.stat().st_size - 4096):
+        fail(f"the gateway received no configuration after returning; see {log}")
+    if not stack.wait_until(lambda: stats()["pool_host"] == f"127.0.0.1:{stack.pool_port}", 30, lambda: stats()["status"]):
+        fail("/stats.json does not report the pool as pool_host after the return")
+    if "Disconnecting all stratum clients" in log.read_text(errors="replace"):
+        fail(f"the gateway disconnected its stratum clients during the switch; see {log}")
+    step(f"passed: moved to the fallback pool and back; the gateway reports {stats()['status']}")
+
+
 def main() -> int:
     home = Path.home() / "src/bitcoin/build/bin"
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -940,6 +1021,9 @@ def main() -> int:
     pf.add_argument("--bob-shares", type=int, default=2, help="shares from the miner on the own gateway")
     pf.add_argument("--timeout", type=float, default=5400, help="seconds to wait for them")
     pf.set_defaults(scenario=public_gateway_fee)
+
+    fb = runs.add_parser("pool-fallback", help="the gateway moves to a fallback pool and back")
+    fb.set_defaults(scenario=pool_fallback)
 
     a = ap.parse_args()
     stack = Stack(a.run, a)

@@ -14,10 +14,11 @@
   .field:last-child { border-bottom: none; }
   .field label { color: var(--muted); }
   .field .tip { grid-column: 2; color: var(--muted); font-size: .8rem; }
-  input, select { background: var(--bg); color: var(--fg); border: 1px solid var(--line);
+  input, select, textarea { background: var(--bg); color: var(--fg); border: 1px solid var(--line);
                   border-radius: 4px; padding: .3rem .5rem; font: inherit; width: 100%; }
+  textarea { font-family: ui-monospace, monospace; font-size: .85rem; resize: vertical; }
   input[type=checkbox] { width: auto; justify-self: start; }
-  input:disabled, select:disabled { color: var(--muted); }
+  input:disabled, select:disabled, textarea:disabled { color: var(--muted); }
   .actions { margin: 1rem 0; display: flex; gap: 1rem; align-items: center; }
   .actions button { padding: .4rem 1rem; }
   .errors { margin: .75rem 0; }
@@ -107,6 +108,15 @@
     <div class="tip">Optional; the status and miner pages link the host to it.</div>
   </div>
   <div class="field">
+    <label for="datum_fallback_pools">Fallback pools</label>
+    <textarea name="datum_fallback_pools" id="datum_fallback_pools" rows="3"
+      placeholder="host:port publickey [web page]"></textarea>
+    <div class="tip">One per line, tried in order while the pool above is unreachable:
+      <code>host:port publickey</code>, then optionally its web page. Every minute on a
+      fallback the pools before it are probed, and the gateway returns to the first that
+      answers.</div>
+  </div>
+  <div class="field">
     <label for="datum_protocol_v3">Version 3 protocol</label>
     <input type="checkbox" name="datum_protocol_v3" id="datum_protocol_v3">
     <div class="tip">Send the version 3 hello: the pool holds the XOR key that hides block hashes
@@ -191,7 +201,8 @@ function setEditable(on, why) {
 // The pool fields apply only while reward sharing is on; a disabled field is not sent.
 function poolFields() {
   const off = form.reward_sharing.value === "never" || form.reward_sharing.disabled;
-  for (const name of ["datum_pool_host", "datum_pool_port", "datum_pool_pubkey", "datum_pool_url"]) {
+  for (const name of ["datum_pool_host", "datum_pool_port", "datum_pool_pubkey", "datum_pool_url",
+                      "datum_fallback_pools"]) {
     form[name].disabled = off;
   }
 }

@@ -133,6 +133,8 @@ poll(() => "stats.json", s => {
   if (s.state === "error") notes.push(esc(s.status));
   if (s.state === "not_ready") notes.push("The pool is not connected and datum.pooled_mining_only is set: no work is served until it is reached.");
   if (s.state === "non_pooled_unreachable") notes.push("The pool is unreachable; the work served pays the gateway's address alone.");
+  if (s.pool_host && s.pools && s.pools.length > 1 && s.pool_host !== s.pools[0])
+    notes.push(`On fallback pool ${esc(s.pool_host)}: ${esc(s.pools[0])} is unreachable and is probed once a minute.`);
   if (s.job && !s.stratum.listening) notes.push("The stratum listener is not up.");
   for (const w of s.node_warnings || []) notes.push("The node reports: " + esc(w));
   const share = s.stratum.network_share, maxShare = s.stratum.max_network_share;

@@ -27,7 +27,7 @@ use clap::Parser;
 use config::Config;
 use gateway::Gateway;
 use log::{error, info, warn};
-use ratum::datum::keys::{KeyPairs, PublicKeys};
+use ratum::datum::keys::KeyPairs;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -104,11 +104,11 @@ fn connect_node(config: &Config) -> ratum::rpc::Client {
         .unwrap_or_else(|e| fatal(format!("bitcoind.rpcurl: {e}")))
 }
 
-fn start_datum(gateway: &Arc<Gateway>, pool_pubkey: PublicKeys) {
+fn start_datum(gateway: &Arc<Gateway>) {
     let identity = KeyPairs::generate();
     info!("DATUM gateway identity: {}", identity.public().to_hex());
     let owned = Arc::clone(gateway);
-    ratum::thread::spawn("datum", move || datum::run_forever(&owned, pool_pubkey, identity));
+    ratum::thread::spawn("datum", move || datum::run_forever(owned, identity));
     let started = Instant::now();
     let mut last_report = 0;
     while started.elapsed() < POOL_CONNECT_WAIT && !gateway.pool.is_active() {
@@ -145,11 +145,10 @@ fn main() {
     let gateway = Gateway::new(config, node);
     #[cfg(unix)]
     signals::install(Arc::clone(&gateway));
-    match gateway.config.pool_pubkey {
-        Some(pool_pubkey) => start_datum(&gateway, pool_pubkey),
-        None => info!(
-            "NON-POOLED MINING: datum.pool_host is empty; every block pays mining.pool_address"
-        ),
+    if gateway.config.pools.is_empty() {
+        info!("NON-POOLED MINING: datum.pool_host is empty; every block pays mining.pool_address");
+    } else {
+        start_datum(&gateway);
     }
 
     node::start_info_thread(Arc::clone(&gateway));
