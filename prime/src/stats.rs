@@ -5,7 +5,7 @@ mod block;
 
 use crate::ledger::IdentityState;
 use crate::ledger::blocks::{ConfirmationReading, FoundBlock, OwedBlock};
-use crate::ledger::split::{Payout, PublicGatewayFeeWork, SplitPolicy};
+use crate::ledger::split::{Payout, SplitPolicy};
 use crate::payout;
 use crate::server::Server;
 use ratum::hashrate::{self, HashrateHistory};
@@ -269,34 +269,9 @@ fn miners_json(server: &Server, l: &LedgerView) -> Vec<Value> {
                 "payable": payable,
                 "unpayable_reason": unpayable_reason,
                 "tag": m.state.tag_secondary,
-                "own_gateway_work": m.state.own_gateway_work.to_string(),
             })
         })
         .collect()
-}
-
-fn public_gateway_fee_json(l: &LedgerView, coinbase_value: Option<u64>) -> Value {
-    let (Some(gateway), Some(work)) = (
-        l.split_policy.public_gateway.as_ref().filter(|g| g.fee_bps > 0),
-        l.public_gateway_fee_work,
-    ) else {
-        return Value::Null;
-    };
-    let miners_value = coinbase_value.map_or(0, |v| l.split_policy.miners_share(v));
-    let sats_for = |work: u128| {
-        u128::from(miners_value).saturating_mul(work).checked_div(l.total_work).unwrap_or(0) as u64
-    };
-    json!({
-        "fee_bps": gateway.fee_bps,
-        "subsidy_bps": gateway.subsidy_bps,
-        "public_gateway_tag": gateway.tag,
-        "public_gateway_work": work.public_gateway_work.to_string(),
-        "fee_work": work.fee_work.to_string(),
-        "fee_sats": sats_for(work.fee_work),
-        "reassigned_work": work.reassigned_work.to_string(),
-        "reassigned_sats": sats_for(work.reassigned_work),
-        "own_gateway_work": work.own_gateway_work.to_string(),
-    })
 }
 
 /// One miner's row of the window, joined once in `LedgerView::read`: its state from the
@@ -330,7 +305,6 @@ struct LedgerView {
     recent_work: u128,
     window_multiple: f64,
     split_policy: SplitPolicy,
-    public_gateway_fee_work: Option<PublicGatewayFeeWork>,
 }
 
 impl LedgerView {
@@ -361,7 +335,6 @@ impl LedgerView {
             miners: Vec::with_capacity(identities.len()),
             window_multiple: l.window_rule().multiple,
             split_policy: l.split_policy().clone(),
-            public_gateway_fee_work: l.public_gateway_fee_work(),
             owed,
             recent_blocks,
             blocks_found,
@@ -424,11 +397,9 @@ pub(crate) fn snapshot(server: &Server, history: &Mutex<HashrateHistory>) -> Val
     let coinbase_value = template.map(|t| t.coinbase_value);
     let l = LedgerView::read(server, coinbase_value);
     let operator_fee = coinbase_value.map_or(0, |v| l.split_policy.fee_on(v));
-    let public_gateway_fee = l.split_policy.public_gateway.as_ref();
 
     let owed = owed_json(&l.owed, &l.confirmations, tip_height);
     let miners = miners_json(server, &l);
-    let public_gateway_fee_detail = public_gateway_fee_json(&l, coinbase_value);
     let network = network_json(tip, coinbase_value, server.node_state.observed_block_seconds());
     let pool_hs = hashes_per_second(l.recent_work, HASHRATE_SPAN_SECS);
 
@@ -440,8 +411,6 @@ pub(crate) fn snapshot(server: &Server, history: &Mutex<HashrateHistory>) -> Val
             "prime_id": server.share_policy.config.prime_id,
             "payout_script": hex::encode(&server.share_policy.config.payout_script),
             "fee_bps": l.split_policy.fee_bps,
-            "public_gateway_fee_bps": public_gateway_fee.map_or(0, |f| f.fee_bps),
-            "public_gateway_fee_subsidy_bps": public_gateway_fee.map_or(0, |f| f.subsidy_bps),
             "min_payout": crate::ledger::split::MIN_PAYOUT,
             "window_multiple": l.window_multiple,
             "min_difficulty": server.share_policy.config.min_difficulty,
@@ -470,7 +439,6 @@ pub(crate) fn snapshot(server: &Server, history: &Mutex<HashrateHistory>) -> Val
             "operator_fee_sats": operator_fee,
             "miners": miners,
         },
-        "public_gateway_fee": public_gateway_fee_detail,
         "owed": {
             "unsettled_sats": owed.unsettled_sats,
             "by_identity": owed.by_identity,

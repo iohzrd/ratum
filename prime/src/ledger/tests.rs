@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::fixtures::{Scratch, found, hash, payout, share};
-use crate::ledger::split::{PublicGateway, PublicGatewayFeeWork, SplitPolicy};
+use crate::ledger::split::{Payout, SplitPolicy};
 
 fn work_by_identity(l: &Ledger) -> Vec<(String, u128)> {
     l.identities().into_iter().map(|(id, s)| (id, s.work)).collect()
@@ -10,14 +10,6 @@ fn work_by_identity(l: &Ledger) -> Vec<(String, u128)> {
 
 fn identity_work(identity: &str, work: u128) -> (String, u128) {
     (identity.to_string(), work)
-}
-
-fn own_work(l: &Ledger) -> HashMap<String, u128> {
-    l.identities()
-        .into_iter()
-        .filter(|(_, s)| s.own_gateway_work != 0)
-        .map(|(id, s)| (id, s.own_gateway_work))
-        .collect()
 }
 
 fn tags_of(l: &Ledger) -> HashMap<String, String> {
@@ -237,7 +229,7 @@ fn the_network_difficulty_sizes_the_window() {
 
 #[test]
 fn the_split_takes_the_operator_fee_and_the_minimum_from_the_policy() {
-    let policy = SplitPolicy { fee_bps: 100, public_gateway: None };
+    let policy = SplitPolicy { fee_bps: 100 };
     let mut l = Ledger::new(WindowRule::fixed(u128::MAX), policy);
     for (i, (identity, difficulty)) in [("a", 99u64), ("b", 1)].into_iter().enumerate() {
         l.record(share(i as u64, identity, difficulty, hash(i as u64), "")).unwrap();
@@ -312,197 +304,88 @@ fn an_unstamped_ledger_is_adopted_by_the_first_chain_to_open_it() {
     assert!(!open_file(&path, 1, None, Some("testnet4")).unwrap().1.stamped);
 }
 
-fn public(fee_bps: u16, subsidy_bps: u16) -> PublicGateway {
-    PublicGateway { tag: "public".into(), fee_bps, subsidy_bps }
-}
-
-fn tagged_ledger(gateway: Option<PublicGateway>, shares: &[(&str, u64, &str)]) -> Ledger {
-    let policy = SplitPolicy { public_gateway: gateway, ..SplitPolicy::default() };
-    let mut l = Ledger::new(WindowRule::fixed(1_000_000), policy);
+fn ledger_with_tags(shares: &[(&str, u64, &str)]) -> Ledger {
+    let mut l = fixed(1_000_000);
     for (i, (identity, difficulty, tag)) in shares.iter().enumerate() {
         l.record(share(1_000 + i as u64, identity, *difficulty, hash(i as u64), tag)).unwrap();
     }
     l
 }
 
-const FEE_BPS: u16 = 5_000;
-const FULL_SUBSIDY_BPS: u16 = 10_000;
+/// Shares under a mixture of secondary tags: 351 work, bob's under two tags.
+const TAGGED: &[(&str, u64, &str)] = &[
+    ("alice", 100, "public"),
+    ("bob", 100, "own"),
+    ("carol", 37, "public"),
+    ("dave", 63, ""),
+    ("bob", 50, "public"),
+    ("erin", 1, "public"),
+];
 
-#[test]
-fn the_fee_is_charged_on_public_gateway_work_and_reassigned_to_own_gateway_miners() {
-    const SHARES: &[(&str, u64, &str)] = &[("alice", 100, "public"), ("bob", 100, "own")];
-    let with = |fee_bps, subsidy_bps| tagged_ledger(Some(public(fee_bps, subsidy_bps)), SHARES);
-
-    let l = with(FEE_BPS, FULL_SUBSIDY_BPS);
-    assert_eq!(
-        l.public_gateway_fee_work(),
-        Some(PublicGatewayFeeWork {
-            public_gateway_work: 100,
-            fee_work: 50,
-            reassigned_work: 50,
-            own_gateway_work: 100,
-        })
-    );
-    assert_eq!(l.split_value(200, 0, 512), vec![payout("bob", 150), payout("alice", 50)]);
-
-    let half = with(FEE_BPS, 5_000);
-    assert_eq!(half.public_gateway_fee_work().unwrap().reassigned_work, 25);
-    let split = half.split_value(200, 0, 512);
-    assert_eq!(split, vec![payout("bob", 125), payout("alice", 50)]);
-    assert_eq!(
-        split.iter().map(|p| p.sats).sum::<u64>(),
-        175,
-        "the fee work not reassigned is left out of the split and reaches the pool as the \
-         remainder"
-    );
-
-    assert_eq!(
-        with(FEE_BPS, 0).split_value(200, 0, 512),
-        vec![payout("bob", 100), payout("alice", 50)],
-        "with no subsidy the whole fee stays with the pool"
-    );
-
-    let untagged = tagged_ledger(None, SHARES);
-    assert_eq!(with(0, 0).split_value(200, 0, 512), untagged.split_value(200, 0, 512));
-    assert_eq!(untagged.split_value(200, 0, 512), vec![payout("alice", 100), payout("bob", 100)]);
-    assert_eq!(untagged.public_gateway_fee_work(), None, "no public gateway, no fee work");
+fn tagged_split() -> Vec<Payout> {
+    vec![
+        payout("bob", 150),
+        payout("alice", 100),
+        payout("dave", 63),
+        payout("carol", 37),
+        payout("erin", 1),
+    ]
 }
 
-/// `split_value` divides by the weights plus the retained fee work, so that total must equal
-/// the window's work exactly: any drift between the charge `weights` deducts and the one
-/// `public_gateway_fee_work` sums would misallocate the block's value.
+#[test]
+fn the_split_pays_by_work_whatever_the_secondary_tags() {
+    let l = ledger_with_tags(TAGGED);
+    let untagged: Vec<(&str, u64, &str)> =
+        TAGGED.iter().map(|(identity, work, _)| (*identity, *work, "")).collect();
+    let plain = ledger_with_tags(&untagged);
+    assert_eq!(l.split_value(351, 0, 512), tagged_split());
+    assert_eq!(l.split_value(351, 0, 512), plain.split_value(351, 0, 512));
+    assert_eq!(l.split_value(1_000_000, 0, 2), plain.split_value(1_000_000, 0, 2));
+    assert_eq!(l.split_value(1_000, 100, 512), plain.split_value(1_000, 100, 512));
+    assert_eq!(tags_of(&l).get("bob").map(String::as_str), Some("public"), "the tag is held");
+}
+
+/// `split_value` divides by the weights' total, so that total must equal the window's work
+/// exactly, and each weight an identity's work, whatever the tags and after every trim.
 #[test]
 fn weights_total_the_window() {
-    const SHARES: &[(&str, u64, &str)] = &[
-        ("alice", 100, "public"),
-        ("bob", 100, "own"),
-        ("carol", 37, "public"),
-        ("dave", 63, ""),
-        ("erin", 1, "public"),
-    ];
-    for fee_bps in [0u16, 1, 250, FEE_BPS, 9_999, 10_000] {
-        for subsidy_bps in [0u16, 1, 3_333, FEE_BPS, FULL_SUBSIDY_BPS] {
-            for gateway in [None, Some(public(fee_bps, subsidy_bps))] {
-                let l = tagged_ledger(gateway, SHARES);
-                let w = l.weights();
-                let total: u128 =
-                    w.entries.iter().map(|(_, w)| w).sum::<u128>() + w.retained_by_pool;
-                assert_eq!(
-                    total,
-                    l.total_work(),
-                    "fee {fee_bps} bps, subsidy {subsidy_bps} bps: the weights and the \
-                     retained fee work must total the window"
-                );
-            }
+    let mut l = ledger_with_tags(TAGGED);
+    for window in [1_000_000u128, 200, 64, 1] {
+        l.set_window(window);
+        let w = l.weights();
+        let total: u128 = w.entries.iter().map(|(_, w)| w).sum();
+        assert_eq!(total, l.total_work(), "window {window}");
+        let by_identity: HashMap<&str, u128> =
+            w.entries.iter().map(|(identity, w)| (&**identity, *w)).collect();
+        let identities = l.identities();
+        assert_eq!(by_identity.len(), identities.len(), "window {window}");
+        for (identity, state) in &identities {
+            assert_eq!(by_identity[identity.as_str()], state.work, "window {window}: {identity}");
         }
     }
 }
 
 #[test]
-fn the_subsidy_is_divided_by_own_gateway_work_not_by_all_work() {
-    let l = tagged_ledger(
-        Some(public(1_000, FULL_SUBSIDY_BPS)),
-        &[
-            ("alice", 900, "public"),
-            ("bob", 300, "own"),
-            ("bob", 100, "public"),
-            ("carol", 100, "own"),
-        ],
-    );
-    assert_eq!(
-        l.public_gateway_fee_work(),
-        Some(PublicGatewayFeeWork {
-            public_gateway_work: 1_000,
-            fee_work: 100,
-            reassigned_work: 100,
-            own_gateway_work: 400,
-        }),
-        "bob's public-gateway share is charged and is not own work"
-    );
-    assert_eq!(
-        l.split_value(1_400, 0, 512),
-        vec![payout("alice", 810), payout("bob", 465), payout("carol", 125)],
-        "the 100 of fee work is divided 75:25 over bob's and carol's own work"
-    );
-}
-
-#[test]
-fn with_no_own_gateway_work_the_fee_stays_with_the_pool() {
-    let l = tagged_ledger(Some(public(FEE_BPS, FULL_SUBSIDY_BPS)), &[("alice", 100, "public")]);
-    assert_eq!(
-        l.public_gateway_fee_work(),
-        Some(PublicGatewayFeeWork {
-            public_gateway_work: 100,
-            fee_work: 50,
-            reassigned_work: 0,
-            own_gateway_work: 0,
-        })
-    );
-    assert_eq!(
-        l.split_value(100, 0, 512),
-        vec![payout("alice", 50)],
-        "alice is paid her charged work and the 50 reach the pool as the remainder"
-    );
-}
-
-#[test]
-fn own_gateway_work_is_not_charged() {
-    let l = tagged_ledger(
-        Some(public(FEE_BPS, FULL_SUBSIDY_BPS)),
-        &[("bob", 100, "own"), ("carol", 100, "")],
-    );
-    let work = l.public_gateway_fee_work().unwrap();
-    assert_eq!((work.public_gateway_work, work.fee_work), (0, 0));
-    assert_eq!(l.split_value(200, 0, 512), vec![payout("bob", 100), payout("carol", 100)]);
-}
-
-#[test]
-fn own_gateway_work_follows_the_window_and_the_tag() {
-    let mut untagged = fixed(64);
-    untagged.record(share(1, "alice", 16, hash(1), "public")).unwrap();
-    untagged.record(share(2, "bob", 16, hash(2), "own")).unwrap();
-    assert!(own_work(&untagged).is_empty(), "no public tag, no own work");
-
-    let policy = SplitPolicy { public_gateway: Some(public(0, 0)), ..SplitPolicy::default() };
-    let mut l = Ledger::new(WindowRule::fixed(64), policy);
-    l.record(share(1, "alice", 16, hash(1), "public")).unwrap();
-    l.record(share(2, "bob", 16, hash(2), "own")).unwrap();
-    assert_eq!(own_work(&l), HashMap::from([("bob".to_string(), 16)]));
-    assert_eq!(l.split_policy().public_gateway, Some(public(0, 0)));
-
-    l.record(share(3, "bob", 16, hash(3), "")).unwrap();
-    assert_eq!(own_work(&l), HashMap::from([("bob".to_string(), 32)]));
-    for i in 4..8 {
-        l.record(share(i, "carol", 16, hash(i), "own")).unwrap();
-    }
-    assert_eq!(l.total_work(), 64);
-    assert_eq!(
-        own_work(&l),
-        HashMap::from([("carol".to_string(), 64)]),
-        "bob's own work left the window with his shares"
-    );
-}
-
-#[test]
-fn the_fee_is_applied_before_the_output_cap_and_the_minimum() {
-    let l = tagged_ledger(
-        Some(public(FEE_BPS, FULL_SUBSIDY_BPS)),
-        &[("alice", 100, "public"), ("bob", 30, "own"), ("carol", 20, "own")],
-    );
-    assert_eq!(
-        l.split_value(150, 0, 512),
-        vec![payout("bob", 60), payout("alice", 50), payout("carol", 40)]
-    );
-    assert_eq!(
-        l.split_value(150, 0, 2),
-        vec![payout("bob", 81), payout("alice", 69)],
-        "with the subsidy bob outweighs alice for the two outputs and carol is left out"
-    );
-    assert_eq!(
-        l.split_value(150, 45, 512),
-        vec![payout("bob", 81), payout("alice", 69)],
-        "carol's 40 is under the minimum once the fee is in the weights"
-    );
+fn a_window_of_tagged_shares_reads_back_the_same_work() {
+    let scratch = Scratch::new("tagged-read-back");
+    let (total, by_identity, tags) = {
+        let (mut l, _) = open(&scratch, 1_000_000, None);
+        for (i, (identity, difficulty, tag)) in TAGGED.iter().enumerate() {
+            l.record(share(1_000 + i as u64, identity, *difficulty, hash(i as u64), tag)).unwrap();
+        }
+        (l.total_work(), work_by_identity(&l), tags_of(&l))
+    };
+    let (reopened, read_back) = open(&scratch, 1_000_000, None);
+    assert_eq!(read_back.skipped, 0);
+    assert_eq!(reopened.total_work(), total);
+    assert_eq!(work_by_identity(&reopened), by_identity);
+    assert_eq!(tags_of(&reopened), tags);
+    assert_eq!(reopened.split_value(351, 0, 512), tagged_split());
+    drop(reopened);
+    let stored: Vec<String> =
+        dumped(&scratch.join("regtest.redb")).into_iter().map(|s| s.tag_secondary).collect();
+    let recorded: Vec<&str> = TAGGED.iter().map(|(_, _, tag)| *tag).collect();
+    assert_eq!(stored, recorded, "every share keeps its tag on disk");
 }
 
 #[test]
@@ -789,7 +672,6 @@ struct Reference {
     window: u128,
     max_shares: usize,
     count_capped: bool,
-    public_tag: Option<String>,
     history: Vec<Share>,
     has_store: bool,
     /// `--ledger-keep-shares`, pruning `history` as the store's retention prunes its rows.
@@ -797,7 +679,7 @@ struct Reference {
 }
 
 impl Reference {
-    fn new(window: u128, public_tag: Option<&str>, has_store: bool, keep: Option<usize>) -> Self {
+    fn new(window: u128, has_store: bool, keep: Option<usize>) -> Self {
         Self {
             shares: VecDeque::new(),
             identities: HashMap::new(),
@@ -805,25 +687,16 @@ impl Reference {
             window,
             max_shares: MAX_SHARES,
             count_capped: false,
-            public_tag: public_tag.map(str::to_string),
             history: Vec::new(),
             has_store,
             keep,
         }
     }
 
-    fn own(&self, s: &Share) -> bool {
-        self.public_tag.as_ref().is_some_and(|t| &s.tag_secondary != t)
-    }
-
     fn push(&mut self, share: Share) {
         self.total_work += u128::from(share.difficulty);
-        let own = self.own(&share);
         let state = self.identities.entry(share.identity.clone()).or_default();
         state.work += u128::from(share.difficulty);
-        if own {
-            state.own_gateway_work += u128::from(share.difficulty);
-        }
         state.tag_secondary.clone_from(&share.tag_secondary);
         self.shares.push_back(share);
     }
@@ -845,12 +718,8 @@ impl Reference {
     fn drop_oldest(&mut self) {
         let Some(oldest) = self.shares.pop_front() else { return };
         self.total_work -= u128::from(oldest.difficulty);
-        let own = self.own(&oldest);
         let Some(state) = self.identities.get_mut(&oldest.identity) else { return };
         state.work -= u128::from(oldest.difficulty);
-        if own {
-            state.own_gateway_work -= u128::from(oldest.difficulty);
-        }
         if state.work == 0 {
             self.identities.remove(&oldest.identity);
         }
@@ -989,15 +858,11 @@ fn drive_beside_the_reference(
     }
 }
 
-fn gateway_policy() -> SplitPolicy {
-    SplitPolicy { public_gateway: Some(public(FEE_BPS, 5_000)), ..SplitPolicy::default() }
-}
-
 #[test]
 fn the_compact_window_matches_the_whole_share_window_file_less() {
     for seed in [1, 0x5eed, 0xdead_beef, 0x0123_4567_89ab_cdef] {
-        let mut l = Ledger::new(WindowRule::fixed(200), gateway_policy());
-        let mut r = Reference::new(200, Some("public"), false, None);
+        let mut l = fixed(200);
+        let mut r = Reference::new(200, false, None);
         drive_beside_the_reference(&mut l, &mut r, seed, 3_000, 1);
     }
 }
@@ -1006,10 +871,10 @@ fn the_compact_window_matches_the_whole_share_window_file_less() {
 fn the_compact_window_matches_the_whole_share_window_read_back_from_a_store() {
     for seed in [7, 0xfeed_f00d] {
         let scratch = Scratch::new(&format!("equivalence-{seed}"));
-        let mut l = Ledger::new(WindowRule::fixed(200), gateway_policy());
+        let mut l = fixed(200);
         l.attach(Store::open(&scratch.join("regtest.redb"), None, Some("regtest")).unwrap())
             .unwrap();
-        let mut r = Reference::new(200, Some("public"), true, None);
+        let mut r = Reference::new(200, true, None);
         drive_beside_the_reference(&mut l, &mut r, seed, 1_500, 1);
     }
 }
@@ -1021,10 +886,10 @@ fn the_compact_window_matches_the_whole_share_window_read_back_from_a_pruned_sto
     const KEEP: u64 = 30;
     for seed in [11, 0xabad_cafe] {
         let scratch = Scratch::new(&format!("equivalence-pruned-{seed}"));
-        let mut l = Ledger::new(WindowRule::fixed(200), gateway_policy());
+        let mut l = fixed(200);
         let store = Store::open(&scratch.join("regtest.redb"), Some(KEEP), Some("regtest"));
         l.attach(store.unwrap()).unwrap();
-        let mut r = Reference::new(200, Some("public"), true, Some(KEEP as usize));
+        let mut r = Reference::new(200, true, Some(KEEP as usize));
         drive_beside_the_reference(&mut l, &mut r, seed, 1_500, 3_000);
     }
 }

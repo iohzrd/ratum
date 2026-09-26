@@ -56,12 +56,6 @@ pub struct Options {
     #[arg(long)]
     pub fee_bps: Option<u16>,
     #[arg(long)]
-    pub public_gateway_fee_bps: Option<u16>,
-    #[arg(long)]
-    pub public_gateway_fee_subsidy_bps: Option<u16>,
-    #[arg(long)]
-    pub public_gateway_tag: Option<String>,
-    #[arg(long)]
     pub rpc: Option<String>,
     #[arg(long)]
     pub rpc_cookie: Option<String>,
@@ -167,16 +161,13 @@ mod tests {
     fn settings_parse_into_their_typed_fields() {
         let c = parse_toml(
             "rpc = \"http://ratum:pw@127.0.0.1:8332\"\nmin-diff = 16384\nwindow = 8.5\n\
-             public-gateway-fee-bps = 200\npublic-gateway-fee-subsidy-bps = 7500\n\
-             public-gateway-tag = \"public\"\n",
+             fee-bps = 200\n",
         )
         .unwrap();
         assert_eq!(c.min_diff, Some(16384));
         assert_eq!(c.window, Some(8.5));
         assert_eq!(c.rpc, Some("http://ratum:pw@127.0.0.1:8332".to_string()));
-        assert_eq!(c.public_gateway_fee_bps, Some(200));
-        assert_eq!(c.public_gateway_fee_subsidy_bps, Some(7500));
-        assert_eq!(c.public_gateway_tag, Some("public".to_string()));
+        assert_eq!(c.fee_bps, Some(200));
         assert_eq!(c.listen, None, "a setting not written stays unset");
     }
 

@@ -130,9 +130,7 @@ pub fn dictate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixtures::{
-        ALICE, BOB, POOL, server_with, server_with_fee, server_with_public_gateway_fee,
-    };
+    use crate::fixtures::{ALICE, BOB, POOL, server_with, server_with_fee};
     use crate::ledger::split::SplitPolicy;
     use ratum::fixtures::p2wpkh;
 
@@ -188,7 +186,7 @@ mod tests {
     }
 
     fn with_bps(fee_bps: u16) -> SplitPolicy {
-        SplitPolicy { fee_bps, ..SplitPolicy::default() }
+        SplitPolicy { fee_bps }
     }
 
     #[test]
@@ -215,20 +213,6 @@ mod tests {
             assert_eq!(outputs[0].value, 750_000);
             assert_eq!(1_000_000 - outputs[0].value, 250_000);
         }
-    }
-
-    #[test]
-    fn the_dictated_split_charges_the_public_gateway_fee_and_reassigns_it() {
-        let server = server_with_public_gateway_fee(5_000, 10_000);
-        let outputs = coinbaser_outputs(&server, 200_000);
-        assert_eq!(
-            outputs.iter().map(|o| (o.value, o.script_pubkey.clone())).collect::<Vec<_>>(),
-            vec![(150_000, p2wpkh(0xb2)), (50_000, p2wpkh(0xa1))]
-        );
-
-        let off = server_with_public_gateway_fee(0, 0);
-        let outputs = coinbaser_outputs(&off, 200_000);
-        assert_eq!(outputs.iter().map(|o| o.value).collect::<Vec<_>>(), vec![100_000, 100_000]);
     }
 
     #[test]

@@ -323,9 +323,7 @@ fn record_unpaid_outputs(server: &Server, peer: SocketAddr, rebuilt: &RebuiltSha
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixtures::{
-        ALICE, BOB, payout, server_with, server_with_fee, server_with_public_gateway_fee,
-    };
+    use crate::fixtures::{ALICE, BOB, payout, server_with, server_with_fee};
 
     const PEER: SocketAddr =
         SocketAddr::V4(std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 28915));
@@ -471,13 +469,6 @@ mod tests {
         record_block(&server, PEER, "alice", &block(0, 1_000_000, Vec::new()), 42);
         assert_eq!(lock(&server.records).blocks().len(), 1);
         assert!(owed_entries(&server).is_empty());
-    }
-
-    #[test]
-    fn the_owed_split_charges_the_public_gateway_fee_and_reassigns_it() {
-        let server = server_with_public_gateway_fee(5_000, 10_000);
-        record_block(&server, PEER, "alice", &block(0, 200_000, Vec::new()), 42);
-        assert_eq!(owed_entries(&server), [vec![payout(BOB, 150_000), payout(ALICE, 50_000)]]);
     }
 
     #[test]

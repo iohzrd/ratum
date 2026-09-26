@@ -52,13 +52,11 @@ pub struct ReadBack {
     pub stamped: bool,
 }
 
-/// What the window holds for one identity: its work, the part of it from shares carrying
-/// a secondary tag other than the public gateway's, and the tag of its newest share. An
+/// What the window holds for one identity: its work and the tag of its newest share. An
 /// entry exists while the identity has a share in the window.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct IdentityState {
     pub work: u128,
-    pub own_gateway_work: u128,
     pub tag_secondary: String,
 }
 
@@ -83,37 +81,32 @@ impl WindowRule {
 
 // An identity is held only while a share in the window credits it, so there are at most
 // `MAX_SHARES + 1` (a share is pushed before the window is trimmed), indexed up to
-// `MAX_SHARES`, and `WindowShare::credit` shifts the index left one bit into a `u32`.
-const _: () = assert!(MAX_SHARES < 1 << 31);
+// `MAX_SHARES` in `WindowShare::credit`, a `u32`.
+const _: () = assert!(MAX_SHARES < u32::MAX as usize);
 
 /// One share in the window, as much of it as the window reads: its work, its acceptance time for
-/// the hashrate, and the identity it credits with whether it counts as own-gateway work. The
-/// block hash, the identity's name and the tag stay in the ledger file. 16 bytes.
+/// the hashrate, and the identity it credits. The block hash, the identity's name and the tag
+/// stay in the ledger file. 16 bytes.
 #[derive(Clone, Copy, Debug)]
 struct WindowShare {
     difficulty: u64,
     /// Seconds since the Unix epoch; `u32` holds them until 2106.
     accepted_at: u32,
-    /// The identity's index in `Identities`, shifted left one bit, with the low bit set when
-    /// the share is own-gateway work.
+    /// The identity's index in `Identities`.
     credit: u32,
 }
 
 impl WindowShare {
-    fn new(share: &Share, identity: u32, own_gateway: bool) -> Self {
+    fn new(share: &Share, identity: u32) -> Self {
         Self {
             difficulty: share.difficulty,
             accepted_at: u32::try_from(share.accepted_at).unwrap_or(u32::MAX),
-            credit: identity << 1 | u32::from(own_gateway),
+            credit: identity,
         }
     }
 
     fn identity(self) -> u32 {
-        self.credit >> 1
-    }
-
-    fn own_gateway(self) -> bool {
-        self.credit & 1 == 1
+        self.credit
     }
 
     fn work(self) -> u128 {
@@ -180,10 +173,6 @@ impl Identities {
     fn iter(&self) -> impl Iterator<Item = (&Arc<str>, &IdentityState)> {
         self.entries.iter().flatten().map(|e| (&e.name, &e.state))
     }
-
-    fn len(&self) -> usize {
-        self.by_name.len()
-    }
 }
 
 pub struct Ledger {
@@ -209,8 +198,7 @@ pub struct Ledger {
 
 impl Ledger {
     /// An empty file-less ledger, its window sized to a network difficulty of 1 until one is
-    /// set. A share whose secondary tag is not the public gateway's counts as own-gateway work;
-    /// with no public gateway, no share does.
+    /// set.
     pub fn new(window_rule: WindowRule, split_policy: SplitPolicy) -> Self {
         Self {
             shares: VecDeque::new(),
@@ -339,11 +327,6 @@ impl Ledger {
         &self.split_policy
     }
 
-    fn is_own_gateway_share(&self, share: &Share) -> bool {
-        let public = self.split_policy.public_gateway.as_ref();
-        public.is_some_and(|public| share.tag_secondary != public.tag)
-    }
-
     pub fn window(&self) -> u128 {
         self.window
     }
@@ -451,14 +434,10 @@ impl Ledger {
     }
 
     fn push(&mut self, share: &Share) {
-        let own = self.is_own_gateway_share(share);
         let index = self.identities.index_of(&share.identity);
         let entry = self.identities.entry_mut(index);
         let work = u128::from(share.difficulty);
         entry.state.work += work;
-        if own {
-            entry.state.own_gateway_work += work;
-        }
         entry.state.tag_secondary.clone_from(&share.tag_secondary);
         entry.shares += 1;
         self.total_work += work;
@@ -471,7 +450,7 @@ impl Ledger {
             let room = (self.max_shares + 1).saturating_sub(len);
             self.shares.reserve_exact((len / 8).min(room).max(1));
         }
-        self.shares.push_back(WindowShare::new(share, index, own));
+        self.shares.push_back(WindowShare::new(share, index));
     }
 
     fn trim(&mut self) {
@@ -511,9 +490,6 @@ impl Ledger {
         let index = oldest.identity();
         let entry = self.identities.entry_mut(index);
         entry.state.work -= work;
-        if oldest.own_gateway() {
-            entry.state.own_gateway_work -= work;
-        }
         entry.shares -= 1;
         if entry.shares == 0 {
             self.identities.release(index);

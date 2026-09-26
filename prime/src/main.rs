@@ -164,14 +164,6 @@ fn report_settings(s: &Settings, ledger: &Ledger) {
         ledger.window(),
         split.fee_bps
     );
-    if let Some(gateway) = split.public_gateway.as_ref().filter(|g| g.fee_bps > 0) {
-        info!(
-            "public gateway fee: {} bps of the work of shares carrying the secondary coinbase \
-             tag {:?}, of which {} bps is reassigned at each split to miners whose shares do \
-             not carry it",
-            gateway.fee_bps, gateway.tag, gateway.subsidy_bps
-        );
-    }
     if s.require_v3 {
         info!(
             "version 3 protocol required: a hello without the DRS extension is refused, so \

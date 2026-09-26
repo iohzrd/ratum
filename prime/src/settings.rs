@@ -3,10 +3,9 @@
 
 use crate::cli::Options;
 use crate::ledger::WindowRule;
-use crate::ledger::split::{PublicGateway, SplitPolicy};
+use crate::ledger::split::SplitPolicy;
 use crate::payout;
 use crate::verify::SharePolicy;
-use log::warn;
 use ratum::datum::messages::config::{ClientConfig, MAX_COINBASE_TAG_LEN};
 use ratum::rpc;
 use std::fmt::Display;
@@ -52,7 +51,6 @@ pub struct Resolved {
 }
 
 pub fn resolve(o: &Options) -> Result<Resolved, String> {
-    let public_gateway = public_gateway(o)?;
     let settings = Settings {
         listen: o.listen.clone().unwrap_or_else(|| DEFAULT_LISTEN.to_string()),
         stats_listen: o.stats_listen.clone(),
@@ -101,7 +99,6 @@ pub fn resolve(o: &Options) -> Result<Resolved, String> {
             ),
             |n| *n <= MAX_FEE_BPS,
         )?,
-        public_gateway,
     };
     Ok(Resolved { settings, window, split })
 }
@@ -161,56 +158,6 @@ fn coinbase_tag(tag: String) -> Result<String, String> {
             .to_string());
     }
     Ok(tag)
-}
-
-/// The gateway `--public-gateway-tag` names and the fee `--public-gateway-fee-bps` and
-/// `--public-gateway-fee-subsidy-bps` set on its shares' work.
-fn public_gateway(o: &Options) -> Result<Option<PublicGateway>, String> {
-    let bps = |value: Option<u16>, flag: &str, what: &str| {
-        let max = ratum::BASIS_POINTS_PER_UNIT;
-        valid_or(value, 0, flag, &format!("basis points from 0 to {max}: {what}"), |n| {
-            u64::from(*n) <= max
-        })
-    };
-    let fee_bps = bps(
-        o.public_gateway_fee_bps,
-        "--public-gateway-fee-bps",
-        "the fee on the work of shares carrying --public-gateway-tag",
-    )?;
-    let subsidy_bps = bps(
-        o.public_gateway_fee_subsidy_bps,
-        "--public-gateway-fee-subsidy-bps",
-        "the portion of the public gateway fee's work reassigned to miners on their own gateways",
-    )?;
-    if subsidy_bps > 0 && fee_bps == 0 {
-        return Err(
-            "--public-gateway-fee-subsidy-bps needs --public-gateway-fee-bps above 0: the \
-             subsidy is a portion of that fee's work"
-                .into(),
-        );
-    }
-    let tag = o.public_gateway_tag.clone().filter(|t| !t.is_empty());
-    match (&tag, fee_bps) {
-        (None, 0) => {}
-        (None, _) => {
-            return Err("--public-gateway-fee-bps needs --public-gateway-tag, the secondary \
-                 coinbase tag (mining.coinbase_tag_secondary) of the public gateway; without it no \
-                 share can be told apart from the public gateway's"
-                .into());
-        }
-        (Some(t), _) if t.len() > MAX_COINBASE_TAG_LEN => {
-            return Err(format!(
-                "--public-gateway-tag must be at most {MAX_COINBASE_TAG_LEN} bytes, not {}",
-                t.len()
-            ));
-        }
-        (Some(_), 0) => warn!(
-            "--public-gateway-tag is set but --public-gateway-fee-bps is 0, so no fee is \
-             charged and the tag only separates own-gateway work in /stats.json"
-        ),
-        (Some(_), _) => {}
-    }
-    Ok(tag.map(|tag| PublicGateway { tag, fee_bps, subsidy_bps }))
 }
 
 fn poll_interval(secs: Option<f64>) -> Result<Duration, String> {
@@ -296,7 +243,6 @@ mod tests {
         assert_eq!(settings.listen, DEFAULT_LISTEN);
         assert_eq!(window, WindowRule { multiple: DEFAULT_WINDOW_MULTIPLE });
         assert_eq!(split.fee_bps, 0);
-        assert!(split.public_gateway.is_none());
         let policy = policy(Options::default()).unwrap();
         assert_eq!(policy.config.min_difficulty, 16384);
         assert_eq!(policy.config.prime_id, PRIME_ID);
@@ -317,14 +263,6 @@ mod tests {
     #[test]
     fn a_value_out_of_its_range_is_refused_with_its_flag() {
         refused(Options { fee_bps: Some(MAX_FEE_BPS + 1), ..Default::default() }, "--fee-bps");
-        refused(
-            Options { public_gateway_fee_bps: Some(10_001), ..Default::default() },
-            "--public-gateway-fee-bps",
-        );
-        refused(
-            Options { public_gateway_fee_subsidy_bps: Some(10_001), ..Default::default() },
-            "--public-gateway-fee-subsidy-bps",
-        );
         refused(Options { poll: Some(0.0), ..Default::default() }, "--poll");
         refused(Options { max_connections: Some(0), ..Default::default() }, "--max-connections");
         refused(
@@ -332,46 +270,6 @@ mod tests {
             "--ledger-keep-shares",
         );
         refused(Options { window: Some(f64::NAN), ..Default::default() }, "--window");
-    }
-
-    #[test]
-    fn the_public_gateway_fee_requires_its_tag_and_the_subsidy_requires_the_fee() {
-        refused(
-            Options { public_gateway_fee_subsidy_bps: Some(5_000), ..Default::default() },
-            "--public-gateway-fee-subsidy-bps needs --public-gateway-fee-bps",
-        );
-        refused(
-            Options { public_gateway_fee_bps: Some(200), ..Default::default() },
-            "--public-gateway-fee-bps needs --public-gateway-tag",
-        );
-        refused(
-            Options {
-                public_gateway_fee_bps: Some(200),
-                public_gateway_tag: Some("x".repeat(MAX_COINBASE_TAG_LEN + 1)),
-                ..Default::default()
-            },
-            "--public-gateway-tag must be at most",
-        );
-        let public = |fee_bps: Option<u16>| {
-            resolve(&Options {
-                public_gateway_fee_bps: fee_bps,
-                public_gateway_fee_subsidy_bps: fee_bps.map(|_| 7_500),
-                public_gateway_tag: Some("public".into()),
-                ..Default::default()
-            })
-            .unwrap()
-            .split
-            .public_gateway
-        };
-        assert_eq!(
-            public(Some(200)),
-            Some(PublicGateway { tag: "public".into(), fee_bps: 200, subsidy_bps: 7_500 })
-        );
-        assert_eq!(
-            public(None),
-            Some(PublicGateway { tag: "public".into(), fee_bps: 0, subsidy_bps: 0 }),
-            "a tag without a fee still separates own-gateway work"
-        );
     }
 
     #[test]

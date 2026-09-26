@@ -28,10 +28,9 @@ ratum-gateway -c gateway.json
 The file is the C gateway's JSON schema with the same defaults, except `datum.pool_host` and
 `datum.pool_pubkey` (`datum-beta1.mine.ocean.xyz` and its key, where the C gateway names
 `datum-beta1.mine.convoy.xyz`) and the two coinbase tags (empty, where the C gateway writes
-"DATUM Gateway" and "DATUM User"; an empty secondary tag is what the pool reads as a gateway
-of the miner's own, see "Public gateway fee"). Required: `bitcoind.rpcurl` (an http:// or
-https:// URL; any other scheme is refused at startup) with `rpcuser`/`rpcpassword` or
-`rpccookiefile`, and `mining.pool_address`. The node's
+"DATUM Gateway" and "DATUM User"). Required: `bitcoind.rpcurl` (an http:// or https:// URL;
+any other scheme is refused at startup) with `rpcuser`/`rpcpassword` or `rpccookiefile`, and
+`mining.pool_address`. The node's
 template decides when BLAKE2b (version 2) headers apply: until it lists the `!blake2b` rule
 no work is served. `mining.blake2b_activation_height` and `mining.blake2b_headline` are
 ignored. `RUST_LOG` overrides `logger.log_level_console`.
@@ -102,9 +101,6 @@ ignored. `RUST_LOG` overrides `logger.log_level_console`.
   it, as in C. Under an anti-block-withholding assignment the gateway holds only the hash of
   the XOR key, cannot compute the block hash and recognizes no block, so a share a check
   refuses is not sent, whatever its hash (the C gateway does the same).
-- A gateway the pool operator runs for miners without a node of their own sets
-  `mining.coinbase_tag_secondary` to the pool's `--public-gateway-tag`, and the pool charges
-  its shares `--public-gateway-fee-bps` (see "Public gateway fee" under Prime).
 - One thread per stratum connection, so `stratum.max_clients` alone limits the total and
   sizes the duplicate-share table and the share queue: each holds the shares
   `stratum.vardiff_target_shares_min` gives every client over the stale window, with
@@ -264,7 +260,7 @@ cargo test --workspace --release -- --ignored  # searches ~2^32 hashes for the t
 e2e/e2e.py full-stack                    # the activation block
 e2e/e2e.py full-stack --mempool-txns 5   # a pooled block carrying transactions the pool requested
 e2e/e2e.py multi-miner                   # three miners, two gateways: credit and payout split
-e2e/e2e.py public-gateway-fee            # a tagged gateway's shares charged, the fee paid to the other's miner
+e2e/e2e.py pool-fallback                 # the gateway moves to a fallback pool and back
 ```
 
 `core/tests/header_vectors.rs` reproduces the five version 2 header vectors in
@@ -320,9 +316,6 @@ min-diff = 16384                          # smallest share difficulty credited, 
 | `--window <multiple>` | 8 | the window's work as a multiple of the network difficulty |
 | `--ledger-keep-shares <n>` | keep all | the shares retained on disk (see "Ledger and window") |
 | `--fee-bps <n>` | 0 | the operator fee, at most 100 |
-| `--public-gateway-tag <text>` | none | the public gateway's secondary coinbase tag |
-| `--public-gateway-fee-bps <n>` | 0 | the fee on public-gateway work, at most 10000 |
-| `--public-gateway-fee-subsidy-bps <n>` | 0 | the portion of that fee reassigned to own-gateway miners |
 | `--require-v3` | off | refuse version 1 gateways at hello |
 | `--max-connections <n>` | 1024 | the gateway connections served at once |
 | `--max-connections-per-ip <n>` | 32 | those from one address |
@@ -508,7 +501,8 @@ pool credited) is dropped after the amounts are computed, so its amount stays in
 value that reaches the pool's payout script as the remainder.
 
 `--fee-bps` (0 to 100, default 0) is deducted from the coinbase before the split and paid to
-the pool's payout script as the remainder.
+the pool's payout script as the remainder. It is the only fee the pool charges: a share's
+secondary coinbase tag is recorded and reported but has no effect on any amount.
 
 A split pays each identity its part of the value it was dictated for, so a share whose job
 names a split dictated for another previous block, or for a value other than the job's
@@ -517,36 +511,6 @@ the coinbase keeps more than their part; for less, the difference would reach th
 script with no owed record. A gateway uses a split only on the value it requested it for. A connection may request 16 splits at once and one a second after that;
 a request past that is not answered. A session keeps its 64 newest splits, and saves with it
 for resume at most the 8 newest of those on the tip or a tip replaced within the last second.
-
-### Public gateway fee
-
-A public gateway is one the pool operator runs for miners without a node of their own.
-`--public-gateway-tag` names its `mining.coinbase_tag_secondary`, which the pool reads from
-every share's coinbase and which a miner cannot alter (under the version 2 header the mining
-machine never receives the coinbase); it must not be empty, since an empty secondary tag is
-the gateway's default. A share carrying that tag is public-gateway work; a share carrying any
-other tag, or none, is own-gateway work.
-
-`--public-gateway-fee-bps` (0 to 10000, default 0) is charged on public-gateway work at each
-split: an identity's weight is its work less that fraction of its public-gateway work, and
-`--public-gateway-fee-subsidy-bps` (0 to 10000, default 0) is the portion of the work so
-charged that is added to the own-gateway miners' weights in proportion to their own-gateway
-work. The rest stays in the coinbase value that reaches the pool's payout script as the
-remainder, so with no own-gateway work in the window the whole fee stays with the pool. The
-fee requires the tag, and the subsidy requires the fee. The fee is charged on the work the
-pool credits, so a share it rejects is not charged and a block share is charged like any
-other. The reassignment is applied before the 1024-output limit and the 546 sat minimum, and the
-owed-block records and `/stats.json` payouts follow it, since all of them are one split. No
-sats are held or paid by hand: the fee and the subsidy are share work, settled in the
-coinbase of the next block found and ageing out of the window with the shares that produced
-them.
-
-Own-gateway miners' extra pay over their own work is `subsidy * fee * p / (1 - p)`, where
-`p` is the public gateway's share of the window's work: at a 2% fee, a full subsidy and 80%
-of the work on the public gateway, 8%. It is not capped; it can never exceed the fee charged
-and falls as miners move to their own gateways. What the tag does not establish: a gateway's
-node is not verified to be the miner's own, and a gateway run by someone else without the
-tag counts as an own gateway.
 
 ### Owed blocks
 
@@ -668,15 +632,12 @@ serves at most 32 connections at once, 8 of them from one address (an IPv4 addre
 /64 prefix; loopback clients count only against the 32), one request each. It carries the tip, the coinbase value, the fee, the connected gateways, the build (`--version` prints the
 same string), an approximate hashrate (accepted-share difficulty over the last 10 minutes,
 at 2^32 hashes per difficulty unit, for the pool and per miner) and each miner's share of the
-window with `payable`, `unpayable_reason`, `tag` (the secondary coinbase tag of the
-miner's newest share in the window, the gateway's `mining.coinbase_tag_secondary`),
-and `own_gateway_work`; the window carries `work` against `target_work`, the `shares` it
-holds against the `max_shares` it may hold, and `count_capped`, true while the count bound
-rather than `target_work` is what ends it, so a reader can tell a window still filling from
-one that has stopped short; `public_gateway_fee` (null unless `--public-gateway-fee-bps` is set)
-carries the rates, the tag, the public-gateway work, the fee work, the work reassigned, the
-own-gateway work it is divided over, and what the fee work and the reassigned work are worth
-in sats at the current split. Every block the pool relays and the node does not refuse is
+window with `payable`, `unpayable_reason` and `tag` (the secondary coinbase tag of the
+miner's newest share in the window, the gateway's `mining.coinbase_tag_secondary`); the
+window carries `work` against `target_work`, the `shares` it holds against the `max_shares`
+it may hold, and `count_capped`, true while the count bound rather than `target_work` is what
+ends it, so a reader can tell a window still filling from one that has stopped short. Every
+block the pool relays and the node does not refuse is
 recorded in the ledger's `blocks` table and listed with its coinbase amounts, finder, the secondary coinbase tag its coinbase carried, and the confirmation count
 the node last answered for it (see "Owed blocks"); from the record and
 a cumulative work counter it derives a luck figure (blocks found over blocks

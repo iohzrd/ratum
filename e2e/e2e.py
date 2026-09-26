@@ -12,8 +12,6 @@ version 2 work.
 
   e2e/e2e.py full-stack          the activation block through one gateway and one miner
   e2e/e2e.py multi-miner         three miners behind two gateways: credit and payout split
-  e2e/e2e.py public-gateway-fee  a tagged gateway's shares charged, the fee paid to the
-                                 other gateway's miner
   e2e/e2e.py pool-fallback       the gateway moves to a fallback pool when the pool stops,
                                  and returns when it is started again
 
@@ -69,7 +67,6 @@ MIN_PAYOUT = 546
 SATS_PER_BTC = 100_000_000
 # The pool's MAX_COINBASER_OUTPUTS: the outputs one split may dictate.
 MAX_OUTPUTS = 1024
-BASIS_POINTS = 10_000
 STARTUP_WAIT = 30.0
 PROGRESS_INTERVAL = 30.0
 
@@ -155,23 +152,11 @@ class Acceptance:
         return self.username.split(".")[0]
 
 
-def split(work, own, value, min_payout, fee_bps, subsidy_bps):
-    """ledger::split in Python: the amounts the pool dictates by identity, and the remainder
-    its own script receives. `own` is each identity's work on gateways other than the public
-    one; with a fee of 0 it does not matter."""
-    charged = {i: (w - own.get(i, 0)) * fee_bps // BASIS_POINTS for i, w in work.items()}
-    fee_work = sum(charged.values())
-    own_total = sum(own.values())
-    reassigned = fee_work * subsidy_bps // BASIS_POINTS if own_total else 0
-    given = 0
-    weights = {}
-    for identity, w in work.items():
-        extra = reassigned * own.get(identity, 0) // own_total if own_total else 0
-        given += extra
-        weights[identity] = w - charged[identity] + extra
-    retained = fee_work - given
-    kept = sorted(weights.items(), key=lambda kv: (-kv[1], kv[0]))[:MAX_OUTPUTS]
-    left_work = sum(w for _, w in kept) + retained
+def split(work, value, min_payout):
+    """ledger::split in Python: the amounts the pool dictates by identity (work by identity,
+    the weights), and the remainder its own script receives."""
+    kept = sorted(work.items(), key=lambda kv: (-kv[1], kv[0]))[:MAX_OUTPUTS]
+    left_work = sum(w for _, w in kept)
     while kept:
         if left_work == 0:
             kept = []
@@ -193,29 +178,20 @@ def split(work, own, value, min_payout, fee_bps, subsidy_bps):
     return out, left
 
 
-def match_split(ledger, max_prefix, value, min_payout, paid, fee=None, pool=None):
-    """The prefix of the ledger whose split reproduces `paid` (sats by address), with the
-    amounts under the fee and without it, or None. The window a coinbase was built from is
-    some prefix of the ledger: a gateway requests a coinbaser only for the jobs whose state
-    sets need_coinbaser (datum_stratum.c), builds the other jobs without a new request, and
-    each gateway holds its own. `fee` is (fee_bps, subsidy_bps, public_tag); with `pool` the
-    remainder is expected under that address, so `paid` must carry the pool's output too."""
-    fee_bps, subsidy_bps, tag = fee or (0, 0, None)
-    work, own = {}, {}
+def match_split(ledger, max_prefix, value, min_payout, paid):
+    """The prefix of the ledger whose split reproduces `paid` (sats by address), with its
+    amounts, or None. The window a coinbase was built from is some prefix of the ledger: a
+    gateway requests a coinbaser only for the jobs whose state sets need_coinbaser
+    (datum_stratum.c), builds the other jobs without a new request, and each gateway holds
+    its own."""
+    work = {}
     for prefix in range(0, max_prefix + 1):
         if prefix:
             s = ledger[prefix - 1]
             work[s.identity] = work.get(s.identity, 0) + s.difficulty
-            if tag is not None and s.tag != tag:
-                own[s.identity] = own.get(s.identity, 0) + s.difficulty
-        out, remainder = split(work, own, value, min_payout, fee_bps, subsidy_bps)
-        expected = dict(out)
-        if pool:
-            expected[pool] = expected.get(pool, 0) + remainder
-        expected = {k: v for k, v in expected.items() if v}
-        if expected == paid:
-            plain, _ = split(work, own, value, min_payout, 0, 0)
-            return prefix, out, plain
+        out, _ = split(work, value, min_payout)
+        if out == paid:
+            return prefix, out
     return None
 
 
@@ -801,129 +777,6 @@ def multi_miner(stack: Stack, a: argparse.Namespace) -> None:
     stack.print_ledger(ledger)
 
 
-def public_gateway_fee(stack: Stack, a: argparse.Namespace) -> None:
-    """Two gateways: a public one whose secondary coinbase tag the pool was given, and one
-    with no tag, as a miner runs beside its own node. The pool charges the tagged gateway's
-    shares the public gateway fee and reassigns the charged work to the miner on the untagged
-    gateway: every pooled coinbase pays the split this module's copy of the pool's arithmetic
-    computes from the ledger, the pool's address receives only the remainder that arithmetic
-    leaves, at least one coinbase pays the public gateway's miner less than its work alone
-    earns, and at least one pays the own-gateway miner more."""
-    # 5000 basis points: half of alice's work is charged, so the fee and the subsidy are
-    # large enough to show in the few shares a CPU miner produces. The whole fee is
-    # reassigned: the pool keeps none, so a coinbase with own-gateway work in the window
-    # leaves the pool address no remainder at all.
-    fee_bps, subsidy_bps, public_tag = 5000, 10000, "public"
-    stack.require_tools("taskset")
-    stack.build_release()
-    stack.start_node()
-    stack.mine_through_activation()
-
-    step(f"starting ratum-prime on port {stack.pool_port}, fee {fee_bps} bps on shares tagged {public_tag}, subsidy {subsidy_bps} bps")
-    stack.start_pool(
-        "--window", WINDOW_MULTIPLE,
-        "--public-gateway-fee-bps", str(fee_bps),
-        "--public-gateway-fee-subsidy-bps", str(subsidy_bps),
-        "--public-gateway-tag", public_tag,
-    )
-    if "public gateway fee:" not in stack.pool_log():
-        fail(f"the pool did not report the public gateway fee at startup; see {stack.pool_log_path}")
-
-    # Gateway A is the public one: it tags its coinbases. Gateway B is what a miner runs
-    # beside its own node: the secondary tag left at its default, which is empty. Every
-    # share is difficulty 1: the pool's floor is 1 and the vardiff target is set so far
-    # above what a CPU miner reaches that the gateway never raises it.
-    ports = {"A": free_port(23300, 90), "B": free_port(23400, 90)}
-    step(f"starting gateway A on stratum port {ports['A']}, tag {public_tag}")
-    stack.start_gateway("A", ports["A"], free_port(7100, 90), GATEWAY_ADDRESS, public_tag)
-    step(f"starting gateway B on stratum port {ports['B']}, no tag")
-    stack.start_gateway("B", ports["B"], free_port(7200, 90), GATEWAY_ADDRESS, "")
-
-    step("starting miners: alice on gateway A, bob on gateway B")
-    alice_cpus, bob_cpus = cpu_spans(2)
-    stack.start_miner(f"{ALICE}.rig", "alice", ports["A"], alice_cpus)
-    stack.start_miner(f"{BOB}.rig", "bob", ports["B"], bob_cpus)
-
-    step(f"accumulating {a.alice_shares} shares from alice and {a.bob_shares} from bob (up to {a.timeout}s)")
-    counts = {"alice": 0, "bob": 0, "enough_at": None}
-
-    def enough() -> bool:
-        acc = stack.acceptances()
-        counts["alice"] = sum(x.identity == ALICE for x in acc)
-        counts["bob"] = sum(x.identity == BOB for x in acc)
-        if counts["alice"] < a.alice_shares or counts["bob"] < a.bob_shares:
-            return False
-        # A coinbase pays bob the subsidy only if its template was built after a share of
-        # alice's and a share of bob's were credited. On regtest nearly every share is a
-        # block, and a template can be one share behind the ledger, so once the counts are
-        # met wait for two more accepted shares before stopping the miners.
-        if counts["enough_at"] is None:
-            counts["enough_at"] = len(acc) + 2
-        return len(acc) >= counts["enough_at"]
-
-    reached = stack.wait_until(
-        enough, a.timeout,
-        lambda: f"alice {counts['alice']}/{a.alice_shares}, bob {counts['bob']}/{a.bob_shares} at height {stack.height()}",
-    )
-    print(f"  alice {counts['alice']}, bob {counts['bob']}")
-    if not reached:
-        fail(f"alice {counts['alice']} and bob {counts['bob']} shares in {a.timeout}s, wanted {a.alice_shares} and {a.bob_shares}")
-
-    check_block_endpoint_for_pooled_blocks(stack, ACTIVATION_HEIGHT + 1)
-    ledger = stack.stop_and_dump_ledger()
-
-    step("work credited per identity and tag")
-    for key in sorted({(s.identity, s.tag) for s in ledger}):
-        mine = [s for s in ledger if (s.identity, s.tag) == key]
-        label = f"{key[0]} {key[1] or '(no tag)'}"
-        print(f"  {label:55} {len(mine):3d} shares {sum(s.difficulty for s in mine):6d} work")
-    if any(s.identity == ALICE and s.tag != public_tag for s in ledger):
-        fail(f"a share of alice's does not carry the tag {public_tag} gateway A was started with")
-    if any(s.identity == BOB and s.tag == public_tag for s in ledger):
-        fail("a share of bob's carries the public tag; gateway B was started with none")
-
-    step("each pooled coinbase pays the split with the fee and leaves the pool the remainder")
-    checked = subsidy_only = charged = subsidized = 0
-    for height in range(ACTIVATION_HEIGHT + 1, stack.height() + 1):
-        block_hash, block = stack.block(height)
-        recorded = stack.acceptance_of(block_hash)
-        if recorded.split == 0:
-            # Subsidy-only work: served between a tip change and the next coinbaser split,
-            # its coinbase pays the pool alone and the pool records what it owes (README,
-            # Owed blocks).
-            subsidy_only += 1
-            continue
-        paid = stack.coinbase_outputs(block, [ALICE, BOB, POOL_ADDRESS])
-        k = stack.ledger_index_of(ledger, block_hash)
-        matched = match_split(
-            ledger, k, stack.coinbase_value(block), MIN_PAYOUT, paid,
-            fee=(fee_bps, subsidy_bps, public_tag), pool=POOL_ADDRESS,
-        )
-        if not matched:
-            fail(f"height {height} pays {paid}, the split of no recent window with the fee")
-        prefix, out, plain = matched
-        checked += 1
-        charged += out.get(ALICE, 0) < plain.get(ALICE, 0)
-        subsidized += out.get(BOB, 0) > plain.get(BOB, 0)
-        print(
-            f"  height {height:<3} over {prefix} shares: alice {out.get(ALICE, 0)} sats "
-            f"({plain.get(ALICE, 0)} without the fee), bob {out.get(BOB, 0)} sats "
-            f"({plain.get(BOB, 0)} without it)"
-        )
-    if checked < 1:
-        fail(f"no pooled coinbase to check ({subsidy_only} subsidy-only blocks)")
-    if charged < 1:
-        fail("no coinbase paid alice less than her work earns; the public gateway fee was not charged")
-    if subsidized < 1:
-        fail("no coinbase paid bob more than his own work earns; the fee work was not reassigned")
-
-    step(
-        f"passed: {checked} pooled coinbases match the split with the fee, {charged} charged "
-        f"alice, {subsidized} paid bob the fee work ({subsidy_only} subsidy-only)"
-    )
-    stack.print_ledger(ledger)
-
-
 def pool_fallback(stack: Stack, a: argparse.Namespace) -> None:
     """Two pools; the gateway names the second as a fallback. Stopping the first moves the
     gateway to the second within the reconnect delay; starting the first again (the same
@@ -1015,12 +868,6 @@ def main() -> int:
     mm.add_argument("--shares", type=int, default=6, help="shares to accumulate before checking")
     mm.add_argument("--timeout", type=float, default=5400, help="seconds to wait for them")
     mm.set_defaults(scenario=multi_miner)
-
-    pf = runs.add_parser("public-gateway-fee", help="a tagged gateway's shares charged, the fee paid to the other's miner")
-    pf.add_argument("--alice-shares", type=int, default=6, help="shares from the miner on the public gateway")
-    pf.add_argument("--bob-shares", type=int, default=2, help="shares from the miner on the own gateway")
-    pf.add_argument("--timeout", type=float, default=5400, help="seconds to wait for them")
-    pf.set_defaults(scenario=public_gateway_fee)
 
     fb = runs.add_parser("pool-fallback", help="the gateway moves to a fallback pool and back")
     fb.set_defaults(scenario=pool_fallback)
