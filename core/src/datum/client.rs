@@ -143,10 +143,18 @@ impl ClientChannel {
     /// carry no MAC, so anyone who derives the header mask could write one, and the session
     /// acts on every mining message it is given, a coinbaser split among them. The C gateway
     /// accepts such a frame; the pool this gateway is released with never sends one, and
-    /// refuses them in the other direction (`ServerChannel::decrypt`).
+    /// refuses them in the other direction (`ServerChannel::decrypt`). The exception is an
+    /// unsigned empty ping, which other pools send as a keepalive and which carries nothing.
     pub fn decrypt(&mut self, header: FrameHeader, ciphertext: &[u8]) -> Result<Vec<u8>, Error> {
         let verify = self.pool_session_sign_pk.as_ref();
         match (header.is_encrypted_channel, header.is_encrypted_pubkey) {
+            (false, false)
+                if header.proto_cmd == framing::cmd::HELLO_OR_PING
+                    && !header.is_signed
+                    && ciphertext.is_empty() =>
+            {
+                Ok(Vec::new())
+            }
             (true, false) => self.channel.decrypt(header, ciphertext, verify),
             (false, true) => {
                 let plain =
@@ -331,7 +339,7 @@ mod tests {
     }
 
     #[test]
-    fn a_frame_neither_channel_encrypted_nor_sealed_is_refused_after_the_handshake() {
+    fn a_plain_frame_other_than_an_empty_ping_is_refused_after_the_handshake() {
         let pool = KeyPairs::generate();
         let mut client = client_with_generated_keys(9);
         let wire = client.hello(&pool.box_pk, "ua", ProtocolVersion::V1);
@@ -360,6 +368,13 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(client.decrypt(signed, &[0u8; 70]), Err(Error::Malformed(_))));
+
+        let ping = FrameHeader { proto_cmd: framing::cmd::HELLO_OR_PING, ..Default::default() };
+        assert_eq!(client.decrypt(ping, &[]).unwrap(), b"", "an unsigned empty plain ping");
+        let signed_ping = FrameHeader { is_signed: true, ..ping };
+        assert!(matches!(client.decrypt(signed_ping, &[]), Err(Error::Malformed(_))));
+        let empty_mining = FrameHeader { proto_cmd: framing::cmd::MINING, ..ping };
+        assert!(matches!(client.decrypt(empty_mining, &[]), Err(Error::Malformed(_))));
 
         let wire = session.encrypt(framing::cmd::MINING, b"after", false).unwrap();
         let header = client.unmask_header(wire[..4].try_into().unwrap());
