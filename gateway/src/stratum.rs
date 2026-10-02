@@ -101,9 +101,7 @@ impl AcceptedSlot {
         gateway
             .stratum
             .accepted
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < max_clients).then_some(n + 1)
-            })
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < max_clients).then_some(n + 1))
             .ok()
             .map(|_| Self(Arc::clone(gateway)))
     }
