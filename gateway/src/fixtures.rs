@@ -49,9 +49,7 @@ pub fn job_with_id(stratum_job_id: &str) -> Job {
     job
 }
 
-pub fn test_gateway(edit: impl FnOnce(&mut Config)) -> Arc<Gateway> {
-    let mut config = config();
-    edit(&mut config);
+pub fn test_gateway() -> Arc<Gateway> {
     let node = ratum::rpc::Client::new("http://127.0.0.1:1", "u", "p", None).unwrap();
-    Gateway::new(config, node)
+    Gateway::new(config(), node)
 }

@@ -8,8 +8,8 @@ use std::sync::Mutex;
 
 /// Reads `getmininginfo` and writes it into `into`: the warnings always, and the network
 /// hashrate estimate only on main, since `network_share` is reported as a share of the
-/// network and the estimate of a test chain names a different network. Returns the chain the
-/// node reported and whether the warnings changed, which is what a caller logs on.
+/// network and the estimate of a test chain names a different network. Returns the warnings
+/// and whether they changed, which is what a caller logs on.
 ///
 /// Both binaries poll through this, so the rule above holds for both; they differ only in
 /// how they log and how they retry.
@@ -19,12 +19,11 @@ pub fn refresh(node: &rpc::Client, into: &LatestMiningInfo) -> Result<Refreshed,
         into.set_network_hashps(info.network_hashps);
     }
     let warnings_changed = into.warnings.set(info.warnings.clone());
-    Ok(Refreshed { chain: info.chain, warnings: info.warnings, warnings_changed })
+    Ok(Refreshed { warnings: info.warnings, warnings_changed })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Refreshed {
-    pub chain: rpc::Chain,
     pub warnings: Vec<String>,
     /// Whether these warnings differ from the ones held, so a standing warning is logged once.
     pub warnings_changed: bool,

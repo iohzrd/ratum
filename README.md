@@ -140,9 +140,9 @@ ignored. `RUST_LOG` overrides `logger.log_level_console`.
   the username, so it is not removed. The address is decoded as `ratum-prime` decodes it, with
   the prefixes of every chain accepted: the gateway does not read the node's chain for this
   check, so an address of another chain passes it and `ratum-prime` refuses its shares.
-- The node's `getmininginfo` is read once a minute, for the network hashrate the connection
-  limit above applies to and for the node's `warnings`, which the status page shows one line
-  each (a node before Bitcoin Core 29 answers a single string in place of the array; both
+- The node's `getmininginfo` is read once a minute, for the network hashrate `/stats.json`
+  reports (`stratum.network_hashps`, `stratum.network_share`) and for the node's `warnings`,
+  which the status page shows one line each (a node before Bitcoin Core 29 answers a single string in place of the array; both
   read back). The C gateway shows neither.
 - A block the node accepts is checked once, two minutes later, with `getblockheader`: the log
   says whether it is still on the best chain and at what depth, or that another block won the

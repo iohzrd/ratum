@@ -449,7 +449,7 @@ mod tests {
             let writer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
             let (served, _) = listener.accept().unwrap();
             writer.set_read_timeout(Some(DEADLINE)).unwrap();
-            let gateway = test_gateway(|_| {});
+            let gateway = test_gateway();
             let g = Arc::clone(&gateway);
             let thread = std::thread::spawn(move || Connection::run(g, served));
             let lines = BufReader::new(writer.try_clone().unwrap());

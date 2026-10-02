@@ -216,7 +216,7 @@ mod tests {
     /// so the shares miners are still submitting on them are not refused.
     #[test]
     fn standard_work_on_the_tip_served_leaves_the_jobs_before_it_valid() {
-        let gateway = test_gateway(|_| {});
+        let gateway = test_gateway();
         let t = on_tip([0; 32]);
         on_template(&gateway, Arc::clone(&t), true, None);
         let first = served(&gateway);
@@ -233,7 +233,7 @@ mod tests {
     /// discarded before a job is built, so the new tip's work stays the work served.
     #[test]
     fn a_coinbaser_completion_for_a_replaced_tip_is_discarded() {
-        let gateway = test_gateway(|_| {});
+        let gateway = test_gateway();
         let old = on_tip([0; 32]);
         on_template(&gateway, Arc::clone(&old), false, None);
         on_template(&gateway, on_tip([0x11; 32]), true, None);
