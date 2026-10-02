@@ -1,7 +1,9 @@
 //! The share rows on disk, each under a sequence number, and the metadata beside them: the chain
 //! the ledger serves and the running total of credited work.
 
-use super::db::{DbResult as _, NAME_SEPARATOR, create_database, split_at_separator, write};
+use super::db::{
+    DbResult as _, NAME_SEPARATOR, create_database, split_at_separator, write, write_deferred,
+};
 use super::{ReadBack, Share};
 use bytes::BufMut as _;
 use ratum::bitcoin::HASH_SIZE;
@@ -144,16 +146,32 @@ impl Store {
 
     /// Stores the share under the next sequence number with `cumulative_work`, the
     /// ledger's counter as it stands with this share.
+    #[cfg(test)]
     pub(super) fn insert(&mut self, share: &Share, cumulative_work: u128) -> io::Result<()> {
+        self.insert_batch(std::slice::from_ref(share), cumulative_work)
+    }
+
+    /// Stores `shares` under the next sequence numbers, in order, with `cumulative_work`, the
+    /// ledger's counter as it stands with the last of them: one transaction, one fsync. On an
+    /// error none is stored.
+    pub(super) fn insert_batch(
+        &mut self,
+        shares: &[Share],
+        cumulative_work: u128,
+    ) -> io::Result<()> {
         write(&self.db, |w| {
-            w.open_table(SHARES).db()?.insert(self.next_seq, pack(share).as_slice()).db()?;
+            let mut table = w.open_table(SHARES).db()?;
+            for (seq, share) in (self.next_seq..).zip(shares) {
+                table.insert(seq, pack(share).as_slice()).db()?;
+            }
+            drop(table);
             w.open_table(META)
                 .db()?
                 .insert(META_CUMULATIVE_WORK, cumulative_work.to_string().as_str())
                 .db()?;
             Ok(())
         })?;
-        self.next_seq += 1;
+        self.next_seq += shares.len() as u64;
         Ok(())
     }
 
@@ -240,7 +258,9 @@ impl Store {
     /// rows must stay for a resend of their share to be refused after a restart. Disk cannot
     /// be bounded below what these need, so the configured figure is a request and both floors
     /// override it. At most `MAX_RETAINED_PER_CALL` rows go per call. The rows to remove are
-    /// found in a read transaction, so a call that removes none commits nothing.
+    /// found in a read transaction, so a call that removes none commits nothing. The removal
+    /// commits without an fsync (`write_deferred`): it reaches the disk with the next share
+    /// commit, and a crash before then leaves rows the next call removes again.
     pub(super) fn retain(
         &self,
         floor: u64,
@@ -269,7 +289,7 @@ impl Store {
         if oldest.is_empty() {
             return Ok(0);
         }
-        write(&self.db, |w| {
+        write_deferred(&self.db, |w| {
             let mut shares = w.open_table(SHARES).db()?;
             for seq in &oldest {
                 shares.remove(*seq).db()?;

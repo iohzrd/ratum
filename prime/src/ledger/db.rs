@@ -59,8 +59,26 @@ pub(super) fn write<T>(
     db: &Database,
     f: impl FnOnce(&redb::WriteTransaction) -> io::Result<T>,
 ) -> io::Result<T> {
+    write_at(db, Durability::Immediate, f)
+}
+
+/// Runs `f` in a write transaction committed at `Durability::None`: no fsync, and on disk with
+/// the next `write`. For changes a crash may undo, such as removing rows retention would remove
+/// again.
+pub(super) fn write_deferred<T>(
+    db: &Database,
+    f: impl FnOnce(&redb::WriteTransaction) -> io::Result<T>,
+) -> io::Result<T> {
+    write_at(db, Durability::None, f)
+}
+
+fn write_at<T>(
+    db: &Database,
+    durability: Durability,
+    f: impl FnOnce(&redb::WriteTransaction) -> io::Result<T>,
+) -> io::Result<T> {
     let mut w = db.begin_write().db()?;
-    w.set_durability(Durability::Immediate).db()?;
+    w.set_durability(durability).db()?;
     let out = f(&w)?;
     w.commit().db()?;
     Ok(out)

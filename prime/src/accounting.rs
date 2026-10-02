@@ -140,8 +140,9 @@ pub fn claim(
     }
 }
 
-/// Records the accepted share to the ledger. A share the ledger could not record releases
-/// its claim, so a resend can be credited.
+/// Records the accepted share to the ledger, in a commit shared with the shares other
+/// connections record meanwhile (`GroupCommit`), and returns once it is on disk. A share the
+/// ledger could not record releases its claim, so a resend can be credited.
 pub fn credit_share(
     server: &Server,
     peer: SocketAddr,
@@ -156,7 +157,7 @@ pub fn credit_share(
         block_hash: rebuilt.block_hash,
         tag_secondary: rebuilt.tag_secondary.clone(),
     };
-    let removed = match lock(&server.ledger).record(share) {
+    let removed = match server.ledger_commits.record(&server.ledger, share) {
         Ok(removed) => removed,
         Err(e) => {
             lock(&server.accepted_hashes).remove(&rebuilt.block_hash);

@@ -4,6 +4,7 @@
 
 pub mod blocks;
 mod db;
+pub mod group_commit;
 mod snapshot;
 pub mod split;
 mod store;
@@ -378,19 +379,31 @@ impl Ledger {
 
     /// Records the share and returns how many stored shares `--ledger-keep-shares` retention
     /// removed. A duplicate is refused before it reaches the ledger (`accounting::claim`).
+    #[cfg(test)]
     pub fn record(&mut self, share: Share) -> io::Result<usize> {
-        let keep_after = share.accepted_at.saturating_sub(ACCEPTED_HASH_RETENTION_SECS);
-        let cumulative_work = self.cumulative_work + u128::from(share.difficulty);
+        self.record_batch(vec![share])
+    }
+
+    /// Records `shares` in order, in one store transaction (`GroupCommit` gathers them), and
+    /// returns how many stored shares `--ledger-keep-shares` retention removed. The window
+    /// takes them only once they are on disk: on an error none is recorded.
+    pub fn record_batch(&mut self, shares: Vec<Share>) -> io::Result<usize> {
+        let Some(newest) = shares.iter().map(|s| s.accepted_at).max() else { return Ok(0) };
+        let keep_after = newest.saturating_sub(ACCEPTED_HASH_RETENTION_SECS);
+        let cumulative_work =
+            shares.iter().fold(self.cumulative_work, |work, s| work + u128::from(s.difficulty));
         if let Some(store) = &mut self.store {
-            store.insert(&share, cumulative_work)?;
+            store.insert_batch(&shares, cumulative_work)?;
         }
         self.cumulative_work = cumulative_work;
-        self.push(&share);
-        self.trim();
+        for share in &shares {
+            self.push(share);
+            self.trim();
+        }
         let Some(store) = &self.store else { return Ok(0) };
         let retained = store.retain(self.shares.len() as u64, keep_after, MAX_ACCEPTED_HASHES);
         Ok(retained.unwrap_or_else(|e| {
-            warn!("ledger retention failed; the share is recorded ({e})");
+            warn!("ledger retention failed; the shares are recorded ({e})");
             0
         }))
     }

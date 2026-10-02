@@ -5,6 +5,7 @@ use crate::accounting::{ACCEPTED_HASH_RETENTION_SECS, AcceptedShareHashes, MAX_A
 use crate::bounded::BoundedSet;
 use crate::ledger::Ledger;
 use crate::ledger::blocks::BlockRecords;
+use crate::ledger::group_commit::GroupCommit;
 use crate::node::NodeState;
 use crate::sessions::SessionStore;
 use crate::settings::Settings;
@@ -33,6 +34,8 @@ pub struct Server {
     pub node_state: NodeState,
     pub accepted_hashes: Mutex<AcceptedShareHashes>,
     pub ledger: Mutex<Ledger>,
+    /// Gathers the shares accepted on every connection into shared ledger commits.
+    pub ledger_commits: GroupCommit,
     pub records: Mutex<BlockRecords>,
     pub share_policy: SharePolicy,
     pub config_payload: Vec<u8>,
@@ -69,6 +72,7 @@ impl Server {
             node,
             node_state: NodeState::default(),
             ledger: Mutex::new(ledger),
+            ledger_commits: GroupCommit::default(),
             records: Mutex::new(records),
             share_policy,
             config_payload,

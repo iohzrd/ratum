@@ -428,10 +428,14 @@ template's for a job on another parent (any bits on testnet and testnet4).
 
 Every accepted share is written to a [redb](https://github.com/cberner/redb) database before
 it is credited: `--data-dir` holds it as `<chain>.redb`; without one the window is in
-memory only. `--ledger-keep-shares <n>` keeps the newest `n` shares
-on disk and removes the rest as each share is recorded, at most 4096 rows per share, so a
-surplus left by setting or lowering it on a large ledger is removed over the shares that
-follow; unset keeps every one, which is what
+memory only. The shares accepted on all connections while one commit runs are written
+together in the next, one fsync for up to 4096 shares, and each is answered once its commit
+returns; a failed commit refuses every share in it. A single connection waits for each of
+its shares' commits, so its own shares are written one per commit. `--ledger-keep-shares <n>`
+keeps the newest `n` shares on disk and removes the rest after each commit, at most 4096 rows
+per commit, so a surplus left by setting or lowering it on a large ledger is removed over the
+commits that follow. The removal is committed without an fsync and reaches the disk with the
+next commit; rows a crash keeps are removed again. Unset keeps every one, which is what
 TIDES specifies, since a rising network difficulty widens the window over shares that had
 left it. Retention never removes a share the window holds, since the window reads itself back
 from these rows, nor one of the newest `2^20` accepted in the last 4 hours 10 minutes, whose
