@@ -87,13 +87,4 @@ impl Gateway {
         }
         published
     }
-
-    pub fn network_share(&self) -> Option<f64> {
-        self.mining_info.network_share(self.stratum.summary().hashrate_hs)
-    }
-
-    pub fn over_network_share(&self) -> Option<f64> {
-        let limit = self.config.max_network_share()?;
-        self.network_share().filter(|share| *share > limit)
-    }
 }

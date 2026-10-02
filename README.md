@@ -93,9 +93,8 @@ ignored. `RUST_LOG` overrides `logger.log_level_console`.
   replaced in place): every change restarts, where the C gateway applies some without one. A
   password in `bitcoind.rpcurl` is shown as `***`; saving the URL as shown keeps the file's
   value. The field names and the `pool_host(old)` convention are the C gateway's;
-  `datum.pool_url`, the stratum port, `stratum.vardiff_min`,
-  `stratum.max_network_share_bps` and `stratum.require_address_username` are editable in
-  addition to the C page's fields.
+  `datum.pool_url`, the stratum port, `stratum.vardiff_min` and
+  `stratum.require_address_username` are editable in addition to the C page's fields.
 - A share whose hash meets the block target is sent to the pool before the block is submitted
   to the node, and is sent even when a share check (stale job, duplicate, username) refuses
   it, as in C. Under an anti-block-withholding assignment the gateway holds only the hash of
@@ -107,18 +106,6 @@ ignored. `RUST_LOG` overrides `logger.log_level_console`.
   headroom. `stratum.max_clients_per_thread` and `stratum.max_threads` bound nothing here
   and are read only for the C gateway's check that their product covers `max_clients`.
   `empty_thread` disconnects every client; `/threads` is not served.
-- New stratum connections are refused while the gateway's own miners measure above
-  `stratum.max_network_share_bps` of the network hashrate (not a C key; 1000 basis points,
-  10%, by default; 0 refuses none). The limit keeps a gateway open to the public from
-  growing past that fraction of the chain, and the miner lookup reports it as
-  `max_network_share_bps` beside the current `network_share`. The gateway's hashrate is the
-  sum of its clients' measured windows; the network's is `getnetworkhashps` from the
-  configured node, read once a minute. Connections already established keep mining and no
-  client is disconnected; the status page and `/stats.json` report the share
-  (`stratum.network_share`) whether or not it is over. The limit applies on chain `main`
-  alone, and is not enforced while the node has answered no estimate: a node that does not
-  serve `getnetworkhashps`, or a regtest chain, leaves every connection accepted. The C
-  gateway has no such limit.
 - The extranonce1 session id is the 32-bit connection counter, so it never repeats for a live
   connection.
 - A new tip builds two immutable jobs (priority and coinbaser) where C rewrites one, so

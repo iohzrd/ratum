@@ -182,7 +182,6 @@ pub(super) fn status_json(ctx: &Context, with_clients: bool) -> Value {
             "hashrate_ths": ths(summary.hashrate_hs),
             "network_hashps": gateway.mining_info.network_hashps(),
             "network_share": gateway.mining_info.network_share(summary.hashrate_hs),
-            "max_network_share": cfg.max_network_share(),
         },
         "node_warnings": gateway.mining_info.warnings(),
         "job": job,
@@ -234,8 +233,6 @@ pub(super) fn miner_lookup_json(ctx: &Context, addr: Option<&str>) -> Value {
         "hashrate_ths": ths(totals.hashrate_hs),
         "stratum_port": cfg.stratum.listen_port,
         "require_address_username": cfg.stratum.require_address_username,
-        "max_network_share_bps": cfg.stratum.max_network_share_bps,
-        "network_share": ctx.gateway.network_share(),
         "pool_host": pool_host_json(&ctx.gateway),
         "pool_url": pool_url_json(&ctx.gateway),
     })

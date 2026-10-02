@@ -218,7 +218,6 @@ fn listen(gateway: Arc<Gateway>) -> io::Result<()> {
     info!("Stratum V1 Server Init complete: listening on {}", listener.local_addr()?);
     gateway.stratum.listening.store(true, Ordering::Relaxed);
     let mut pool_refusals = ConnectionRefusals::default();
-    let mut share_refusals = ConnectionRefusals::default();
     for stream in listener.incoming() {
         let stream = match stream {
             Ok(s) => s,
@@ -232,16 +231,6 @@ fn listen(gateway: Arc<Gateway>) -> io::Result<()> {
             if let Some(refused) = pool_refusals.note() {
                 warn!(
                     "Refusing stratum connections while the pool is unreachable and datum.pooled_mining_only is set ({refused} refused)"
-                );
-            }
-            continue;
-        }
-        if let Some(share) = gateway.over_network_share() {
-            if let Some(refused) = share_refusals.note() {
-                warn!(
-                    "Refusing stratum connections: this gateway's miners measure {:.2}% of the network's hashrate, above the stratum.max_network_share_bps limit of {:.2}% ({refused} refused). Connected miners keep mining; point new ones at another gateway.",
-                    share * 100.0,
-                    gateway.config.max_network_share().unwrap_or_default() * 100.0
                 );
             }
             continue;
@@ -265,95 +254,6 @@ fn listen(gateway: Arc<Gateway>) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixtures::test_gateway;
-
-    fn add_client(gateway: &Gateway, hashrate_hs: f64) -> mio::Poll {
-        let poll = mio::Poll::new().unwrap();
-        let waker = mio::Waker::new(poll.registry(), mio::Token(0)).unwrap();
-        let unique_id = gateway.stratum.next_unique_id.fetch_add(1, Ordering::Relaxed);
-        lock(&gateway.stratum.clients).insert(
-            unique_id,
-            Arc::new(ClientEntry {
-                unique_id,
-                kill_requested: AtomicBool::new(false),
-                waker,
-                stats: Mutex::new(ClientStats {
-                    subscribed_at: Some(Instant::now()),
-                    hashrate: Some((Instant::now(), hashrate_hs)),
-                    ..Default::default()
-                }),
-            }),
-        );
-        poll
-    }
-
-    #[test]
-    fn without_an_estimate_no_share_refuses_a_connection() {
-        let gateway = test_gateway(|c| c.stratum.max_network_share_bps = 500);
-        let _poll = add_client(&gateway, 1e21);
-        assert!(gateway.network_share().is_none(), "no estimate has been read");
-        assert!(gateway.over_network_share().is_none(), "so no connection is refused");
-    }
-
-    #[test]
-    fn a_gateway_over_the_limit_refuses_and_one_under_it_does_not() {
-        let gateway = test_gateway(|c| c.stratum.max_network_share_bps = 500);
-        let _poll = add_client(&gateway, 6e16);
-        gateway.mining_info.set_network_hashps(1e18);
-        let share = gateway.over_network_share().expect("6% is over the 5% limit");
-        assert!((share - 0.06).abs() < 1e-6, "share {share}");
-
-        gateway.mining_info.set_network_hashps(2e18);
-        assert!(gateway.over_network_share().is_none(), "3% is under the 5% limit");
-        let share = gateway.network_share().expect("an estimate has been read");
-        assert!((share - 0.03).abs() < 1e-6, "share {share}");
-    }
-
-    #[test]
-    fn a_gateway_exactly_at_the_limit_is_not_refused() {
-        let gateway = test_gateway(|c| c.stratum.max_network_share_bps = 500);
-        let _poll = add_client(&gateway, 5e16);
-        gateway.mining_info.set_network_hashps(1e18);
-        let share = gateway.network_share().expect("an estimate has been read");
-        let limit = gateway.config.max_network_share().expect("the configured limit");
-        assert!((share - limit).abs() < 1e-6, "share {share}");
-        assert!(
-            gateway.over_network_share().is_none(),
-            "a connection is refused above the limit, not at it"
-        );
-    }
-
-    #[test]
-    fn the_limit_is_the_configured_share_and_defaults_to_ten_percent() {
-        let gateway = test_gateway(|_| {});
-        assert_eq!(
-            gateway.config.stratum.max_network_share_bps,
-            crate::config::DEFAULT_MAX_NETWORK_SHARE_BPS
-        );
-        assert_eq!(gateway.config.max_network_share(), Some(0.1));
-
-        for (bps, over) in [(500, true), (600, false), (1_000, false), (100, true)] {
-            let gateway = test_gateway(|c| c.stratum.max_network_share_bps = bps);
-            let _poll = add_client(&gateway, 6e16);
-            gateway.mining_info.set_network_hashps(1e18);
-            assert_eq!(
-                gateway.over_network_share().is_some(),
-                over,
-                "6% of the network against a {bps} bps limit"
-            );
-        }
-    }
-
-    #[test]
-    fn a_limit_of_zero_refuses_nothing() {
-        let gateway = test_gateway(|c| c.stratum.max_network_share_bps = 0);
-        let _poll = add_client(&gateway, 9e17);
-        gateway.mining_info.set_network_hashps(1e18);
-        assert_eq!(gateway.config.max_network_share(), None);
-        let share = gateway.network_share().expect("the share is still reported");
-        assert!((share - 0.9).abs() < 1e-6, "share {share}");
-        assert!(gateway.over_network_share().is_none(), "but no connection is refused");
-    }
 
     #[test]
     fn refusals_are_logged_once_per_interval() {

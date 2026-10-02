@@ -4,8 +4,7 @@
 
 use crate::config::{
     COINBASE_UNIQUE_ID_RANGE, Config, GLOBAL_TIMEOUT_MARGIN_SECS, MAX_CONFIGURED_TAG_LEN,
-    MAX_CONFIGURED_TAGS_TOTAL_LEN, MAX_NETWORK_SHARE_BPS_RANGE, PORT_RANGE, Pool,
-    VARDIFF_MIN_RANGE, WORK_UPDATE_SECONDS_RANGE,
+    MAX_CONFIGURED_TAGS_TOTAL_LEN, PORT_RANGE, Pool, VARDIFF_MIN_RANGE, WORK_UPDATE_SECONDS_RANGE,
 };
 use serde_json::{Value, json};
 use std::ops::RangeInclusive;
@@ -75,11 +74,6 @@ const FIELDS: &[Field] = &[
     field!(datum.protocol_v3, "Version 3 protocol", FieldKind::Bool),
     field!(stratum.listen_port, "Stratum port", int(&PORT_RANGE)),
     field!(stratum.vardiff_min, "Minimum difficulty", int(&VARDIFF_MIN_RANGE)),
-    field!(
-        stratum.max_network_share_bps,
-        "Network hashrate limit",
-        int(&MAX_NETWORK_SHARE_BPS_RANGE)
-    ),
     field!(stratum.require_address_username, "Require an address as the username", FieldKind::Bool),
     field!(bitcoind.work_update_seconds, "Job update interval", int(&WORK_UPDATE_SECONDS_RANGE)),
     // Shown and compared in its redacted form, so the page never carries the password a
@@ -659,8 +653,6 @@ mod tests {
         assert_eq!(e, ["Unique gateway ID must be between 0 and 65535"]);
         let e = apply(&c, FILE, &form(&[("datum_pool_port", "x")])).unwrap_err();
         assert_eq!(e, ["Pool port must be a whole number"]);
-        let e = apply(&c, FILE, &form(&[("stratum_max_network_share_bps", "20000")])).unwrap_err();
-        assert_eq!(e, ["Network hashrate limit must be between 0 and 10000"]);
     }
 
     #[test]

@@ -24,8 +24,6 @@ pub const WORK_UPDATE_SECONDS_RANGE: std::ops::RangeInclusive<u64> = 5..=120;
 pub const PORT_RANGE: std::ops::RangeInclusive<u64> = 1..=u16::MAX as u64;
 pub const VARDIFF_MIN_RANGE: std::ops::RangeInclusive<u64> = 1..=u64::MAX;
 pub const COINBASE_UNIQUE_ID_RANGE: std::ops::RangeInclusive<u64> = 0..=u16::MAX as u64;
-pub const MAX_NETWORK_SHARE_BPS_RANGE: std::ops::RangeInclusive<u64> =
-    0..=ratum::BASIS_POINTS_PER_UNIT;
 const MIN_VARDIFF_TARGET_SHARES_MIN: u64 = 1;
 const MIN_VARDIFF_QUICKDIFF_COUNT: u64 = 4;
 const MIN_VARDIFF_QUICKDIFF_DELTA: u64 = 3;
@@ -39,7 +37,6 @@ const MIN_VARDIFF_QUICKDIFF_DELTA: u64 = 3;
 const MAX_VARDIFF_TARGET_SHARES_MIN: u64 =
     ratum::SECS_PER_MINUTE * 1000 / MIN_VARDIFF_QUICKDIFF_DELTA;
 const SHARE_STALE_SECONDS_RANGE: std::ops::RangeInclusive<u64> = 60..=150;
-pub const DEFAULT_MAX_NETWORK_SHARE_BPS: u32 = 1000;
 pub const GLOBAL_TIMEOUT_MARGIN_SECS: u64 = 5;
 /// The longest `datum.protocol_global_timeout`. The DATUM session adds the timeout to
 /// `Instant::now()`, which panics on overflow for values near u64::MAX seconds; a day is far
@@ -82,7 +79,6 @@ pub struct StratumConfig {
     pub max_clients_per_thread: usize,
     pub max_threads: usize,
     pub max_clients: usize,
-    pub max_network_share_bps: u32,
     pub trust_proxy: i64,
     pub vardiff_min: u64,
     pub vardiff_target_shares_min: u64,
@@ -145,7 +141,6 @@ impl Default for StratumConfig {
             max_clients_per_thread: 128,
             max_threads: 8,
             max_clients: 1024,
-            max_network_share_bps: DEFAULT_MAX_NETWORK_SHARE_BPS,
             trust_proxy: -1,
             vardiff_min: 16384,
             vardiff_target_shares_min: 8,
@@ -473,17 +468,6 @@ impl Config {
                 "stratum.vardiff_min {was} is not a power of two; using {rounded}"
             ));
         }
-        let max_network_share_bps = self.stratum.max_network_share_bps;
-        in_range(
-            "stratum.max_network_share_bps",
-            u64::from(max_network_share_bps),
-            &MAX_NETWORK_SHARE_BPS_RANGE,
-        )?;
-        if max_network_share_bps == 0 {
-            self.note_warning(
-                "stratum.max_network_share_bps is 0: new stratum connections are accepted whatever share of the network hashrate this gateway holds",
-            );
-        }
         if self.stratum.trust_proxy != -1 {
             self.note_warning("stratum.trust_proxy is set but the PROXY protocol is not supported; a connection that sends a PROXY line is closed");
         }
@@ -679,13 +663,6 @@ impl Config {
     pub fn payout_script<'a>(&'a self, pool: Option<&'a ClientConfig>) -> &'a [u8] {
         pool.map_or(&self.pool_output_script, |p| &p.payout_script)
     }
-
-    pub fn max_network_share(&self) -> Option<f64> {
-        match self.stratum.max_network_share_bps {
-            0 => None,
-            bps => Some(f64::from(bps) / ratum::BASIS_POINTS_PER_UNIT as f64),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -827,37 +804,6 @@ mod tests {
         assert_eq!(c.api.miner_listen_port, 8000);
         assert_eq!(c.bitcoind.work_update_seconds, 40);
         assert!(!c.datum.pooled_mining_only);
-    }
-
-    #[test]
-    fn the_network_share_limit_defaults_to_ten_percent_and_zero_disables_it() {
-        let c = Config::parse(&minimal()).unwrap();
-        assert_eq!(c.stratum.max_network_share_bps, DEFAULT_MAX_NETWORK_SHARE_BPS);
-        assert_eq!(c.max_network_share(), Some(0.1));
-        assert!(c.startup_notes.is_empty(), "{:?}", c.startup_notes);
-
-        let with_bps = |bps: &str| {
-            minimal().replace(
-                "\"pool_address\":\"bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080\"},",
-                &format!(
-                    "\"pool_address\":\"bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080\"}},
-                     \"stratum\": {{\"max_network_share_bps\": {bps}}},"
-                ),
-            )
-        };
-        let c = Config::parse(&with_bps("500")).unwrap();
-        assert_eq!(c.max_network_share(), Some(0.05));
-
-        let c = Config::parse(&with_bps("0")).unwrap();
-        assert_eq!(c.max_network_share(), None, "0 refuses no connection");
-        assert!(
-            c.startup_notes.iter().any(|n| n.message.contains("max_network_share_bps is 0")),
-            "a limit of 0 is reported at startup: {:?}",
-            c.startup_notes
-        );
-
-        let e = Config::parse(&with_bps("10001")).unwrap_err();
-        assert!(e.contains("stratum.max_network_share_bps must be 0..10000"), "{e}");
     }
 
     #[test]

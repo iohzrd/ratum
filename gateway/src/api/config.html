@@ -137,14 +137,6 @@
     <div class="tip">A power of two; the lowest difficulty vardiff assigns a miner.</div>
   </div>
   <div class="field">
-    <label for="stratum_max_network_share_bps">Network hashrate limit (basis points)</label>
-    <input name="stratum_max_network_share_bps" id="stratum_max_network_share_bps" maxlength="5">
-    <div class="tip">0 to 10000; new connections are refused while this gateway's miners measure
-      above this share of the network hashrate, read from the node once a minute. 1000, the
-      default, is 10%. 0 accepts every connection whatever the share. Connected miners are
-      never disconnected, and the limit applies on chain main alone.</div>
-  </div>
-  <div class="field">
     <label for="stratum_require_address_username">Require an address as the username</label>
     <input type="checkbox" name="stratum_require_address_username" id="stratum_require_address_username">
     <div class="tip">A miner whose username is not a payable address is refused.</div>

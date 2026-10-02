@@ -137,9 +137,6 @@ poll(() => "stats.json", s => {
     notes.push(`On fallback pool ${esc(s.pool_host)}: ${esc(s.pools[0])} is unreachable and is probed once a minute.`);
   if (s.job && !s.stratum.listening) notes.push("The stratum listener is not up.");
   for (const w of s.node_warnings || []) notes.push("The node reports: " + esc(w));
-  const share = s.stratum.network_share, maxShare = s.stratum.max_network_share;
-  if (share != null && maxShare != null && share > maxShare)
-    notes.push(`This gateway's miners are ${(share * 100).toFixed(2)}% of the network hashrate, above the ${(maxShare * 100).toFixed(2)}% limit set by stratum.max_network_share_bps: new stratum connections are refused until the share falls. Connected miners keep mining.`);
   const banner = document.getElementById("banner");
   banner.style.display = notes.length ? "" : "none";
   banner.innerHTML = notes.join("<br>");
