@@ -292,3 +292,85 @@ fn a_saved_session_keeps_the_newest_few_splits_on_the_tip() {
     assert!(saved.get(13).is_some() && saved.get(20).is_some());
     assert_eq!(saved.next_id(), 22, "the ids continue from the newest recorded, kept or not");
 }
+
+/// A coinbaser request during a widening's re-read is answered at once from the window as it
+/// stands and its split verifies; a share credited meanwhile joins the wider window once.
+#[test]
+fn a_split_dictated_while_a_widening_re_reads_the_window_is_answered_at_once_and_verifies() {
+    use crate::fixtures::{ALICE, BOB, Scratch, server_on};
+    use crate::ledger::split::SplitPolicy;
+    use crate::ledger::{self, Ledger, Share, WindowRule};
+    use crate::payout::dictate;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let window_share = |at: u64, identity: &str, difficulty: u64| Share {
+        accepted_at: at,
+        identity: identity.to_string(),
+        difficulty,
+        block_hash: fixtures::hash(at),
+        tag_secondary: String::new(),
+    };
+    let scratch = Scratch::new("dictate-during-reread");
+    let path = scratch.join("regtest.redb");
+    let narrow = Ledger::new(WindowRule { multiple: 32.0 }, SplitPolicy::default());
+    let (mut l, records) =
+        ledger::open_share_ledger(Some(&path), None, Some("regtest"), narrow).unwrap();
+    for (at, identity, difficulty) in [(1, ALICE, 32), (2, BOB, 16), (3, ALICE, 16)] {
+        l.record(window_share(at, identity, difficulty)).unwrap();
+    }
+    let server = server_on(l, records);
+    assert!(ratum::lock(&server.ledger).set_network_difficulty(2.0), "32 work widened to 64");
+
+    let peer = "127.0.0.1:28915".parse().unwrap();
+    let ledger_lock = &server.ledger;
+    let (read_tx, read_rx) = mpsc::channel();
+    let (answered_tx, answered_rx) = mpsc::channel();
+    let (re_read, waited_out, (dictated, payload)) = std::thread::scope(|s| {
+        let node_watch = s.spawn(move || {
+            let mut waited_out = false;
+            let re_read = ledger::reread_with(ledger_lock, || {
+                read_tx.send(()).unwrap();
+                waited_out = answered_rx.recv_timeout(Duration::from_secs(10)).is_err();
+            });
+            (re_read, waited_out)
+        });
+        read_rx.recv().unwrap();
+        let answer = dictate(&server, peer, COINBASE_VALUE, 1);
+        server.ledger_commits.record(&server.ledger, window_share(4, BOB, 16)).unwrap();
+        // Unreceived when the re-read waited out its timeout; `waited_out` reports it.
+        let _ = answered_tx.send(());
+        let (re_read, waited_out) = node_watch.join().unwrap();
+        (re_read, waited_out, answer)
+    });
+    assert!(!waited_out, "answered and credited between the re-read's read and its install");
+    assert_eq!(re_read, 1, "the wider window adds alice's first share");
+    assert_eq!(
+        dictated.iter().map(|d| d.payout.clone()).collect::<Vec<_>>(),
+        vec![payout(ALICE, 156_250_000), payout(BOB, 156_250_000)],
+        "the narrower window: 16 work each"
+    );
+    let outputs: Vec<TxOut> = dictated.iter().map(DictatedOutput::output).collect();
+    assert_eq!(
+        CoinbaserResponse::decode(&payload).unwrap(),
+        CoinbaserResponse { value: COINBASE_VALUE, coinbaser_id: 1, outputs: outputs.clone() },
+        "the answer sent carries the outputs recorded"
+    );
+
+    let policy = &server.share_policy;
+    let mut v = Verifier::new(policy);
+    v.record_dictated(1, COINBASE_VALUE, [0x5a; 32], dictated, NOW);
+    let (cb, target_byte_index) = coinbase_sections(policy, &outputs);
+    let rebuilt = v
+        .rebuild_checked_ignoring_target(&share_on(job_section(target_byte_index), cb), None, NOW)
+        .expect("a coinbase paying the answer verifies");
+    assert_eq!((rebuilt.paid_to_split, rebuilt.paid_to_pool), (COINBASE_VALUE, 0));
+    assert!(rebuilt.unpaid_outputs.is_empty());
+
+    let (later, _) = dictate(&server, peer, COINBASE_VALUE, 2);
+    assert_eq!(
+        later.into_iter().map(|d| d.payout).collect::<Vec<_>>(),
+        vec![payout(ALICE, 187_500_000), payout(BOB, 125_000_000)],
+        "the wider window: alice 48 and bob 32, the share credited meanwhile counted once"
+    );
+}

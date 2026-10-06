@@ -96,8 +96,11 @@ impl Ledger {
     /// Each identity's weight in the split, its work. One pass over the window, taken under
     /// the ledger lock; `Weights::split` then runs without it.
     pub fn weights(&self) -> Weights {
-        let entries =
-            self.identities.iter().map(|(identity, state)| (Arc::clone(identity), state.work));
+        let entries = self
+            .contents
+            .identities
+            .iter()
+            .map(|(identity, state)| (Arc::clone(identity), state.work));
         Weights { entries: entries.collect() }
     }
 

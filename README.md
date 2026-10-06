@@ -453,8 +453,12 @@ determines how much of the bound is used: at `2^33` on a window of 8 the window 
 while the same `--min-diff` at the present mainnet difficulty holds it under 30 MiB. The window
 is read back from the store at startup, and again each time a difficulty increase widens it,
 oldest first and without holding the shares it reads: 2.2 million shares take about 0.4 seconds
-with the file in the operating system's page cache. The previous window is kept until the read
-succeeds, so a failed read leaves it in place, and a reload briefly holds two windows.
+with the file in the operating system's page cache. A widening's read runs without the ledger
+lock, from a snapshot of the store taken when it begins: until the wider window replaces the
+narrower one, coinbaser responses are computed from the narrower window, the shares accepted
+meanwhile are credited to it and added to the wider one when it is installed, and retention
+removes nothing. The previous window is kept until the read succeeds, so a failed read leaves
+it in place, and a reload briefly holds two windows.
 
 A share is credited once however many times it is sent, across every connection and across a
 restart: its block hash is held for 4 hours 10 minutes after it is accepted, and read back

@@ -16,13 +16,13 @@ pub use snapshot::{snapshot_refusal, write_snapshot};
 use crate::accounting::{ACCEPTED_HASH_RETENTION_SECS, MAX_ACCEPTED_HASHES};
 use blocks::BlockRecords;
 use log::{info, warn};
-use ratum::rpc;
-use redb::Database;
+use ratum::{lock, rpc};
+use redb::{Database, ReadTransaction};
 use split::SplitPolicy;
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use store::{Store, WindowRow};
 
 /// The most shares the window holds whatever their difficulties sum to. The window is a work
@@ -176,12 +176,123 @@ impl Identities {
     }
 }
 
-pub struct Ledger {
+/// The shares in the window, oldest first, the identities they credit and their total work.
+#[derive(Debug, Default)]
+struct Contents {
     shares: VecDeque<WindowShare>,
     identities: Identities,
+    total_work: u128,
+}
+
+impl Contents {
+    /// The contents `read` gives, trimmed to `window` work and `max_shares` shares: `read`
+    /// gives the function it is called with the number of shares, then each share.
+    fn read(
+        window: u128,
+        max_shares: usize,
+        read: impl FnOnce(&mut dyn FnMut(WindowRow)) -> io::Result<ReadBack>,
+    ) -> io::Result<(Self, ReadBack)> {
+        let mut contents = Self::default();
+        let read_back = read(&mut |row| match row {
+            // One slot over the count: a recorded share is pushed before the oldest is trimmed.
+            WindowRow::Count(n) => contents.shares.reserve_exact(n + 1),
+            WindowRow::Share(share) => {
+                contents.push(&share, max_shares);
+                contents.trim(window, max_shares);
+            }
+        })?;
+        Ok((contents, read_back))
+    }
+
+    fn push(&mut self, share: &Share, max_shares: usize) {
+        let index = self.identities.index_of(&share.identity);
+        let entry = self.identities.entry_mut(index);
+        let work = u128::from(share.difficulty);
+        entry.state.work += work;
+        entry.state.tag_secondary.clone_from(&share.tag_secondary);
+        entry.shares += 1;
+        self.total_work += work;
+        let len = self.shares.len();
+        if len == self.shares.capacity() {
+            // Grown here rather than by `push_back`, which doubles: by an eighth, so the buffer
+            // stays within an eighth of the most shares the window has held, and never past
+            // `max_shares + 1`, the most it holds since a share is pushed before the oldest is
+            // trimmed.
+            let room = (max_shares + 1).saturating_sub(len);
+            self.shares.reserve_exact((len / 8).min(room).max(1));
+        }
+        self.shares.push_back(WindowShare::new(share, index));
+    }
+
+    /// Drops the oldest shares the newest no longer need to reach `window` work, then those
+    /// past `max_shares`.
+    fn trim(&mut self, window: u128, max_shares: usize) {
+        while self.shares.len() > 1 && self.total_work > window {
+            let over = self.total_work - window;
+            let oldest = self.shares.front().expect("non-empty");
+            if oldest.work() > over {
+                break;
+            }
+            self.drop_oldest();
+        }
+        while self.shares.len() > max_shares {
+            self.drop_oldest();
+        }
+    }
+
+    fn drop_oldest(&mut self) {
+        let Some(oldest) = self.shares.pop_front() else { return };
+        let work = oldest.work();
+        self.total_work -= work;
+        let index = oldest.identity();
+        let entry = self.identities.entry_mut(index);
+        entry.state.work -= work;
+        entry.shares -= 1;
+        if entry.shares == 0 {
+            self.identities.release(index);
+        }
+    }
+}
+
+/// A re-read of the store begun under the ledger lock (`Ledger::begin_reread`): the read
+/// transaction it reads, and the window size and count bound it reads to.
+struct Reread {
+    snapshot: ReadTransaction,
+    window: u128,
+    max_shares: usize,
+}
+
+impl Reread {
+    /// Reads the window from the snapshot; called without the ledger lock.
+    fn read(&self) -> io::Result<(Contents, ReadBack)> {
+        let (window, max_shares) = (self.window, self.max_shares);
+        Contents::read(window, max_shares, |push| {
+            store::read_window(&self.snapshot, window, max_shares, push)
+        })
+    }
+}
+
+/// Runs a due re-read, locking only to begin and to install it: coinbaser answers and share
+/// credit use the window as it stands while it reads. Returns the shares the window gained.
+pub fn reread(ledger: &Mutex<Ledger>) -> usize {
+    reread_with(ledger, || {})
+}
+
+/// `reread`, calling `before_install` without the lock once the window is read.
+pub fn reread_with(ledger: &Mutex<Ledger>, before_install: impl FnOnce()) -> usize {
+    let Some(reread) = lock(ledger).begin_reread() else { return 0 };
+    let read = reread.read();
+    before_install();
+    let (gained, replaced) = lock(ledger).finish_reread(reread.window, read);
+    // Freed without the lock: up to `MAX_SHARES` shares and an identity for each.
+    drop(replaced);
+    gained
+}
+
+pub struct Ledger {
+    contents: Contents,
     window_rule: WindowRule,
     split_policy: SplitPolicy,
-    total_work: u128,
     window: u128,
     store: Option<Store>,
     cumulative_work: u128,
@@ -191,10 +302,12 @@ pub struct Ledger {
     /// The network difficulty last passed to `set_network_difficulty`, in the node's unit:
     /// that of the block being mined, which is what the window is sized to.
     network_difficulty: Option<f64>,
-    /// Set when a widening re-read of the store failed: the window is at its new size but holds
-    /// only the shares of the narrower one, so the next `set_network_difficulty` re-reads even
-    /// when the size it computes is the one already set.
-    refill_pending: bool,
+    /// Set by a widening of a ledger with a store until a re-read (`reread`) installs the wider
+    /// window: the window is at its new size but holds only the shares of the narrower one.
+    reread_due: bool,
+    /// The shares recorded since a running re-read's snapshot, which `finish_reread` adds to
+    /// the window it read; none while no re-read runs.
+    recorded_during_reread: Option<Vec<Share>>,
 }
 
 impl Ledger {
@@ -202,18 +315,17 @@ impl Ledger {
     /// set.
     pub fn new(window_rule: WindowRule, split_policy: SplitPolicy) -> Self {
         Self {
-            shares: VecDeque::new(),
-            identities: Identities::default(),
+            contents: Contents::default(),
             window: window_rule.window_for(1.0),
             window_rule,
             split_policy,
-            total_work: 0,
             store: None,
             cumulative_work: 0,
             max_shares: MAX_SHARES,
             count_capped: false,
             network_difficulty: None,
-            refill_pending: false,
+            reread_due: false,
+            recorded_during_reread: None,
         }
     }
 
@@ -231,7 +343,8 @@ impl Ledger {
     /// from the file oldest first. A read that fails part way leaves the window as it was.
     fn load(&mut self, store: &Store) -> io::Result<ReadBack> {
         let (window, max_shares) = (self.window, self.max_shares);
-        self.load_from(|push| store.read_window(window, max_shares, push))
+        let snapshot = store.begin_read()?;
+        self.load_from(|push| store::read_window(&snapshot, window, max_shares, push))
     }
 
     /// `load` with the read passed in: `read` gives the function it is called with the number
@@ -242,37 +355,17 @@ impl Ledger {
         &mut self,
         read: impl FnOnce(&mut dyn FnMut(WindowRow)) -> io::Result<ReadBack>,
     ) -> io::Result<ReadBack> {
-        let held = (
-            std::mem::take(&mut self.shares),
-            std::mem::take(&mut self.identities),
-            std::mem::replace(&mut self.total_work, 0),
-            self.count_capped,
-        );
-        let loaded = read(&mut |row| match row {
-            // One slot over the count: a recorded share is pushed before the oldest is trimmed.
-            WindowRow::Count(n) => self.shares.reserve_exact(n + 1),
-            WindowRow::Share(share) => {
-                self.push(&share);
-                self.trim();
-            }
-        });
-        match &loaded {
-            Ok(_) => self.count_capped = self.is_count_capped(),
-            Err(_) => (self.shares, self.identities, self.total_work, self.count_capped) = held,
-        }
-        loaded
+        let (contents, read_back) = Contents::read(self.window, self.max_shares, read)?;
+        self.contents = contents;
+        self.trim();
+        Ok(read_back)
     }
 
-    /// Sizes the window to `network_difficulty` by the window rule and returns how many
-    /// shares widening it re-read from the store. A widening whose re-read failed is re-read
-    /// at the next call, whatever size that call computes.
-    pub fn set_network_difficulty(&mut self, network_difficulty: f64) -> usize {
+    /// Sizes the window to `network_difficulty` by the window rule; returns whether a re-read
+    /// is due (`reread`). A widening leaves one due until a re-read succeeds.
+    pub fn set_network_difficulty(&mut self, network_difficulty: f64) -> bool {
         self.network_difficulty = Some(network_difficulty);
-        let window = self.window_rule.window_for(network_difficulty);
-        if window == self.window && !self.refill_pending {
-            return 0;
-        }
-        self.set_window(window)
+        self.set_window(self.window_rule.window_for(network_difficulty))
     }
 
     /// The network difficulty the window was last sized to, in the node's unit; none before
@@ -281,43 +374,62 @@ impl Ledger {
         self.network_difficulty
     }
 
-    fn set_window(&mut self, window: u128) -> usize {
+    fn set_window(&mut self, window: u128) -> bool {
         let window = window.max(1);
-        let widened = window > self.window || self.refill_pending;
+        self.reread_due |= window > self.window && self.store.is_some();
         self.window = window;
-        let re_read = if widened { self.refill() } else { 0 };
         self.trim();
-        re_read
+        self.reread_due
     }
 
-    /// Re-reads the window from the store after a widening. On a failed read the shares held
-    /// stay as they were, which span less than the window, and `refill_pending` is set so the
-    /// read is tried again.
-    fn refill(&mut self) -> usize {
-        let Some(store) = self.store.take() else { return 0 };
-        let before = self.shares.len();
-        let loaded = self.load(&store);
-        self.store = Some(store);
-        self.refill_pending = loaded.is_err();
-        match loaded {
-            Ok(read_back) => {
-                if read_back.truncated {
-                    warn!(
-                        "the wider share window exceeds the retained ledger; work older than \
-                         that is not credited (raise --ledger-keep-shares to keep it)"
-                    );
-                }
-                self.shares.len().saturating_sub(before)
-            }
-            Err(e) => {
-                warn!(
-                    "could not re-read the ledger to widen the share window ({e}); it holds the \
-                     shares of the narrower window until the next time the node's difficulty \
-                     is read, when the read is retried"
-                );
-                0
-            }
+    /// Takes the store snapshot a due re-read reads and keeps the shares recorded from then on;
+    /// none when none is due, one runs, or the snapshot fails, which leaves it due.
+    fn begin_reread(&mut self) -> Option<Reread> {
+        if !self.reread_due || self.recorded_during_reread.is_some() {
+            return None;
         }
+        let snapshot = match self.store.as_ref()?.begin_read() {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                warn_reread_failed(&e);
+                return None;
+            }
+        };
+        self.recorded_during_reread = Some(Vec::new());
+        Some(Reread { snapshot, window: self.window, max_shares: self.max_shares })
+    }
+
+    /// Installs what a re-read read to `window` and the shares recorded since its snapshot;
+    /// returns the shares gained and the contents replaced. A failed read installs nothing.
+    fn finish_reread(
+        &mut self,
+        window: u128,
+        read: io::Result<(Contents, ReadBack)>,
+    ) -> (usize, Contents) {
+        let recorded = self.recorded_during_reread.take().unwrap_or_default();
+        let (contents, read_back) = match read {
+            Ok(read) => read,
+            Err(e) => {
+                warn_reread_failed(&e);
+                return (0, Contents::default());
+            }
+        };
+        if read_back.truncated {
+            warn!(
+                "the wider share window exceeds the retained ledger; work older than that is \
+                 not credited (raise --ledger-keep-shares to keep it)"
+            );
+        }
+        let before = self.contents.shares.len();
+        let replaced = std::mem::replace(&mut self.contents, contents);
+        // Still due when the window widened again while the read ran.
+        self.reread_due = window < self.window;
+        self.trim();
+        for share in &recorded {
+            self.contents.push(share, self.max_shares);
+            self.trim();
+        }
+        (self.contents.shares.len().saturating_sub(before), replaced)
     }
 
     pub fn window_rule(&self) -> WindowRule {
@@ -333,7 +445,7 @@ impl Ledger {
     }
 
     pub fn total_work(&self) -> u128 {
-        self.total_work
+        self.contents.total_work
     }
 
     pub fn max_shares(&self) -> usize {
@@ -354,18 +466,18 @@ impl Ledger {
     }
 
     pub fn len(&self) -> usize {
-        self.shares.len()
+        self.contents.shares.len()
     }
 
     #[cfg(test)]
     pub fn is_empty(&self) -> bool {
-        self.shares.is_empty()
+        self.contents.shares.is_empty()
     }
 
     /// The acceptance time of every share in the window, oldest first: which shares it holds.
     #[cfg(test)]
     pub fn accepted_times(&self) -> Vec<u64> {
-        self.shares.iter().map(|s| u64::from(s.accepted_at)).collect()
+        self.contents.shares.iter().map(|s| u64::from(s.accepted_at)).collect()
     }
 
     /// The acceptance time and block hash of the stored shares accepted at or after `cutoff`,
@@ -397,11 +509,17 @@ impl Ledger {
         }
         self.cumulative_work = cumulative_work;
         for share in &shares {
-            self.push(share);
+            self.contents.push(share, self.max_shares);
             self.trim();
         }
+        if let Some(recorded) = &mut self.recorded_during_reread {
+            // No retention until the wider window is installed: its floor, the narrower
+            // window's share count, would let it remove rows the wider window holds.
+            recorded.extend(shares);
+            return Ok(0);
+        }
         let Some(store) = &self.store else { return Ok(0) };
-        let retained = store.retain(self.shares.len() as u64, keep_after, MAX_ACCEPTED_HASHES);
+        let retained = store.retain(self.len() as u64, keep_after, MAX_ACCEPTED_HASHES);
         Ok(retained.unwrap_or_else(|e| {
             warn!("ledger retention failed; the shares are recorded ({e})");
             0
@@ -420,7 +538,7 @@ impl Ledger {
 
     /// The shares accepted at or after `cutoff`, newest first.
     fn shares_since(&self, cutoff: u64) -> impl Iterator<Item = &WindowShare> {
-        self.shares.iter().rev().take_while(move |s| u64::from(s.accepted_at) >= cutoff)
+        self.contents.shares.iter().rev().take_while(move |s| u64::from(s.accepted_at) >= cutoff)
     }
 
     /// The work of the shares accepted at or after `cutoff`.
@@ -435,49 +553,24 @@ impl Ledger {
         for s in self.shares_since(cutoff) {
             *by_index.entry(s.identity()).or_insert(0) += s.work();
         }
-        by_index.into_iter().map(|(i, work)| (self.identities.name(i).to_string(), work)).collect()
+        let names = &self.contents.identities;
+        by_index.into_iter().map(|(i, work)| (names.name(i).to_string(), work)).collect()
     }
 
     /// Every identity with work in the window and its state, most work first.
     pub fn identities(&self) -> Vec<(String, IdentityState)> {
-        let mut v: Vec<(String, IdentityState)> =
-            self.identities.iter().map(|(id, state)| (id.to_string(), state.clone())).collect();
+        let mut v: Vec<(String, IdentityState)> = self
+            .contents
+            .identities
+            .iter()
+            .map(|(id, state)| (id.to_string(), state.clone()))
+            .collect();
         v.sort_by(|(a, x), (b, y)| most_work_first((a, x.work), (b, y.work)));
         v
     }
 
-    fn push(&mut self, share: &Share) {
-        let index = self.identities.index_of(&share.identity);
-        let entry = self.identities.entry_mut(index);
-        let work = u128::from(share.difficulty);
-        entry.state.work += work;
-        entry.state.tag_secondary.clone_from(&share.tag_secondary);
-        entry.shares += 1;
-        self.total_work += work;
-        let len = self.shares.len();
-        if len == self.shares.capacity() {
-            // Grown here rather than by `push_back`, which doubles: by an eighth, so the buffer
-            // stays within an eighth of the most shares the window has held, and never past
-            // `max_shares + 1`, the most it holds since a share is pushed before the oldest is
-            // trimmed.
-            let room = (self.max_shares + 1).saturating_sub(len);
-            self.shares.reserve_exact((len / 8).min(room).max(1));
-        }
-        self.shares.push_back(WindowShare::new(share, index));
-    }
-
     fn trim(&mut self) {
-        while self.shares.len() > 1 && self.total_work > self.window {
-            let over = self.total_work - self.window;
-            let oldest = self.shares.front().expect("non-empty");
-            if oldest.work() > over {
-                break;
-            }
-            self.drop_oldest();
-        }
-        while self.shares.len() > self.max_shares {
-            self.drop_oldest();
-        }
+        self.contents.trim(self.window, self.max_shares);
         let capped = self.is_count_capped();
         if capped && !self.count_capped {
             warn!(
@@ -493,21 +586,16 @@ impl Ledger {
 
     /// Whether the window holds `max_shares` shares with less work than it asks for.
     fn is_count_capped(&self) -> bool {
-        self.shares.len() >= self.max_shares && self.total_work < self.window
+        self.len() >= self.max_shares && self.total_work() < self.window
     }
+}
 
-    fn drop_oldest(&mut self) {
-        let Some(oldest) = self.shares.pop_front() else { return };
-        let work = oldest.work();
-        self.total_work -= work;
-        let index = oldest.identity();
-        let entry = self.identities.entry_mut(index);
-        entry.state.work -= work;
-        entry.shares -= 1;
-        if entry.shares == 0 {
-            self.identities.release(index);
-        }
-    }
+fn warn_reread_failed(e: &io::Error) {
+    warn!(
+        "could not re-read the ledger to widen the share window ({e}); it holds the shares of \
+         the narrower window until the next time the node's difficulty is read, when the read \
+         is retried"
+    );
 }
 
 /// Most work first; identities with equal work in name order, so a split is the same

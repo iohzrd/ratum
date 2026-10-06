@@ -8,7 +8,10 @@ use super::{ReadBack, Share};
 use bytes::BufMut as _;
 use ratum::bitcoin::HASH_SIZE;
 use ratum::reader::ByteReader;
-use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
+use redb::{
+    Database, ReadTransaction, ReadableDatabase, ReadableTable, ReadableTableMetadata,
+    TableDefinition,
+};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -72,7 +75,7 @@ fn unpack_head(bytes: &[u8]) -> Option<RowHead> {
     Some(RowHead { accepted_at, difficulty, block_hash })
 }
 
-/// What `Store::read_window` passes on: the number of shares it will read, then each one.
+/// What `read_window` passes on: the number of shares it will read, then each one.
 pub(super) enum WindowRow {
     Count(usize),
     Share(Share),
@@ -175,52 +178,9 @@ impl Store {
         Ok(())
     }
 
-    /// Passes `f` the newest shares whose difficulties reach `window`, oldest first, and at
-    /// most `max_shares` of them: the ledger discards anything past its own count bound, so
-    /// reading further would only be trimmed again. Both passes read one snapshot. The first
-    /// walks back from the newest row summing difficulties to find the row the window starts
-    /// at, and gives `f` the number of shares it counted, so a buffer is sized once; the
-    /// second walks forward from it, so no share outlives its call to `f`.
-    pub(super) fn read_window(
-        &self,
-        window: u128,
-        max_shares: usize,
-        mut f: impl FnMut(WindowRow),
-    ) -> io::Result<ReadBack> {
-        let r = self.db.begin_read().db()?;
-        let shares = r.open_table(SHARES).db()?;
-        let mut read_back = ReadBack::default();
-        let mut work = 0u128;
-        let mut counted = 0usize;
-        let mut start = None;
-        let mut hit_count_cap = false;
-        let mut iter = shares.iter().db()?;
-        while work < window {
-            if counted >= max_shares {
-                hit_count_cap = true;
-                break;
-            }
-            let Some(entry) = iter.next_back() else { break };
-            let (seq, value) = entry.db()?;
-            match unpack_head(value.value()) {
-                Some(head) => {
-                    work = work.saturating_add(u128::from(head.difficulty));
-                    counted += 1;
-                    start = Some(seq.value());
-                }
-                None => read_back.skipped += 1,
-            }
-        }
-        read_back.truncated = work < window && !hit_count_cap;
-        let Some(start) = start else { return Ok(read_back) };
-        f(WindowRow::Count(counted));
-        for entry in shares.range(start..).db()? {
-            let (_seq, value) = entry.db()?;
-            if let Some(share) = unpack(value.value()) {
-                f(WindowRow::Share(share));
-            }
-        }
-        Ok(read_back)
+    /// A read transaction on the store: it reads the rows committed before it began.
+    pub(super) fn begin_read(&self) -> io::Result<ReadTransaction> {
+        self.db.begin_read().db()
     }
 
     /// The acceptance time and block hash of the shares accepted at or after `cutoff`, at most
@@ -297,6 +257,53 @@ impl Store {
             Ok(oldest.len())
         })
     }
+}
+
+/// Passes `f` the newest shares `r` reads whose difficulties reach `window`, oldest first, and
+/// at most `max_shares` of them: the ledger discards anything past its own count bound, so
+/// reading further would only be trimmed again. The first pass walks back from the newest row
+/// summing difficulties to find the row the window starts at, and gives `f` the number of
+/// shares it counted, so a buffer is sized once; the second walks forward from it, so no share
+/// outlives its call to `f`.
+pub(super) fn read_window(
+    r: &ReadTransaction,
+    window: u128,
+    max_shares: usize,
+    mut f: impl FnMut(WindowRow),
+) -> io::Result<ReadBack> {
+    let shares = r.open_table(SHARES).db()?;
+    let mut read_back = ReadBack::default();
+    let mut work = 0u128;
+    let mut counted = 0usize;
+    let mut start = None;
+    let mut hit_count_cap = false;
+    let mut iter = shares.iter().db()?;
+    while work < window {
+        if counted >= max_shares {
+            hit_count_cap = true;
+            break;
+        }
+        let Some(entry) = iter.next_back() else { break };
+        let (seq, value) = entry.db()?;
+        match unpack_head(value.value()) {
+            Some(head) => {
+                work = work.saturating_add(u128::from(head.difficulty));
+                counted += 1;
+                start = Some(seq.value());
+            }
+            None => read_back.skipped += 1,
+        }
+    }
+    read_back.truncated = work < window && !hit_count_cap;
+    let Some(start) = start else { return Ok(read_back) };
+    f(WindowRow::Count(counted));
+    for entry in shares.range(start..).db()? {
+        let (_seq, value) = entry.db()?;
+        if let Some(share) = unpack(value.value()) {
+            f(WindowRow::Share(share));
+        }
+    }
+    Ok(read_back)
 }
 
 /// Passes `f` each stored share, oldest first, and stops at the first error it returns. One

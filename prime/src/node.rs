@@ -2,6 +2,7 @@
 //! it, resizes the share window to the new difficulty, and wakes every gateway connection when the
 //! work they should build on changed.
 
+use crate::ledger;
 use crate::server::Server;
 use log::{debug, error, info, warn};
 use mio::Waker;
@@ -175,9 +176,9 @@ fn window_difficulty(tip: &rpc::Tip, template: Option<rpc::TemplateSummary>) -> 
         .unwrap_or(tip.difficulty)
 }
 
-/// Reads the node's tip, template and mining info into the server's node state, waking
-/// the gateway connections on a change and resizing the share window to the difficulty of
-/// the block being mined on each new tip or newly read template.
+/// Reads the node's tip, template and mining info into the server's node state, waking the
+/// gateway connections on a change and resizing the share window to the difficulty of the block
+/// being mined on each new tip or newly read template; a widened window is re-read after the wake.
 pub fn watch_node(server: &Server, expected_chain: Option<rpc::Chain>) {
     let (node, view, interval) = (&server.node, &server.node_state, server.settings.poll);
     let mut have_template = false;
@@ -207,18 +208,21 @@ pub fn watch_node(server: &Server, expected_chain: Option<rpc::Chain>) {
                     read
                 });
                 let next = template.flatten();
-                if tip_changed || next.is_some() {
-                    let difficulty = window_difficulty(&t, next);
-                    let re_read = lock(&server.ledger).set_network_difficulty(difficulty);
+                let reread_due = (tip_changed || next.is_some())
+                    && lock(&server.ledger).set_network_difficulty(window_difficulty(&t, next));
+                if view.update(t, template) {
+                    view.wake_connections();
+                }
+                if reread_due {
+                    let started = Instant::now();
+                    let re_read = ledger::reread(&server.ledger);
                     if re_read != 0 {
                         info!(
                             "difficulty rose; the wider window re-read {re_read} share(s) from \
-                             the ledger"
+                             the ledger in {:.3}s",
+                            started.elapsed().as_secs_f64()
                         );
                     }
-                }
-                if view.update(t, template) {
-                    view.wake_connections();
                 }
                 Some(t.height)
             }

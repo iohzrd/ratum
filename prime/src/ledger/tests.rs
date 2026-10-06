@@ -39,6 +39,19 @@ fn ledger_with(window: u128, shares: &[(&str, u64)]) -> Ledger {
     l
 }
 
+/// The re-read a widening left due, run as `reread` runs it, on a ledger the test owns.
+fn reread_now(l: &mut Ledger) -> usize {
+    let Some(reread) = l.begin_reread() else { return 0 };
+    let read = reread.read();
+    l.finish_reread(reread.window, read).0
+}
+
+/// `set_network_difficulty` and the re-read it leaves due, as the node watcher runs them.
+fn resize(l: &mut Ledger, network_difficulty: f64) -> usize {
+    l.set_network_difficulty(network_difficulty);
+    reread_now(l)
+}
+
 #[test]
 fn credits_shares_by_identity() {
     let l = ledger_with(1_000_000, &[("alice", 16), ("bob", 32), ("alice", 16)]);
@@ -221,7 +234,7 @@ fn the_network_difficulty_sizes_the_window() {
         l.record(share(i, "a", 16, hash(i), "")).unwrap();
     }
     assert_eq!(l.total_work(), 16);
-    assert_eq!(l.set_network_difficulty(2.0), 0, "no store to re-read");
+    assert!(!l.set_network_difficulty(2.0), "no store to re-read");
     assert_eq!(l.window(), 32);
     l.record(share(4, "a", 16, hash(4), "")).unwrap();
     assert_eq!(l.total_work(), 32, "the wider window keeps two shares");
@@ -488,9 +501,9 @@ fn read_back_reports_truncated_when_the_store_holds_less_work_than_the_window() 
 fn narrowing_a_file_less_windows_trim_is_not_undone_by_widening() {
     let mut l = ledger_with(1_000_000, &[("alice", 16), ("bob", 32), ("carol", 8)]);
     assert_eq!(l.total_work(), 56);
-    assert_eq!(l.set_window(8), 0);
+    assert!(!l.set_window(8));
     assert_eq!(work_by_identity(&l), vec![identity_work("carol", 8)]);
-    assert_eq!(l.set_window(1_000_000), 0, "no store to read the trimmed shares back from");
+    assert!(!l.set_window(1_000_000), "no store to read the trimmed shares back from");
     assert_eq!(l.total_work(), 8, "what was trimmed is gone rather than hidden");
     assert_eq!(l.len(), 1);
 }
@@ -503,11 +516,13 @@ fn widening_the_window_re_reads_shares_from_the_store() {
     l.record(share(2, "bob", 32, hash(2), "")).unwrap();
     l.record(share(3, "carol", 8, hash(3), "")).unwrap();
 
-    assert_eq!(l.set_window(8), 0);
+    assert!(!l.set_window(8));
     assert_eq!(work_by_identity(&l), vec![identity_work("carol", 8)]);
     assert_eq!(l.accepted_times(), vec![3]);
 
-    assert_eq!(l.set_window(56), 2, "alice and bob are re-read");
+    assert!(l.set_window(56), "a re-read is due");
+    assert_eq!(work_by_identity(&l), vec![identity_work("carol", 8)], "until it runs");
+    assert_eq!(reread_now(&mut l), 2, "alice and bob are re-read");
     assert_eq!(l.total_work(), 56);
     assert_eq!(
         work_by_identity(&l),
@@ -827,6 +842,7 @@ fn drive_beside_the_reference(
             80..=91 => {
                 let window = 1 + u128::from(rng.below(600));
                 l.set_window(window);
+                reread_now(l);
                 r.set_window(window);
             }
             _ => {
@@ -919,18 +935,22 @@ fn a_read_back_allocates_the_window_once_at_its_size() {
         }
     }
     let (mut l, _) = open(&scratch, u128::MAX, None);
-    let read_back = l.shares.capacity();
+    let read_back = l.contents.shares.capacity();
     assert_eq!(l.len(), 1_000);
     assert!((1_001..1_100).contains(&read_back), "one slot over, not 1024: {read_back}");
     l.record(share(1_000, "alice", 16, hash(1_000), "")).unwrap();
-    assert_eq!(l.shares.capacity(), read_back, "which the next share takes without growing");
+    assert_eq!(
+        l.contents.shares.capacity(),
+        read_back,
+        "which the next share takes without growing"
+    );
     for i in 1_001..1_200u64 {
         l.record(share(i, "alice", 16, hash(i), "")).unwrap();
     }
     assert!(
-        l.shares.capacity() <= 1_200 + 1_200 / 8,
+        l.contents.shares.capacity() <= 1_200 + 1_200 / 8,
         "a growing window grows its buffer by an eighth, not by doubling: {}",
-        l.shares.capacity()
+        l.contents.shares.capacity()
     );
 }
 
@@ -941,11 +961,11 @@ fn at_the_bound_the_window_grows_by_one_slot_not_by_doubling() {
     for i in 0..64u64 {
         l.record(share(i, "a", 1, hash(i), "")).unwrap();
     }
-    l.shares.shrink_to_fit();
+    l.contents.shares.shrink_to_fit();
     for i in 64..200u64 {
         l.record(share(i, "a", 1, hash(i), "")).unwrap();
     }
-    assert!(l.shares.capacity() <= 65, "capacity {}", l.shares.capacity());
+    assert!(l.contents.shares.capacity() <= 65, "capacity {}", l.contents.shares.capacity());
 }
 
 #[test]
@@ -983,25 +1003,25 @@ fn a_widening_whose_read_failed_is_read_again_at_the_same_difficulty() {
     let scratch = Scratch::new("widen-retry");
     let mut l = Ledger::new(WindowRule { multiple: 1.0 }, SplitPolicy::default());
     l.attach(Store::open(&scratch.join("regtest.redb"), None, Some("regtest")).unwrap()).unwrap();
-    assert_eq!(l.set_network_difficulty(56.0), 0, "nothing stored to re-read");
+    assert_eq!(resize(&mut l, 56.0), 0, "nothing stored to re-read");
     l.record(share(1, "alice", 16, hash(1), "")).unwrap();
     l.record(share(2, "bob", 32, hash(2), "")).unwrap();
     l.record(share(3, "carol", 8, hash(3), "")).unwrap();
-    assert_eq!(l.set_network_difficulty(8.0), 0, "narrowing reads nothing");
+    assert_eq!(resize(&mut l, 8.0), 0, "narrowing reads nothing");
     assert_eq!(l.accepted_times(), vec![3]);
     assert_eq!(l.network_difficulty(), Some(8.0));
 
     hide_share_table(&l, true);
-    assert_eq!(l.set_network_difficulty(56.0), 0, "the read fails");
+    assert_eq!(resize(&mut l, 56.0), 0, "the read fails");
     assert_eq!(l.window(), 56, "the window is at its new size");
     assert_eq!(l.accepted_times(), vec![3], "holding the shares it held");
-    assert_eq!(l.set_network_difficulty(56.0), 0, "and fails again while the table is hidden");
+    assert_eq!(resize(&mut l, 56.0), 0, "and fails again while the table is hidden");
 
     hide_share_table(&l, false);
-    assert_eq!(l.set_network_difficulty(56.0), 2, "the same difficulty re-reads alice and bob");
+    assert_eq!(resize(&mut l, 56.0), 2, "the same difficulty re-reads alice and bob");
     assert_eq!(l.accepted_times(), vec![1, 2, 3]);
     assert_eq!(l.total_work(), 56);
-    assert_eq!(l.set_network_difficulty(56.0), 0, "once read, the same difficulty reads nothing");
+    assert_eq!(resize(&mut l, 56.0), 0, "once read, the same difficulty reads nothing");
 }
 
 #[test]
@@ -1028,4 +1048,139 @@ fn the_network_difficulty_is_the_one_last_set() {
     l.set_network_difficulty(4.0625);
     assert_eq!(l.network_difficulty(), Some(4.0625), "recorded when the window keeps its size");
     assert_eq!(l.window(), 32);
+}
+
+/// A widening's re-read reads a snapshot taken when it begins: a share recorded while it runs
+/// is credited to the narrower window, then added to the wider one once.
+#[test]
+fn a_share_recorded_while_the_window_is_re_read_is_in_the_wider_window_once() {
+    let scratch = Scratch::new("record-during-reread");
+    let (mut l, _) = open(&scratch, 56, None);
+    l.record(share(1, "alice", 16, hash(1), "")).unwrap();
+    l.record(share(2, "bob", 32, hash(2), "")).unwrap();
+    l.record(share(3, "carol", 8, hash(3), "")).unwrap();
+    assert!(!l.set_window(8));
+    assert!(l.set_window(64));
+    let reread = l.begin_reread().expect("a re-read is due");
+    assert!(l.begin_reread().is_none(), "one runs at a time");
+    l.record(share(4, "dave", 8, hash(4), "")).unwrap();
+    assert_eq!(
+        work_by_identity(&l),
+        vec![identity_work("carol", 8), identity_work("dave", 8)],
+        "the narrower window credits it meanwhile"
+    );
+    let read = reread.read();
+    assert_eq!(l.finish_reread(reread.window, read).0, 2, "alice and bob are re-read");
+    assert_eq!(l.accepted_times(), vec![1, 2, 3, 4]);
+    assert_eq!(l.total_work(), 64);
+    assert_eq!(reread_now(&mut l), 0, "none is due once it is installed");
+}
+
+#[test]
+fn a_window_widened_again_while_it_is_re_read_is_re_read_again() {
+    let scratch = Scratch::new("widen-during-reread");
+    let (mut l, _) = open(&scratch, 56, None);
+    l.record(share(1, "alice", 16, hash(1), "")).unwrap();
+    l.record(share(2, "bob", 32, hash(2), "")).unwrap();
+    l.record(share(3, "carol", 8, hash(3), "")).unwrap();
+    assert!(!l.set_window(8));
+    assert!(l.set_window(24));
+    let reread = l.begin_reread().expect("a re-read is due");
+    assert!(l.set_window(56), "still due");
+    let read = reread.read();
+    assert_eq!(l.finish_reread(reread.window, read).0, 1, "bob, read to 24");
+    assert_eq!(l.accepted_times(), vec![2, 3]);
+    assert_eq!(reread_now(&mut l), 1, "and alice by the next re-read, to 56");
+    assert_eq!(l.accepted_times(), vec![1, 2, 3]);
+}
+
+/// Retention's floor is the window's share count, the narrower window's while a re-read runs:
+/// it waits, so the rows the wider window holds stay on disk.
+#[test]
+fn retention_waits_for_a_running_re_read() {
+    const APART: u64 = 5 * ratum::SECS_PER_HOUR;
+    let scratch = Scratch::new("retain-during-reread");
+    let (mut l, _) = open(&scratch, 56, Some(1));
+    l.record(share(0, "alice", 16, hash(1), "")).unwrap();
+    l.record(share(APART, "bob", 32, hash(2), "")).unwrap();
+    l.record(share(2 * APART, "carol", 8, hash(3), "")).unwrap();
+    assert!(!l.set_window(8));
+    assert!(l.set_window(64));
+    let reread = l.begin_reread().expect("a re-read is due");
+    assert_eq!(l.record(share(3 * APART, "dave", 8, hash(4), "")).unwrap(), 0, "none removed");
+    let read = reread.read();
+    l.finish_reread(reread.window, read);
+    assert_eq!(l.accepted_times(), vec![0, APART, 2 * APART, 3 * APART]);
+    drop(l);
+    assert_eq!(dumped(&scratch.join("regtest.redb")).len(), 4, "each on disk");
+}
+
+/// The ledger lock's holds by a widening that re-reads `RE_READ` shares, `CREDITED` recorded
+/// meanwhile, and the longest a coinbaser answer (`Ledger::weights_for`) waits for the lock.
+#[test]
+#[ignore = "measures the ledger lock's holds on the drive TMPDIR names; run with --release -- --ignored --nocapture"]
+fn widening_lock_hold() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+    /// What block 975744's widening re-read.
+    const RE_READ: u64 = 226_929;
+    /// About 1000 a second over the 8 seconds block 975744's re-read took.
+    const CREDITED: u64 = 8_192;
+    const STORED: u64 = MAX_SHARES as u64 - CREDITED;
+    const DIFFICULTY: u64 = 16;
+    let shares = |from: u64, to: u64| -> Vec<Share> {
+        let miner = |i: u64| format!("miner{:02}", i % 32);
+        (from..to).map(|i| share(1_000 + i, &miner(i), DIFFICULTY, hash(i), "")).collect()
+    };
+    let scratch = Scratch::new("widening-lock-hold");
+    let (mut l, _) = open(&scratch, u128::MAX, None);
+    for from in (0..STORED).step_by(4096) {
+        l.record_batch(shares(from, (from + 4096).min(STORED))).unwrap();
+    }
+    assert!(!l.set_window(u128::from((STORED - RE_READ) * DIFFICULTY)));
+    let ledger = Mutex::new(l);
+    let began = Instant::now();
+    let reread = {
+        let mut l = lock(&ledger);
+        assert!(l.set_window(u128::from(MAX_SHARES as u64 * DIFFICULTY)));
+        l.begin_reread().expect("a re-read is due")
+    };
+    let begin_hold = began.elapsed();
+    for from in (STORED..STORED + CREDITED).step_by(4096) {
+        lock(&ledger).record_batch(shares(from, from + 4096)).unwrap();
+    }
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|s| {
+        let probe = s.spawn(|| {
+            let (mut longest, mut answered) = (Duration::ZERO, 0u64);
+            while !stop.load(Ordering::Relaxed) {
+                let asked = Instant::now();
+                drop(lock(&ledger).weights_for(312_500_000));
+                longest = longest.max(asked.elapsed());
+                answered += 1;
+            }
+            (longest, answered)
+        });
+        let reading = Instant::now();
+        let read = reread.read();
+        let read_took = reading.elapsed();
+        let installing = Instant::now();
+        let (re_read, replaced) = lock(&ledger).finish_reread(reread.window, read);
+        let install_hold = installing.elapsed();
+        drop(replaced);
+        std::thread::sleep(Duration::from_millis(50));
+        stop.store(true, Ordering::Relaxed);
+        let (longest, answered) = probe.join().unwrap();
+        assert_eq!(re_read as u64, RE_READ);
+        assert_eq!(lock(&ledger).len(), MAX_SHARES);
+        println!(
+            "read {STORED} rows in {:.3} s; the lock was held {:.6} s to begin the re-read and \
+             {:.6} s to install it with {CREDITED} shares credited meanwhile; the longest of \
+             {answered} lock takes during the read and install waited {:.6} s",
+            read_took.as_secs_f64(),
+            begin_hold.as_secs_f64(),
+            install_hold.as_secs_f64(),
+            longest.as_secs_f64()
+        );
+    });
 }
