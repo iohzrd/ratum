@@ -3,7 +3,7 @@ resolver = "3"
 members = ["core", "prime", "gateway", "miner"]
 
 [workspace.package]
-version = "0.1.62"
+version = "0.1.63"
 edition = "2024"
 publish = false
 license = "AGPL-3.0-or-later"
@@ -17,7 +17,7 @@ blake2 = "0.11"
 bs58 = { version = "0.5", features = ["check"] }
 bytes = "1"
 clap = { version = "4.6.7", features = ["derive"] }
-dryoc = "1"
+dryoc = "2"
 env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
 hex = "0.4"
 libc = "0.2"
@@ -35,5 +35,5 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.11"
 socket2 = "0.6"
-thiserror = "2.0.20"
+thiserror = "2"
 toml = "1.1.6"
