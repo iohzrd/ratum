@@ -121,11 +121,11 @@ ignored. `RUST_LOG` overrides `logger.log_level_console`.
   after up to 4 s of retries). A coinbaser answer for a template on a replaced tip is
   discarded.
 - `mining.set_difficulty` carries the difficulty as the C gateway formats it,
-  n * 65535 / 65536 (16384 is announced as 16383.75); the share target is the one n names.
+  n \* 65535 / 65536 (16384 is announced as 16383.75); the share target is the one n names.
 - At startup the gateway raises its soft open file limit (RLIMIT_NOFILE) to the hard limit and
   logs the limit in force. Each stratum connection holds three descriptors (its socket and its
   poller's epoll instance and eventfd), and a warning names the number of clients that fit when
-  3 * `stratum.max_clients` + 64 exceeds the soft limit. The C gateway warns when `max_clients`
+  3 \* `stratum.max_clients` + 64 exceeds the soft limit. The C gateway warns when `max_clients`
   exceeds either limit and raises neither.
 - `datum.protocol_global_timeout` is at most 86400 seconds and
   `stratum.vardiff_target_shares_min` at most 20000.
@@ -288,25 +288,25 @@ rpc = "http://ratum:...@127.0.0.1:8332"   # the node, on this host or a private 
 min-diff = 16384                          # smallest share difficulty credited, a power of two
 ```
 
-| Flag | Default | Effect |
-| --- | --- | --- |
-| `--rpc <url>` | required | the node; a `user:password@` in the URL is the credential |
-| `--rpc-cookie <file>` | none | the node's cookie file, used instead of the URL's credential and re-read when a request is refused |
-| `--payout-address <address>` | required | the pool's script: the coinbase output every job reserves, and every fallback payment |
-| `--data-dir <dir>` | none | holds `<chain>.redb`, `ratum-prime.key`, `hashrate.json` and `ratum.toml`; without it the window is in memory only |
-| `--config <file>` | `ratum.toml` in `--data-dir` | the settings file |
-| `--listen <address>` | `0.0.0.0:28915` | the DATUM listener |
-| `--stats-listen <address>` | none | the `/stats.json` and `/block.json` listener (see "Stats interface") |
-| `--coinbase-tag <text>` | empty | pushed into every pooled coinbase ahead of the gateway's secondary tag |
-| `--motd <text>` | `RATUM Prime` | sent to every gateway at hello |
-| `--min-diff <n>` | 16384 | the smallest share difficulty credited, a power of two |
-| `--window <multiple>` | 8 | the window's work as a multiple of the network difficulty |
-| `--ledger-keep-shares <n>` | keep all | the shares retained on disk (see "Ledger and window") |
-| `--fee-bps <n>` | 0 | the operator fee, at most 100 |
-| `--require-v3` | off | refuse version 1 gateways at hello |
-| `--max-connections <n>` | 1024 | the gateway connections served at once |
-| `--max-connections-per-ip <n>` | 32 | those from one address |
-| `--poll <seconds>` | 0.5 | the bound on each wait for the next block before the tip is re-read |
+| Flag                           | Default                      | Effect                                                                                                             |
+| ------------------------------ | ---------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `--rpc <url>`                  | required                     | the node; a `user:password@` in the URL is the credential                                                          |
+| `--rpc-cookie <file>`          | none                         | the node's cookie file, used instead of the URL's credential and re-read when a request is refused                 |
+| `--payout-address <address>`   | required                     | the pool's script: the coinbase output every job reserves, and every fallback payment                              |
+| `--data-dir <dir>`             | none                         | holds `<chain>.redb`, `ratum-prime.key`, `hashrate.json` and `ratum.toml`; without it the window is in memory only |
+| `--config <file>`              | `ratum.toml` in `--data-dir` | the settings file                                                                                                  |
+| `--listen <address>`           | `0.0.0.0:28915`              | the DATUM listener                                                                                                 |
+| `--stats-listen <address>`     | none                         | the `/stats.json` and `/block.json` listener (see "Stats interface")                                               |
+| `--coinbase-tag <text>`        | empty                        | pushed into every pooled coinbase ahead of the gateway's secondary tag                                             |
+| `--motd <text>`                | `RATUM Prime`                | sent to every gateway at hello                                                                                     |
+| `--min-diff <n>`               | 16384                        | the smallest share difficulty credited, a power of two                                                             |
+| `--window <multiple>`          | 8                            | the window's work as a multiple of the network difficulty                                                          |
+| `--ledger-keep-shares <n>`     | keep all                     | the shares retained on disk (see "Ledger and window")                                                              |
+| `--fee-bps <n>`                | 0                            | the operator fee, at most 100                                                                                      |
+| `--require-v3`                 | off                          | refuse version 1 gateways at hello                                                                                 |
+| `--max-connections <n>`        | 1024                         | the gateway connections served at once                                                                             |
+| `--max-connections-per-ip <n>` | 32                           | those from one address                                                                                             |
+| `--poll <seconds>`             | 0.5                          | the bound on each wait for the next block before the tip is re-read                                                |
 
 The ledger commands (`--settle-block`, `--void-block`, `--record-owed` with `--owed`,
 `--dump-ledger`, `--snapshot`) run instead of the pool, with `--data-dir`, and are executed
@@ -557,15 +557,15 @@ that.
 The ledger commands run instead of the pool and take the same `--data-dir` (or `--config`
 naming a file that sets it):
 
-| Command | Effect |
-| --- | --- |
-| `--settle-block <block-hash>` | marks the block's owed record settled (see "Owed blocks") |
-| `--settle-block list` | prints every owed record with its confirmations |
-| `--void-block <block-hash>` | removes the block's record, its owed record and its confirmation reading |
-| `--record-owed <block-hash> --owed <identity>=<sats> ...` | adds an owed record for a block in the history that has none |
-| `--dump-ledger` | prints every stored share, one per line: time, difficulty, identity, hash, secondary tag |
-| `--snapshot <path>` | writes a copy of the ledger file to `<path>` |
-| `--offline` | with any of the above: opens the ledger file directly instead of asking the pool |
+| Command                                                   | Effect                                                                                   |
+| --------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| `--settle-block <block-hash>`                             | marks the block's owed record settled (see "Owed blocks")                                |
+| `--settle-block list`                                     | prints every owed record with its confirmations                                          |
+| `--void-block <block-hash>`                               | removes the block's record, its owed record and its confirmation reading                 |
+| `--record-owed <block-hash> --owed <identity>=<sats> ...` | adds an owed record for a block in the history that has none                             |
+| `--dump-ledger`                                           | prints every stored share, one per line: time, difficulty, identity, hash, secondary tag |
+| `--snapshot <path>`                                       | writes a copy of the ledger file to `<path>`                                             |
+| `--offline`                                               | with any of the above: opens the ledger file directly instead of asking the pool         |
 
 A pool started with `--data-dir` listens on a Unix domain socket at `<data-dir>/control.sock`
 (mode 0600; never a TCP port, and not the stats interface). A command first connects to that
@@ -677,13 +677,13 @@ read with its block hash, which needs none. The parameters are checked before th
 read: `hash` must be exactly 64 hex digits (either case; the reply prints it lowercase) and
 `height` a decimal integer below 2^32. The statuses, each with a JSON body:
 
-| Status | Condition | Body |
-| ------ | --------- | ---- |
-| 200 | the node holds the block | the object below |
-| 400 | neither or both parameters, or one that does not parse | `{"error": "<reason>"}` |
-| 404 | the node stores no block under the hash (`no block under the hash`), or the height is above its tip (`no block at the height`) | `{"error": "<reason>", "pool": <the pool's record of the hash, as in the object below, or null>}` |
-| 405 | a method other than GET | `{"error": "method not allowed"}` |
-| 502 | a node error other than those, or an answer missing a field | `{"error": "<the node error, or the field missing>"}` |
+| Status | Condition                                                                                                                      | Body                                                                                              |
+| ------ | ------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------- |
+| 200    | the node holds the block                                                                                                       | the object below                                                                                  |
+| 400    | neither or both parameters, or one that does not parse                                                                         | `{"error": "<reason>"}`                                                                           |
+| 404    | the node stores no block under the hash (`no block under the hash`), or the height is above its tip (`no block at the height`) | `{"error": "<reason>", "pool": <the pool's record of the hash, as in the object below, or null>}` |
+| 405    | a method other than GET                                                                                                        | `{"error": "method not allowed"}`                                                                 |
+| 502    | a node error other than those, or an answer missing a field                                                                    | `{"error": "<the node error, or the field missing>"}`                                             |
 
 The node's answer for a hash (the block and its coinbase) is held for 60 seconds per hash,
 and a height's hash for 60 seconds per height, each at most 128 entries (the least recently
@@ -730,6 +730,10 @@ cannot carry them; `nonce` is the first nonce field, `version` is the header's v
 integer without the version 2 flag, and `time` is the block time with the header's time
 offset applied, as the node reports it. Transactions, addresses and the mempool have no
 endpoint: the node keeps no index for them.
+
+## Donations (XBT)
+
+`bc1q9xhs58365h72ycm35hke92kw7gxylhs999k955`
 
 ## References
 
