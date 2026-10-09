@@ -5,6 +5,7 @@
 mod api;
 mod config;
 mod datum;
+mod difficulty;
 #[cfg(test)]
 mod fixtures;
 mod gateway;

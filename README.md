@@ -122,6 +122,12 @@ ignored. `RUST_LOG` overrides `logger.log_level_console`.
   discarded.
 - `mining.set_difficulty` carries the difficulty as the C gateway formats it,
   n \* 65535 / 65536 (16384 is announced as 16383.75); the share target is the one n names.
+- `stratum.vardiff_min` is read as in the C gateway: an integer up to 2^31 - 1 is a share
+  difficulty (a warning names the hash count to write instead); a larger integer, a real, or a
+  decimal string with an optional SI suffix (`"70.4T"`) is a hash count, share difficulty \* 2^32,
+  rounded up to a power of two. The C gateway refuses an integer share difficulty that is not
+  a power of two; this gateway rounds it down with a warning. The settings page shows and saves
+  the share difficulty.
 - At startup the gateway raises its soft open file limit (RLIMIT_NOFILE) to the hard limit and
   logs the limit in force. Each stratum connection holds three descriptors (its socket and its
   poller's epoll instance and eventfd), and a warning names the number of clients that fit when

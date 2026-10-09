@@ -22,7 +22,7 @@ const MAX_CLIENTS_PER_THREAD: usize = 4096;
 /// `in_range` and the form's `int` read them all.
 pub const WORK_UPDATE_SECONDS_RANGE: std::ops::RangeInclusive<u64> = 5..=120;
 pub const PORT_RANGE: std::ops::RangeInclusive<u64> = 1..=u16::MAX as u64;
-pub const VARDIFF_MIN_RANGE: std::ops::RangeInclusive<u64> = 1..=u64::MAX;
+pub const VARDIFF_MIN_RANGE: std::ops::RangeInclusive<u64> = 1..=crate::difficulty::MAX;
 pub const COINBASE_UNIQUE_ID_RANGE: std::ops::RangeInclusive<u64> = 0..=u16::MAX as u64;
 const MIN_VARDIFF_TARGET_SHARES_MIN: u64 = 1;
 const MIN_VARDIFF_QUICKDIFF_COUNT: u64 = 4;
@@ -80,6 +80,10 @@ pub struct StratumConfig {
     pub max_threads: usize,
     pub max_clients: usize,
     pub trust_proxy: i64,
+    /// `stratum.vardiff_min` as written; `validate_stratum` parses it into `vardiff_min`.
+    #[serde(rename = "vardiff_min")]
+    vardiff_min_input: serde_json::Value,
+    #[serde(skip)]
     pub vardiff_min: u64,
     pub vardiff_target_shares_min: u64,
     pub vardiff_quickdiff_count: u64,
@@ -142,6 +146,7 @@ impl Default for StratumConfig {
             max_threads: 8,
             max_clients: 1024,
             trust_proxy: -1,
+            vardiff_min_input: serde_json::Value::Null,
             vardiff_min: 16384,
             vardiff_target_shares_min: 8,
             vardiff_quickdiff_count: 8,
@@ -438,6 +443,8 @@ impl Config {
             return Err("stratum.max_clients exceeds max_clients_per_thread * max_threads".into());
         }
         in_range("stratum.listen_port", u64::from(s.listen_port), &PORT_RANGE)?;
+        self.parse_vardiff_min()?;
+        let s = &self.stratum;
         in_range("stratum.vardiff_min", s.vardiff_min, &VARDIFF_MIN_RANGE)?;
         at_least(
             "stratum.vardiff_target_shares_min",
@@ -470,6 +477,34 @@ impl Config {
         }
         if self.stratum.trust_proxy != -1 {
             self.note_warning("stratum.trust_proxy is set but the PROXY protocol is not supported; a connection that sends a PROXY line is closed");
+        }
+        Ok(())
+    }
+
+    fn parse_vardiff_min(&mut self) -> Result<(), String> {
+        use crate::difficulty::{Parsed, format, parse};
+        if self.stratum.vardiff_min_input.is_null() {
+            return Ok(());
+        }
+        let parsed = parse(&self.stratum.vardiff_min_input).ok_or_else(|| {
+            format!(
+                "stratum.vardiff_min must be a positive integer or a decimal hash count with an optional SI suffix (\"4.4T\"), at most \"{}\"",
+                format(crate::difficulty::MAX)
+            )
+        })?;
+        match parsed {
+            Parsed::Exact(d) => self.stratum.vardiff_min = d,
+            Parsed::RoundedUp(d) => {
+                self.stratum.vardiff_min = d;
+                self.note_warning(format!("stratum.vardiff_min rounded up to {}", format(d)));
+            }
+            Parsed::Legacy(d) => {
+                self.stratum.vardiff_min = d;
+                self.note_warning(format!(
+                    "stratum.vardiff_min uses legacy integer syntax; use \"{}\" instead",
+                    format(ratum::target::pow2_floor(d))
+                ));
+            }
         }
         Ok(())
     }
@@ -708,6 +743,36 @@ mod tests {
         assert!(Config::parse(&pooled(0)).unwrap_err().contains("datum.pool_port"));
         assert!(Config::parse(&pooled(28915)).is_ok());
         assert!(Config::parse(&minimal()).is_ok(), "no pool host, so the port is not reached");
+    }
+
+    #[test]
+    fn vardiff_min_reads_a_hash_count_or_a_legacy_difficulty() {
+        let parse =
+            |v: &str| Config::parse(&with_extra(&format!(r#""stratum": {{"vardiff_min": {v}}}"#)));
+        let notes =
+            |c: &Config| c.startup_notes.iter().map(|n| n.message.clone()).collect::<Vec<_>>();
+
+        let c = parse("null").unwrap();
+        assert_eq!((c.stratum.vardiff_min, notes(&c).len()), (16384, 0));
+        let c = parse(r#""2.2T""#).unwrap();
+        assert_eq!((c.stratum.vardiff_min, notes(&c).len()), (512, 0));
+        let c = parse("512").unwrap();
+        assert_eq!(c.stratum.vardiff_min, 512);
+        assert_eq!(
+            notes(&c),
+            ["stratum.vardiff_min uses legacy integer syntax; use \"2.2T\" instead"]
+        );
+        let c = parse(r#""4.5T""#).unwrap();
+        assert_eq!(c.stratum.vardiff_min, 2048);
+        assert_eq!(notes(&c), ["stratum.vardiff_min rounded up to 8.8T"]);
+        let c = parse("1000").unwrap();
+        assert_eq!(c.stratum.vardiff_min, 512);
+        assert_eq!(notes(&c).len(), 2, "{:?}", notes(&c));
+        let c = parse("4398046511104").unwrap();
+        assert_eq!((c.stratum.vardiff_min, notes(&c).len()), (1024, 0), "above i32::MAX: hashes");
+        for bad in [r#""1.2Z""#, "0", r#""4e12""#, "[]"] {
+            assert!(parse(bad).unwrap_err().contains("stratum.vardiff_min"), "{bad}");
+        }
     }
 
     const KEY: &str = "f21f2f0ef0aa1970468f22bad9bb7f4535146f8e4a8f646bebc93da3d89b1406f40d032f09a417d94dc068055df654937922d2c89522e3e8f6f0e649de473003";

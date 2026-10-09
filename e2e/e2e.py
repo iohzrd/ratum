@@ -412,7 +412,7 @@ class Stack:
             },
             "stratum": {
                 "listen_port": stratum_port,
-                "vardiff_min": 1,
+                "vardiff_min": "4.3G",
                 "vardiff_target_shares_min": vardiff_target,
             },
             "mining": {
