@@ -127,7 +127,9 @@ ignored. `RUST_LOG` overrides `logger.log_level_console`.
   decimal string with an optional SI suffix (`"70.4T"`) is a hash count, share difficulty \* 2^32,
   rounded up to a power of two. The C gateway refuses an integer share difficulty that is not
   a power of two; this gateway rounds it down with a warning. The settings page shows and saves
-  the share difficulty.
+  it as a hash count (`"70.4T"`), and the status page shows every difficulty (miner, shares,
+  pool minimum, network) as a hash count, as C's `datum_format_difficulty` prints it;
+  `/stats.json` keeps share difficulties.
 - At startup the gateway raises its soft open file limit (RLIMIT_NOFILE) to the hard limit and
   logs the limit in force. Each stratum connection holds three descriptors (its socket and its
   poller's epoll instance and eventfd), and a warning names the number of clients that fit when

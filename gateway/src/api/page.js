@@ -33,6 +33,19 @@ function hashrate(hs) {
   return hs.toLocaleString(undefined, {maximumFractionDigits: hs < 10 ? 2 : 1}) + " " + units[i];
 }
 
+// A share difficulty as C's datum_format_difficulty prints it: the hashes it takes on average,
+// difficulty * 2^32, with an SI suffix.
+function diff(d) {
+  if (d == null) return "-";
+  let v = d * 4294967296;
+  if (v < 1000) return v.toFixed(0);
+  const suffixes = "kMGTPEZYRQ";
+  let i = 0;
+  v /= 1000;
+  while (v >= 999.95 && i < suffixes.length - 1) { v /= 1000; i += 1; }
+  return v.toFixed(1) + suffixes[i];
+}
+
 // A rough duration: seconds below 90 s, minutes below 90 min, hours below 48 h, then days.
 function duration(secs) {
   if (secs == null || !isFinite(secs) || secs <= 0) return "-";

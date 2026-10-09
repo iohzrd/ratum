@@ -133,8 +133,8 @@
   </div>
   <div class="field">
     <label for="stratum_vardiff_min">Minimum difficulty</label>
-    <input name="stratum_vardiff_min" id="stratum_vardiff_min" maxlength="20">
-    <div class="tip">A power of two; the lowest difficulty vardiff assigns a miner.</div>
+    <input name="stratum_vardiff_min" id="stratum_vardiff_min" maxlength="32">
+    <div class="tip">The lowest difficulty vardiff assigns a miner, as a hash count with an SI suffix ("70.4T"), rounded up to a power of two difficulty.</div>
   </div>
   <div class="field">
     <label for="stratum_require_address_username">Require an address as the username</label>

@@ -99,7 +99,7 @@ function btc(b) { return b == null ? "-" : Number(b).toLocaleString(undefined, {
 function ago(s) { return s == null || s < 0 ? "-" : duration(Math.max(s, 1)) + " ago"; }
 function pct(part, whole) { return whole > 0 ? (part / whole * 100).toFixed(1) + "%" : "-"; }
 // A count with its difficulty beside it.
-function tally(count, diff) { return `${num(count)} <span class="motd">(${num(diff)})</span>`; }
+function tally(count, d) { return `${num(count)} <span class="motd">(${diff(d)})</span>`; }
 // A cell with a bar for its share of `whole`.
 function barCell(text, part, whole) {
   const w = whole > 0 ? Math.min(part / whole * 100, 100) : 0;
@@ -148,11 +148,11 @@ poll(() => "stats.json", s => {
     tile("Hashrate", rate > 0 ? "~" + hashrate(rate * 1e12) : "-",
       `${num(s.stratum.subscriptions)} subscribed of ${num(s.stratum.connections)} connections`),
     tile("Shares accepted", num(acc.count),
-      `${num(acc.diff)} difficulty · ${num(rej.count)} rejected (${pct(rej.count, acc.count + rej.count)})`),
+      `${diff(acc.diff)} difficulty · ${num(rej.count)} rejected (${pct(rej.count, acc.count + rej.count)})`),
     tile("Block height", s.job ? num(j.height) : "-",
       s.job ? `${btc(j.value_btc)} · ${num(j.txn_count)} transactions` : "no job yet"),
     tile("Uptime", duration(s.uptime_seconds),
-      s.pool_host ? `pool minimum difficulty ${num(s.pool_min_diff)}` : "non-pooled mining"),
+      s.pool_host ? `pool minimum difficulty ${diff(s.pool_min_diff)}` : "non-pooled mining"),
   ].join("");
 
   document.getElementById("chart-note").textContent = drawChart(
@@ -168,7 +168,7 @@ poll(() => "stats.json", s => {
     document.getElementById("job-chips").innerHTML = [
       chip("job", esc(j.job_id)),
       chip("payout", j.is_datum_job ? "pool split" : "gateway address"),
-      chip("difficulty", num(j.difficulty)),
+      chip("difficulty", diff(j.difficulty)),
       chip("coinbase outputs", num(j.coinbaser_outputs)),
       `<span class="chip" title="${esc(j.previous_block)}">previous block <b>…${esc(String(j.previous_block).slice(-12))}</b></span>`,
     ].join("");
@@ -189,7 +189,7 @@ poll(() => "stats.json", s => {
       <td>${esc(c.remote)}</td>
       <td class="mono">${esc(c.username)}${!c.subscribed ? '<span class="tag">not subscribed</span>' : c.unpayable ? '<span class="tag">unpayable</span>' : ""}</td>
       ${c.hashrate_ths == null ? '<td class="num">-</td>' : barCell("~" + hashrate(c.hashrate_ths * 1e12), c.hashrate_ths, maxThs)}
-      <td class="num">${num(c.vardiff)}</td>
+      <td class="num">${diff(c.vardiff)}</td>
       <td class="num">${tally(c.accepted_count, c.accepted_diff)}</td>
       <td class="num">${tally(c.rejected_count, c.rejected_diff)}</td>
       <td class="num">${ago(c.last_accepted_seconds)}</td>

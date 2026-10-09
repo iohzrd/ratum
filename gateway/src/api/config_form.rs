@@ -4,7 +4,7 @@
 
 use crate::config::{
     COINBASE_UNIQUE_ID_RANGE, Config, GLOBAL_TIMEOUT_MARGIN_SECS, MAX_CONFIGURED_TAG_LEN,
-    MAX_CONFIGURED_TAGS_TOTAL_LEN, PORT_RANGE, Pool, VARDIFF_MIN_RANGE, WORK_UPDATE_SECONDS_RANGE,
+    MAX_CONFIGURED_TAGS_TOTAL_LEN, PORT_RANGE, Pool, WORK_UPDATE_SECONDS_RANGE,
 };
 use serde_json::{Value, json};
 use std::ops::RangeInclusive;
@@ -30,6 +30,9 @@ enum FieldKind {
     },
     Bool,
     Password,
+    /// A hash count as `difficulty::parse` reads a string, saved as `difficulty::format` prints
+    /// the power of two it rounds to.
+    Difficulty,
 }
 
 /// The form's bound for a configuration range, so a field's limits are declared once, in
@@ -73,7 +76,9 @@ const FIELDS: &[Field] = &[
     field!(datum.pool.pool_url, "Pool web page", FieldKind::Text),
     field!(datum.protocol_v3, "Version 3 protocol", FieldKind::Bool),
     field!(stratum.listen_port, "Stratum port", int(&PORT_RANGE)),
-    field!(stratum.vardiff_min, "Minimum difficulty", int(&VARDIFF_MIN_RANGE)),
+    field!(@ stratum, vardiff_min, "Minimum difficulty", FieldKind::Difficulty, |c| json!(
+        crate::difficulty::format(c.stratum.vardiff_min)
+    )),
     field!(stratum.require_address_username, "Require an address as the username", FieldKind::Bool),
     field!(bitcoind.work_update_seconds, "Job update interval", int(&WORK_UPDATE_SECONDS_RANGE)),
     // Shown and compared in its redacted form, so the page never carries the password a
@@ -262,6 +267,17 @@ fn parse_int(label: &str, text: &str, min: i64, max: i64) -> Result<i64, String>
     Ok(v)
 }
 
+fn parse_difficulty(label: &str, text: &str) -> Result<String, String> {
+    use crate::difficulty::{Parsed, format, parse};
+    match parse(&json!(text.trim())) {
+        Some(Parsed::Exact(d) | Parsed::RoundedUp(d)) => Ok(format(d)),
+        _ => Err(format!(
+            "{label} must be a hash count with an optional SI suffix, such as \"70.4T\", at most \"{}\"",
+            format(crate::difficulty::MAX)
+        )),
+    }
+}
+
 fn parse_bool(label: &str, text: &str) -> Result<bool, String> {
     match text.trim() {
         "1" | "true" | "on" => Ok(true),
@@ -403,6 +419,10 @@ pub fn apply(
                 }
             }
             FieldKind::Int { min, max } => match parse_int(f.label, text, min, max) {
+                Ok(v) => edit.set_if_changed(f.section, f.key, json!(v), current),
+                Err(e) => edit.errors.push(e),
+            },
+            FieldKind::Difficulty => match parse_difficulty(f.label, text) {
                 Ok(v) => edit.set_if_changed(f.section, f.key, json!(v), current),
                 Err(e) => edit.errors.push(e),
             },
@@ -572,7 +592,10 @@ mod tests {
             let want = match f.kind {
                 FieldKind::Bool => Some("checkbox"),
                 FieldKind::Password => Some("password"),
-                FieldKind::Text | FieldKind::RedactedUrl | FieldKind::Int { .. } => None,
+                FieldKind::Text
+                | FieldKind::RedactedUrl
+                | FieldKind::Int { .. }
+                | FieldKind::Difficulty => None,
             };
             assert_eq!(*input_type, want, "{} has the wrong input type on the page", f.name);
         }
@@ -627,6 +650,7 @@ mod tests {
             ("bitcoind_rpcpassword", ""),
             ("reward_sharing", "never"),
             ("username_behaviour", "full_users"),
+            ("stratum_vardiff_min", "70.4T"),
         ]);
         assert_eq!(apply(&c, FILE, &f).unwrap(), None);
     }
@@ -634,11 +658,11 @@ mod tests {
     #[test]
     fn edits_are_written_with_the_file_order_kept() {
         let c = cfg();
-        let f = form(&[("mining_coinbase_unique_id", "7"), ("stratum_vardiff_min", "1024")]);
+        let f = form(&[("mining_coinbase_unique_id", "7"), ("stratum_vardiff_min", "4.5T")]);
         let text = apply(&c, FILE, &f).unwrap().unwrap();
         let doc: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(doc["mining"]["coinbase_unique_id"], 7);
-        assert_eq!(doc["stratum"]["vardiff_min"], 1024);
+        assert_eq!(doc["stratum"]["vardiff_min"], "8.8T", "rounded up and saved as printed");
         let keys: Vec<&str> = doc.as_object().unwrap().keys().map(String::as_str).collect();
         assert_eq!(keys, ["bitcoind", "mining", "datum", "stratum"]);
         assert!(text.starts_with("{\n    \"bitcoind\""), "{text}");
@@ -653,6 +677,8 @@ mod tests {
         assert_eq!(e, ["Unique gateway ID must be between 0 and 65535"]);
         let e = apply(&c, FILE, &form(&[("datum_pool_port", "x")])).unwrap_err();
         assert_eq!(e, ["Pool port must be a whole number"]);
+        let e = apply(&c, FILE, &form(&[("stratum_vardiff_min", "1.2Z")])).unwrap_err();
+        assert!(e[0].starts_with("Minimum difficulty must be a hash count"), "{e:?}");
     }
 
     #[test]

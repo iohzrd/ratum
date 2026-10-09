@@ -78,8 +78,9 @@ fn with_rounded_min_difficulty(c: ClientConfig) -> ClientConfig {
     let rounded = target::pow2_ceil(c.min_difficulty);
     if rounded != c.min_difficulty {
         warn!(
-            "pool minimum difficulty {} is not a power of two; using {rounded}",
-            c.min_difficulty
+            "pool minimum difficulty {} is not a power of two; using {}",
+            crate::difficulty::format(c.min_difficulty),
+            crate::difficulty::format(rounded)
         );
     }
     ClientConfig { min_difficulty: rounded, ..c }

@@ -22,8 +22,8 @@ const MAX_CLIENTS_PER_THREAD: usize = 4096;
 /// `in_range` and the form's `int` read them all.
 pub const WORK_UPDATE_SECONDS_RANGE: std::ops::RangeInclusive<u64> = 5..=120;
 pub const PORT_RANGE: std::ops::RangeInclusive<u64> = 1..=u16::MAX as u64;
-pub const VARDIFF_MIN_RANGE: std::ops::RangeInclusive<u64> = 1..=crate::difficulty::MAX;
 pub const COINBASE_UNIQUE_ID_RANGE: std::ops::RangeInclusive<u64> = 0..=u16::MAX as u64;
+const VARDIFF_MIN_RANGE: std::ops::RangeInclusive<u64> = 1..=crate::difficulty::MAX;
 const MIN_VARDIFF_TARGET_SHARES_MIN: u64 = 1;
 const MIN_VARDIFF_QUICKDIFF_COUNT: u64 = 4;
 const MIN_VARDIFF_QUICKDIFF_DELTA: u64 = 3;
