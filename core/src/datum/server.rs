@@ -5,7 +5,8 @@
 use super::channel::{Channel, Error, open_sealed, seal_signed, split_signed, verify};
 use super::framing::{self, FrameHeader, HeaderKeys, SessionNonces};
 use super::handshake::{
-    DRS_FLAG_AT, DRS_MARKER, DRS_TOKEN_AT, ProtocolVersion, RESUME_TOKEN_LEN, ResumeToken,
+    DRS_FLAG_AT, DRS_MARKER, DRS_RESUME_PRESENT, DRS_TOKEN_AT, ProtocolVersion, RESUME_TOKEN_LEN,
+    ResumeToken,
 };
 use super::keys::{KeyPairs, PUBLIC_KEYS_LEN, PublicKeys};
 use super::messages::STRUCT_END;
@@ -52,7 +53,8 @@ pub fn open_hello(header: FrameHeader, payload: &[u8], pool: &KeyPairs) -> Resul
 
     let tail = &after[AFTER_UA_LEN..];
     let protocol_version = if tail.len() > DRS_FLAG_AT && tail[..DRS_FLAG_AT] == DRS_MARKER {
-        let resume = if tail[DRS_FLAG_AT] != 0 {
+        // Other flag bits (the C gateway's 0x02 framing v2 offer) are not served.
+        let resume = if tail[DRS_FLAG_AT] & DRS_RESUME_PRESENT != 0 {
             let token: ResumeToken = tail
                 .get(DRS_TOKEN_AT..DRS_TOKEN_AT + RESUME_TOKEN_LEN)
                 .ok_or(Error::Malformed("DRS flag set without a token"))?
@@ -176,6 +178,52 @@ pub(crate) mod tests {
         assert_eq!(hello.user_agent, "v0.4.1-beta/deadbeef");
         assert_eq!(hello.nk, nk);
         assert_eq!(hello.session, session.public());
+    }
+
+    /// The C gateway's DRS tail since CONVOY baa0282: flags 0x02 (framing v2 offered), 0x01 when a
+    /// token follows, then 1 to 200 pad bytes.
+    #[test]
+    fn only_the_resume_bit_of_the_drs_flags_reads_a_token() {
+        let pool = KeyPairs::generate();
+        let long_term = KeyPairs::generate();
+        let token: ResumeToken = std::array::from_fn(|i| i as u8);
+        let open = |flags: u8, token: Option<&ResumeToken>, pad_len: usize| {
+            let mut body = Vec::new();
+            body.extend_from_slice(&long_term.public().to_bytes());
+            body.extend_from_slice(&KeyPairs::generate().public().to_bytes());
+            body.extend_from_slice(b"v0.5.0-beta/69c61a9");
+            body.extend_from_slice(&[0, STRUCT_END, 1, 2, 3, 4]);
+            body.extend_from_slice(&DRS_MARKER);
+            body.push(flags);
+            body.extend_from_slice(token.map_or(&[][..], |t| &t[..]));
+            body.resize(body.len() + pad_len, 0x5c);
+            let sealed = seal_signed(&long_term.sign_sk, &pool.box_pk, body).unwrap();
+            let header = FrameHeader {
+                cmd_len: sealed.len() as u32,
+                is_signed: true,
+                is_encrypted_pubkey: true,
+                proto_cmd: framing::cmd::HELLO_OR_PING,
+                ..Default::default()
+            };
+            open_hello(header, &sealed, &pool).map(|h| h.protocol_version)
+        };
+        for pad_len in [1, RESUME_TOKEN_LEN - 1, RESUME_TOKEN_LEN, 200] {
+            for flags in [0x00, 0x02] {
+                assert_eq!(
+                    open(flags, None, pad_len).unwrap(),
+                    ProtocolVersion::V3 { resume: None },
+                    "flags {flags:#04x}, {pad_len} pad bytes"
+                );
+            }
+            for flags in [0x01, 0x03] {
+                assert_eq!(
+                    open(flags, Some(&token), pad_len).unwrap(),
+                    ProtocolVersion::V3 { resume: Some(token) },
+                    "flags {flags:#04x}, {pad_len} pad bytes"
+                );
+            }
+        }
+        assert!(matches!(open(0x03, None, 1), Err(Error::Malformed(_))));
     }
 
     #[test]
