@@ -75,13 +75,10 @@ impl Job {
         }
     }
 
-    /// The sia ntime field of every job on this template, as the C gateway writes it: zero in
-    /// the low word and curtime in the high word, which the header carries as a time offset
-    /// of 0 and nonce3 equal to curtime (`share::set_sia_fields`). The block time is the
-    /// template's curtime either way: the header's time is curtime, and the time offset is
-    /// added to it only under `FLAG_USE_TIME_OFFSET`, which this gateway never sets.
+    /// The sia ntime field of every job: zero (time offset 0, nonce3 0), as the C gateway writes
+    /// it since CONVOY 6ad8a7e. The block time stays curtime: `FLAG_USE_TIME_OFFSET` is never set.
     pub fn ntime_hex(&self) -> String {
-        hex::encode(header::sia_words(0, self.template.curtime as u32))
+        hex::encode(header::sia_words(0, 0))
     }
 
     pub fn is_stale_prevblock(&self) -> bool {
@@ -337,21 +334,20 @@ mod tests {
         assert_eq!(table.tip(), Some([0x11; 32]));
     }
 
-    /// The notify's ntime is the C gateway's: curtime in the high word. A miner that returns
-    /// it unchanged submits a header with a time offset of 0 and nonce3 equal to curtime,
-    /// whose block time is curtime on the node and in the pool's rebuild of the share, and
-    /// whose hash the pool computes as the gateway does.
+    /// The notify's ntime is the C gateway's: zero. A miner that returns it unchanged submits a
+    /// header with a time offset and nonce3 of 0, whose block time is curtime on the node and in
+    /// the pool's rebuild of the share, and whose hash the pool computes as the gateway does.
     #[test]
     fn the_notified_ntime_is_the_c_gateways_and_keeps_the_block_time() {
         use ratum::datum::messages::share::{Blake2bSection, PowSubmit, share_extranonce};
         let job = aged(0, Duration::ZERO);
         let curtime = job.template.curtime as u32;
-        assert_eq!(job.ntime_hex(), format!("00000000{}", hex::encode(curtime.to_le_bytes())));
+        assert_eq!(job.ntime_hex(), "0".repeat(2 * SIA_WORDS_LEN));
 
         let ntime: [u8; SIA_WORDS_LEN] = hex::decode(job.ntime_hex()).unwrap().try_into().unwrap();
         let (kind, target_byte) = (CoinbaseKind::Pooled, 14);
         let h = job.header(kind, target_byte, [0; 16], ntime, header::sia_words(1, 2)).unwrap();
-        assert_eq!((h.time_offset, h.nonce3, h.time, h.flags), (0, curtime, curtime, 0));
+        assert_eq!((h.time_offset, h.nonce3, h.time, h.flags), (0, 0, curtime, 0));
         let wire = h.serialize();
         let time_on_wire_at = 4 + 32 + 32;
         assert_eq!(&wire[time_on_wire_at..time_on_wire_at + 4], &curtime.to_le_bytes());
