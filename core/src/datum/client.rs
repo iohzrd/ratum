@@ -142,9 +142,10 @@ impl ClientChannel {
     /// the session's box key. A frame with neither flag, or with both, is refused: its bytes
     /// carry no MAC, so anyone who derives the header mask could write one, and the session
     /// acts on every mining message it is given, a coinbaser split among them. The C gateway
-    /// accepts such a frame; the pool this gateway is released with never sends one, and
-    /// refuses them in the other direction (`ServerChannel::decrypt`). The exception is an
-    /// unsigned empty ping, which other pools send as a keepalive and which carries nothing.
+    /// accepted such a frame until CONVOY baa0282; the pool released with this gateway never
+    /// sends one, and refuses them in the other direction (`ServerChannel::decrypt`). The
+    /// exception is an unsigned empty ping, which other pools send as a keepalive and which
+    /// carries nothing.
     pub fn decrypt(&mut self, header: FrameHeader, ciphertext: &[u8]) -> Result<Vec<u8>, Error> {
         let verify = self.pool_session_sign_pk.as_ref();
         match (header.is_encrypted_channel, header.is_encrypted_pubkey) {

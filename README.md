@@ -165,13 +165,17 @@ ignored. `RUST_LOG` overrides `logger.log_level_console`.
   failure goes to stderr and the records keep reaching the open file.
 - Every message to the pool is padded, the block-transactions response included.
 - After the handshake a frame from the pool that is neither channel-encrypted nor sealed ends
-  the session, which then reconnects; the C gateway processes it, which lets anyone able to
-  write to the connection send an unauthenticated coinbaser split. The pool's coinbase tag is
+  the session, which then reconnects, except an unsigned empty ping. The C gateway processed
+  such a frame until CONVOY baa0282, which let anyone able to write to the connection send an
+  unauthenticated coinbaser split; it now ends the session on it, on that ping, on a sealed
+  frame and on a handshake response (command 2), where this gateway accepts the ping, opens a
+  sealed frame and logs command 2 as unknown. The pool's coinbase tag is
   cut at its first NUL byte, as the C gateway's use of it is, and a tag that is not UTF-8, like
   any configuration that does not decode, ends the session.
 - A transaction request (0x50 0x11) that names one index twice is answered bad-request, and a
   transaction reply that would not fit in one frame is answered too-many-transactions; the C
-  gateway copies a repeated index once per listing and sends large replies bulk-framed. While
+  gateway copies a repeated index once per listing, sends a reply over 16 KiB bulk-framed, and
+  answers one over 4,194,191 bytes reply-too-large (0xF5, CONVOY 6afeef6). While
   the share queue is full, or while shares arrive for an anti-block-withholding commitment the
   session does not hold, the first dropped share is logged and then one line per 10 seconds
   with the count dropped since.
@@ -203,12 +207,13 @@ ignored. `RUST_LOG` overrides `logger.log_level_console`.
 - A username (`mining.authorize` and `mining.submit`) is cut at its first NUL character, as the
   C gateway's copy of it stops there.
 
-Not served: the PROXY protocol (`stratum.trust_proxy`), `datum.always_pay_self`, the
-per-client pacing of job updates, the testnet fast-forward, hasher time rolling
-(`mining.allow_hasher_time_rolling`), the retention and audit of anti-block-withholding proofs
+Not served: the PROXY protocol (`stratum.trust_proxy`), the per-client pacing of job updates,
+the testnet fast-forward, hasher time rolling (`mining.allow_hasher_time_rolling`), the
+retention and audit of anti-block-withholding proofs
 (`mining.abw_verify_all_shares_on_disclosure`), migration (`datum.migration_max_seconds`),
 `--example-conf`, `--test` and `/assets` (`--help` lists this gateway's own options). Set
-values among these are reported at startup.
+values among these are reported at startup, as is `datum.always_pay_self`, which the C gateway
+never implemented and no longer reads (CONVOY c2cc0f1).
 
 ### Coinbase size
 
