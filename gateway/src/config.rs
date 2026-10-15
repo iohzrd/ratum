@@ -689,8 +689,9 @@ impl Config {
         let s = &self.stratum;
         s.max_clients
             .saturating_mul(s.vardiff_target_shares_min as usize)
-            .saturating_mul((s.share_stale_seconds / ratum::SECS_PER_MINUTE) as usize)
+            .saturating_mul(self.stale_window().as_secs() as usize)
             .saturating_mul(SHARE_CAPACITY_HEADROOM)
+            .div_ceil(ratum::SECS_PER_MINUTE as usize)
     }
 
     /// The script the pool's share of a block pays: the pool's, while a pool configuration
@@ -1021,7 +1022,11 @@ mod tests {
         let defaults = Config::parse(&minimal()).unwrap();
         assert_eq!(defaults.stratum.max_clients, 1024);
         assert_eq!(defaults.stratum.share_stale_seconds, 120);
-        assert_eq!(defaults.shares_in_stale_window(), 1024 * 8 * 2 * SHARE_CAPACITY_HEADROOM);
+        // (120 + 40) s at 8 shares a minute each, as C datum_expected_n_global_nonstale_shares.
+        assert_eq!(
+            defaults.shares_in_stale_window(),
+            (1024 * 8 * (120 + 40) * SHARE_CAPACITY_HEADROOM).div_ceil(60)
+        );
 
         // The same client limit spread over the thread settings two ways. Both bound the same
         // one queue and one duplicate-share table, so both must size them the same.
@@ -1033,6 +1038,9 @@ mod tests {
 
         let half =
             stratum(r#""max_clients": 512, "max_clients_per_thread": 512, "max_threads": 1"#);
-        assert_eq!(half.shares_in_stale_window() * 2, wide.shares_in_stale_window());
+        assert_eq!(
+            half.shares_in_stale_window(),
+            (512 * 8 * (120 + 40) * SHARE_CAPACITY_HEADROOM).div_ceil(60)
+        );
     }
 }
