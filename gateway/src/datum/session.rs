@@ -371,7 +371,7 @@ impl<'a> Session<'a> {
             "DATUM pool configuration: prime_id {:#010x}, tag {:?}, min diff {}, payout script {}",
             config.prime_id,
             config.coinbase_tag,
-            config.min_difficulty,
+            crate::difficulty::format(config.min_difficulty),
             hex::encode(&config.payout_script)
         );
         let mut s = self.gateway.pool.session();
