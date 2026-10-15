@@ -1,9 +1,10 @@
-//! The anti-block-withholding messages from the pool: a slot assignment and its key hash, and
-//! the reveal of a key, which is checked against the hash committed to.
+//! The anti-block-withholding messages from the pool: a slot assignment and its key hash, the
+//! activation of an assigned slot, and the reveal of a key, which is checked against the hash
+//! committed to.
 
 use super::Session;
 use log::{debug, error};
-use ratum::datum::messages::abw::{AssignmentNotice, Reveal};
+use ratum::datum::messages::abw::{Activation, AssignmentNotice, Reveal};
 
 impl Session<'_> {
     pub(super) fn on_abw_notice(&self, plain: &[u8]) {
@@ -18,6 +19,17 @@ impl Session<'_> {
         if notice.active {
             self.gateway.template_waker.refresh();
         }
+    }
+
+    /// A job update on the same tip, as for an active notice.
+    pub(super) fn on_abw_activation(&self, plain: &[u8]) {
+        let Some(activation) = decoded("activation", Activation::decode(plain)) else { return };
+        if !self.gateway.pool.session().abw.activate(activation.slot) {
+            error!("ABW activation for slot {} with no commitment held; ignored", activation.slot);
+            return;
+        }
+        debug!("ABW slot {} activated", activation.slot);
+        self.gateway.template_waker.refresh();
     }
 
     pub(super) fn on_abw_reveal(&self, plain: &[u8]) {

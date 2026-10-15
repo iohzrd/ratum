@@ -16,10 +16,9 @@ pub(crate) const ASSIGNMENT_ACTIVE: u8 = 0x01;
 
 pub mod subcmd {
     pub const CANDIDATE_RECEIPT: u8 = 0xA5;
-    /// Reserved: the draft's separate activation message. The pool activates a slot with
-    /// an `AssignmentNotice` carrying `active`, so nothing sends this and the gateway has no
-    /// handler for it.
-    pub const RESERVED_ACTIVATION: u8 = 0xA6;
+    /// Activates a slot an inactive `AssignmentNotice` installed. RATUM's pool sends none: it
+    /// activates with the notice's `active` flag.
+    pub const ACTIVATION: u8 = 0xA6;
     pub const CANDIDATE_RELEASE: u8 = 0xA7;
     pub const ASSIGNMENT_NOTICE: u8 = 0xA8;
     pub const REVEAL: u8 = 0xA9;
@@ -34,6 +33,11 @@ pub struct AssignmentNotice {
     pub active: bool,
     pub slot: u8,
     pub key_hash: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Activation {
+    pub slot: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,6 +98,19 @@ impl AssignmentNotice {
         let key_hash: [u8; 32] = c.arr("key hash")?;
         read_final_terminator(&mut c)?;
         Ok(Self { active: flags & ASSIGNMENT_ACTIVE != 0, slot, key_hash })
+    }
+}
+
+impl Activation {
+    pub fn encode(&self) -> Vec<u8> {
+        message(subcmd::ACTIVATION, |out| out.put_u8(self.slot))
+    }
+
+    pub fn decode(data: &[u8]) -> Result<Self, Error> {
+        let mut c = open(data, subcmd::ACTIVATION)?;
+        let slot = slot_checked(c.u8("slot")?)?;
+        read_final_terminator(&mut c)?;
+        Ok(Self { slot })
     }
 }
 
@@ -226,6 +243,11 @@ mod tests {
         assert_eq!(b[36], STRUCT_END);
         assert_eq!(AssignmentNotice::decode(&b).unwrap(), notice);
 
+        let activation = Activation { slot: 3 };
+        let b = activation.encode();
+        assert_eq!(b, [0xA6, 0, 3, STRUCT_END], "A6 payload is 3 bytes after the subcommand");
+        assert_eq!(Activation::decode(&b).unwrap(), activation);
+
         let cand = CandidateRef { slot: 3, raw_pow_hash_le: [0x80; 32] };
         let b = cand.encode_candidate(subcmd::CANDIDATE_RECEIPT);
         assert_eq!(b.len(), 36);
@@ -262,5 +284,7 @@ mod tests {
         let mut bad = Reveal { slot: 3, xor_key: [2; 16] }.encode();
         bad[19] = 0;
         assert!(matches!(Reveal::decode(&bad), Err(Error::BadTerminator)));
+        assert!(matches!(Activation::decode(&[0xA6, 0, 16, STRUCT_END]), Err(Error::BadSlot(16))));
+        assert!(matches!(Activation::decode(&[0xA6, 0, 3]), Err(Error::Truncated(_))));
     }
 }

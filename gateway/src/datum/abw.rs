@@ -34,6 +34,16 @@ impl AbwAssignments {
         }
     }
 
+    /// Makes `slot` active. False, and no change, when the slot holds no key hash (never
+    /// installed, or revealed).
+    pub fn activate(&mut self, slot: u8) -> bool {
+        if self.key_hashes[slot as usize].is_none() {
+            return false;
+        }
+        self.active = Some(slot);
+        true
+    }
+
     pub fn reveal(&mut self, slot: u8, xor_key: &XorKey) -> bool {
         if let Some(hash) = self.key_hashes[slot as usize]
             && xor_key_hash(xor_key) != hash
@@ -45,5 +55,36 @@ impl AbwAssignments {
             self.active = None;
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The C gateway's `datum_protocol_abw_activation_state_test` sequence.
+    #[test]
+    fn an_activation_moves_the_active_slot_to_an_installed_one() {
+        let key = |b: u8| [b; 16];
+        let mut a = AbwAssignments::default();
+        assert!(!a.activate(0), "not installed");
+        a.install(0, xor_key_hash(&key(1)), false);
+        assert_eq!(a.assignment(), None, "an inactive notice installs without activating");
+        assert!(a.activate(0));
+        assert_eq!(a.assignment().map(|x| x.slot), Some(0));
+
+        a.install(1, xor_key_hash(&key(2)), false);
+        assert_eq!(a.assignment().map(|x| x.slot), Some(0));
+        assert!(a.activate(1));
+        assert_eq!(
+            a.assignment(),
+            Some(AbwAssignment { slot: 1, key_hash: xor_key_hash(&key(2)) })
+        );
+
+        assert!(a.reveal(0, &key(1)));
+        assert!(!a.activate(0), "revealed");
+        assert_eq!(a.assignment().map(|x| x.slot), Some(1));
+        assert!(a.reveal(1, &key(2)));
+        assert_eq!(a.assignment(), None);
     }
 }

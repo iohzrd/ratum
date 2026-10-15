@@ -275,6 +275,7 @@ impl<'a> Session<'a> {
                 log_migration_request(plain);
             }
             Some(abw::subcmd::ASSIGNMENT_NOTICE) => self.on_abw_notice(plain),
+            Some(abw::subcmd::ACTIVATION) => self.on_abw_activation(plain),
             Some(abw::subcmd::REVEAL) => self.on_abw_reveal(plain),
             Some(abw::subcmd::CANDIDATE_RECEIPT) => {
                 if let Ok(c) = CandidateRef::decode_candidate(plain, abw::subcmd::CANDIDATE_RECEIPT)

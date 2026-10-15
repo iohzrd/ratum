@@ -13,7 +13,7 @@ use ratum::datum::coinbase::{self, ScriptSigInputs};
 use ratum::datum::framing::{self, FrameHeader, HeaderKeyRatchet};
 use ratum::datum::handshake::{ProtocolVersion, RESUME_TOKEN_LEN};
 use ratum::datum::keys::KeyPairs;
-use ratum::datum::messages::abw::{self, AssignmentNotice, CandidateRef, Reveal};
+use ratum::datum::messages::abw::{self, Activation, AssignmentNotice, CandidateRef, Reveal};
 use ratum::datum::messages::coinbaser::{CoinbaserRequest, CoinbaserResponse};
 use ratum::datum::messages::config::ClientConfig;
 use ratum::datum::messages::migration::MigrationRequest;
@@ -98,6 +98,7 @@ fn feed_everything(blob: &[u8]) {
     let _ = TxnList::decode(blob, validation::response::TXNS);
     let _ = TxnList::decode(blob, validation::response::BLOCK_TXNS);
     let _ = AssignmentNotice::decode(blob);
+    let _ = Activation::decode(blob);
     for selector in [abw::subcmd::CANDIDATE_RECEIPT, abw::subcmd::CANDIDATE_RELEASE] {
         let _ = CandidateRef::decode_candidate(blob, selector);
     }
@@ -458,6 +459,14 @@ fn a_damaged_assignment_notice_is_refused_or_reproduces_itself() {
             AssignmentNotice::decode(bytes).ok().map(|n| n.encode())
         });
     }
+}
+
+#[test]
+fn a_damaged_activation_is_refused_or_reproduces_itself() {
+    let activation = Activation { slot: 9 };
+    truncations_and_flips(&activation.encode(), |bytes| {
+        Activation::decode(bytes).ok().map(|a| a.encode())
+    });
 }
 
 #[test]
