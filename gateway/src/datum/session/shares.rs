@@ -69,7 +69,13 @@ impl Session<'_> {
                 );
             }
             ShareVerdict::Rejected(reason) => {
-                warn!("DATUM share rejected: {what}: {reason:?} ({})", reason.code());
+                // Every block change refuses shares on the replaced tip; C logs those at debug.
+                let level = if reason == RejectReason::StaleBlock {
+                    log::Level::Debug
+                } else {
+                    log::Level::Warn
+                };
+                log::log!(level, "DATUM share rejected: {what}: {reason:?} ({})", reason.code());
             }
         }
         if accepted {
