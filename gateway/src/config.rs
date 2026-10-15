@@ -501,7 +501,7 @@ impl Config {
             Parsed::Legacy(d) => {
                 self.stratum.vardiff_min = d;
                 self.note_warning(format!(
-                    "stratum.vardiff_min uses legacy integer syntax; use \"{}\" instead",
+                    "stratum.vardiff_min is set incorrectly; use \"{}\" instead",
                     format(ratum::target::pow2_floor(d))
                 ));
             }
@@ -759,10 +759,7 @@ mod tests {
         assert_eq!((c.stratum.vardiff_min, notes(&c).len()), (512, 0));
         let c = parse("512").unwrap();
         assert_eq!(c.stratum.vardiff_min, 512);
-        assert_eq!(
-            notes(&c),
-            ["stratum.vardiff_min uses legacy integer syntax; use \"2.2T\" instead"]
-        );
+        assert_eq!(notes(&c), ["stratum.vardiff_min is set incorrectly; use \"2.2T\" instead"]);
         let c = parse(r#""4.5T""#).unwrap();
         assert_eq!(c.stratum.vardiff_min, 2048);
         assert_eq!(notes(&c), ["stratum.vardiff_min rounded up to 8.8T"]);
